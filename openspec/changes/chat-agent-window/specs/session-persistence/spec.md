@@ -13,6 +13,10 @@ The system SHALL persist chat sessions to a local SQLite database, with each ses
 - **WHEN** a message is added to a session
 - **THEN** the session's `updated_at` field is set to the current time
 
+#### Scenario: Auto-title from first user message
+- **WHEN** the first user message is added to a session with the default title "New Chat"
+- **THEN** the session title is updated to the first 30 characters of the message content (truncated with "..." if longer)
+
 #### Scenario: Delete session
 - **WHEN** user deletes a session from the sidebar
 - **THEN** the session and all its messages are removed from the database (cascading delete)
@@ -53,3 +57,7 @@ The system SHALL automatically create the SQLite database file and schema (sessi
 #### Scenario: Schema already exists
 - **WHEN** the app launches and the database file already has the correct schema
 - **THEN** no schema changes are applied
+
+#### Scenario: Schema version mismatch
+- **WHEN** the app launches and the database file has a different `user_version` pragma than expected
+- **THEN** the database is dropped and recreated with the current schema (data loss acceptable in Phase 1)

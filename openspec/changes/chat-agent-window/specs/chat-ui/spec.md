@@ -62,6 +62,17 @@ The system SHALL show a visual indicator (e.g., blinking cursor or "..." animati
 - **WHEN** the assistant finishes generating (on_done callback)
 - **THEN** the streaming indicator is removed
 
+### Requirement: Tool call display
+The system SHALL display tool call requests and results as distinct cards within the message list, visually differentiated from regular user and assistant messages.
+
+#### Scenario: Tool call card appears
+- **WHEN** the model requests a tool invocation (on_tool_call callback)
+- **THEN** a tool call card is inserted into the message list showing the tool name and input parameters
+
+#### Scenario: Tool result displayed
+- **WHEN** a tool execution completes with a result
+- **THEN** the tool call card updates to show the result summary (collapsible for long results)
+
 ### Requirement: Session list sidebar
 The system SHALL display a sidebar listing all saved sessions, ordered by last update time descending, with the ability to switch between sessions and create new ones.
 
