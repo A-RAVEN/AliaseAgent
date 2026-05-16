@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"E:/Projects/AliasAgent/sidecar/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

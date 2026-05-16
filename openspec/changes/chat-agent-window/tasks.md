@@ -19,11 +19,15 @@
 
 ## 1. Project Scaffolding
 
-- [ ] 1.1 Create Flutter desktop project with Win/Mac/Linux platform targets
-- [ ] 1.2 Add Flutter dependencies: `sqflite`, `path_provider`, `flutter_markdown`, `ffi`, `uuid`
-- [ ] 1.3 Create C++ Sidecar project with CMake build (shared library target)
-- [ ] 1.4 Set up C++ dependencies: libcurl (HTTP/SSE), nlohmann/json (JSON parsing)
-- [ ] 1.5 Integrate C++ build into Flutter build: CMake invocation in Flutter build hook, output dynamic library to correct platform directory
+- [x] 1.1 Create Flutter desktop project with Win/Mac/Linux platform targets
+- [x] 1.2 Add Flutter dependencies: `sqflite`, `path_provider`, `flutter_markdown`, `ffi`, `uuid`
+- [x] 1.3 Create C++ Sidecar project with CMake build (shared library target)
+- [x] 1.4 Set up C++ dependencies: libcurl (HTTP/SSE), nlohmann/json (JSON parsing)
+- [x] 1.5 Integrate C++ build into Flutter build: CMake invocation in Flutter build hook, output dynamic library to correct platform directory
+
+> [!CAUTION]
+> ⛔ **STOP HERE** — After completing Phase 1 tasks, run the Checkpoint 1 verification below.
+> Do NOT proceed to Phase 2 until the user explicitly says: "execute phase 2" or "start phase 2".
 
 ### 🔎 Checkpoint 1: FFI Ping
 
@@ -39,6 +43,10 @@
 ---
 
 ## 2. Agent Configuration
+
+> [!CAUTION]
+> ⛔ **STOP HERE** — Phase 1 must be fully verified before starting Phase 2.
+> Do NOT implement any task in this phase until the user explicitly says: "execute phase 2" or "start phase 2".
 
 - [ ] 2.1 Define Dart data models: `ProviderConfig`, `AgentTypeConfig`, `AppConfig`
 - [ ] 2.2 Implement config file reader: read and parse `~/.aliasagent/config.json`, handle missing/malformed cases
@@ -61,6 +69,10 @@
 ---
 
 ## 3. Session Persistence
+
+> [!CAUTION]
+> ⛔ **STOP HERE** — Phase 2 must be fully verified before starting Phase 3.
+> Do NOT implement any task in this phase until the user explicitly says: "execute phase 3" or "start phase 3".
 
 - [ ] 3.1 Define SQLite schema: `sessions` and `messages` tables with indexes
 - [ ] 3.2 Implement database initialization: auto-create DB file and tables on first launch
@@ -85,6 +97,10 @@
 
 ## 4. FFI Bridge (Dart side)
 
+> [!CAUTION]
+> ⛔ **STOP HERE** — Phase 3 must be fully verified before starting Phase 4.
+> Do NOT implement any task in this phase until the user explicitly says: "execute phase 4" or "start phase 4".
+
 - [ ] 4.1 Define C function signatures in Dart using `dart:ffi`: `send_message`, `set_workspace`
 - [ ] 4.2 Define Dart callback types: `OnChunkCallback`, `OnToolCallCallback`, `OnDoneCallback`
 - [ ] 4.3 Implement `SidecarBridge` class: load library, bind functions, expose `sendMessage()` method
@@ -104,6 +120,10 @@
 ---
 
 ## 5. Model Gateway (C++ side)
+
+> [!CAUTION]
+> ⛔ **STOP HERE** — Phase 4 must be fully verified before starting Phase 5.
+> Do NOT implement any task in this phase until the user explicitly says: "execute phase 5" or "start phase 5".
 
 - [ ] 5.1 Implement Anthropic API request builder: construct HTTP POST with headers (x-api-key, anthropic-version, content-type) and JSON body (model, messages, system, tools, stream: true)
 - [ ] 5.2 Implement SSE stream parser: read HTTP response body line by line, parse `data:` lines, decode JSON events
@@ -128,6 +148,10 @@
 
 ## 6. Basic Tools (C++ side)
 
+> [!CAUTION]
+> ⛔ **STOP HERE** — Phase 5 must be fully verified before starting Phase 6.
+> Do NOT implement any task in this phase until the user explicitly says: "execute phase 6" or "start phase 6".
+
 - [ ] 6.1 Implement workspace path management: `set_workspace` C entry point, store and validate path
 - [ ] 6.2 Implement `read_file`: read file content, error on missing/binary/out-of-workspace
 - [ ] 6.3 Implement `list_dir`: enumerate directory entries with type indicator, error on missing/not-dir/out-of-workspace
@@ -149,6 +173,10 @@
 ---
 
 ## 7. Chat UI (Flutter)
+
+> [!CAUTION]
+> ⛔ **STOP HERE** — Phase 5 and/or Phase 6 must be fully verified before starting Phase 7.
+> Do NOT implement any task in this phase until the user explicitly says: "execute phase 7" or "start phase 7".
 
 - [ ] 7.1 Build app shell: window title, sidebar layout (session list left, chat area right)
 - [ ] 7.2 Build session list sidebar: load sessions from repository, display sorted by updated_at, "New Chat" button, delete session
@@ -176,6 +204,10 @@
 ---
 
 ## 8. Integration & Wiring
+
+> [!CAUTION]
+> ⛔ **STOP HERE** — Phases 4, 5, 6, and 7 must ALL be fully verified before starting Phase 8.
+> Do NOT implement any task in this phase until the user explicitly says: "execute phase 8" or "start phase 8".
 
 - [ ] 8.1 Wire session persistence: load session list on startup, load messages on session switch, save messages after send/response
 - [ ] 8.2 Wire config → FFI: pass provider config (api_key) and agent type config (model, system_prompt, tools) to C++ send_message

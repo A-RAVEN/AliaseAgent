@@ -1,0 +1,10 @@
+^E:\PROJECTS\ALIASAGENT\SIDECAR\BUILD\CMAKEFILES\C824730C4AEF9408F65F949B1B0ECFC5\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SE:/Projects/AliasAgent/sidecar -BE:/Projects/AliasAgent/sidecar/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file E:/Projects/AliasAgent/sidecar/build/sidecar.slnx
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
