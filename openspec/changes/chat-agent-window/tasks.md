@@ -125,12 +125,12 @@
 > ⛔ **STOP HERE** — Phase 4 must be fully verified before starting Phase 5.
 > Do NOT implement any task in this phase until the user explicitly says: "execute phase 5" or "start phase 5".
 
-- [ ] 5.1 Implement Anthropic API request builder: construct HTTP POST with headers (x-api-key, anthropic-version, content-type) and JSON body (model, messages, system, tools, stream: true)
-- [ ] 5.2 Implement SSE stream parser: read HTTP response body line by line, parse `data:` lines, decode JSON events
-- [ ] 5.3 Implement event dispatch: `content_block_delta` → on_chunk, `content_block_start` (tool_use) → on_tool_call, `message_stop` → on_done, `error` → on_done with error
-- [ ] 5.4 Implement `send_message` C entry point: accept parameters from Dart, drive HTTP request and SSE parsing, invoke callbacks
-- [ ] 5.5 Implement HTTP timeout (120s default) and connection error handling
-- [ ] 5.6 Add C++ logging to file (`~/.aliasagent/logs/`) for debugging
+- [x] 5.1 Implement Anthropic API request builder: construct HTTP POST with headers (x-api-key, anthropic-version, content-type) and JSON body (model, messages, system, tools, stream: true)
+- [x] 5.2 Implement SSE stream parser: read HTTP response body line by line, parse `data:` lines, decode JSON events
+- [x] 5.3 Implement event dispatch: `content_block_delta` → on_chunk, `content_block_start` (tool_use) → on_tool_call, `message_stop` → on_done, `error` → on_done with error
+- [x] 5.4 Implement `send_message` C entry point: accept parameters from Dart, drive HTTP request and SSE parsing, invoke callbacks
+- [x] 5.5 Implement HTTP timeout (120s default) and connection error handling
+- [x] 5.6 Add C++ logging to file (`~/.aliasagent/logs/`) for debugging
 
 ### 🔎 Checkpoint 5: Real API Call
 

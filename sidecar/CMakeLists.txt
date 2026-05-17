@@ -35,6 +35,8 @@ find_package(CURL REQUIRED)
 # Source files
 set(SOURCES
   src/sidecar_api.cpp
+  src/logger.cpp
+  src/model_gateway.cpp
 )
 
 # Shared library
