@@ -101,10 +101,10 @@
 > ⛔ **STOP HERE** — Phase 3 must be fully verified before starting Phase 4.
 > Do NOT implement any task in this phase until the user explicitly says: "execute phase 4" or "start phase 4".
 
-- [ ] 4.1 Define C function signatures in Dart using `dart:ffi`: `send_message`, `set_workspace`
-- [ ] 4.2 Define Dart callback types: `OnChunkCallback`, `OnToolCallCallback`, `OnDoneCallback`
-- [ ] 4.3 Implement `SidecarBridge` class: load library, bind functions, expose `sendMessage()` method
-- [ ] 4.4 Implement callback marshaling: convert Dart closures to C function pointers, handle thread safety
+- [x] 4.1 Define C function signatures in Dart using `dart:ffi`: `send_message`, `set_workspace`
+- [x] 4.2 Define Dart callback types: `OnChunkCallback`, `OnToolCallCallback`, `OnDoneCallback`
+- [x] 4.3 Implement `SidecarBridge` class: load library, bind functions, expose `sendMessage()` method
+- [x] 4.4 Implement callback marshaling: convert Dart closures to C function pointers, handle thread safety
 
 ### 🔎 Checkpoint 4: FFI Contract
 
