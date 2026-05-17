@@ -1,4 +1,0 @@
-E:/Projects/AliasAgent/sidecar/build/CMakeFiles/sidecar.dir
-E:/Projects/AliasAgent/sidecar/build/CMakeFiles/INSTALL.dir
-E:/Projects/AliasAgent/sidecar/build/CMakeFiles/ALL_BUILD.dir
-E:/Projects/AliasAgent/sidecar/build/CMakeFiles/ZERO_CHECK.dir

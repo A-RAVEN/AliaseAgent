@@ -48,11 +48,11 @@
 > ⛔ **STOP HERE** — Phase 1 must be fully verified before starting Phase 2.
 > Do NOT implement any task in this phase until the user explicitly says: "execute phase 2" or "start phase 2".
 
-- [ ] 2.1 Define Dart data models: `ProviderConfig`, `AgentTypeConfig`, `AppConfig`
-- [ ] 2.2 Implement config file reader: read and parse `~/.aliasagent/config.json`, handle missing/malformed cases
-- [ ] 2.3 Implement first-launch setup dialog: prompt for Anthropic API key, write initial config file
-- [ ] 2.4 Implement `AgentTypeRegistry`: register from config, lookup by name, list names
-- [ ] 2.5 Implement `ProviderResolver`: resolve provider by name, return api_key and base_url
+- [x] 2.1 Define Dart data models: `ProviderConfig`, `AgentTypeConfig`, `AppConfig`
+- [x] 2.2 Implement config file reader: read and parse `~/.aliasagent/config.json`, handle missing/malformed cases
+- [x] 2.3 Implement first-launch setup dialog: prompt for Anthropic API key, write initial config file
+- [x] 2.4 Implement `AgentTypeRegistry`: register from config, lookup by name, list names
+- [x] 2.5 Implement `ProviderResolver`: resolve provider by name, return api_key and base_url
 
 ### 🔎 Checkpoint 2: Config Round-trip
 
