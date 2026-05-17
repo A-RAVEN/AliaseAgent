@@ -32,7 +32,7 @@ DynamicLibrary _open() {
   throw UnsupportedError('Unsupported platform');
 }
 
-String? _readApiKey() {
+Map<String, String>? _readConfig() {
   final configPath = Platform.isWindows
       ? '${Platform.environment['USERPROFILE']}/.aliasagent/config.json'
       : '${Platform.environment['HOME']}/.aliasagent/config.json';
@@ -42,7 +42,16 @@ String? _readApiKey() {
   final providers = cfg['providers'] as Map<String, dynamic>?;
   if (providers == null) return null;
   final anthropic = providers['anthropic'] as Map<String, dynamic>?;
-  return anthropic?['api_key'] as String?;
+  if (anthropic == null) return null;
+
+  final agentTypes = cfg['agent_types'] as Map<String, dynamic>?;
+  final general = agentTypes?['general'] as Map<String, dynamic>?;
+
+  return {
+    'api_key': anthropic['api_key'] as String? ?? '',
+    'base_url': anthropic['base_url'] as String? ?? '',
+    'model': general?['model'] as String? ?? '',
+  };
 }
 
 String? _safeToDart(Pointer<Utf8> ptr) {
@@ -62,11 +71,17 @@ Future<bool> _spinUntil(bool Function() check, {int maxMs = 5000}) async {
 void main() async {
   final lib = _open();
   final sendFn = lib.lookupFunction<SendMessageNative, SendMessageDart>('send_message');
-  final apiKey = _readApiKey();
+  final cfg = _readConfig();
+  final apiKey = cfg?['api_key'] ?? '';
+  final baseUrl = cfg?['base_url'] ?? '';
+  final cfgModel = cfg?['model'] ?? '';
   final home = Platform.environment['USERPROFILE'] ?? Platform.environment['HOME'] ?? '.';
   final logDir = '$home/.aliasagent/logs';
 
-  print('API key configured: ${apiKey != null ? 'yes (${apiKey!.substring(0, apiKey!.length.clamp(0, 12))}...)' : 'no'}');
+  final hasKey = apiKey.isNotEmpty;
+  print('API key configured: ${hasKey ? 'yes (${apiKey.substring(0, apiKey.length.clamp(0, 12))}...)' : 'no'}');
+  print('Base URL: $baseUrl');
+  print('Model: $cfgModel');
   print('');
 
   // ---------- C: API error (bad key) ----------
@@ -85,17 +100,19 @@ void main() async {
 
     final msgs = jsonEncode([{'role': 'user', 'content': 'test'}]).toNativeUtf8();
     final badKey = 'bad-key'.toNativeUtf8();
-    final model = ''.toNativeUtf8();
-    final sp = ''.toNativeUtf8();
+    final cgBaseUrl = baseUrl.toNativeUtf8();
+    final cgModel = cfgModel.toNativeUtf8();
+    final cgSp = ''.toNativeUtf8();
     final empty = ''.toNativeUtf8();
 
-    sendFn(badKey, empty, model, sp, msgs, empty,
+    sendFn(badKey, cgBaseUrl, cgModel, cgSp, msgs, empty,
         onChunkC.nativeFunction, onToolC.nativeFunction, onDoneC.nativeFunction);
 
     malloc.free(msgs);
     malloc.free(badKey);
-    malloc.free(model);
-    malloc.free(sp);
+    malloc.free(cgBaseUrl);
+    malloc.free(cgModel);
+    malloc.free(cgSp);
     malloc.free(empty);
 
     await _spinUntil(() => onDoneCalled, maxMs: 10000);
@@ -107,7 +124,7 @@ void main() async {
   }
 
   // ---------- A & B: Real API call ----------
-  if (apiKey != null) {
+  if (hasKey) {
     final chunks = <String>[];
     final toolCalls = <String>[];
     bool onDoneCalled = false;
@@ -128,16 +145,18 @@ void main() async {
       doneErr = _safeToDart(err);
     });
 
-    final model = 'claude-sonnet-4-6'.toNativeUtf8();
+    final model = cfgModel.toNativeUtf8();
     final sp = 'You are concise.'.toNativeUtf8();
-    final msgs = jsonEncode([{'role': 'user', 'content': 'Say "Hi"'}]).toNativeUtf8();
-    final empty = ''.toNativeUtf8();
+    final msgs = jsonEncode([{'role': 'user', 'content': 'Say just hi'}]).toNativeUtf8();
+    final bu = baseUrl.toNativeUtf8();
     final ak = apiKey.toNativeUtf8();
+    final empty = ''.toNativeUtf8();
 
-    final requestId = sendFn(ak, empty, model, sp, msgs, empty,
+    final requestId = sendFn(ak, bu, model, sp, msgs, empty,
         onChunkC.nativeFunction, onToolC.nativeFunction, onDoneC.nativeFunction);
 
     malloc.free(ak);
+    malloc.free(bu);
     malloc.free(empty);
     malloc.free(msgs);
     malloc.free(sp);
@@ -146,11 +165,11 @@ void main() async {
     await _spinUntil(() => onDoneCalled, maxMs: 120000);
 
     assert(onDoneCalled, 'on_done should be called within 120s');
+    assert(requestId > 0, 'Expected positive request_id, got $requestId');
 
     if (doneCode != 0) {
-      // Key may be invalid (403) or expired — infrastructure-level failure, not code
       print('[A] WARN: API returned error → on_done(code=$doneCode, err="$doneErr")');
-      print('[B] WARN: Key rejected by API — verify key has access to model/region');
+      print('[B] WARN: Non-zero done code');
     } else {
       assert(chunks.isNotEmpty, 'on_chunk should be called at least once');
       final fullText = chunks.join();
@@ -173,7 +192,6 @@ void main() async {
   final logFile = File('$logDir/sidecar.log');
   if (logFile.existsSync()) {
     final content = logFile.readAsStringSync();
-    final lines = content.split('\n').where((l) => l.isNotEmpty).toList();
     final hasPOST = content.contains('POST');
     final hasHTTP = content.contains('HTTP');
     final hasSSE = content.contains('SSE:');
@@ -181,7 +199,7 @@ void main() async {
 
     assert(hasPOST, 'Log must contain request URL');
     assert(hasHTTP, 'Log must contain HTTP status code');
-    print('[E] PASS: Log file — ${lines.length} lines, POST=$hasPOST HTTP=$hasHTTP SSE=$hasSSE ERR=$hasError');
+    print('[E] PASS: Log file — ${content.split("\n").where((l) => l.isNotEmpty).length} lines, POST=$hasPOST HTTP=$hasHTTP SSE=$hasSSE ERR=$hasError');
   } else {
     print('[E] WARN: Log file not found (verify ~/.aliasagent/logs/ exists)');
   }
