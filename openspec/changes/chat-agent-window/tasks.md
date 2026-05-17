@@ -74,10 +74,10 @@
 > ⛔ **STOP HERE** — Phase 2 must be fully verified before starting Phase 3.
 > Do NOT implement any task in this phase until the user explicitly says: "execute phase 3" or "start phase 3".
 
-- [ ] 3.1 Define SQLite schema: `sessions` and `messages` tables with indexes
-- [ ] 3.2 Implement database initialization: auto-create DB file and tables on first launch
-- [ ] 3.3 Implement `SessionRepository`: CRUD operations (create, get, list ordered by updated_at desc, delete with cascade)
-- [ ] 3.4 Implement `MessageRepository`: insert user/assistant messages, query by session_id ordered by created_at
+- [x] 3.1 Define SQLite schema: `sessions` and `messages` tables with indexes
+- [x] 3.2 Implement database initialization: auto-create DB file and tables on first launch
+- [x] 3.3 Implement `SessionRepository`: CRUD operations (create, get, list ordered by updated_at desc, delete with cascade)
+- [x] 3.4 Implement `MessageRepository`: insert user/assistant messages, query by session_id ordered by created_at
 
 ### 🔎 Checkpoint 3: Data Layer
 
