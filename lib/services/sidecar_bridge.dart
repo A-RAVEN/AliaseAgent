@@ -25,7 +25,7 @@ typedef SendMessageNative = Int32 Function(
   Pointer<NativeFunction<OnDoneNative>> onDone,
 );
 
-typedef SetWorkspaceNative = Void Function(Pointer<Utf8> path);
+typedef SetWorkspaceNative = Pointer<Utf8> Function(Pointer<Utf8> path);
 
 // Dart-facing types (int, void) — the second type parameter to lookupFunction.
 typedef SendMessageDart = int Function(
@@ -40,7 +40,9 @@ typedef SendMessageDart = int Function(
   Pointer<NativeFunction<OnDoneNative>> onDone,
 );
 
-typedef SetWorkspaceDart = void Function(Pointer<Utf8> path);
+typedef SetWorkspaceDart = Pointer<Utf8> Function(Pointer<Utf8> path);
+typedef ReadFileDart = Pointer<Utf8> Function(Pointer<Utf8> path);
+typedef ListDirDart = Pointer<Utf8> Function(Pointer<Utf8> path);
 
 // ---------------------------------------------------------------------------
 // 4.2 — Dart-facing callback types
@@ -60,6 +62,8 @@ class SidecarBridge {
   late final DynamicLibrary _lib;
   late final SendMessageDart _sendMessageFn;
   late final SetWorkspaceDart _setWorkspaceFn;
+  late final ReadFileDart _readFileFn;
+  late final ListDirDart _listDirFn;
 
   SidecarBridge._() {
     _lib = _openLibrary();
@@ -67,6 +71,10 @@ class SidecarBridge {
         _lib.lookupFunction<SendMessageNative, SendMessageDart>('send_message');
     _setWorkspaceFn =
         _lib.lookupFunction<SetWorkspaceNative, SetWorkspaceDart>('set_workspace');
+    _readFileFn =
+        _lib.lookupFunction<SetWorkspaceNative, ReadFileDart>('read_file');
+    _listDirFn =
+        _lib.lookupFunction<SetWorkspaceNative, ListDirDart>('list_dir');
   }
 
   static SidecarBridge get instance {
@@ -135,10 +143,31 @@ class SidecarBridge {
     return result;
   }
 
-  void setWorkspace(String path) {
+  /// Returns null on success, or an error message on failure.
+  String? setWorkspace(String path) {
     final ptr = path.toNativeUtf8();
-    _setWorkspaceFn(ptr);
+    final resultPtr = _setWorkspaceFn(ptr);
     malloc.free(ptr);
+    final result = resultPtr.toDartString();
+    return result.isEmpty ? null : result;
+  }
+
+  /// Read a file within the workspace.
+  /// Returns JSON: {"ok":true,"content":"..."} or {"ok":false,"error":"..."}
+  String readFile(String path) {
+    final ptr = path.toNativeUtf8();
+    final resultPtr = _readFileFn(ptr);
+    malloc.free(ptr);
+    return resultPtr.toDartString();
+  }
+
+  /// List directory contents within the workspace.
+  /// Returns JSON: {"ok":true,"entries":[...]} or {"ok":false,"error":"..."}
+  String listDir(String path) {
+    final ptr = path.toNativeUtf8();
+    final resultPtr = _listDirFn(ptr);
+    malloc.free(ptr);
+    return resultPtr.toDartString();
   }
 
   // -- internal --

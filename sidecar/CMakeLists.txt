@@ -37,6 +37,7 @@ set(SOURCES
   src/sidecar_api.cpp
   src/logger.cpp
   src/model_gateway.cpp
+  src/tools.cpp
 )
 
 # Shared library

@@ -152,10 +152,10 @@
 > ⛔ **STOP HERE** — Phase 5 must be fully verified before starting Phase 6.
 > Do NOT implement any task in this phase until the user explicitly says: "execute phase 6" or "start phase 6".
 
-- [ ] 6.1 Implement workspace path management: `set_workspace` C entry point, store and validate path
-- [ ] 6.2 Implement `read_file`: read file content, error on missing/binary/out-of-workspace
-- [ ] 6.3 Implement `list_dir`: enumerate directory entries with type indicator, error on missing/not-dir/out-of-workspace
-- [ ] 6.4 Implement path sandboxing: canonical path resolution, workspace boundary check for both tools
+- [x] 6.1 Implement workspace path management: `set_workspace` C entry point, store and validate path
+- [x] 6.2 Implement `read_file`: read file content, error on missing/binary/out-of-workspace
+- [x] 6.3 Implement `list_dir`: enumerate directory entries with type indicator, error on missing/not-dir/out-of-workspace
+- [x] 6.4 Implement path sandboxing: canonical path resolution, workspace boundary check for both tools
 
 ### 🔎 Checkpoint 6: Tool Execution
 

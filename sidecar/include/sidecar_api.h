@@ -37,8 +37,17 @@ SIDECAR_API int send_message(
   OnDoneCallback on_done
 );
 
-/// Set the workspace root for read_file / list_dir tools
-SIDECAR_API void set_workspace(const char* path);
+/// Set the workspace root for read_file / list_dir tools.
+/// Returns an error message on failure, or empty string on success.
+SIDECAR_API const char* set_workspace(const char* path);
+
+/// Read a text file within the workspace.
+/// Returns JSON: {"ok":true,"content":"..."} or {"ok":false,"error":"..."}
+SIDECAR_API const char* read_file(const char* path);
+
+/// List directory contents within the workspace.
+/// Returns JSON: {"ok":true,"entries":[...]} or {"ok":false,"error":"..."}
+SIDECAR_API const char* list_dir(const char* path);
 
 #ifdef __cplusplus
 }
