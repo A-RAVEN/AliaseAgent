@@ -21,43 +21,36 @@ class DatabaseService {
     return openDatabase(
       p.join(dir, 'aliasagent.db'),
       version: _schemaVersion,
-      onCreate: _onCreate,
-      onUpgrade: (db, oldV, newV) => _onUpgrade(db),
+      onCreate: (db, version) async {
+        await db.execute('''
+          CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT 'New Chat',
+            agent_type TEXT NOT NULL DEFAULT 'general',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+          )
+        ''');
+        await db.execute('''
+          CREATE TABLE messages (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+            content TEXT NOT NULL,
+            token_count INTEGER,
+            created_at INTEGER NOT NULL
+          )
+        ''');
+        await db.execute(
+            'CREATE INDEX idx_messages_session ON messages(session_id)');
+        await db.execute(
+            'CREATE INDEX idx_sessions_updated ON sessions(updated_at DESC)');
+      },
+      onUpgrade: (db, oldV, newV) async {
+        await db.execute('DROP TABLE IF EXISTS messages');
+        await db.execute('DROP TABLE IF EXISTS sessions');
+      },
     );
-  }
-
-  static Future<void> _onCreate(Database db) async {
-    await db.execute('''
-      CREATE TABLE sessions (
-        id TEXT PRIMARY KEY,
-        title TEXT NOT NULL DEFAULT 'New Chat',
-        agent_type TEXT NOT NULL DEFAULT 'general',
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      )
-    ''');
-
-    await db.execute('''
-      CREATE TABLE messages (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-        role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
-        content TEXT NOT NULL,
-        token_count INTEGER,
-        created_at INTEGER NOT NULL
-      )
-    ''');
-
-    await db.execute(
-        'CREATE INDEX idx_messages_session ON messages(session_id)');
-    await db.execute(
-        'CREATE INDEX idx_sessions_updated ON sessions(updated_at DESC)');
-  }
-
-  static Future<void> _onUpgrade(Database db) async {
-    await db.execute('DROP TABLE IF EXISTS messages');
-    await db.execute('DROP TABLE IF EXISTS sessions');
-    await _onCreate(db);
   }
 
   /// Only for testing — inject a database opened at a custom path.
@@ -65,8 +58,28 @@ class DatabaseService {
     _db = await openDatabase(
       p.join(dirPath, 'aliasagent.db'),
       version: _schemaVersion,
-      onCreate: _onCreate,
-      onUpgrade: (db, oldV, newV) => _onUpgrade(db),
+      onCreate: (db, version) async {
+        // Minimal init for tests — caller is responsible for schema
+        await db.execute('''
+          CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT 'New Chat',
+            agent_type TEXT NOT NULL DEFAULT 'general',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+          )
+        ''');
+        await db.execute('''
+          CREATE TABLE IF NOT EXISTS messages (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+            content TEXT NOT NULL,
+            token_count INTEGER,
+            created_at INTEGER NOT NULL
+          )
+        ''');
+      },
     );
   }
 

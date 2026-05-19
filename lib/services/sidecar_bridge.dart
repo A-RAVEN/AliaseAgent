@@ -107,16 +107,22 @@ class SidecarBridge {
     // 4.4 — NativeCallable.listener marshals Dart closures to C function
     // pointers and delivers callbacks from any thread to this isolate's
     // event loop.
-    final onChunkCallable = NativeCallable<OnChunkNative>.listener((ptr) {
-      onChunk(ptr.toDartString());
-    });
-    final onToolCallCallable = NativeCallable<OnToolCallNative>.listener((ptr) {
-      onToolCall(ptr.toDartString());
-    });
-    final onDoneCallable = NativeCallable<OnDoneNative>.listener((code, ptr) {
-      final err = ptr.toDartString();
-      onDone(code, err.isEmpty ? null : err);
-    });
+    final onChunkCallable = NativeCallable<OnChunkNative>.listener(
+      (Pointer<Utf8> ptr) {
+        onChunk(ptr.toDartString());
+      },
+    );
+    final onToolCallCallable = NativeCallable<OnToolCallNative>.listener(
+      (Pointer<Utf8> ptr) {
+        onToolCall(ptr.toDartString());
+      },
+    );
+    final onDoneCallable = NativeCallable<OnDoneNative>.listener(
+      (int code, Pointer<Utf8> ptr) {
+        final err = ptr.toDartString();
+        onDone(code, err.isEmpty ? null : err);
+      },
+    );
 
     final result = _sendMessageFn(
       apiKeyPtr,

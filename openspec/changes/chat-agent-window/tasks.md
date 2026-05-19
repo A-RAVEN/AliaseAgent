@@ -178,12 +178,12 @@
 > ⛔ **STOP HERE** — Phase 5 and/or Phase 6 must be fully verified before starting Phase 7.
 > Do NOT implement any task in this phase until the user explicitly says: "execute phase 7" or "start phase 7".
 
-- [ ] 7.1 Build app shell: window title, sidebar layout (session list left, chat area right)
-- [ ] 7.2 Build session list sidebar: load sessions from repository, display sorted by updated_at, "New Chat" button, delete session
-- [ ] 7.3 Build message list: scrollable list, differentiate user/assistant messages visually, auto-scroll to bottom on new content
-- [ ] 7.4 Build Markdown message bubble component: render fenced code blocks with syntax highlighting, inline formatting, links
-- [ ] 7.5 Build message input: multi-line text field, Enter to submit, Shift+Enter for newline, send button, block empty submit
-- [ ] 7.6 Build streaming indicator: show "..." animation while assistant generating, remove on completion
+- [x] 7.1 Build app shell: window title, sidebar layout (session list left, chat area right)
+- [x] 7.2 Build session list sidebar: load sessions from repository, display sorted by updated_at, "New Chat" button, delete session
+- [x] 7.3 Build message list: scrollable list, differentiate user/assistant messages visually, auto-scroll to bottom on new content
+- [x] 7.4 Build Markdown message bubble component: render fenced code blocks with syntax highlighting, inline formatting, links
+- [x] 7.5 Build message input: multi-line text field, Enter to submit, Shift+Enter for newline, send button, block empty submit
+- [x] 7.6 Build streaming indicator: show "..." animation while assistant generating, remove on completion
 
 ### 🔎 Checkpoint 7: UI Ready
 

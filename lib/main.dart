@@ -1,23 +1,24 @@
-import 'dart:ffi';
-import 'dart:io';
-
-import 'package:ffi/ffi.dart';
 import 'package:flutter/material.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'models/app_config.dart';
+import 'models/message.dart';
+import 'models/session.dart';
 import 'services/agent_type_registry.dart';
 import 'services/config_service.dart';
+import 'services/message_repository.dart';
 import 'services/provider_resolver.dart';
+import 'services/session_repository.dart';
+import 'ui/chat_area.dart';
+import 'ui/session_sidebar.dart';
 import 'ui/setup_dialog.dart';
-
-// C function signature: const char* ping(void)
-typedef PingNative = Pointer<Utf8> Function();
-typedef PingDart = Pointer<Utf8> Function();
 
 final registry = AgentTypeRegistry();
 ProviderResolver? resolver;
 
 void main() {
+  sqfliteFfiInit();
+  databaseFactory = databaseFactoryFfi;
   runApp(const MyApp());
 }
 
@@ -29,7 +30,10 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       title: 'AliasAgent',
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.deepPurple,
+          brightness: Brightness.dark,
+        ),
         useMaterial3: true,
       ),
       home: const AppShell(),
@@ -98,10 +102,7 @@ class _AppShellState extends State<AppShell> {
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(24),
-            child: Text(
-              _error!,
-              style: Theme.of(context).textTheme.bodyLarge,
-            ),
+            child: Text(_error!, style: Theme.of(context).textTheme.bodyLarge),
           ),
         ),
       );
@@ -113,147 +114,229 @@ class _AppShellState extends State<AppShell> {
       );
     }
 
-    return MyHomePage(
-      title: 'AliasAgent',
-      config: _config!,
+    return Scaffold(
+      body: ChatScreen(config: _config!),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  final String title;
+// ---------------------------------------------------------------------------
+// ChatScreen — the main chat UI with sidebar + chat area
+// ---------------------------------------------------------------------------
+
+class ChatScreen extends StatefulWidget {
   final AppConfig config;
 
-  const MyHomePage({super.key, required this.title, required this.config});
+  const ChatScreen({super.key, required this.config});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  String _pingResult = 'not run';
-  String _ffiStatus = 'not loaded';
+class _ChatScreenState extends State<ChatScreen> {
+  final _sessionRepo = SessionRepository();
+  final _msgRepo = MessageRepository();
+
+  List<Session> _sessions = [];
+  String? _currentId;
+  List<Message> _messages = [];
+
+  // Streaming state
+  bool _isStreaming = false;
+  String _streamingText = '';
+
+  bool _loading = true;
 
   @override
   void initState() {
     super.initState();
-    _testFfiPing();
+    _loadSessions();
   }
 
-  void _testFfiPing() {
-    try {
-      final lib = _openSidecar();
-      final pingFn = lib.lookupFunction<PingNative, PingDart>('ping');
-      final result = pingFn();
-      final text = result.toDartString();
-      setState(() {
-        _ffiStatus = 'loaded OK';
-        _pingResult = text;
-      });
-    } catch (e) {
-      setState(() {
-        _ffiStatus = 'failed';
-        _pingResult = e.toString();
-      });
+  Future<void> _loadSessions() async {
+    final sessions = await _sessionRepo.list();
+    setState(() {
+      _sessions = sessions;
+      _loading = false;
+      if (sessions.isNotEmpty && _currentId == null) {
+        _currentId = sessions.first.id;
+        _loadMessages();
+      }
+    });
+  }
+
+  Future<void> _loadMessages() async {
+    if (_currentId == null) {
+      setState(() => _messages = []);
+      return;
     }
+    final msgs = await _msgRepo.queryBySession(_currentId!);
+    setState(() => _messages = msgs);
   }
 
-  DynamicLibrary _openSidecar() {
-    if (Platform.isWindows) return DynamicLibrary.open('sidecar.dll');
-    if (Platform.isMacOS) return DynamicLibrary.open('libsidecar.dylib');
-    if (Platform.isLinux) return DynamicLibrary.open('libsidecar.so');
-    throw UnsupportedError('Unsupported platform');
+  void _selectSession(Session s) {
+    setState(() {
+      _currentId = s.id;
+      _isStreaming = false;
+      _streamingText = '';
+    });
+    _loadMessages();
+  }
+
+  Future<void> _newChat() async {
+    final s = await _sessionRepo.create();
+    setState(() {
+      _currentId = s.id;
+      _messages = [];
+      _isStreaming = false;
+      _streamingText = '';
+    });
+    _loadSessions();
+  }
+
+  Future<void> _deleteSession(Session s) async {
+    await _sessionRepo.delete(s.id);
+    final wasCurrent = _currentId == s.id;
+    setState(() {
+      _sessions.removeWhere((x) => x.id == s.id);
+      if (wasCurrent) {
+        _currentId = _sessions.isNotEmpty ? _sessions.first.id : null;
+        _messages = [];
+        _isStreaming = false;
+        _streamingText = '';
+        if (_currentId != null) _loadMessages();
+      }
+    });
+  }
+
+  Future<void> _sendMessage(String text) async {
+    if (_currentId == null) {
+      // Auto-create a session if none exists
+      await _newChat();
+    }
+    if (_currentId == null) return;
+
+    // Insert user message
+    final userMsg = await _msgRepo.insert(
+      sessionId: _currentId!,
+      role: 'user',
+      content: text,
+    );
+    await _sessionRepo.touch(_currentId!);
+
+    setState(() {
+      _messages.add(userMsg);
+      _isStreaming = true;
+      _streamingText = '';
+    });
+
+    _loadSessions();
+
+    // Mock assistant response (3 chunks with delays)
+    _mockAssistantReply();
+  }
+
+  void _mockAssistantReply() {
+    // Predefined mock responses based on user message patterns
+    final userText = _messages.last.content.toLowerCase();
+
+    String fullResponse;
+    if (userText.contains('hello') || userText.contains('hi')) {
+      fullResponse =
+          'Hello! How can I help you today?\n\nI\'m a helpful assistant. Feel free to ask me anything!';
+    } else if (userText.contains('markdown') || userText.contains('code')) {
+      fullResponse =
+          'Here\'s an example of **Markdown** support:\n\n```dart\nvoid main() {\n  print("Hello, World!");\n}\n```\n\n- Item 1\n- Item 2\n\nVisit [Flutter](https://flutter.dev) for more info.';
+    } else if (userText.contains('tool') || userText.contains('read')) {
+      fullResponse =
+          'Let me read that file for you.\n\n```json\n{"ok":true,"content":"Hello from workspace!"}\n```';
+    } else {
+      fullResponse =
+          'I received your message. This is a **mock response** while the UI is being built.\n\n*Streaming works!*';
+    }
+
+    // Simulate streaming in 3 chunks with delays
+    final chunks = <String>[];
+    final third = (fullResponse.length / 3).ceil();
+
+    // Split at word boundaries
+    int pos = 0;
+    for (int i = 0; i < 3; i++) {
+      int end;
+      if (i == 2) {
+        end = fullResponse.length;
+      } else {
+        final target = pos + third;
+        if (target >= fullResponse.length) {
+          end = fullResponse.length;
+        } else {
+          end = target;
+          while (end < fullResponse.length && fullResponse[end] != ' ') {
+            end++;
+          }
+        }
+      }
+      chunks.add(fullResponse.substring(pos, end));
+      pos = end;
+    }
+
+    Future.delayed(const Duration(milliseconds: 500), () {
+      if (!mounted) return;
+      setState(() => _streamingText = chunks[0]);
+    });
+
+    Future.delayed(const Duration(milliseconds: 1000), () {
+      if (!mounted) return;
+      setState(() => _streamingText = chunks[0] + chunks[1]);
+    });
+
+    Future.delayed(const Duration(milliseconds: 1500), () async {
+      if (!mounted) return;
+      setState(() {
+        _streamingText = fullResponse;
+        _isStreaming = false;
+      });
+
+      final assistantMsg = await _msgRepo.insert(
+        sessionId: _currentId!,
+        role: 'assistant',
+        content: fullResponse,
+      );
+      await _sessionRepo.touch(_currentId!);
+      setState(() {
+        _messages.add(assistantMsg);
+        _streamingText = '';
+      });
+    });
   }
 
   @override
   Widget build(BuildContext context) {
-    final passed = _pingResult == 'pong';
+    if (_loading) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
 
-    // Checkpoint 2 verification info
-    final providerNames = widget.config.providers.keys.join(', ');
-    final agentTypeNames = registry.listNames().join(', ');
-    final generalConfig = registry.lookup('general');
-    final generalProvider = generalConfig?.provider ?? 'N/A';
-    final generalModel = generalConfig?.model ?? 'N/A';
-    final lookupNonexistent = registry.lookup('nonexistent');
-    final resolved = resolver?.resolve('anthropic');
-    final hasAnthropicKey =
-        resolved != null && resolved.apiKey.isNotEmpty;
-
-    return Scaffold(
-      appBar: AppBar(
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        title: Text(widget.title),
-      ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(24),
-        child: Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // --- Checkpoint 1: FFI Ping ---
-              Icon(
-                passed ? Icons.check_circle : Icons.error,
-                size: 48,
-                color: passed ? Colors.green : Colors.red,
-              ),
-              const SizedBox(height: 8),
-              Text(
-                'Checkpoint 1: FFI Ping',
-                style: Theme.of(context).textTheme.titleMedium,
-              ),
-              const SizedBox(height: 12),
-              _row('FFI Load', _ffiStatus),
-              _row('ping() →', _pingResult),
-              _row('Expected', 'pong'),
-              _row('Result', passed ? 'PASS' : 'FAIL',
-                  color: passed ? Colors.green : Colors.red),
-
-              const Divider(height: 40),
-
-              // --- Checkpoint 2: Config ---
-              Text(
-                'Checkpoint 2: Config Round-trip',
-                style: Theme.of(context).textTheme.titleMedium,
-              ),
-              const SizedBox(height: 12),
-              _row('Providers', providerNames),
-              _row('Agent Types', agentTypeNames),
-              _row('General Provider', generalProvider),
-              _row('General Model', generalModel),
-              _row('Registry lookup("general")',
-                  generalConfig != null ? 'found' : 'null'),
-              _row('Registry lookup("nonexistent")',
-                  lookupNonexistent != null ? 'found' : 'null'),
-              _row('Provider resolve("anthropic")',
-                  hasAnthropicKey ? 'has key' : 'missing'),
-            ],
+    return Row(
+      children: [
+        SessionSidebar(
+          sessions: _sessions,
+          currentId: _currentId,
+          onNewChat: _newChat,
+          onSelect: _selectSession,
+          onDelete: _deleteSession,
+        ),
+        const VerticalDivider(width: 1),
+        Expanded(
+          child: ChatArea(
+            messages: _messages,
+            streamingText: _isStreaming ? _streamingText : null,
+            isStreaming: _isStreaming,
+            onSendMessage: _sendMessage,
           ),
         ),
-      ),
-    );
-  }
-
-  Widget _row(String label, String value, {Color? color}) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 2),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          SizedBox(
-            width: 220,
-            child: Text(
-              label,
-              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
-            ),
-          ),
-          Flexible(
-            child: Text(value,
-                style: TextStyle(color: color, fontSize: 12),
-                overflow: TextOverflow.ellipsis),
-          ),
-        ],
-      ),
+      ],
     );
   }
 }
