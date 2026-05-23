@@ -209,11 +209,11 @@
 > ⛔ **STOP HERE** — Phases 4, 5, 6, and 7 must ALL be fully verified before starting Phase 8.
 > Do NOT implement any task in this phase until the user explicitly says: "execute phase 8" or "start phase 8".
 
-- [ ] 8.1 Wire session persistence: load session list on startup, load messages on session switch, save messages after send/response
-- [ ] 8.2 Wire config → FFI: pass provider config (api_key) and agent type config (model, system_prompt, tools) to C++ send_message
-- [ ] 8.3 Wire tools: display tool call requests in the message UI, pass tool results back to model (single turn for now)
-- [ ] 8.4 Handle errors end-to-end: network errors, API errors, FFI errors → display in UI as error message bubbles
-- [ ] 8.5 Wire message send flow: user input → store user message → SidecarBridge.sendMessage() → stream on_chunk into UI → on_done → store assistant message
+- [x] 8.1 Wire session persistence: load session list on startup, load messages on session switch, save messages after send/response
+- [x] 8.2 Wire config → FFI: pass provider config (api_key) and agent type config (model, system_prompt, tools) to C++ send_message
+- [x] 8.3 Wire tools: display tool call requests in the message UI, pass tool results back to model (single turn for now)
+- [x] 8.4 Handle errors end-to-end: network errors, API errors, FFI errors → display in UI as error message bubbles
+- [x] 8.5 Wire message send flow: user input → store user message → SidecarBridge.sendMessage() → stream on_chunk into UI → on_done → store assistant message
 
 ### 🔎 Checkpoint 8: End-to-End Acceptance
 
@@ -227,3 +227,98 @@
 | D | 错误处理 | 断网后发消息 → UI 显示错误提示（不 crash） |
 | E | 单轮工具 | Agent 回复中调用 read_file → UI 显示工具调用卡片 → 工具结果回传并显示后续回复 |
 | F | 跨平台 | 在目标平台完成完整对话流程（至少一个桌面平台）
+
+---
+
+## 9. 会话隔离修复
+
+> [!CAUTION]
+> ⛔ **STOP HERE** — Phase 8 must be fully verified before starting Phase 9.
+> Do NOT implement any task in this phase until the user explicitly says: "execute phase 9" or "start phase 9".
+
+### 问题
+
+`_callModel()` 在 `await SidecarBridge.sendMessage()` 之后直接引用 `_currentId!` 和 `_messages`，但用户可能在 await 期间切换/创建了新会话，导致异步回调中的 `setState` 和 `_msgRepo.insert` 操作到错误的 session。
+
+根本原因：`_currentId` / `_messages` 是 state field，被多个异步操作共享，没有在 await 边界前做快照。
+
+### 修复任务
+
+- [x] 9.1 在 `_sendMessage()` 中 await `_callModel()` 前，将 `_currentId!` 和 `_messages` 快照到局部变量并传入 `_callModel()`
+- [x] 9.2 将所有 `_currentId!`、`_messages` 的引用替换为传入的局部参数
+- [x] 9.3 `setState` 中增加 `_currentId == sessionId` 守卫，防止在已切换的会话中更新 UI
+- [x] 9.4 清理多余的 `_currentId!` 断言（传入参数后不再需要）
+- [x] 9.5 `_storeError()` 改为接收 `sessionId` 参数，不再读取 `_currentId!`；调用处传入已快照的 sessionId
+
+### 🔎 Checkpoint 9: 会话隔离
+
+> 验收目标：多会话并发操作时回复不会串到错误会话。
+
+| # | 验收项 | 通过标准 |
+|---|--------|----------|
+| A | 流式回复隔离 | 会话 A 发消息 → 不等回复切到会话 B → A 的回复仍然存入会话 A，不在 B 的 UI 中闪现 |
+| B | 新建会话隔离 | 会话 A 发消息 → 不等回复新建会话 B → A 的回复正确存入会话 A，B 的消息列表保持空（仅 welcome） |
+| C | UI 不错误更新 | 会话切换后，旧请求的 `setState` 被 `_currentId == sessionId` 守卫拦截，不会往当前 UI 插入不属于当前会话的消息 |
+| D | 数据库一致性 | 最终 assistant 消息的 `session_id` 与 user 消息一致 |
+| E | 错误消息隔离 | API 错误或网络异常回复存入正确会话，不污染切换后的会话 |
+
+---
+
+## 10. 多轮工具调用文本修复
+
+> [!CAUTION]
+> ⛔ **STOP HERE** — Phase 9 must be fully verified before starting Phase 10.
+> Do NOT implement any task in this phase until the user explicitly says: "execute phase 10" or "start phase 10".
+
+### 问题
+
+`_callModel()` 中 `allText` 跨轮次累加（`allText += text`），多轮 tool call 场景下最终存储的 assistant 消息包含所有轮次的文本拼接，且无分隔符。
+
+例如：第一轮模型回复 "让我读取文件" + tool call，第二轮回复 "文件内容是 hello"。存入 DB 的 content 为 `"让我读取文件文件内容是 hello"`，而非仅最终轮次的 `"文件内容是 hello"`。
+
+根本原因：`allText` 设计为全程累加，但对单条 assistant 消息而言，前面轮次的文本已作为 API history 的一部分，不应重复出现在最终消息内容中。
+
+### 修复任务
+
+- [ ] 10.1 将存储 assistant 消息时的 `content` 从 `allText` 改为 `turnText`（当前轮次文本），仅保留最终轮次的回复内容
+- [ ] 10.2 确认 `_streamingText` UI 显示逻辑不受影响（流式显示仍可展示过程文本）
+
+### 🔎 Checkpoint 10: 多轮文本正确性
+
+> 验收目标：多轮工具调用场景下存入 DB 的 assistant 消息内容正确。
+
+| # | 验收项 | 通过标准 |
+|---|--------|----------|
+| A | 单轮无工具 | 存储的 assistant 消息内容与 `_streamingText` 一致，不受影响 |
+| B | 多轮有工具 | 最终 assistant 消息仅包含最后轮次文本，不含前面轮次文本 |
+| C | 单轮有工具 | 仅工具调用无文本时，不产生空 content 消息 |
+
+---
+
+## 11. 输入防护与 mounted 检查
+
+> [!CAUTION]
+> ⛔ **STOP HERE** — Phase 10 must be fully verified before starting Phase 11.
+> Do NOT implement any task in this phase until the user explicitly says: "execute phase 11" or "start phase 11".
+
+### 问题
+
+1. `_sendMessage()` 无 `_isStreaming` 检查：流式回复期间用户仍可按 Send 或 Enter 触发新请求，导致并发调用
+2. `_callModel()` 中多个 `await sendMessage()` 之后的 `setState` 缺少 `mounted` 检查（当前仅 onChunk 回调中有），Widget 销毁后会 crash
+3. `_storeError()` 中 `setState` 同样缺少 `mounted` 守卫
+
+### 修复任务
+
+- [ ] 11.1 `_sendMessage()` 开头增加 `if (_isStreaming) return;` 防护
+- [ ] 11.2 `_callModel()` 中所有 await 后的 `setState` 加上 `if (mounted)` 守卫（行 346、363、368、404、428）
+- [ ] 11.3 `_storeError()` 中 `setState` 增加 `if (mounted)` 守卫
+
+### 🔎 Checkpoint 11: 健壮性
+
+> 验收目标：并发发送被阻止，Widget 销毁后回调不 crash。
+
+| # | 验收项 | 通过标准 |
+|---|--------|----------|
+| A | 流式中发送 | 流式回复期间按 Send 或 Enter 不触发新请求 |
+| B | 正常发送恢复 | 流式结束后可正常发送新消息 |
+| C | mounted 守卫 | Widget 销毁后回调不 crash（可通过快速切换会话模拟） |

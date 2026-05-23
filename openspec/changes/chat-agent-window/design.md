@@ -30,58 +30,102 @@ AliasAgent 一期目标是构建一个可对话的桌面窗口。Flutter 负责 
 ### 1. 进程模型
 
 ```
-┌─────────────────────────┐
-│  Flutter 进程 (Desktop)  │
-│  - UI 渲染              │
-│  - 消息管理              │
-│  - SQLite (sqflite)     │
-│  - Agent Type 注册表     │
-│       │                  │
-│       │ dart:ffi         │
-│       │ (同步调用+回调)   │
-│       ▼                  │
-│  ┌───────────────────┐  │
-│  │  C++ 动态库 (.so/  │  │
-│  │  .dylib/.dll)      │  │
-│  │  - HTTP/SSE Client │  │
-│  │  - read_file       │  │
-│  │  - list_dir        │  │
-│  └───────────────────┘  │
-│  同进程内加载, 非独立进程  │
-└─────────────────────────┘
+┌──────────────────────────────────────────┐
+│  Flutter 进程 (Desktop)                   │
+│                                           │
+│  Main Isolate (UI)       Worker Isolate   │
+│  ┌─────────────────┐    ┌──────────────┐ │
+│  │ - UI 渲染        │    │ - send_message│ │
+│  │ - 消息管理        │    │ - curl_easy_  │ │
+│  │ - SQLite         │    │   perform     │ │
+│  │ - Agent Type 注册 │    │ - NativeCall- │ │
+│  │ - 工具执行        │    │   able 回调   │ │
+│  │                  │    │       │       │ │
+│  │  ▲ SendPort      │    │       │       │ │
+│  │  │ ReceivePort   │    │       ▼       │ │
+│  │  │ await for     │    │  dart:ffi     │ │
+│  │  │              │    │  (同步调用)    │ │
+│  └──┼──────────────┘    └──────┼───────┘ │
+│     │                          │          │
+│     │                   ┌──────▼───────┐  │
+│     │                   │  C++ 动态库   │  │
+│     │                   │  (.dll/.so/  │  │
+│     │                   │   .dylib)     │  │
+│     │                   │  - HTTP/SSE  │  │
+│     │                   │  - read_file │  │
+│     │                   │  - list_dir  │  │
+│     │                   └──────────────┘  │
+│     │  同进程内加载, 非独立进程             │
+└──────────────────────────────────────────┘
 ```
 
-**Decision**: C++ 编译为动态库，Flutter 进程内通过 `dart:ffi` 加载调用，而非独立进程 IPC。
+**Decision**: C++ 编译为动态库，Flutter 进程内通过 `dart:ffi` 加载调用。`send_message`（阻塞 HTTP 调用）在 worker isolate 中执行，通过 `Isolate.spawn` + `SendPort`/`ReceivePort` 与主 isolate 通信。`set_workspace`、`read_file`、`list_dir` 等快速本地调用保留在主 isolate 直接执行。
 
 **Alternatives considered**:
 - 独立进程 + IPC（gRPC/socket）：更隔离，崩溃不互相影响，但一期复杂度太高
 - 进程内动态库：简单，零序列化开销，崩溃会带垮 Flutter 进程，但一期可接受
+- 主 isolate 直接调用（原实现）：最简，但 `curl_easy_perform` 阻塞导致 UI 冻结，不可接受
 
-**Rationale**: 一期 C++ 逻辑简单（HTTP + 两个 FS 工具），进程内加载最简。后期 C++ 职责加重后如需隔离，可再拆独立进程，FFI 接口层抽象好了迁移成本不高。
+**Rationale**: 一期 C++ 逻辑简单（HTTP + 两个 FS 工具），进程内加载最简。Worker isolate 解决 UI 冻结问题，同时不引入独立进程的复杂度。后期 C++ 职责加重后如需隔离，可再拆独立进程，FFI 接口层抽象好了迁移成本不高。
 
 ### 2. FFI 通信协议
 
-```
-Dart 侧                           C 侧
+**C 侧签名**（阻塞调用，运行在 worker isolate）:
 
-// 发送消息 (同步，返回 request_id)
+```c
+// 发送消息 (阻塞 HTTP，返回时回调已全部触发)
 int send_message(
-  const char* agent_type,  // "general"
-  const char* model,       // "claude-sonnet-4-6"
+  const char* api_key,
+  const char* base_url,
+  const char* model,
   const char* system_prompt,
   const char* messages_json, // JSON: [{role,content},...]
-  const char* tools_json,    // JSON: [{name,description,parameters},...]
-  void (*on_chunk)(const char* text),    // 流式文本回调
-  void (*on_tool_call)(const char* json), // 工具调用回调
+  const char* tools_json,    // JSON: [{name,description,input_schema},...]
+  void (*on_chunk)(const char* text),      // 流式文本回调
+  void (*on_tool_call)(const char* json),  // 工具调用回调
   void (*on_done)(int code, const char* err) // 完成回调
 );
+
+// 本地工具（主 isolate 直接调用，同步返回 JSON）
+const char* set_workspace(const char* path);
+const char* read_file(const char* path);
+const char* list_dir(const char* path);
 ```
 
-**Decision**: 单一入口函数 + 三个回调。用 C 风格接口（`const char*`），Dart 侧通过 `Pointer<Utf8>` 传参。JSON 序列化在 Dart 侧完成，C 侧解析。
+**Dart 侧包装**（`SidecarBridge`）:
+
+```dart
+class SidecarBridge {
+  Future<void> sendMessage({
+    required String apiKey,
+    required String baseUrl,
+    required String model,
+    required String systemPrompt,
+    required String messagesJson,
+    required String toolsJson,
+    required OnChunkCallback onChunk,
+    required OnToolCallCallback onToolCall,
+    required OnDoneCallback onDone,
+  }); // 通过 Isolate.spawn + ReceivePort 实现
+
+  String? setWorkspace(String path); // 主 isolate 同步
+  String readFile(String path);
+  String listDir(String path);
+}
+```
+
+`sendMessage` work flow:
+1. `Isolate.spawn(_workerMain, args)` — 启动 worker isolate
+2. Worker isolate 加载 DLL、创建 `NativeCallable.listener` 回调、调用阻塞 `send_message` FFI
+3. C 回调触发时，worker 通过 `SendPort` 将事件转发到主 isolate
+4. 主 isolate `await for` 消费 `ReceivePort`，依次调用 Dart 回调 (`onChunk`/`onToolCall`/`onDone`)
+
+**Decision**: 单一入口函数 + 三个回调。用 C 风格接口（`const char*`），Dart 侧通过 `Pointer<Utf8>` 传参。JSON 序列化在 Dart 侧完成，C 侧解析。阻塞调用以 worker isolate 封装，保持 UI 响应。
 
 **Alternatives considered**:
 - protobuf/flatbuffers：强类型，但引入构建复杂度
 - 消息队列 + 事件循环：灵活但太重
+- 主 isolate 直接同步调用（原实现）：UI 冻结，已废弃
 
 **Rationale**: C 字符串 + JSON 是一期最轻量的方案。后期工具轮次复杂时，可演进为结构化协议。
 

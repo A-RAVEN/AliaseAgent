@@ -35,6 +35,7 @@ class ConfigService {
     return env['HOME'] ?? '';
   }
 
+  static String get homeDir => _homeDir;
   static String get configDir => '$_homeDir${Platform.pathSeparator}.aliasagent';
   static String get configPath => '$configDir${Platform.pathSeparator}config.json';
 

@@ -1,14 +1,14 @@
+import 'dart:async';
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:ffi/ffi.dart';
 
 // ---------------------------------------------------------------------------
-// 4.1 — Native C function signatures (must match sidecar_api.h exactly)
+// Native C function signatures (must match sidecar_api.h exactly)
 // ---------------------------------------------------------------------------
 
-// C-side native types (Int32, Void, etc.) — used with NativeCallable and
-// as the first type parameter to lookupFunction.
 typedef OnChunkNative = Void Function(Pointer<Utf8> text);
 typedef OnToolCallNative = Void Function(Pointer<Utf8> json);
 typedef OnDoneNative = Void Function(Int32 code, Pointer<Utf8> err);
@@ -27,7 +27,7 @@ typedef SendMessageNative = Int32 Function(
 
 typedef SetWorkspaceNative = Pointer<Utf8> Function(Pointer<Utf8> path);
 
-// Dart-facing types (int, void) — the second type parameter to lookupFunction.
+// Dart-facing types
 typedef SendMessageDart = int Function(
   Pointer<Utf8> apiKey,
   Pointer<Utf8> baseUrl,
@@ -45,7 +45,7 @@ typedef ReadFileDart = Pointer<Utf8> Function(Pointer<Utf8> path);
 typedef ListDirDart = Pointer<Utf8> Function(Pointer<Utf8> path);
 
 // ---------------------------------------------------------------------------
-// 4.2 — Dart-facing callback types
+// Dart-facing callback types
 // ---------------------------------------------------------------------------
 
 typedef OnChunkCallback = void Function(String text);
@@ -53,22 +53,19 @@ typedef OnToolCallCallback = void Function(String json);
 typedef OnDoneCallback = void Function(int code, String? error);
 
 // ---------------------------------------------------------------------------
-// 4.3 & 4.4 — SidecarBridge with callback marshaling
+// SidecarBridge
 // ---------------------------------------------------------------------------
 
 class SidecarBridge {
   static SidecarBridge? _instance;
 
   late final DynamicLibrary _lib;
-  late final SendMessageDart _sendMessageFn;
   late final SetWorkspaceDart _setWorkspaceFn;
   late final ReadFileDart _readFileFn;
   late final ListDirDart _listDirFn;
 
   SidecarBridge._() {
     _lib = _openLibrary();
-    _sendMessageFn =
-        _lib.lookupFunction<SendMessageNative, SendMessageDart>('send_message');
     _setWorkspaceFn =
         _lib.lookupFunction<SetWorkspaceNative, SetWorkspaceDart>('set_workspace');
     _readFileFn =
@@ -82,11 +79,9 @@ class SidecarBridge {
     return _instance!;
   }
 
-  // -- public API --
+  // -- non-blocking model call (runs FFI on a worker isolate) --
 
-  /// Send a message to the model. Blocks until the C++ side completes.
-  /// Callbacks are invoked synchronously before this method returns.
-  int sendMessage({
+  Future<void> sendMessage({
     required String apiKey,
     required String baseUrl,
     required String model,
@@ -96,7 +91,51 @@ class SidecarBridge {
     required OnChunkCallback onChunk,
     required OnToolCallCallback onToolCall,
     required OnDoneCallback onDone,
-  }) {
+  }) async {
+    final receivePort = ReceivePort();
+
+    await Isolate.spawn(_workerMain, {
+      'sendPort': receivePort.sendPort,
+      'apiKey': apiKey,
+      'baseUrl': baseUrl,
+      'model': model,
+      'systemPrompt': systemPrompt,
+      'messagesJson': messagesJson,
+      'toolsJson': toolsJson,
+    });
+
+    await for (final msg in receivePort) {
+      final map = msg as Map<String, dynamic>;
+      switch (map['type'] as String) {
+        case 'chunk':
+          onChunk(map['text'] as String);
+        case 'tool_call':
+          onToolCall(map['json'] as String);
+        case 'done':
+          final code = map['code'] as int;
+          final error = map['error'] as String?;
+          onDone(code, error);
+          receivePort.close();
+          return;
+      }
+    }
+  }
+
+  // -- worker isolate entry point --
+
+  static void _workerMain(Map<String, dynamic> args) {
+    final sendPort = args['sendPort'] as SendPort;
+    final apiKey = args['apiKey'] as String;
+    final baseUrl = args['baseUrl'] as String;
+    final model = args['model'] as String;
+    final systemPrompt = args['systemPrompt'] as String;
+    final messagesJson = args['messagesJson'] as String;
+    final toolsJson = args['toolsJson'] as String;
+
+    final lib = _openLibrary();
+    final sendMessageFn =
+        lib.lookupFunction<SendMessageNative, SendMessageDart>('send_message');
+
     final apiKeyPtr = apiKey.toNativeUtf8();
     final baseUrlPtr = baseUrl.toNativeUtf8();
     final modelPtr = model.toNativeUtf8();
@@ -104,27 +143,28 @@ class SidecarBridge {
     final messagesJsonPtr = messagesJson.toNativeUtf8();
     final toolsJsonPtr = toolsJson.toNativeUtf8();
 
-    // 4.4 — NativeCallable.listener marshals Dart closures to C function
-    // pointers and delivers callbacks from any thread to this isolate's
-    // event loop.
     final onChunkCallable = NativeCallable<OnChunkNative>.listener(
       (Pointer<Utf8> ptr) {
-        onChunk(ptr.toDartString());
+        sendPort.send({'type': 'chunk', 'text': ptr.toDartString()});
       },
     );
     final onToolCallCallable = NativeCallable<OnToolCallNative>.listener(
       (Pointer<Utf8> ptr) {
-        onToolCall(ptr.toDartString());
+        sendPort.send({'type': 'tool_call', 'json': ptr.toDartString()});
       },
     );
     final onDoneCallable = NativeCallable<OnDoneNative>.listener(
       (int code, Pointer<Utf8> ptr) {
         final err = ptr.toDartString();
-        onDone(code, err.isEmpty ? null : err);
+        sendPort.send({
+          'type': 'done',
+          'code': code,
+          'error': err.isEmpty ? null : err,
+        });
       },
     );
 
-    final result = _sendMessageFn(
+    sendMessageFn(
       apiKeyPtr,
       baseUrlPtr,
       modelPtr,
@@ -143,13 +183,16 @@ class SidecarBridge {
     malloc.free(messagesJsonPtr);
     malloc.free(toolsJsonPtr);
 
-    // NativeCallables stay alive for the duration of the synchronous call;
-    // all callbacks have fired by the time sendMessage returns.
-
-    return result;
+    // Schedule cleanup after queued callbacks have fired on this isolate
+    Timer.run(() {
+      onChunkCallable.close();
+      onToolCallCallable.close();
+      onDoneCallable.close();
+    });
   }
 
-  /// Returns null on success, or an error message on failure.
+  // -- tools (run on main isolate — they're fast, local calls) --
+
   String? setWorkspace(String path) {
     final ptr = path.toNativeUtf8();
     final resultPtr = _setWorkspaceFn(ptr);
@@ -158,8 +201,6 @@ class SidecarBridge {
     return result.isEmpty ? null : result;
   }
 
-  /// Read a file within the workspace.
-  /// Returns JSON: {"ok":true,"content":"..."} or {"ok":false,"error":"..."}
   String readFile(String path) {
     final ptr = path.toNativeUtf8();
     final resultPtr = _readFileFn(ptr);
@@ -167,8 +208,6 @@ class SidecarBridge {
     return resultPtr.toDartString();
   }
 
-  /// List directory contents within the workspace.
-  /// Returns JSON: {"ok":true,"entries":[...]} or {"ok":false,"error":"..."}
   String listDir(String path) {
     final ptr = path.toNativeUtf8();
     final resultPtr = _listDirFn(ptr);

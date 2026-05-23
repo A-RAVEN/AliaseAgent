@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
@@ -9,6 +11,7 @@ import 'services/config_service.dart';
 import 'services/message_repository.dart';
 import 'services/provider_resolver.dart';
 import 'services/session_repository.dart';
+import 'services/sidecar_bridge.dart';
 import 'ui/chat_area.dart';
 import 'ui/session_sidebar.dart';
 import 'ui/setup_dialog.dart';
@@ -150,6 +153,7 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
+    SidecarBridge.instance.setWorkspace(ConfigService.homeDir);
     _loadSessions();
   }
 
@@ -232,81 +236,248 @@ class _ChatScreenState extends State<ChatScreen> {
 
     _loadSessions();
 
-    // Mock assistant response (3 chunks with delays)
-    _mockAssistantReply();
+    // Snapshot session state before async gap to prevent race conditions
+    final sessionId = _currentId!;
+    final snapMessages = List<Message>.from(_messages);
+    await _callModel(sessionId: sessionId, messages: snapMessages);
   }
 
-  void _mockAssistantReply() {
-    // Predefined mock responses based on user message patterns
-    final userText = _messages.last.content.toLowerCase();
+  // -------------------------------------------------------------------------
+  // Model calling with tool execution loop
+  // -------------------------------------------------------------------------
 
-    String fullResponse;
-    if (userText.contains('hello') || userText.contains('hi')) {
-      fullResponse =
-          'Hello! How can I help you today?\n\nI\'m a helpful assistant. Feel free to ask me anything!';
-    } else if (userText.contains('markdown') || userText.contains('code')) {
-      fullResponse =
-          'Here\'s an example of **Markdown** support:\n\n```dart\nvoid main() {\n  print("Hello, World!");\n}\n```\n\n- Item 1\n- Item 2\n\nVisit [Flutter](https://flutter.dev) for more info.';
-    } else if (userText.contains('tool') || userText.contains('read')) {
-      fullResponse =
-          'Let me read that file for you.\n\n```json\n{"ok":true,"content":"Hello from workspace!"}\n```';
-    } else {
-      fullResponse =
-          'I received your message. This is a **mock response** while the UI is being built.\n\n*Streaming works!*';
+  static const _toolDefs = {
+    'read_file': {
+      'name': 'read_file',
+      'description': 'Read the contents of a file within the workspace.',
+      'input_schema': {
+        'type': 'object',
+        'properties': {
+          'path': {
+            'type': 'string',
+            'description':
+                'Path to the file relative to the workspace root.',
+          },
+        },
+        'required': ['path'],
+      },
+    },
+    'list_dir': {
+      'name': 'list_dir',
+      'description':
+          'List the contents of a directory within the workspace.',
+      'input_schema': {
+        'type': 'object',
+        'properties': {
+          'path': {
+            'type': 'string',
+            'description':
+                'Path to the directory relative to the workspace root.',
+          },
+        },
+        'required': ['path'],
+      },
+    },
+  };
+
+  Future<void> _callModel({required String sessionId, required List<Message> messages}) async {
+    final agentType = registry.lookup('general');
+    if (agentType == null) {
+      setState(() => _isStreaming = false);
+      await _storeError('No agent type configured.', sessionId: sessionId);
+      return;
     }
 
-    // Simulate streaming in 3 chunks with delays
-    final chunks = <String>[];
-    final third = (fullResponse.length / 3).ceil();
+    final provider = resolver?.resolve(agentType.provider);
+    if (provider == null) {
+      setState(() => _isStreaming = false);
+      await _storeError('Provider "${agentType.provider}" not found.', sessionId: sessionId);
+      return;
+    }
 
-    // Split at word boundaries
-    int pos = 0;
-    for (int i = 0; i < 3; i++) {
-      int end;
-      if (i == 2) {
-        end = fullResponse.length;
-      } else {
-        final target = pos + third;
-        if (target >= fullResponse.length) {
-          end = fullResponse.length;
+    final baseUrl = provider.baseUrl.isNotEmpty
+        ? provider.baseUrl
+        : 'https://api.anthropic.com';
+
+    final toolsJson = agentType.tools.isEmpty
+        ? '[]'
+        : jsonEncode(agentType.tools
+            .map((n) => _toolDefs[n])
+            .where((d) => d != null)
+            .toList());
+
+    // Build API conversation from current DB messages
+    final apiMessages = <Map<String, dynamic>>[];
+    for (final msg in messages) {
+      apiMessages.add({'role': msg.role, 'content': msg.content});
+    }
+
+    String allText = '';
+
+    for (int turn = 0; turn < 5; turn++) {
+      final messagesJson = jsonEncode(apiMessages);
+
+      String turnText = '';
+      final turnToolCalls = <Map<String, dynamic>>[];
+      int doneCode = 0;
+      String? doneError;
+
+      await SidecarBridge.instance.sendMessage(
+        apiKey: provider.apiKey,
+        baseUrl: baseUrl,
+        model: agentType.model,
+        systemPrompt: agentType.systemPrompt,
+        messagesJson: messagesJson,
+        toolsJson: toolsJson,
+        onChunk: (text) {
+          turnText += text;
+          allText += text;
+          if (_currentId == sessionId && mounted) setState(() => _streamingText = allText);
+        },
+        onToolCall: (json) {
+          try {
+            turnToolCalls.add(jsonDecode(json) as Map<String, dynamic>);
+          } catch (_) {}
+        },
+        onDone: (code, error) {
+          doneCode = code;
+          doneError = error;
+        },
+      );
+
+      if (doneCode != 0) {
+        if (_currentId == sessionId) {
+          setState(() {
+            _isStreaming = false;
+            _streamingText = '';
+          });
+        }
+        await _storeError(doneError ?? 'Unknown error', sessionId: sessionId);
+        return;
+      }
+
+      // No tool calls — store final assistant message and done
+      if (turnToolCalls.isEmpty) {
+        if (allText.isNotEmpty) {
+          final assistantMsg = await _msgRepo.insert(
+            sessionId: sessionId,
+            role: 'assistant',
+            content: allText,
+          );
+          await _sessionRepo.touch(sessionId);
+          if (_currentId == sessionId) {
+            setState(() {
+              _messages.add(assistantMsg);
+              _isStreaming = false;
+              _streamingText = '';
+            });
+          }
         } else {
-          end = target;
-          while (end < fullResponse.length && fullResponse[end] != ' ') {
-            end++;
+          if (_currentId == sessionId) {
+            setState(() {
+              _isStreaming = false;
+              _streamingText = '';
+            });
           }
         }
+        return;
       }
-      chunks.add(fullResponse.substring(pos, end));
-      pos = end;
+
+      // Build assistant content blocks for the API
+      final assistantBlocks = <Map<String, dynamic>>[];
+      if (turnText.isNotEmpty) {
+        assistantBlocks.add({'type': 'text', 'text': turnText});
+      }
+      assistantBlocks.addAll(turnToolCalls);
+
+      apiMessages.add({
+        'role': 'assistant',
+        'content': assistantBlocks.length == 1
+            ? assistantBlocks[0]
+            : assistantBlocks,
+      });
+
+      // Execute tools and build tool results
+      final toolResults = <Map<String, dynamic>>[];
+      for (final tc in turnToolCalls) {
+        final result = _executeTool(tc);
+        final resultContent = result['ok'] == true
+            ? (result['content'] as String? ?? '')
+            : (result['error'] as String? ?? 'Tool failed');
+
+        // Show tool activity in streaming text
+        final toolLabel = tc['name'] ?? 'unknown';
+        final preview = resultContent.length > 300
+            ? '${resultContent.substring(0, 300)}...'
+            : resultContent;
+        if (_currentId == sessionId) {
+          setState(() {
+            _streamingText =
+                '$allText\n\n**Tool `$toolLabel`**\n```\n$preview\n```';
+          });
+        }
+
+        toolResults.add({
+          'type': 'tool_result',
+          'tool_use_id': tc['id'] ?? '',
+          'content': resultContent,
+        });
+      }
+
+      apiMessages.add({
+        'role': 'user',
+        'content': toolResults.length == 1
+            ? toolResults[0]
+            : toolResults,
+      });
+
+      // Reset per-turn state; loop continues for model's tool-result reply
+      turnText = '';
     }
 
-    Future.delayed(const Duration(milliseconds: 500), () {
-      if (!mounted) return;
-      setState(() => _streamingText = chunks[0]);
-    });
-
-    Future.delayed(const Duration(milliseconds: 1000), () {
-      if (!mounted) return;
-      setState(() => _streamingText = chunks[0] + chunks[1]);
-    });
-
-    Future.delayed(const Duration(milliseconds: 1500), () async {
-      if (!mounted) return;
+    // Max tool turns exceeded
+    if (_currentId == sessionId) {
       setState(() {
-        _streamingText = fullResponse;
         _isStreaming = false;
-      });
-
-      final assistantMsg = await _msgRepo.insert(
-        sessionId: _currentId!,
-        role: 'assistant',
-        content: fullResponse,
-      );
-      await _sessionRepo.touch(_currentId!);
-      setState(() {
-        _messages.add(assistantMsg);
         _streamingText = '';
       });
+    }
+    await _sessionRepo.touch(sessionId);
+  }
+
+  Map<String, dynamic> _executeTool(Map<String, dynamic> toolCall) {
+    final name = toolCall['name'] as String?;
+    final input = (toolCall['input'] as Map<String, dynamic>?) ?? {};
+    final path = (input['path'] as String?) ?? '';
+
+    String resultJson;
+    switch (name) {
+      case 'read_file':
+        resultJson = SidecarBridge.instance.readFile(path);
+      case 'list_dir':
+        resultJson = SidecarBridge.instance.listDir(path);
+      default:
+        resultJson = '{"ok":false,"error":"Unknown tool: $name"}';
+    }
+
+    try {
+      return jsonDecode(resultJson) as Map<String, dynamic>;
+    } catch (_) {
+      return {'ok': false, 'error': 'Failed to parse tool result'};
+    }
+  }
+
+  Future<void> _storeError(String message, {required String sessionId}) async {
+    final errorMsg = await _msgRepo.insert(
+      sessionId: sessionId,
+      role: 'assistant',
+      content: 'Error: $message',
+    );
+    await _sessionRepo.touch(sessionId);
+    setState(() {
+      if (_currentId == sessionId) {
+        _messages.add(errorMsg);
+      }
     });
   }
 
