@@ -214,6 +214,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _sendMessage(String text) async {
+    if (_isStreaming) return;
     if (_currentId == null) {
       // Auto-create a session if none exists
       await _newChat();
@@ -309,7 +310,12 @@ class _ChatScreenState extends State<ChatScreen> {
     // Build API conversation from current DB messages
     final apiMessages = <Map<String, dynamic>>[];
     for (final msg in messages) {
-      apiMessages.add({'role': msg.role, 'content': msg.content});
+      apiMessages.add({
+        'role': msg.role,
+        'content': [
+          {'type': 'text', 'text': msg.content}
+        ],
+      });
     }
 
     String allText = '';
@@ -321,6 +327,7 @@ class _ChatScreenState extends State<ChatScreen> {
       final turnToolCalls = <Map<String, dynamic>>[];
       int doneCode = 0;
       String? doneError;
+      String? doneStopReason;
 
       await SidecarBridge.instance.sendMessage(
         apiKey: provider.apiKey,
@@ -339,14 +346,16 @@ class _ChatScreenState extends State<ChatScreen> {
             turnToolCalls.add(jsonDecode(json) as Map<String, dynamic>);
           } catch (_) {}
         },
-        onDone: (code, error) {
+        onDone: (code, error, stopReason) {
           doneCode = code;
           doneError = error;
+          doneStopReason = stopReason;
+          debugPrint('[AliasAgent] stop_reason: $doneStopReason');
         },
       );
 
       if (doneCode != 0) {
-        if (_currentId == sessionId) {
+        if (_currentId == sessionId && mounted) {
           setState(() {
             _isStreaming = false;
             _streamingText = '';
@@ -358,14 +367,14 @@ class _ChatScreenState extends State<ChatScreen> {
 
       // No tool calls — store final assistant message and done
       if (turnToolCalls.isEmpty) {
-        if (allText.isNotEmpty) {
+        if (turnText.isNotEmpty) {
           final assistantMsg = await _msgRepo.insert(
             sessionId: sessionId,
             role: 'assistant',
-            content: allText,
+            content: turnText,
           );
           await _sessionRepo.touch(sessionId);
-          if (_currentId == sessionId) {
+          if (_currentId == sessionId && mounted) {
             setState(() {
               _messages.add(assistantMsg);
               _isStreaming = false;
@@ -373,7 +382,7 @@ class _ChatScreenState extends State<ChatScreen> {
             });
           }
         } else {
-          if (_currentId == sessionId) {
+          if (_currentId == sessionId && mounted) {
             setState(() {
               _isStreaming = false;
               _streamingText = '';
@@ -392,9 +401,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
       apiMessages.add({
         'role': 'assistant',
-        'content': assistantBlocks.length == 1
-            ? assistantBlocks[0]
-            : assistantBlocks,
+        'content': assistantBlocks,
       });
 
       // Execute tools and build tool results
@@ -410,7 +417,7 @@ class _ChatScreenState extends State<ChatScreen> {
         final preview = resultContent.length > 300
             ? '${resultContent.substring(0, 300)}...'
             : resultContent;
-        if (_currentId == sessionId) {
+        if (_currentId == sessionId && mounted) {
           setState(() {
             _streamingText =
                 '$allText\n\n**Tool `$toolLabel`**\n```\n$preview\n```';
@@ -426,9 +433,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
       apiMessages.add({
         'role': 'user',
-        'content': toolResults.length == 1
-            ? toolResults[0]
-            : toolResults,
+        'content': toolResults,
       });
 
       // Reset per-turn state; loop continues for model's tool-result reply
@@ -436,7 +441,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     // Max tool turns exceeded
-    if (_currentId == sessionId) {
+    if (_currentId == sessionId && mounted) {
       setState(() {
         _isStreaming = false;
         _streamingText = '';
@@ -474,11 +479,13 @@ class _ChatScreenState extends State<ChatScreen> {
       content: 'Error: $message',
     );
     await _sessionRepo.touch(sessionId);
-    setState(() {
-      if (_currentId == sessionId) {
-        _messages.add(errorMsg);
-      }
-    });
+    if (mounted) {
+      setState(() {
+        if (_currentId == sessionId) {
+          _messages.add(errorMsg);
+        }
+      });
+    }
   }
 
   @override

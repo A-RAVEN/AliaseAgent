@@ -18,10 +18,11 @@ enum class SseEventKind { CHUNK, TOOL_CALL, DONE };
 
 struct SseEvent {
   SseEventKind kind;
-  std::string text;      // for CHUNK
-  std::string tool_json; // for TOOL_CALL
-  int done_code = 0;     // for DONE
-  std::string done_err;  // for DONE
+  std::string text;           // for CHUNK
+  std::string tool_json;      // for TOOL_CALL
+  int done_code = 0;          // for DONE
+  std::string done_err;       // for DONE
+  std::string done_stop_reason; // for DONE, from message_delta
 };
 
 // ---------------------------------------------------------------------------
@@ -38,6 +39,12 @@ struct ModelGateway::Impl {
   // SSE parsing state
   std::string line_buf;
   bool done_dispatched = false;
+  // Tool use assembly: accumulate input_json_delta partial_json per block index
+  std::map<int, json> pending_tool_uses;
+  std::map<int, std::string> partial_jsons;
+  // stop_reason from message_delta, carried into DONE events
+  std::string last_stop_reason;
+  std::string last_error;
 
   int request_id = 0;
   static std::atomic<int> next_request_id;
@@ -68,7 +75,7 @@ static size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdat
 
         if (data == "[DONE]") {
           LOG_INFO("SSE: [DONE] marker");
-          impl->events.push_back({SseEventKind::DONE, "", "", 0, ""});
+          impl->events.push_back({SseEventKind::DONE, "", "", 0, "", impl->last_stop_reason});
           impl->done_dispatched = true;
           continue;
         }
@@ -78,19 +85,33 @@ static size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdat
           std::string type = ev.value("type", "");
 
           if (type == "content_block_delta") {
-            if (ev.contains("delta") && ev["delta"].contains("text")) {
-              std::string text = ev["delta"]["text"];
-              LOG_INFO("SSE: content_block_delta text=\"" + text + "\"");
-              impl->events.push_back({SseEventKind::CHUNK, text, "", 0, ""});
+            if (ev.contains("delta")) {
+              auto& delta = ev["delta"];
+              std::string delta_type = delta.value("type", "");
+              if (delta_type == "text_delta") {
+                std::string text = delta.value("text", "");
+                LOG_INFO("SSE: content_block_delta text=\"" + text + "\"");
+                impl->events.push_back({SseEventKind::CHUNK, text, "", 0, "", ""});
+              } else if (delta_type == "input_json_delta") {
+                int idx = ev.value("index", -1);
+                std::string pj = delta.value("partial_json", "");
+                impl->partial_jsons[idx] += pj;
+                LOG_INFO("SSE: input_json_delta index=" + std::to_string(idx) + " partial=" + pj);
+              } else if (delta_type == "thinking_delta") {
+                LOG_INFO("SSE: thinking_delta (ignored)");
+              } else if (delta_type == "signature_delta") {
+                LOG_INFO("SSE: signature_delta (ignored)");
+              }
             }
           }
           else if (type == "content_block_start") {
             if (ev.contains("content_block")) {
               auto& cb = ev["content_block"];
               if (cb.value("type", "") == "tool_use") {
-                std::string tool_json = cb.dump();
-                LOG_INFO("SSE: content_block_start tool_use " + tool_json);
-                impl->events.push_back({SseEventKind::TOOL_CALL, "", tool_json, 0, ""});
+                int idx = ev.value("index", -1);
+                impl->pending_tool_uses[idx] = cb;
+                impl->partial_jsons[idx] = "";
+                LOG_INFO("SSE: content_block_start tool_use index=" + std::to_string(idx) + " name=" + cb.value("name", ""));
               } else {
                 LOG_INFO("SSE: content_block_start type=" + cb.value("type", ""));
               }
@@ -98,23 +119,44 @@ static size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdat
           }
           else if (type == "message_stop") {
             LOG_INFO("SSE: message_stop");
-            impl->events.push_back({SseEventKind::DONE, "", "", 0, ""});
+            impl->events.push_back({SseEventKind::DONE, "", "", 0, "", impl->last_stop_reason});
             impl->done_dispatched = true;
           }
           else if (type == "error") {
             std::string msg = ev.value("error", json::object()).value("message", "Unknown API error");
             LOG_ERR("SSE: error \"" + msg + "\"");
-            impl->events.push_back({SseEventKind::DONE, "", "", -1, msg});
+            impl->events.push_back({SseEventKind::DONE, "", "", -1, msg, impl->last_stop_reason});
             impl->done_dispatched = true;
           }
           else if (type == "message_start") {
             LOG_INFO("SSE: message_start");
           }
           else if (type == "content_block_stop") {
-            LOG_INFO("SSE: content_block_stop index=" + std::to_string(ev.value("index", -1)));
+            int idx = ev.value("index", -1);
+            LOG_INFO("SSE: content_block_stop index=" + std::to_string(idx));
+            auto it = impl->pending_tool_uses.find(idx);
+            if (it != impl->pending_tool_uses.end()) {
+              json tool = it->second;
+              auto pj_it = impl->partial_jsons.find(idx);
+              if (pj_it != impl->partial_jsons.end() && !pj_it->second.empty()) {
+                try {
+                  tool["input"] = json::parse(pj_it->second);
+                } catch (const json::parse_error& e) {
+                  LOG_ERR("SSE: failed to parse accumulated input_json for block " + std::to_string(idx) + " — " + std::string(e.what()));
+                }
+              }
+              std::string tool_json = tool.dump();
+              LOG_INFO("SSE: tool_use final " + tool_json);
+              impl->events.push_back({SseEventKind::TOOL_CALL, "", tool_json, 0, "", ""});
+              impl->pending_tool_uses.erase(it);
+              impl->partial_jsons.erase(idx);
+            }
           }
           else if (type == "message_delta") {
-            LOG_INFO("SSE: message_delta");
+            if (ev.contains("delta") && ev["delta"].contains("stop_reason")) {
+              impl->last_stop_reason = ev["delta"]["stop_reason"];
+            }
+            LOG_INFO("SSE: message_delta stop_reason=" + impl->last_stop_reason);
           }
           else if (type == "ping") {
             // Ignore
@@ -172,7 +214,7 @@ static void dispatch_events(ModelGateway::Impl* impl,
         if (on_tool_call) on_tool_call(ev.tool_json.c_str());
         break;
       case SseEventKind::DONE:
-        if (on_done) on_done(ev.done_code, ev.done_err.empty() ? "" : ev.done_err.c_str());
+        if (on_done) on_done(ev.done_code, ev.done_err.empty() ? "" : ev.done_err.c_str(), ev.done_stop_reason.c_str());
         break;
     }
   }
@@ -195,7 +237,7 @@ int ModelGateway::execute(
 ) {
   if (!impl_->curl) {
     LOG_ERR("CURL handle not initialized");
-    if (on_done) on_done(-1, "Internal error: CURL not initialized");
+    if (on_done) on_done(-1, "Internal error: CURL not initialized", "");
     return -1;
   }
 
@@ -204,6 +246,8 @@ int ModelGateway::execute(
   impl_->events.clear();
   impl_->line_buf.clear();
   impl_->done_dispatched = false;
+  impl_->last_stop_reason.clear();
+  impl_->last_error.clear();
 
   LOG_INFO("=== Request #" + std::to_string(rid) + " start ===");
 
@@ -221,7 +265,7 @@ int ModelGateway::execute(
     body["messages"] = json::parse(messages_json);
   } catch (const json::parse_error& e) {
     LOG_ERR("Failed to parse messages_json: " + std::string(e.what()));
-    if (on_done) on_done(-1, "Invalid messages JSON");
+    if (on_done) on_done(-1, "Invalid messages JSON", "");
     return -1;
   }
 
@@ -230,7 +274,7 @@ int ModelGateway::execute(
       body["tools"] = json::parse(tools_json);
     } catch (const json::parse_error& e) {
       LOG_ERR("Failed to parse tools_json: " + std::string(e.what()));
-      if (on_done) on_done(-1, "Invalid tools JSON");
+      if (on_done) on_done(-1, "Invalid tools JSON", "");
       return -1;
     }
   }
@@ -269,6 +313,7 @@ int ModelGateway::execute(
   curl_easy_setopt(impl_->curl, CURLOPT_SSL_VERIFYPEER, 1L);
 
   LOG_INFO("Sending request (timeout=" + std::to_string(impl_->timeout_secs) + "s)...");
+  LOG_INFO("body=" + body_str);
 
   // 5.2/5.3 — Execute; SSE events are buffered (not callback'd) during curl
   CURLcode res = curl_easy_perform(impl_->curl);
@@ -282,7 +327,8 @@ int ModelGateway::execute(
     LOG_ERR(err);
     dispatch_events(impl_, on_chunk, on_tool_call, on_done);
     if (!impl_->done_dispatched && on_done) {
-      on_done(-1, err.c_str());
+      impl_->last_error = err;
+      on_done(-1, impl_->last_error.c_str(), "");
     }
     return rid;
   }
@@ -295,7 +341,7 @@ int ModelGateway::execute(
     LOG_ERR("Authentication failed (HTTP 401)");
     dispatch_events(impl_, on_chunk, on_tool_call, on_done);
     if (!impl_->done_dispatched && on_done) {
-      on_done(-1, "Authentication failed — invalid API key");
+      on_done(-1, "Authentication failed — invalid API key", "");
     }
     return rid;
   }
@@ -305,7 +351,8 @@ int ModelGateway::execute(
     LOG_ERR(err);
     dispatch_events(impl_, on_chunk, on_tool_call, on_done);
     if (!impl_->done_dispatched && on_done) {
-      on_done(-1, err.c_str());
+      impl_->last_error = err;
+      on_done(-1, impl_->last_error.c_str(), "");
     }
     return rid;
   }
@@ -314,7 +361,7 @@ int ModelGateway::execute(
   dispatch_events(impl_, on_chunk, on_tool_call, on_done);
 
   if (!impl_->done_dispatched && on_done) {
-    on_done(0, "");
+    on_done(0, "", "");
   }
 
   LOG_INFO("=== Request #" + std::to_string(rid) + " complete ===");

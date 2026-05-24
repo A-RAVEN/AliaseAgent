@@ -11,7 +11,7 @@ import 'package:ffi/ffi.dart';
 
 typedef OnChunkNative = Void Function(Pointer<Utf8> text);
 typedef OnToolCallNative = Void Function(Pointer<Utf8> json);
-typedef OnDoneNative = Void Function(Int32 code, Pointer<Utf8> err);
+typedef OnDoneNative = Void Function(Int32 code, Pointer<Utf8> err, Pointer<Utf8> stopReason);
 
 typedef SendMessageNative = Int32 Function(
   Pointer<Utf8> apiKey,
@@ -50,7 +50,7 @@ typedef ListDirDart = Pointer<Utf8> Function(Pointer<Utf8> path);
 
 typedef OnChunkCallback = void Function(String text);
 typedef OnToolCallCallback = void Function(String json);
-typedef OnDoneCallback = void Function(int code, String? error);
+typedef OnDoneCallback = void Function(int code, String? error, String? stopReason);
 
 // ---------------------------------------------------------------------------
 // SidecarBridge
@@ -114,7 +114,8 @@ class SidecarBridge {
         case 'done':
           final code = map['code'] as int;
           final error = map['error'] as String?;
-          onDone(code, error);
+          final stopReason = map['stopReason'] as String?;
+          onDone(code, error, stopReason);
           receivePort.close();
           return;
       }
@@ -154,12 +155,14 @@ class SidecarBridge {
       },
     );
     final onDoneCallable = NativeCallable<OnDoneNative>.listener(
-      (int code, Pointer<Utf8> ptr) {
-        final err = ptr.toDartString();
+      (int code, Pointer<Utf8> errPtr, Pointer<Utf8> stopReasonPtr) {
+        final err = errPtr.toDartString();
+        final stopReason = stopReasonPtr.toDartString();
         sendPort.send({
           'type': 'done',
           'code': code,
           'error': err.isEmpty ? null : err,
+          'stopReason': stopReason.isEmpty ? null : stopReason,
         });
       },
     );

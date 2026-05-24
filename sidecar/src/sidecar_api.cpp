@@ -44,7 +44,7 @@ SIDECAR_API int send_message(
   ensure_log();
 
   if (!api_key || std::strlen(api_key) == 0) {
-    if (on_done) on_done(0, "");
+    if (on_done) on_done(0, "", "");
     return 1;
   }
 

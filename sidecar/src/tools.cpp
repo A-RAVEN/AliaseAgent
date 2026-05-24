@@ -295,7 +295,8 @@ std::string list_dir(const std::string& path) {
   closedir(d);
 #endif
 
-  std::string result = "{\"ok\":true,\"entries\":[" + entries.str() + "]}";
+  std::string entries_json = "[" + entries.str() + "]";
+  std::string result = ok_result(entries_json);
   LOG_INFO("list_dir: " + resolved + " (" + result + ")");
   return result;
 }
