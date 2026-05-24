@@ -280,8 +280,8 @@
 
 ### 修复任务
 
-- [ ] 10.1 将存储 assistant 消息时的 `content` 从 `allText` 改为 `turnText`（当前轮次文本），仅保留最终轮次的回复内容
-- [ ] 10.2 确认 `_streamingText` UI 显示逻辑不受影响（流式显示仍可展示过程文本）
+- [x] 10.1 将存储 assistant 消息时的 `content` 从 `allText` 改为 `turnText`（当前轮次文本），仅保留最终轮次的回复内容
+- [x] 10.2 确认 `_streamingText` UI 显示逻辑不受影响（流式显示仍可展示过程文本）
 
 ### 🔎 Checkpoint 10: 多轮文本正确性
 
@@ -309,9 +309,9 @@
 
 ### 修复任务
 
-- [ ] 11.1 `_sendMessage()` 开头增加 `if (_isStreaming) return;` 防护
-- [ ] 11.2 `_callModel()` 中所有 await 后的 `setState` 加上 `if (mounted)` 守卫（行 346、363、368、404、428）
-- [ ] 11.3 `_storeError()` 中 `setState` 增加 `if (mounted)` 守卫
+- [x] 11.1 `_sendMessage()` 开头增加 `if (_isStreaming) return;` 防护
+- [x] 11.2 `_callModel()` 中所有 await 后的 `setState` 加上 `if (mounted)` 守卫（行 346、363、368、404、428）
+- [x] 11.3 `_storeError()` 中 `setState` 增加 `if (mounted)` 守卫
 
 ### 🔎 Checkpoint 11: 健壮性
 
@@ -322,3 +322,183 @@
 | A | 流式中发送 | 流式回复期间按 Send 或 Enter 不触发新请求 |
 | B | 正常发送恢复 | 流式结束后可正常发送新消息 |
 | C | mounted 守卫 | Widget 销毁后回调不 crash（可通过快速切换会话模拟） |
+
+---
+
+## 12. SSE 解析与 API 格式修复
+
+> [!CAUTION]
+> ⛔ **STOP HERE** — Phase 11 must be fully verified before starting Phase 12.
+> Do NOT implement any task in this phase until the user explicitly says: "execute phase 12" or "start phase 12".
+
+### 背景
+
+对照最新 Anthropic/DeepSeek API 文档（2026-05-24 抓取），发现当前实现存在两个严重 bug 和两个健壮性缺口。
+
+### 问题 1：`input_json_delta` 未处理，tool input 永远为空
+
+**根因**：`model_gateway.cpp` SSE 解析器只处理 `text_delta`，未处理 `input_json_delta`。当前在 `content_block_start`（tool_use）时直接 dump 整个 `content_block`，但 Anthropic 流式规范中 tool_use block 的 `input` 在 start 事件时始终为 `{}`，实际参数通过后续 `input_json_delta` 事件的 `partial_json` 增量下发。
+
+流式 tool use 的标准时序：
+```
+content_block_start  → tool_use {id:"toolu_xxx", name:"read_file", input:{}}
+content_block_delta  → input_json_delta {partial_json: "{\"path\": \"/src/main.dart\"}"}
+content_block_stop
+```
+
+当前行为：`content_block_start` 时抓到的 tool_use 里 `input` 永远是 `{}`，工具调用拿不到参数。
+
+### 问题 2：单 tool_use / tool_result 的 content 未包裹为数组
+
+**根因**：`_callModel()` 中构建 assistant 消息和 tool result 消息时，对单元素做了"解包"优化（`length == 1 ? blocks[0] : blocks`）。但 Anthropic API 规范要求 content 必须是**字符串**或 **content block 数组**。单个 `{"type": "tool_use", ...}` 或 `{"type": "tool_result", ...}` 对象直接作为 content 值不符合规范，会导致 HTTP 400。
+
+### 问题 3：`stop_reason` 未从 `message_delta` 提取
+
+**根因**：当前仅靠"是否收到 `content_block_start`(tool_use)" 推断工具调用，而非解析 `message_delta.stop_reason`。若模型输出了空的 tool_use 块但又取消了调用，逻辑会误判。
+
+### 问题 4：`thinking_delta` / `signature_delta` 未处理
+
+**根因**：SSE 解析器未处理 `thinking_delta` 和 `signature_delta`。当模型启用 extended thinking 时，这些事件会落入 `else` 分支产生 "unrecognized event type" warning，且思考文本被丢弃。
+
+### 修复任务
+
+- [x] 12.1 SSE 解析器增加 `input_json_delta` 处理：累积 `partial_json`，在 `content_block_stop` 时拼接完整 input JSON，替换 tool_use block 中的 `input` 字段
+- [x] 12.2 `_callModel()` 中 assistantBlocks 和 toolResults 的 content 始终使用数组格式（去掉单元素解包逻辑）
+- [x] 12.3 SSE 解析器从 `message_delta` 提取 `stop_reason` 并透传至回调（`on_done` 增加 stop_reason 参数或通过现有机制传递）
+- [x] 12.4 SSE 解析器增加 `thinking_delta` / `signature_delta` 识别（暂不暴露到 UI，仅打日志，避免 unrecognized event warning）
+
+### 🔎 Checkpoint 12: API 规范合规
+
+> 验收目标：工具调用拿到正确参数，API 请求格式符合官方规范。
+
+| # | 验收项 | 通过标准 |
+|---|--------|----------|
+| A | tool input 完整 | 模型调用 `read_file` 时，C++ 侧回调的 tool_use JSON 中 `input.path` 有正确的路径值，不是空 `{}` |
+| B | tool_result content 格式 | 单工具结果时请求体的 `content` 字段为数组格式 `[{type:"tool_result",...}]`，非单个对象 |
+| C | assistant tool_use content 格式 | 纯 tool_use（无 text）时 assistant 消息的 `content` 为数组格式 |
+| D | stop_reason 传递 | `message_delta.stop_reason` 被正确解析，`on_done` 可区分 `end_turn` / `tool_use` / `max_tokens` |
+| E | thinking delta 不报 warning | 启用 thinking 的模型不再产生 "unrecognized event type" 日志 warning |
+| F | 回归：单轮无工具 | 普通对话功能不受影响 |
+| G | 回归：多轮工具调用 | 工具调用 → 结果回传 → 模型继续回复全流程正常 |
+
+---
+
+## 13. on_done 回调悬空指针修复
+
+> [!CAUTION]
+> ⛔ **STOP HERE** — Phase 12 must be fully verified before starting Phase 13.
+> Do NOT implement any task in this phase until the user explicitly says: "execute phase 13" or "start phase 13".
+
+### 背景
+
+`NativeCallable.listener` 的 C→Dart 回调是**异步**的：C 代码调用回调时，Dart 侧只是将消息放入 isolate 事件队列，实际 Dart 闭包在 C 函数返回后才执行。因此传给 `on_done` 的指针必须在 C 函数返回后仍然有效。
+
+`dispatch_events()` 中的 DONE 事件是安全的 — `done_err` / `done_stop_reason` 存储在 `impl->events` 中，持久到下一次 `send_message` 调用。但若干 fallback `on_done` 错误路径直接使用了**局部变量**的 `.c_str()`：
+
+| 行 | 代码 | 安全性 |
+|----|------|--------|
+| 327 | `on_done(-1, err.c_str(), "")` | ❌ `err` 是局部 `std::string` |
+| 340 | `on_done(-1, "Authentication failed", "")` | ✓ 字符串字面量 |
+| 350 | `on_done(-1, err.c_str(), "")` | ❌ `err` 是局部 `std::string` |
+| 359 | `on_done(0, "", "")` | ✓ 字符串字面量 |
+
+### 复现条件
+
+多轮工具调用：第一轮返回 `tool_use` → 工具执行 → 第二轮 API 返回 HTTP 400（如 DeepSeek 拒绝某些请求），走到 350 行局部变量路径 → crash。
+
+### 修复任务
+
+- [x] 13.1 在 `ModelGateway::Impl` 中添加 `std::string last_error` 成员，`execute()` 开始时清空
+- [x] 13.2 将 327 行和 350 行的 fallback `on_done` 调用改为使用 `impl_->last_error` 而非局部变量
+
+### 🔎 Checkpoint 13: 悬空指针修复
+
+| # | 验收项 | 通过标准 |
+|---|--------|----------|
+| A | 多轮工具调用不 crash | 模型请求工具 → 工具执行 → 第二轮 API 调用（无论成败）不出现 `FormatException` crash |
+| B | 错误信息正确传递 | HTTP 错误码 / CURL 错误信息正确显示在 UI 中 |
+| C | 回归：单轮正常 | 单轮对话功能不受影响 |
+
+---
+
+## 14. list_dir 工具结果格式统一
+
+> ⛔ **STOP HERE** — Phase 13 must be fully verified before starting Phase 14.
+
+### 问题
+
+`list_dir` 返回 `{"ok":true,"entries":[...]}`，没有 `content` 字段。Dart 侧读取 `result['content']` 得到 `null` → 空字符串，导致第二轮 API 请求的 `tool_result.content` 为空，DeepSeek 返回 HTTP 400。
+
+`read_file` 使用 `ok_result()` helper 返回 `{"ok":true,"content":"..."}` 没有问题。
+
+### 修复任务
+
+- [x] 14.1 将 `tools.cpp:298` 中 `list_dir` 的手工拼 JSON 改为调用 `ok_result(entries_json)`
+
+### 🔎 Checkpoint 14: 工具返回格式统一
+
+| # | 验收项 | 通过标准 |
+|---|--------|----------|
+| A | list_dir 后第二轮 API 不 400 | 模型调用 list_dir → 工具执行 → 第二轮 API 正常返回 |
+| B | list_dir 内容正确传递 | 模型能看到目录列表并基于它继续回答 |
+
+---
+
+## 15. DeepSeek API 兼容性修复（content 格式统一）
+
+> ⛔ **STOP HERE** — Phase 14 must be fully verified before starting Phase 15.
+
+### 问题
+
+API 请求体中第一条用户消息的 `content` 是纯字符串（`"你好"`），但后续 assistant/tool_result 消息的 `content` 是数组。DeepSeek 的 Anthropic 代理对混用格式的请求返回 HTTP 400（仅 68ms 就返回，属于请求体格式校验失败）。
+
+DeepSeek 文档示例中即使是简单文本也使用 `[{"type":"text","text":"..."}]` 数组格式。
+
+### 修复任务
+
+- [x] 15.1 在 `model_gateway.cpp` 中增加 `LOG_INFO("body=" + body_str)` 打印实际请求体
+- [x] 15.2 将 `main.dart` 中从 DB 读取的消息 content 从纯字符串改为 `[{"type":"text","text":"..."}]` 数组格式
+
+### 🔎 Checkpoint 15: DeepSeek API 兼容
+
+| # | 验收项 | 通过标准 |
+|---|--------|----------|
+| A | 工具调用后第二轮 API 不 400 | list_dir 工具调用 → 第二轮 API 正常返回 text 回复 |
+| B | 纯文本对话不受影响 | 无工具调用的正常对话不出现格式错误 |
+
+---
+
+## 16. Thinking 块透传
+
+> ⛔ **STOP HERE** — Phase 15 must be fully verified before starting Phase 16.
+
+### 问题
+
+DeepSeek 默认启用思考模式（`thinking: {"type":"enabled"}`），assistant 回复的 `content[]` 中第一个元素是 `{"type":"thinking","thinking":"...","signature":"..."}` 块。后续请求**必须原样传回**此块，否则 API 返回 HTTP 400。
+
+当前 C++ SSE 解析器仅打日志忽略 thinking 块，Dart 侧构建 assistantBlocks 也不包含它，导致 thinking 块丢失。
+
+详见 design.md Decision 2（FFI 通信协议）、Decision 8（API 兼容性），以及 specs/model-gateway（Thinking block handling）。
+
+### 修复任务
+
+- [ ] 16.1 `SseEvent` 新增 `std::string thinking_json` 字段；`SseEventKind` 新增 `THINKING`；`Impl` 新增 `std::map<int, PendingThinking>`（含 `thinking` + `signature` 两个 string）
+- [ ] 16.2 `content_block_start` 分支增加 `type == "thinking"` 处理，记录 index 到 `pending_thinking`
+- [ ] 16.3 `thinking_delta` → 累积 `pending_thinking[idx].thinking`；`signature_delta` → 累积 `pending_thinking[idx].signature`
+- [ ] 16.4 `content_block_stop` 分支优先检查 `pending_thinking`，命中则生成 `{"type":"thinking","thinking":"...","signature":"..."}` JSON → `SseEventKind::THINKING` 事件
+- [ ] 16.5 `dispatch_events()` 新增 `on_thinking` 参数，处理 THINKING 事件
+- [ ] 16.6 `sidecar_api.h` 新增 `OnThinkingCallback` typedef；`send_message` 新增第 10 参数；`model_gateway.h` 同步
+- [ ] 16.7 `execute()` 开头清空 `pending_thinking`
+- [ ] 16.8 `sidecar_bridge.dart` 新增 `OnThinkingNative` / `OnThinkingCallback` 类型；`sendMessage()` 新增 `onThinking` 参数（可选）；worker isolate 新增 `NativeCallable` + `'thinking'` message type
+- [ ] 16.9 `_callModel()` 新增 `turnThinkingBlocks` 列表，`onThinking` 回调捕获，每轮重置
+- [ ] 16.10 assistant 消息 content 拼装顺序：`[thinking..., text, tool_use...]`
+
+### 🔎 Checkpoint 16: Thinking 块透传
+
+| # | 验收项 | 通过标准 |
+|---|--------|----------|
+| A | 工具调用后第二轮 API 不 400 | thinking 块正确传回，API 正常返回 text 回复 |
+| B | 非思考模式不受影响 | 模型不返回 thinking 时，`pending_thinking` 为空，无 THINKING 事件 |
+| C | thinking 块内容完整 | 传回的 `thinking`/`signature` 字段与 SSE 流式输出完全一致 |
+| D | 多轮工具调用 | 每一轮 assistant thinking 块都被正确捕获和传回 |
+| E | assistantBlocks 顺序正确 | content 数组中 thinking 块始终在 text/tool_use 之前 |
