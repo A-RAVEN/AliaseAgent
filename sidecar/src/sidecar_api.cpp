@@ -39,6 +39,7 @@ SIDECAR_API int send_message(
   const char* tools_json,
   OnChunkCallback on_chunk,
   OnToolCallCallback on_tool_call,
+  OnThinkingCallback on_thinking,
   OnDoneCallback on_done
 ) {
   ensure_log();
@@ -54,7 +55,7 @@ SIDECAR_API int send_message(
     system_prompt ? system_prompt : "",
     messages_json ? messages_json : "",
     tools_json ? tools_json : "",
-    on_chunk, on_tool_call, on_done
+    on_chunk, on_tool_call, on_thinking, on_done
   );
 }
 

@@ -474,7 +474,7 @@ DeepSeek 文档示例中即使是简单文本也使用 `[{"type":"text","text":"
 
 ### 问题
 
-DeepSeek 默认启用思考模式（`thinking: {"type":"enabled"}`），assistant 回复的 `content[]` 中第一个元素是 `{"type":"thinking","thinking":"...","signature":"..."}` 块。后续请求**必须原样传回**此块，否则 API 返回 HTTP 400。
+DeepSeek 默认启用思考模式（`thinking: {"type":"enabled"}`），assistant 回复的 `content[]` 中第一个元素是 `{"type":"thinking","thinking":"...","signature":"..."}` 块。同轮 tool use loop 内**必须原样传回**此块，否则 API 返回 HTTP 400（已验证：跨轮次 end_turn 后不需要，仅 tool loop 内需要）。
 
 当前 C++ SSE 解析器仅打日志忽略 thinking 块，Dart 侧构建 assistantBlocks 也不包含它，导致 thinking 块丢失。
 
@@ -482,16 +482,16 @@ DeepSeek 默认启用思考模式（`thinking: {"type":"enabled"}`），assistan
 
 ### 修复任务
 
-- [ ] 16.1 `SseEvent` 新增 `std::string thinking_json` 字段；`SseEventKind` 新增 `THINKING`；`Impl` 新增 `std::map<int, PendingThinking>`（含 `thinking` + `signature` 两个 string）
-- [ ] 16.2 `content_block_start` 分支增加 `type == "thinking"` 处理，记录 index 到 `pending_thinking`
-- [ ] 16.3 `thinking_delta` → 累积 `pending_thinking[idx].thinking`；`signature_delta` → 累积 `pending_thinking[idx].signature`
-- [ ] 16.4 `content_block_stop` 分支优先检查 `pending_thinking`，命中则生成 `{"type":"thinking","thinking":"...","signature":"..."}` JSON → `SseEventKind::THINKING` 事件
-- [ ] 16.5 `dispatch_events()` 新增 `on_thinking` 参数，处理 THINKING 事件
-- [ ] 16.6 `sidecar_api.h` 新增 `OnThinkingCallback` typedef；`send_message` 新增第 10 参数；`model_gateway.h` 同步
-- [ ] 16.7 `execute()` 开头清空 `pending_thinking`
-- [ ] 16.8 `sidecar_bridge.dart` 新增 `OnThinkingNative` / `OnThinkingCallback` 类型；`sendMessage()` 新增 `onThinking` 参数（可选）；worker isolate 新增 `NativeCallable` + `'thinking'` message type
-- [ ] 16.9 `_callModel()` 新增 `turnThinkingBlocks` 列表，`onThinking` 回调捕获，每轮重置
-- [ ] 16.10 assistant 消息 content 拼装顺序：`[thinking..., text, tool_use...]`
+- [x] 16.1 `SseEvent` 新增 `std::string thinking_json` 字段；`SseEventKind` 新增 `THINKING`；`Impl` 新增 `std::map<int, PendingThinking>`（含 `thinking` + `signature` 两个 string）
+- [x] 16.2 `content_block_start` 分支增加 `type == "thinking"` 处理，记录 index 到 `pending_thinking`
+- [x] 16.3 `thinking_delta` → 累积 `pending_thinking[idx].thinking`；`signature_delta` → 累积 `pending_thinking[idx].signature`
+- [x] 16.4 `content_block_stop` 分支优先检查 `pending_thinking`，命中则生成 `{"type":"thinking","thinking":"...","signature":"..."}` JSON → `SseEventKind::THINKING` 事件
+- [x] 16.5 `dispatch_events()` 新增 `on_thinking` 参数，处理 THINKING 事件
+- [x] 16.6 `sidecar_api.h` 新增 `OnThinkingCallback` typedef；`send_message` 新增第 10 参数；`model_gateway.h`、`sidecar_api.cpp` 同步更新签名和 `g_gateway.execute()` 调用
+- [x] 16.7 `execute()` 开头清空 `pending_thinking`、`pending_tool_uses`、`partial_jsons`（已有遗漏，顺手修复）
+- [x] 16.8 `sidecar_bridge.dart` 新增 `OnThinkingNative` / `OnThinkingCallback` 类型；`sendMessage()` 新增 `onThinking` 参数（可选）；worker isolate 新增 `NativeCallable` + `'thinking'` message type
+- [x] 16.9 `_callModel()` 新增 `turnThinkingBlocks` 列表，`onThinking` 回调捕获，每轮重置
+- [x] 16.10 assistant 消息 content 拼装顺序：`[thinking..., text, tool_use...]`
 
 ### 🔎 Checkpoint 16: Thinking 块透传
 

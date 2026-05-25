@@ -325,6 +325,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
       String turnText = '';
       final turnToolCalls = <Map<String, dynamic>>[];
+      final turnThinkingBlocks = <Map<String, dynamic>>[];
       int doneCode = 0;
       String? doneError;
       String? doneStopReason;
@@ -344,6 +345,11 @@ class _ChatScreenState extends State<ChatScreen> {
         onToolCall: (json) {
           try {
             turnToolCalls.add(jsonDecode(json) as Map<String, dynamic>);
+          } catch (_) {}
+        },
+        onThinking: (json) {
+          try {
+            turnThinkingBlocks.add(jsonDecode(json) as Map<String, dynamic>);
           } catch (_) {}
         },
         onDone: (code, error, stopReason) {
@@ -393,7 +399,9 @@ class _ChatScreenState extends State<ChatScreen> {
       }
 
       // Build assistant content blocks for the API
+      // Order: thinking blocks first, then text, then tool_use
       final assistantBlocks = <Map<String, dynamic>>[];
+      assistantBlocks.addAll(turnThinkingBlocks);
       if (turnText.isNotEmpty) {
         assistantBlocks.add({'type': 'text', 'text': turnText});
       }
@@ -438,6 +446,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
       // Reset per-turn state; loop continues for model's tool-result reply
       turnText = '';
+      turnToolCalls.clear();
+      turnThinkingBlocks.clear();
     }
 
     // Max tool turns exceeded

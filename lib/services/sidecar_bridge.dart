@@ -11,6 +11,7 @@ import 'package:ffi/ffi.dart';
 
 typedef OnChunkNative = Void Function(Pointer<Utf8> text);
 typedef OnToolCallNative = Void Function(Pointer<Utf8> json);
+typedef OnThinkingNative = Void Function(Pointer<Utf8> thinkingJson);
 typedef OnDoneNative = Void Function(Int32 code, Pointer<Utf8> err, Pointer<Utf8> stopReason);
 
 typedef SendMessageNative = Int32 Function(
@@ -22,6 +23,7 @@ typedef SendMessageNative = Int32 Function(
   Pointer<Utf8> toolsJson,
   Pointer<NativeFunction<OnChunkNative>> onChunk,
   Pointer<NativeFunction<OnToolCallNative>> onToolCall,
+  Pointer<NativeFunction<OnThinkingNative>> onThinking,
   Pointer<NativeFunction<OnDoneNative>> onDone,
 );
 
@@ -37,6 +39,7 @@ typedef SendMessageDart = int Function(
   Pointer<Utf8> toolsJson,
   Pointer<NativeFunction<OnChunkNative>> onChunk,
   Pointer<NativeFunction<OnToolCallNative>> onToolCall,
+  Pointer<NativeFunction<OnThinkingNative>> onThinking,
   Pointer<NativeFunction<OnDoneNative>> onDone,
 );
 
@@ -50,6 +53,7 @@ typedef ListDirDart = Pointer<Utf8> Function(Pointer<Utf8> path);
 
 typedef OnChunkCallback = void Function(String text);
 typedef OnToolCallCallback = void Function(String json);
+typedef OnThinkingCallback = void Function(String thinkingJson);
 typedef OnDoneCallback = void Function(int code, String? error, String? stopReason);
 
 // ---------------------------------------------------------------------------
@@ -90,6 +94,7 @@ class SidecarBridge {
     required String toolsJson,
     required OnChunkCallback onChunk,
     required OnToolCallCallback onToolCall,
+    OnThinkingCallback? onThinking,
     required OnDoneCallback onDone,
   }) async {
     final receivePort = ReceivePort();
@@ -111,6 +116,8 @@ class SidecarBridge {
           onChunk(map['text'] as String);
         case 'tool_call':
           onToolCall(map['json'] as String);
+        case 'thinking':
+          onThinking?.call(map['json'] as String);
         case 'done':
           final code = map['code'] as int;
           final error = map['error'] as String?;
@@ -154,6 +161,11 @@ class SidecarBridge {
         sendPort.send({'type': 'tool_call', 'json': ptr.toDartString()});
       },
     );
+    final onThinkingCallable = NativeCallable<OnThinkingNative>.listener(
+      (Pointer<Utf8> ptr) {
+        sendPort.send({'type': 'thinking', 'json': ptr.toDartString()});
+      },
+    );
     final onDoneCallable = NativeCallable<OnDoneNative>.listener(
       (int code, Pointer<Utf8> errPtr, Pointer<Utf8> stopReasonPtr) {
         final err = errPtr.toDartString();
@@ -176,6 +188,7 @@ class SidecarBridge {
       toolsJsonPtr,
       onChunkCallable.nativeFunction,
       onToolCallCallable.nativeFunction,
+      onThinkingCallable.nativeFunction,
       onDoneCallable.nativeFunction,
     );
 
@@ -190,6 +203,7 @@ class SidecarBridge {
     Timer.run(() {
       onChunkCallable.close();
       onToolCallCallable.close();
+      onThinkingCallable.close();
       onDoneCallable.close();
     });
   }

@@ -18,6 +18,7 @@ extern "C" {
 /// Callback types for async streaming
 typedef void (*OnChunkCallback)(const char* text);
 typedef void (*OnToolCallCallback)(const char* json);
+typedef void (*OnThinkingCallback)(const char* thinking_json);
 typedef void (*OnDoneCallback)(int code, const char* err, const char* stop_reason);
 
 /// Ping: verify FFI bridge is working
@@ -34,6 +35,7 @@ SIDECAR_API int send_message(
   const char* tools_json,
   OnChunkCallback on_chunk,
   OnToolCallCallback on_tool_call,
+  OnThinkingCallback on_thinking,
   OnDoneCallback on_done
 );
 

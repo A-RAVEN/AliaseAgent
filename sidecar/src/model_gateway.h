@@ -25,6 +25,7 @@ public:
     const char* tools_json,
     OnChunkCallback on_chunk,
     OnToolCallCallback on_tool_call,
+    OnThinkingCallback on_thinking,
     OnDoneCallback on_done
   );
 
