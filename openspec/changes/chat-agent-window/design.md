@@ -186,10 +186,12 @@ CREATE TABLE messages (
   session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
   content TEXT NOT NULL,
+  tool_calls TEXT,
   token_count INTEGER,
   created_at INTEGER NOT NULL
 );
 ```
+`tool_calls` 列为 JSON 数组，存储该 assistant 消息关联的工具调用记录，每条记录包含 `id`、`name`、`input`、`status`、`result`。渲染时解析为 `ToolCallCard` 并插入该消息之前在消息列表中。
 
 **Decision**: 两个表，外键约束，UUID 主键。
 
@@ -275,6 +277,21 @@ DeepSeek Anthropic 兼容端点差异：
 - `is_error` (tool_result) 被忽略
 - `budget_tokens` (thinking) 被忽略
 - 不支持 `redacted_thinking`、image、document 等块类型
+
+### 9. ChatItem 统一列表模型
+
+**Decision**: 使用 Dart 3 sealed class 而非 enum + nullable 字段。三种变体：
+
+```dart
+sealed class ChatItem { const ChatItem(); }
+class ChatMessageItem extends ChatItem { final Message message; }
+class ChatToolCallItem extends ChatItem { final ToolCallActivity activity; }
+class ChatStreamingItem extends ChatItem { final String text; }
+```
+
+`ChatArea` 接收 `List<ChatItem> items`，`ListView.builder` 通过 `switch (item)` 穷尽分发三种 widget。每个 widget 使用对应 ID 的 `ValueKey` 保持交互状态（如 ToolCallCard 展开/折叠）。
+
+**Rationale**: enum + nullable 方案 (`type` + `message?` + `toolCall?`) 每个变体都带着不相关的 null 字段，穷尽匹配靠 `switch (type)` 而非语言级别检查。sealed class 消除 nullable、`switch` 穷尽保证编译期检查，发现新变体时编译器给出错误而非运行期漏掉。Phase 18 的工具卡片持久化是消息列表模型的第一次结构性重构，用更强的类型系统为后续扩展留余地。
 
 ## Risks / Trade-offs
 

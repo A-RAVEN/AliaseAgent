@@ -60,4 +60,8 @@ The system SHALL automatically create the SQLite database file and schema (sessi
 
 #### Scenario: Schema version mismatch
 - **WHEN** the app launches and the database file has a different `user_version` pragma than expected
-- **THEN** the database is dropped and recreated with the current schema (data loss acceptable in Phase 1)
+- **THEN** for known migration paths (e.g., v1→v2), a non-destructive migration is applied (e.g., ALTER TABLE ADD COLUMN) to preserve existing data; for unrecognized version gaps, the database is dropped and recreated with the current schema
+
+#### Scenario: Store assistant response with tool calls
+- **WHEN** assistant finishes generating a response that includes tool call invocations
+- **THEN** a message row is inserted with role "assistant", the full response content, the tool calls serialized as JSON in the `tool_calls` column, and current timestamp

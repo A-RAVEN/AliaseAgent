@@ -73,6 +73,10 @@ The system SHALL display tool call requests and results as distinct cards within
 - **WHEN** a tool execution completes with a result
 - **THEN** the tool call card updates to show the result summary (collapsible for long results)
 
+#### Scenario: Tool cards persist in session history
+- **WHEN** the user switches to a different session and back, or restarts the application
+- **THEN** all tool call cards from previous conversation turns are still rendered in their original positions within the message list
+
 ### Requirement: Session list sidebar
 The system SHALL display a sidebar listing all saved sessions, ordered by last update time descending, with the ability to switch between sessions and create new ones.
 

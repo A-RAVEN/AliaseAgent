@@ -14,6 +14,10 @@
   │                               │                              │
   │                               ▼                              │
   │                          Phase 8 (integration)              │
+  │                               │                              │
+  │                     ┌─────────┼─────────┐                    │
+  │                     ▼                   ▼                    │
+  │            Phase 17 (auto-title)  Phase 18 (tool cards)     │
   └──────────────────────────────────────────────────────────────┘
 -->
 
@@ -502,3 +506,71 @@ DeepSeek 默认启用思考模式（`thinking: {"type":"enabled"}`），assistan
 | C | thinking 块内容完整 | 传回的 `thinking`/`signature` 字段与 SSE 流式输出完全一致 |
 | D | 多轮工具调用 | 每一轮 assistant thinking 块都被正确捕获和传回 |
 | E | assistantBlocks 顺序正确 | content 数组中 thinking 块始终在 text/tool_use 之前 |
+
+---
+
+## 17. Session Auto-Title
+
+> [!CAUTION]
+> ⛔ **STOP HERE** — Phase 16 must be fully verified before starting Phase 17.
+> Do NOT implement any task in this phase until the user explicitly says: "execute phase 17" or "start phase 17".
+
+### 问题
+
+`session-persistence` spec 要求：首次用户消息后，session title 从 "New Chat" 自动更新为消息内容的前 30 个字符。`SessionRepository.updateTitle()` 已实现，但 `_sendMessage()` 中从未调用。
+
+### 修复任务
+
+- [x] 17.1 在 `_sendMessage()` 中，插入用户消息后、`_loadSessions()` 调用前，检查当前 session 的 title 是否为默认的 "New Chat"。如果是，取消息文本的前 30 字符（超过 30 截断加 `"..."`），`await _sessionRepo.updateTitle()` 后再调用 `_loadSessions()` 刷新 sidebar
+
+### 🔎 Checkpoint 17: 会话自动标题
+
+| # | 验收项 | 通过标准 |
+|---|--------|----------|
+| A | 首次消息触发标题更新 | 新建会话 → 发送 "帮我分析项目结构" → 侧边栏标题变为 "帮我分析项目结构" |
+| B | 长消息截断 | 发送超 30 字消息 → 标题为前 30 字符 + "..." |
+| C | 非首次消息不触发 | 标题已非 "New Chat" 时，后续消息不改变标题 |
+
+---
+
+## 18. Tool Call Cards
+
+> [!CAUTION]
+> ⛔ **STOP HERE** — Phase 17 must be fully verified before starting Phase 18.
+> Do NOT implement any task in this phase until the user explicitly says: "execute phase 18" or "start phase 18".
+
+### 问题
+
+`chat-ui` spec 要求工具调用以 "distinct cards within the message list, visually differentiated from regular messages" 展示，结果可折叠。当前实现将工具活动信息内联写入 `_streamingText`（Markdown 格式），不满足 spec 的交互形态。
+
+### 修复任务
+
+- [x] 18.1 新建 `lib/models/tool_call_activity.dart`，定义 `ToolCallActivity` 数据类：`toolName`、`input`（Map）、`status`（executing/done/error）、`result`（String?）、`resultPreview`（String?，截断到 300 字符）
+- [x] 18.2 新建 `lib/ui/tool_call_card.dart`，实现 `ToolCallCard` 组件：显示工具名 + 输入参数摘要 + 执行状态指示器 + 结果区（默认折叠，点击展开）；视觉与 `MessageBubble` 明显区分（不同背景色 / 边框 / 图标）
+- [x] 18.3 在 `_ChatScreenState` 中新增 `List<ToolCallActivity> _toolActivities = []`，流式开始时清空，`onToolCall` 回调中新增 executing 状态条目（用 `tool_use_id` 作为 key 以便后续匹配），工具执行完成后通过 `tool_use_id` 匹配并更新为 done + result
+- [x] 18.4 更新 `ChatArea` 接受 `List<ToolCallActivity> toolActivities` 参数；将 `ListView.builder` 改为按时间线索引分发 3 种内容类型（message → `MessageBubble`，tool_activity → `ToolCallCard`，streaming → streaming bubble），工具卡片穿插在消息列表中，按发生时间排序
+- [x] 18.5 移除 `_callModel()` 中向 `_streamingText` 写入工具活动信息的内联逻辑（行 424-433），工具信息改为仅通过 `ToolCallCard` 展示；`_streamingText` 恢复为纯文本流
+
+### 持久化修复（spec: tool cards persist in session history）
+
+> 18.1-18.5 实现了卡片 UI，但 `_toolActivities` 在 streaming 结束时被清空，工具卡片随 AI 回复完成而消失，不满足 spec "within the message list" 的持久化要求。
+
+- [ ] 18.6 DB schema v2：`messages` 表新增 `tool_calls TEXT` 列（nullable JSON），`onCreate` 和 `openAt` 同步更新；`onUpgrade` 增加 v1→v2 的 `ALTER TABLE` 迁移
+- [ ] 18.7 `Message` 模型新增 `toolCallsJson` 字段（`String?`），`fromRow` / `toRow` 同步更新；`MessageRepository.insert()` 新增可选参数 `toolCallsJson`
+- [ ] 18.8 新建 `lib/models/chat_item.dart`，定义 sealed class 层次：`ChatItem`（sealed）→ `ChatMessageItem`（含 `Message`）、`ChatToolCallItem`（含 `ToolCallActivity`）、`ChatStreamingItem`（含 `String text`）
+- [ ] 18.9 `_ChatScreenState` 中 `_messages` + `_toolActivities` 替换为 `List<ChatItem> _chatItems`；加载会话时解析每条 message 的 `tool_calls` JSON，在该 message 之前插入 `ChatItem.toolCall`；**每轮**工具调用对应的 assistant 消息都要序列化 `toolCallsJson` 入库（不仅是最终轮次）；`_callModel` 中 streaming 显示改为当前轮次文本（`turnText`），避免跨轮 `allText` 与已持久化的中间消息重复；构建 API 对话历史时，从 DB 加载的 Message 若含 `toolCallsJson`，需从 JSON 还原 `tool_use` 内容块拼入 content 数组，并在其后插入一条合成的 `user` role 消息携带对应的 `tool_result` 块（think 块参见 Phase 16：仅 tool loop 内需要透传，跨轮次可省略）
+- [ ] 18.10 `ChatArea` 改为接收 `List<ChatItem> items`，`ListView.builder` 按 `ChatItemType` 分发三种 widget；移除 `streamingText` / `toolActivities` 单独参数
+
+### 🔎 Checkpoint 18: 工具调用卡片
+
+| # | 验收项 | 通过标准 |
+|---|--------|----------|
+| A | 工具调用卡片出现 | 模型请求 read_file/list_dir 时，消息列表中渲染出 ToolCallCard，显示工具名和输入参数 |
+| B | 执行状态指示 | 工具执行期间卡片显示 loading 动画，完成后更新为结果摘要 |
+| C | 结果可折叠 | 长结果默认折叠显示前 300 字符，点击展开查看完整内容 |
+| D | 视觉区分 | ToolCallCard 与 MessageBubble 有明显不同的背景色 / 边框 / 图标 |
+| E | 回归：单轮无工具 | 普通对话不受影响，不出现空卡片或异常空白 |
+| F | 工具卡片持久化 | 含工具调用的会话 → 切换到其他会话 → 切回来，工具卡片仍在原位 |
+| G | 重启后保留 | 关闭应用重新打开，含工具调用的会话中卡片仍然渲染 |
+| H | 多轮工具调用 | 同一会话多次工具调用，所有卡片按时间顺序排列，不清空 |
+| I | 有工具调用历史的会话继续对话 | 完成一次含工具调用的对话 → 在同会话发第二条消息 → API 收到完整历史（含 tool_use 和 tool_result），模型正常回复 |
