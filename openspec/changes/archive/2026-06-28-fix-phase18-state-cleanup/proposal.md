@@ -8,6 +8,13 @@
 - `_deleteSession` 增加 `_toolActivities = []` 清理
 - `_sendMessage` 的 `_sessionRepo.get()` await 之后增加 `mounted` 检查
 - `onToolCall` / `onThinking` 的 `catch (_) {}` 改为至少 `debugPrint` 记录错误
+- 空 tool ID fallback 单点赋值（仅 `onToolCall` 一处 `tc['id'] ??=`）
+- `_streamingText` 从 `allText` 改为 `turnText`，修复多轮工具调用时 streaming bubble 跨轮文本拼接
+
+### 回归修复（测试中发现）
+- **`_selectSession` 切换会话时清空 `_messages`**：`_endStreaming()` 抽离后，`setState` 被拆成两次，`_messages` 在 async `_loadMessages()` 完成前保留旧会话数据。若用户在此窗口内发送消息，`snapMessages` 捕获错误历史，导致跨会话内容污染
+- **`_deleteSession` 嵌套 `setState` 修正**：`_endStreaming()` 当前在外层 `setState` 内部调用，移出以避免嵌套
+- **`_loadMessages` 增加错误处理**：DB 查询失败时静默保留旧 `_messages`，导致错误会话内容持续显示
 - 空 tool ID 兜底逻辑：当 `tc['id']` 为空时生成 fallback ID 而非用空字符串
 
 ### 清理

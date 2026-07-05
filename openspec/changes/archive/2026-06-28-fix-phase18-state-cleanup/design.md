@@ -59,9 +59,36 @@ void _endStreaming() {
 **原因**: `allText` 跨 tool loop turn 累积，中间轮次若产生文本会拼接到后续轮次的 streaming 显示中（如 "让我读取文件" + "文件内容是 hello" → "让我读取文件文件内容是 hello"）。`turnText` 每轮重置（task 10.1 已修复存储侧，此为显示侧的对应修复）。
 **替代方案**: 每轮开始时 `allText = ''` 清零 — 但 `allText` 若被其他地方引用（如最终存储逻辑）则需额外检查，不如直接用 `turnText` 隔离。
 
+### D7: `_selectSession` 中同步清空 `_messages`（回归修复）
+
+**选择**: 在 `_selectSession` 的 `setState` 中增加 `_messages = []`，与 `_currentId = s.id` 同帧执行。
+**原因**: `_endStreaming()` 抽离后，`_selectSession` 拆成两个 `setState`（先清 streaming state，再设新 session）。第二个 `setState` 更新了 `_currentId` 但没清 `_messages`，然后异步 `_loadMessages()` 才加载新数据。在这个 async gap 中，UI 显示新 session 的标题 + 旧 session 的消息。若用户在此期间发送消息，`_sendMessage` 的 `snapMessages` 捕获到错误会话的历史。
+**替代方案**: 合并 `_endStreaming()` 和 session 切换回单个 `setState` — 但会失去 `_endStreaming()` 的复用价值。直接在 `_loadMessages` 开头清空 `_messages` — 但先设 `_currentId` 后清空 `_messages` 的顺序不如一起做。
+
+### D8: `_deleteSession` 中 `_endStreaming()` 移出外层 setState（回归修复）
+
+**选择**: `_endStreaming()` 仍在 `wasCurrent` 分支内调用，但在外层 `setState` **之前**独立执行（与 `_selectSession`、`_newChat` 一致）。
+**原因**: 当前 `_endStreaming()` 在 `setState(() { ... _endStreaming(); ... })` 内被调用，造成嵌套 `setState`。Flutter 不会 crash 但依赖实现细节，不是规范用法。移出后代码更清晰。
+**替代方案**: 移到 `setState` 之后 — 等价，但与其他两个调用点（`_selectSession` 行 184、`_newChat` 行 193）的 before-setState 模式不一致。
+
+### D9: `_loadMessages` 增加错误处理（回归修复）
+
+**选择**: 将 `final msgs = await _msgRepo.queryBySession(_currentId!)` 包裹在 try-catch 中，catch 时 `setState(() => _messages = [])` 清空列表。
+**原因**: D7 已在所有调用点（`_selectSession`、`_deleteSession`）同步清空 `_messages = []`，D9 提供 catch 内的冗余防御——若未来新增调用路径漏了 D7 的清空，或 DB 查询在清空后、返回前失败，catch 块确保 `_messages` 始终被清空。同时提供 `debugPrint` 错误日志用于诊断。catch 内先 `if (!mounted) return;` 再 `setState`，与 `_endStreaming()` 保持一致。
+**替代方案**: 不处理，完全依赖 D7 — 但缺少 error logging 会掩盖 DB 故障。
+
+### D10: `onToolCall` / 工具结果增加会话守卫（对抗验证发现）
+
+**选择**: 将 `_toolActivities.add(...)` 包裹在 `if (_currentId == sessionId)` 中；将 `_toolActivities[idx] = ...` 包裹在 `if (_currentId == sessionId && idx >= 0)` 中。
+**原因**: 当前 `onToolCall` 回调（行 358）无条件修改 `_toolActivities`，仅在 `setState`（行 363）处检查会话守卫。用户切换会话后，旧会话的回调仍可污染 `_toolActivities` 列表，下一次任何来源的 `setState` 都会渲染错误数据。`_endStreaming()` / `_sendMessage` 会在后续自动清空（transient corruption），但应在源头防止。
+**替代方案**: 依赖现有 `setState` 守卫 — 但 `setState` 守卫仅阻止 rebuild，不阻止数据写入 `_toolActivities`。下一次 rebuild 时污染仍然可见。
+
 ## Risks / Trade-offs
 
 - **[R] `jumpTo` 滚动可能感觉突兀** → Mitigation：仅在 `isStreaming` 时用 `jumpTo`（文本在逐字增长，用户注意力在文字上，不会感知到滚动动画缺失）。新消息到达时的滚动仍用 `animateTo`。
 - **[R] `_endStreaming()` 被某路径遗忘调用** → Mitigation：方法名清晰，review 时容易发现。Phase 18.10 的 ChatItem 统一列表会从根上消除这个问题。
 - **[R] `_endStreaming()` 是临时代码** → Mitigation：方法声明加 `// NOTE: Will be refactored in Phase 18.9` 注释，提醒后续开发者。
 - **[R] `allText` 改为 `turnText` 可能影响其他引用** → Mitigation：`allText` 仅用于 `_streamingText` 赋值和最终存储的 content。存储逻辑已由 task 10.1 修复使用 `turnText`，本次仅修复显示侧的一致性。
+- **[R] `_messages = []` 后 `_loadMessages` 失败导致空列表** → Mitigation：D9 的 try-catch 覆盖了 DB 失败场景。另外 `_newChat` 也设 `_messages = []` 且不加载 DB（新会话无历史），行为一致。
+- **[R] `_endStreaming()` 移出 setState 后多一次 rebuild** → Mitigation：与 D1 已接受的 trade-off 一致，Phase 18.9 会整体重构。
+- **[R] Abandoned `_callModel` callbacks continue running** → 旧会话的 `sendMessage` 无法被取消（C FFI 在 worker isolate 上阻塞，Dart 没有取消原语）。`onChunk` / `onToolCall` / `onThinking` / `onDone` 回调会继续触发，所有状态变更必须通过 `_currentId == sessionId` 守卫。D10 + Section 5.4/5.5 修复了 `_toolActivities` 的守卫遗漏。

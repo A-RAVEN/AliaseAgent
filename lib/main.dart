@@ -6,6 +6,7 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'models/app_config.dart';
 import 'models/message.dart';
 import 'models/session.dart';
+import 'models/tool_call_activity.dart';
 import 'services/agent_type_registry.dart';
 import 'services/config_service.dart';
 import 'services/message_repository.dart';
@@ -147,6 +148,7 @@ class _ChatScreenState extends State<ChatScreen> {
   // Streaming state
   bool _isStreaming = false;
   String _streamingText = '';
+  List<ToolCallActivity> _toolActivities = [];
 
   bool _loading = true;
 
@@ -159,6 +161,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _loadSessions() async {
     final sessions = await _sessionRepo.list();
+    if (!mounted) return;
     setState(() {
       _sessions = sessions;
       _loading = false;
@@ -174,40 +177,47 @@ class _ChatScreenState extends State<ChatScreen> {
       setState(() => _messages = []);
       return;
     }
-    final msgs = await _msgRepo.queryBySession(_currentId!);
-    setState(() => _messages = msgs);
+    try {
+      final msgs = await _msgRepo.queryBySession(_currentId!);
+      if (!mounted) return;
+      setState(() => _messages = msgs);
+    } catch (e) {
+      debugPrint('[AliasAgent] _loadMessages error: $e');
+      if (!mounted) return;
+      setState(() => _messages = []);
+    }
   }
 
   void _selectSession(Session s) {
+    _endStreaming();
     setState(() {
       _currentId = s.id;
-      _isStreaming = false;
-      _streamingText = '';
+      _messages = [];
     });
     _loadMessages();
   }
 
   Future<void> _newChat() async {
     final s = await _sessionRepo.create();
+    if (!mounted) return;
+    _endStreaming();
     setState(() {
       _currentId = s.id;
       _messages = [];
-      _isStreaming = false;
-      _streamingText = '';
     });
     _loadSessions();
   }
 
   Future<void> _deleteSession(Session s) async {
     await _sessionRepo.delete(s.id);
+    if (!mounted) return;
     final wasCurrent = _currentId == s.id;
+    if (wasCurrent) _endStreaming();
     setState(() {
       _sessions.removeWhere((x) => x.id == s.id);
       if (wasCurrent) {
         _currentId = _sessions.isNotEmpty ? _sessions.first.id : null;
         _messages = [];
-        _isStreaming = false;
-        _streamingText = '';
         if (_currentId != null) _loadMessages();
       }
     });
@@ -233,9 +243,16 @@ class _ChatScreenState extends State<ChatScreen> {
       _messages.add(userMsg);
       _isStreaming = true;
       _streamingText = '';
+      _toolActivities = [];
     });
 
-    _loadSessions();
+    // Auto-title: update "New Chat" from first user message
+    final titleUpdated = await _sessionRepo.updateTitleIfDefault(_currentId!, text);
+    if (titleUpdated && mounted) {
+      setState(() {
+        _sessions.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+      });
+    }
 
     // Snapshot session state before async gap to prevent race conditions
     final sessionId = _currentId!;
@@ -318,8 +335,6 @@ class _ChatScreenState extends State<ChatScreen> {
       });
     }
 
-    String allText = '';
-
     for (int turn = 0; turn < 5; turn++) {
       final messagesJson = jsonEncode(apiMessages);
 
@@ -339,18 +354,31 @@ class _ChatScreenState extends State<ChatScreen> {
         toolsJson: toolsJson,
         onChunk: (text) {
           turnText += text;
-          allText += text;
-          if (_currentId == sessionId && mounted) setState(() => _streamingText = allText);
+          if (_currentId == sessionId && mounted) setState(() => _streamingText = turnText);
         },
         onToolCall: (json) {
           try {
-            turnToolCalls.add(jsonDecode(json) as Map<String, dynamic>);
-          } catch (_) {}
+            final tc = jsonDecode(json) as Map<String, dynamic>;
+            tc['id'] ??= 'tool_${turn}_${turnToolCalls.length}';
+            turnToolCalls.add(tc);
+            if (_currentId == sessionId) {
+              _toolActivities.add(ToolCallActivity(
+                id: tc['id'] as String,
+                toolName: (tc['name'] as String?) ?? 'unknown',
+                input: (tc['input'] as Map<String, dynamic>?) ?? {},
+              ));
+            }
+            if (_currentId == sessionId && mounted) setState(() {});
+          } catch (e) {
+            debugPrint('[AliasAgent] onToolCall parse error: $e\nraw: $json');
+          }
         },
         onThinking: (json) {
           try {
             turnThinkingBlocks.add(jsonDecode(json) as Map<String, dynamic>);
-          } catch (_) {}
+          } catch (e) {
+            debugPrint('[AliasAgent] onThinking parse error: $e\nraw: $json');
+          }
         },
         onDone: (code, error, stopReason) {
           doneCode = code;
@@ -361,12 +389,7 @@ class _ChatScreenState extends State<ChatScreen> {
       );
 
       if (doneCode != 0) {
-        if (_currentId == sessionId && mounted) {
-          setState(() {
-            _isStreaming = false;
-            _streamingText = '';
-          });
-        }
+        if (_currentId == sessionId) _endStreaming();
         await _storeError(doneError ?? 'Unknown error', sessionId: sessionId);
         return;
       }
@@ -383,17 +406,11 @@ class _ChatScreenState extends State<ChatScreen> {
           if (_currentId == sessionId && mounted) {
             setState(() {
               _messages.add(assistantMsg);
-              _isStreaming = false;
-              _streamingText = '';
             });
           }
+          if (_currentId == sessionId) _endStreaming();
         } else {
-          if (_currentId == sessionId && mounted) {
-            setState(() {
-              _isStreaming = false;
-              _streamingText = '';
-            });
-          }
+          if (_currentId == sessionId) _endStreaming();
         }
         return;
       }
@@ -420,16 +437,17 @@ class _ChatScreenState extends State<ChatScreen> {
             ? (result['content'] as String? ?? '')
             : (result['error'] as String? ?? 'Tool failed');
 
-        // Show tool activity in streaming text
-        final toolLabel = tc['name'] ?? 'unknown';
-        final preview = resultContent.length > 300
-            ? '${resultContent.substring(0, 300)}...'
-            : resultContent;
-        if (_currentId == sessionId && mounted) {
-          setState(() {
-            _streamingText =
-                '$allText\n\n**Tool `$toolLabel`**\n```\n$preview\n```';
-          });
+        // Update tool activity card
+        final toolId = (tc['id'] as String?) ?? '';
+        final idx = _toolActivities.indexWhere((a) => a.id == toolId);
+        if (_currentId == sessionId && idx >= 0) {
+          _toolActivities[idx] = _toolActivities[idx].copyWith(
+            status: result['ok'] == true ? ToolCallStatus.done : ToolCallStatus.error,
+            result: resultContent,
+            resultPreview: resultContent.length > 300
+                ? '${resultContent.substring(0, 300)}...'
+                : resultContent,
+          );
         }
 
         toolResults.add({
@@ -438,6 +456,9 @@ class _ChatScreenState extends State<ChatScreen> {
           'content': resultContent,
         });
       }
+
+      // Batch setState after all tools executed
+      if (_currentId == sessionId && mounted) setState(() {});
 
       apiMessages.add({
         'role': 'user',
@@ -451,12 +472,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     // Max tool turns exceeded
-    if (_currentId == sessionId && mounted) {
-      setState(() {
-        _isStreaming = false;
-        _streamingText = '';
-      });
-    }
+    if (_currentId == sessionId) _endStreaming();
     await _sessionRepo.touch(sessionId);
   }
 
@@ -477,9 +493,20 @@ class _ChatScreenState extends State<ChatScreen> {
 
     try {
       return jsonDecode(resultJson) as Map<String, dynamic>;
-    } catch (_) {
+    } catch (e) {
+      debugPrint('[AliasAgent] _executeTool parse error: $e');
       return {'ok': false, 'error': 'Failed to parse tool result'};
     }
+  }
+
+  // NOTE: Will be refactored in Phase 18.9 when _chatItems replaces separate lists
+  void _endStreaming() {
+    if (!mounted) return;
+    setState(() {
+      _isStreaming = false;
+      _streamingText = '';
+      _toolActivities = [];
+    });
   }
 
   Future<void> _storeError(String message, {required String sessionId}) async {
@@ -519,6 +546,7 @@ class _ChatScreenState extends State<ChatScreen> {
         Expanded(
           child: ChatArea(
             messages: _messages,
+            toolActivities: _toolActivities,
             streamingText: _isStreaming ? _streamingText : null,
             isStreaming: _isStreaming,
             onSendMessage: _sendMessage,

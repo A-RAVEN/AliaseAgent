@@ -2,10 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../models/message.dart';
+import '../models/tool_call_activity.dart';
 import 'message_bubble.dart';
+import 'tool_call_card.dart';
 
 class ChatArea extends StatefulWidget {
   final List<Message> messages;
+  final List<ToolCallActivity> toolActivities;
   final String? streamingText;
   final bool isStreaming;
   final ValueChanged<String> onSendMessage;
@@ -13,6 +16,7 @@ class ChatArea extends StatefulWidget {
   const ChatArea({
     super.key,
     required this.messages,
+    this.toolActivities = const [],
     this.streamingText,
     this.isStreaming = false,
     required this.onSendMessage,
@@ -35,14 +39,16 @@ class _ChatAreaState extends State<ChatArea> {
   @override
   void didUpdateWidget(ChatArea old) {
     super.didUpdateWidget(old);
-    final oldLen = old.messages.length + (old.streamingText != null ? 1 : 0);
-    final newLen = widget.messages.length + (widget.streamingText != null ? 1 : 0);
+    final oldLen = old.messages.length + old.toolActivities.length + (old.streamingText != null ? 1 : 0);
+    final newLen = widget.messages.length + widget.toolActivities.length + (widget.streamingText != null ? 1 : 0);
     if (newLen > oldLen) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
     }
-    // Also auto-scroll while streaming text updates
+    // Also auto-scroll while streaming text updates (instant jump to avoid animation jank)
     if (widget.isStreaming && widget.streamingText != null) {
-      _scrollToBottom();
+      if (_scrollCtrl.hasClients) {
+        _scrollCtrl.jumpTo(_scrollCtrl.position.maxScrollExtent);
+      }
     }
   }
 
@@ -93,12 +99,18 @@ class _ChatAreaState extends State<ChatArea> {
                   controller: _scrollCtrl,
                   padding: const EdgeInsets.symmetric(vertical: 8),
                   itemCount:
-                      msgs.length + (widget.isStreaming ? 1 : 0),
+                      msgs.length + widget.toolActivities.length + (widget.isStreaming ? 1 : 0),
                   itemBuilder: (context, i) {
                     if (i < msgs.length) {
                       return MessageBubble(
                         role: msgs[i].role,
                         content: msgs[i].content,
+                      );
+                    }
+                    final toolIdx = i - msgs.length;
+                    if (toolIdx < widget.toolActivities.length) {
+                      return ToolCallCard(
+                        activity: widget.toolActivities[toolIdx],
                       );
                     }
                     // Streaming bubble

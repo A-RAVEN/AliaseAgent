@@ -35,6 +35,47 @@ The system SHALL display only the current tool-call turn's text in the streaming
 - **WHEN** a multi-turn tool call conversation produces text in intermediate turns (e.g., "Let me read that file" before a tool_use, then "The file contains: hello" in the final turn)
 - **THEN** the streaming bubble shows only the current turn's text (`turnText`), not the concatenation of all turns (`allText`)
 
+### Requirement: Session switch clears message list synchronously
+The system SHALL clear `_messages` to empty in the same `setState` that updates `_currentId`, before the async `_loadMessages()` call, to prevent stale messages from the previous session appearing in the current session's UI.
+
+#### Scenario: Switch session with messages present
+- **WHEN** the user selects a different session in the sidebar while `_messages` contains the previous session's chat history
+- **THEN** `_messages` is set to `[]` atomically with `_currentId` update
+- **AND** `_loadMessages()` then loads the correct session's messages asynchronously
+
+#### Scenario: Send message during async load gap
+- **WHEN** the user sends a message after switching sessions but before `_loadMessages()` completes
+- **THEN** `_sendMessage` snapshots `_messages` as `[]` (not the previous session's history)
+- **AND** the API request is built with only the new user message, not mixed context from another session
+
+### Requirement: No nested setState in _deleteSession
+The system SHALL call `_endStreaming()` outside of any enclosing `setState` callback in `_deleteSession`, keeping each state mutation in its own `setState` block.
+
+#### Scenario: Delete current session
+- **WHEN** the user deletes the currently active session
+- **THEN** `_endStreaming()` is invoked independently (not inside another `setState` callback)
+- **AND** the session switch (`_currentId`, `_messages = []`) occurs in a separate `setState` call
+
+### Requirement: _loadMessages handles DB errors gracefully
+The system SHALL catch exceptions from the database query in `_loadMessages` and clear `_messages` to empty on failure, preventing permanently stale data display.
+
+#### Scenario: Database query fails during session switch
+- **WHEN** `_msgRepo.queryBySession()` throws an exception
+- **THEN** the error is caught and `_messages` is set to `[]` via `setState`
+- **AND** the UI shows an empty message list rather than retaining another session's history
+
+### Requirement: Tool call callbacks do not mutate state for abandoned sessions
+The system SHALL guard `_toolActivities` mutations in `_callModel`'s `onToolCall` callback and tool-execution loop with a `_currentId == sessionId` check, preventing stale callbacks from abandoned sessions from polluting the current session's tool activity cards.
+
+#### Scenario: Switch sessions during in-flight tool call
+- **WHEN** the user switches from session A to session B while session A has an in-flight API response containing a tool_use block
+- **THEN** session A's `onToolCall` callback does NOT add a `ToolCallActivity` to `_toolActivities`
+- **AND** session A's tool-result updates do NOT modify `_toolActivities` entries
+
+#### Scenario: Tool result arrives after session switch
+- **WHEN** session A's tool execution completes and the result callback fires after the user has switched to session B
+- **THEN** the `_toolActivities[idx] = ...` assignment is skipped due to `_currentId != sessionId`
+
 ## MODIFIED Requirements
 
 ### Requirement: Auto-title from first user message

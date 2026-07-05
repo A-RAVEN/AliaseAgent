@@ -44,6 +44,16 @@ class SessionRepository {
         where: 'id = ?', whereArgs: [id]);
   }
 
+  /// Updates the session title from the first user message if it's still the
+  /// default "New Chat". Returns true if the title was updated.
+  Future<bool> updateTitleIfDefault(String id, String text) async {
+    final session = await get(id);
+    if (session == null || session.title != 'New Chat') return false;
+    final title = text.length > 30 ? '${text.substring(0, 30)}...' : text;
+    await updateTitle(id, title);
+    return true;
+  }
+
   Future<void> touch(String id) async {
     final db = await DatabaseService.database;
     final now = DateTime.now().millisecondsSinceEpoch;

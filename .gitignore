@@ -49,3 +49,7 @@ sidecar/build/
 
 # Screenshots
 Screenshot*.png
+
+# Binary build artifacts
+*.dll
+*.exe
