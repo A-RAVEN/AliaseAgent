@@ -2,7 +2,7 @@
 
 AliasAgent 是一个 Flutter 桌面应用，核心状态集中在 `_ChatScreenState`，通过 C FFI 调用 sidecar。当前验证手段分散：`dart analyze`（静态）、`flutter build`（编译）、`checkpoint_X_verify.dart`（逻辑层）、手动启动 + 侧车日志（运行时）。缺少一个统一的编排层，也没有视觉验证能力。
 
-Claude 运行环境：可执行 bash 命令、读写文件、查询 SQLite、读取日志，且 MCP 提供 `ui_diff_check`、`analyze_image`、`extract_text_from_screenshot` 等截图分析工具。瓶颈在截图——Flutter 的 GPU 渲染无法被 Windows GDI `PrintWindow` 捕获，需要 DirectX 级别的截图工具（nircmd）。
+Claude 运行环境：可执行 bash 命令、读写文件、查询 SQLite、读取日志，且 MCP 提供 `ui_diff_check`、`analyze_image`、`extract_text_from_screenshot` 等截图分析工具。瓶颈在截图——Flutter 的 GPU 渲染无法被 Windows GDI `PrintWindow` 捕获，但 PowerShell `CopyFromScreen` 直接读取屏幕缓冲区，可以正确捕获 GPU 渲染窗口。
 
 ## Goals / Non-Goals
 
@@ -20,13 +20,16 @@ Claude 运行环境：可执行 bash 命令、读写文件、查询 SQLite、读
 
 ## Decisions
 
-### D1: 截图工具选 nircmd
+### D1: 截图工具选 PowerShell CopyFromScreen
 
-**选择**: `nircmd.exe savescreenshot <path>`（150KB 免安装）。
+**选择**: PowerShell `CopyFromScreen`（Windows 自带，零外部依赖）。
+通过 `System.Drawing.Graphics.CopyFromScreen()` 读取屏幕缓冲区，不依赖目标窗口的渲染管线，因此 Flutter GPU 渲染窗口也能正确捕获。
+
 **替代方案**: 
+- `nircmd.exe savescreenshot` — 150KB 免安装，但需手动下载外部二进制；`savescreenshot` 同样截全屏
 - `flutter screenshot` — 仅支持移动设备，桌面端不支持
-- Windows GDI `PrintWindow` — Flutter GPU 渲染窗口返回黑屏
-- Rust/Go 写的 DXGI capture 小工具 — 更可控但需要编译工具链，nircmd 即下即用
+- Windows GDI `PrintWindow` — 向目标窗口发送 WM_PRINT 消息，Flutter GPU 渲染窗口无法响应，返回黑屏
+- Rust/Go 写的 DXGI capture 小工具 — 更可控但需要编译工具链
 
 ### D2: 脚本用 bash（Git Bash）
 
@@ -79,7 +82,7 @@ Step 8: Cleanup     → kill 进程
 
 ## Risks / Trade-offs
 
-- **[R] nircmd 可能被杀毒软件误报** → Mitigation：nircmd 是 NirSoft 的知名工具，从官方下载。或在 README 标注来源。
+- **[R] PowerShell 截图捕获全屏而非单窗口** → Mitigation：`CopyFromScreen` 读取屏幕缓冲区而非向窗口发消息，无法限定单窗口。对 smoke test 而言可接受——验证的是"界面上确实出现了预期内容"而非像素级窗口截图。MCP `ui_diff_check`/`extract_text_from_screenshot` 可从全屏截图中定位 UI 元素。
 - **[R] 参考截图会随 UI 变更过期** → Mitigation：`references/` 是 git-tracked 文件，UI 改动时同时更新。
 - **[R] GPU 缩放/DPI 差异导致截图不一致** → Mitigation：MCP `ui_diff_check` 支持语义对比而非像素级对比。固定窗口大小 1280×720。
 - **[R] Flutter 启动慢，step 4 中 sleep 不可靠** → Mitigation：用 `wait_for_window` 函数轮询 `tasklist` 确认进程存活 + 窗口出现，而非固定 sleep。

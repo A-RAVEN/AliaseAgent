@@ -1,18 +1,18 @@
 ## ADDED Requirements
 
 ### Requirement: Screenshot capture of AliasAgent window
-The system SHALL capture a screenshot of the AliasAgent application window using nircmd.
+The system SHALL capture a screenshot of the AliasAgent application window using PowerShell `CopyFromScreen`.
 
-#### Scenario: App window is visible
+#### Scenario: App window is visible and PowerShell is available
 - **WHEN** `alias_agent.exe` is running with a visible window
-- **AND** `nircmd.exe savescreenshot <path>` is called
+- **AND** PowerShell `CopyFromScreen` captures the primary screen to a PNG file
 - **THEN** a PNG file is saved at the specified path
 - **AND** the file size is non-zero
 
-#### Scenario: nircmd not available
-- **WHEN** `nircmd.exe` is not on PATH
+#### Scenario: Screenshot capture fails
+- **WHEN** PowerShell is not available or `CopyFromScreen` fails
 - **THEN** the step exits with code 1
-- **AND** an error message indicates the missing dependency
+- **AND** an error message indicates the capture failure
 
 ### Requirement: Visual regression comparison
 The system SHALL support comparing a newly captured screenshot against a known-good reference screenshot using MCP `ui_diff_check`.

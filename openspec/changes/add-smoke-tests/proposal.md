@@ -4,7 +4,7 @@
 
 ## What Changes
 
-- 新增 `tools/nircmd.exe` 依赖（150KB 免安装截图工具）
+- 截图使用 PowerShell `CopyFromScreen`（Windows 自带，零外部依赖）
 - 新增 `test/smoke/` 目录，包含一键运行脚本 `run_all.sh`
 - Shell 工具函数：`launch_app`、`wait_for_window`、`capture_screenshot`、`verify_db`、`verify_logs`
 - 串联现有 checkpoint 脚本到统一流程
@@ -21,6 +21,5 @@
 
 ## Impact
 
-- `tools/nircmd.exe` — 新增依赖
 - `test/smoke/` — 新增目录，不影响现有代码
 - 无应用代码变更，无 API 变更

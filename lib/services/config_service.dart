@@ -39,25 +39,26 @@ class ConfigService {
   static String get configDir => '$_homeDir${Platform.pathSeparator}.aliasagent';
   static String get configPath => '$configDir${Platform.pathSeparator}config.json';
 
-  static ConfigResult load() {
-    final file = File(configPath);
+  static ConfigResult load({String? configPath}) {
+    final file = File(configPath ?? ConfigService.configPath);
     if (!file.existsSync()) return ConfigResult.notFound();
 
+    final resolvedPath = file.path;
     try {
       final content = file.readAsStringSync();
       final json = jsonDecode(content) as Map<String, dynamic>;
       return ConfigResult.ok(AppConfig.fromJson(json));
     } on FormatException catch (e) {
-      return ConfigResult.malformed('Invalid JSON in $configPath: ${e.message}');
+      return ConfigResult.malformed('Invalid JSON in $resolvedPath: ${e.message}');
     } on TypeError catch (e) {
-      return ConfigResult.malformed('Unexpected data structure in $configPath: ${e.toString()}');
+      return ConfigResult.malformed('Unexpected data structure in $resolvedPath: ${e.toString()}');
     }
   }
 
-  static void save(AppConfig config) {
-    final dir = Directory(configDir);
+  static void save(AppConfig config, {String? configPath}) {
+    final path = configPath ?? ConfigService.configPath;
+    final dir = Directory(path).parent;
     if (!dir.existsSync()) dir.createSync(recursive: true);
-    final file = File(configPath);
-    file.writeAsStringSync(const JsonEncoder.withIndent('  ').convert(config.toJson()));
+    File(path).writeAsStringSync(const JsonEncoder.withIndent('  ').convert(config.toJson()));
   }
 }

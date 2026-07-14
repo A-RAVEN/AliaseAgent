@@ -46,7 +46,8 @@ class MyApp extends StatelessWidget {
 }
 
 class AppShell extends StatefulWidget {
-  const AppShell({super.key});
+  final ConfigResult Function()? configLoader;
+  const AppShell({super.key, this.configLoader});
 
   @override
   State<AppShell> createState() => _AppShellState();
@@ -63,7 +64,7 @@ class _AppShellState extends State<AppShell> {
   }
 
   void _loadConfig() {
-    final result = ConfigService.load();
+    final result = widget.configLoader != null ? widget.configLoader!() : ConfigService.load();
     switch (result.status) {
       case ConfigStatus.ok:
         setState(() {
@@ -130,16 +131,26 @@ class _AppShellState extends State<AppShell> {
 
 class ChatScreen extends StatefulWidget {
   final AppConfig config;
+  final SessionRepository? sessionRepo;
+  final MessageRepository? msgRepo;
+  final ISidecar? sidecar;
 
-  const ChatScreen({super.key, required this.config});
+  const ChatScreen({
+    super.key,
+    required this.config,
+    this.sessionRepo,
+    this.msgRepo,
+    this.sidecar,
+  });
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
 class _ChatScreenState extends State<ChatScreen> {
-  final _sessionRepo = SessionRepository();
-  final _msgRepo = MessageRepository();
+  late final SessionRepository _sessionRepo;
+  late final MessageRepository _msgRepo;
+  late final ISidecar _sidecar;
 
   List<Session> _sessions = [];
   String? _currentId;
@@ -155,7 +166,13 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
-    SidecarBridge.instance.setWorkspace(ConfigService.homeDir);
+    _sessionRepo = widget.sessionRepo ?? SessionRepository();
+    _msgRepo = widget.msgRepo ?? MessageRepository();
+    _sidecar = widget.sidecar ?? SidecarBridge.instance;
+    // Skip sidecar init when in test mode (DI detected)
+    if (widget.sidecar == null && widget.sessionRepo == null) {
+      _sidecar.setWorkspace(ConfigService.homeDir);
+    }
     _loadSessions();
   }
 
@@ -345,7 +362,7 @@ class _ChatScreenState extends State<ChatScreen> {
       String? doneError;
       String? doneStopReason;
 
-      await SidecarBridge.instance.sendMessage(
+      await _sidecar.sendMessage(
         apiKey: provider.apiKey,
         baseUrl: baseUrl,
         model: agentType.model,
@@ -484,9 +501,9 @@ class _ChatScreenState extends State<ChatScreen> {
     String resultJson;
     switch (name) {
       case 'read_file':
-        resultJson = SidecarBridge.instance.readFile(path);
+        resultJson = _sidecar.readFile(path);
       case 'list_dir':
-        resultJson = SidecarBridge.instance.listDir(path);
+        resultJson = _sidecar.listDir(path);
       default:
         resultJson = '{"ok":false,"error":"Unknown tool: $name"}';
     }

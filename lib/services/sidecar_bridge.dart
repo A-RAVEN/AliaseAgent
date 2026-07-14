@@ -57,10 +57,33 @@ typedef OnThinkingCallback = void Function(String thinkingJson);
 typedef OnDoneCallback = void Function(int code, String? error, String? stopReason);
 
 // ---------------------------------------------------------------------------
+// ISidecar — abstract interface for sidecar communication
+// ---------------------------------------------------------------------------
+
+abstract class ISidecar {
+  Future<void> sendMessage({
+    required String apiKey,
+    required String baseUrl,
+    required String model,
+    required String systemPrompt,
+    required String messagesJson,
+    required String toolsJson,
+    required OnChunkCallback onChunk,
+    required OnToolCallCallback onToolCall,
+    OnThinkingCallback? onThinking,
+    required OnDoneCallback onDone,
+  });
+
+  String? setWorkspace(String path);
+  String readFile(String path);
+  String listDir(String path);
+}
+
+// ---------------------------------------------------------------------------
 // SidecarBridge
 // ---------------------------------------------------------------------------
 
-class SidecarBridge {
+class SidecarBridge implements ISidecar {
   static SidecarBridge? _instance;
 
   late final DynamicLibrary _lib;
@@ -85,6 +108,7 @@ class SidecarBridge {
 
   // -- non-blocking model call (runs FFI on a worker isolate) --
 
+  @override
   Future<void> sendMessage({
     required String apiKey,
     required String baseUrl,
@@ -210,6 +234,7 @@ class SidecarBridge {
 
   // -- tools (run on main isolate — they're fast, local calls) --
 
+  @override
   String? setWorkspace(String path) {
     final ptr = path.toNativeUtf8();
     final resultPtr = _setWorkspaceFn(ptr);
@@ -218,6 +243,7 @@ class SidecarBridge {
     return result.isEmpty ? null : result;
   }
 
+  @override
   String readFile(String path) {
     final ptr = path.toNativeUtf8();
     final resultPtr = _readFileFn(ptr);
@@ -225,6 +251,7 @@ class SidecarBridge {
     return resultPtr.toDartString();
   }
 
+  @override
   String listDir(String path) {
     final ptr = path.toNativeUtf8();
     final resultPtr = _listDirFn(ptr);

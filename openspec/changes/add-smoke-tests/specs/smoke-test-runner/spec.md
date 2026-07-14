@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Dependency verification
-The system SHALL verify that all required tools (`flutter`, `dart`, `nircmd.exe`, `sqlite3`) are available on PATH before executing any verification steps.
+The system SHALL verify that all required tools (`flutter`, `dart`, `powershell`, `sqlite3`) are available on PATH before executing any verification steps.
 
 #### Scenario: All dependencies present
 - **WHEN** `check_deps()` is called

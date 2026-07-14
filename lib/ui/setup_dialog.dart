@@ -7,8 +7,9 @@ import '../services/config_service.dart';
 
 class SetupDialog extends StatefulWidget {
   final VoidCallback onComplete;
+  final void Function(AppConfig)? saveConfig;
 
-  const SetupDialog({super.key, required this.onComplete});
+  const SetupDialog({super.key, required this.onComplete, this.saveConfig});
 
   @override
   State<SetupDialog> createState() => _SetupDialogState();
@@ -35,7 +36,11 @@ class _SetupDialogState extends State<SetupDialog> {
     setState(() => _saving = true);
 
     final config = _buildDefaultConfig(key);
-    ConfigService.save(config);
+    if (widget.saveConfig != null) {
+      widget.saveConfig!(config);
+    } else {
+      ConfigService.save(config);
+    }
 
     widget.onComplete();
   }
