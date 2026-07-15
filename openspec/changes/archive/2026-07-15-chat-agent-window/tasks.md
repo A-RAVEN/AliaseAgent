@@ -555,11 +555,56 @@ DeepSeek 默认启用思考模式（`thinking: {"type":"enabled"}`），assistan
 
 > 18.1-18.5 实现了卡片 UI，但 `_toolActivities` 在 streaming 结束时被清空，工具卡片随 AI 回复完成而消失，不满足 spec "within the message list" 的持久化要求。
 
-- [ ] 18.6 DB schema v2：`messages` 表新增 `tool_calls TEXT` 列（nullable JSON），`onCreate` 和 `openAt` 同步更新；`onUpgrade` 增加 v1→v2 的 `ALTER TABLE` 迁移
-- [ ] 18.7 `Message` 模型新增 `toolCallsJson` 字段（`String?`），`fromRow` / `toRow` 同步更新；`MessageRepository.insert()` 新增可选参数 `toolCallsJson`
-- [ ] 18.8 新建 `lib/models/chat_item.dart`，定义 sealed class 层次：`ChatItem`（sealed）→ `ChatMessageItem`（含 `Message`）、`ChatToolCallItem`（含 `ToolCallActivity`）、`ChatStreamingItem`（含 `String text`）
-- [ ] 18.9 `_ChatScreenState` 中 `_messages` + `_toolActivities` 替换为 `List<ChatItem> _chatItems`；加载会话时解析每条 message 的 `tool_calls` JSON，在该 message 之前插入 `ChatItem.toolCall`；**每轮**工具调用对应的 assistant 消息都要序列化 `toolCallsJson` 入库（不仅是最终轮次）；`_callModel` 中 streaming 显示改为当前轮次文本（`turnText`），避免跨轮 `allText` 与已持久化的中间消息重复；构建 API 对话历史时，从 DB 加载的 Message 若含 `toolCallsJson`，需从 JSON 还原 `tool_use` 内容块拼入 content 数组，并在其后插入一条合成的 `user` role 消息携带对应的 `tool_result` 块（think 块参见 Phase 16：仅 tool loop 内需要透传，跨轮次可省略）
-- [ ] 18.10 `ChatArea` 改为接收 `List<ChatItem> items`，`ListView.builder` 按 `ChatItemType` 分发三种 widget；移除 `streamingText` / `toolActivities` 单独参数
+- [x] 18.6 DB schema v2：`_schemaVersion` 升至 2；`onCreate` 和 `openAt` 的 messages 表新增 `tool_calls TEXT` 列（nullable JSON）；**`onUpgrade` 修复**：当前 `database_service.dart:49-52` 无条件 `DROP TABLE` 销毁所有数据——改为按 `oldVersion` 分支：`oldVersion == 1` 时执行 `ALTER TABLE messages ADD COLUMN tool_calls TEXT` 保留现有数据，不可识别版本才 DROP+重建
+- [x] 18.7 `Message` 模型新增 `toolCallsJson` 字段（`String?`），`fromRow` / `toRow` 同步更新；`MessageRepository.insert()` 新增可选参数 `toolCallsJson`
+- [x] 18.8 新建 `lib/models/chat_item.dart`，定义 sealed class 层次：`ChatItem`（sealed）→ `ChatMessageItem`（含 `Message`）、`ChatToolCallItem`（含 `ToolCallActivity`）、`ChatStreamingItem`（含 `String text`）
+- [x] 18.9 `_ChatScreenState` 中 `_messages` + `_toolActivities` 替换为 `List<ChatItem> _chatItems`；加载会话时解析每条 message 的 `tool_calls` JSON，在该 message 之前插入 `ChatItem.toolCall`；**每轮**工具调用对应的 assistant 消息都要序列化 `toolCallsJson` 入库（不仅是最终轮次）；`_callModel` 中 streaming 显示改为当前轮次文本（`turnText`），避免跨轮 `allText` 与已持久化的中间消息重复；构建 API 对话历史时，从 DB 加载的 Message 若含 `toolCallsJson`，需从 JSON 还原 `tool_use` 内容块拼入 content 数组，并在其后插入一条合成的 `user` role 消息携带对应的 `tool_result` 块（think 块参见 Phase 16：仅 tool loop 内需要透传，跨轮次可省略）
+- [x] 18.10 `ChatArea` 改为接收 `List<ChatItem> items`，`ListView.builder` 按 `ChatItemType` 分发三种 widget；移除 `streamingText` / `toolActivities` 单独参数
+
+### 测试基础设施修复（自动化测试的前置条件）
+
+> 审查发现 FakeSidecar / FakeMessageRepository 存在与真实实现不一致的问题，需在编写测试前修复。
+
+- [x] 18.F1 修复 `FakeSidecar.listDir()` stub 默认返回格式：当前返回 `{"ok":true,"entries":[]}`，真实 C++ `list_dir` 返回 `{"ok":true,"content":"[]"}`。修正为一致格式，否则集成测试会掩盖格式 mismatch bug
+- [x] 18.F2 `FakeMessageRepository.insert()` 新增可选参数 `toolCallsJson`（`String?`），与 `MessageRepository.insert()` 的 18.7 修改对齐；不传时默认 null
+- [x] 18.F3 新增 test helper：`testMessageWithToolCalls()` — 创建携带 `toolCallsJson` 的 Message，用于 T4/T6 预填充 msgRepo 数据
+
+### 自动化测试（基于 FakeSidecar + Fake repos, TDD）
+
+> 利用 `add-integration-visual-tests` 已建立的 FakeSidecar / FakeMessageRepository / FakeSessionRepository 基础设施，在不启动真实 sidecar 的情况下验证持久化行为。T2-T6 预期在代码修复前 **FAIL**，修复后全部 PASS。
+
+- [x] 18.T1 `test/integration/tool_call_test.dart` — 新增测试：tool card 出现在流式过程中
+  - FakeSidecar 排队 `queueToolCall` + `queueDone`
+  - pump 后验证 `find.byType(ToolCallCard)` 存在、显示 tool name
+  - **无需代码修复即可 PASS**（18.1-18.5 已实现 UI）
+- [x] 18.T2 `test/integration/tool_persistence_test.dart` — 流结束后 tool card 保持可见
+  - 同上流程，多 pump 等流结束
+  - 验证 ToolCallCard **仍在 widget tree 中**
+  - **当前 FAIL**：`_endStreaming()` 执行 `_toolActivities = []`
+- [x] 18.T3 `test/integration/tool_persistence_test.dart` — tool call 数据存入 MessageRepository
+  - 发送含 tool call 的消息 → 流结束后检查 `msgRepo.messages`
+  - 验证存在 assistant role 消息，且 `toolCallsJson` 非 null
+  - 解析 `toolCallsJson` JSON：验证数组结构，每条含 `id`、`name`、`input`、`status`、`result` 字段
+  - 验证 `input` 为 `Map<String, dynamic>`（非 null 非空）
+  - **当前 FAIL**：`_sendMessage()` 中 tool_use 路径不调用 `_msgRepo.insert()`
+- [x] 18.T4 `test/integration/tool_persistence_test.dart` — 加载会话时恢复 tool card
+  - 预填充 `msgRepo`：user 消息 + assistant(tool_use) 消息
+  - 打开会话 → 验证 `ToolCallCard` 出现在 widget tree 中
+  - **当前 FAIL**：`_loadMessages()` 不解析 tool_calls 列 → 不重建 `_toolActivities`
+- [x] 18.T5 `test/integration/tool_persistence_test.dart` — 会话切换后 tool card 仍在
+  - Session A 发送含 tool call 消息 → Session B → 切回 Session A
+  - 验证 ToolCallCard 仍然可见（从 msgRepo 恢复）
+  - 需要在 `selectSession` 切换时重新加载；`_endStreaming()` 不应在切换时清空
+- [x] 18.T6 `test/integration/tool_persistence_test.dart` — 完整多轮对话恢复
+  - 预填充 msgRepo：user → tool_use(assistant) → tool_result(user) → text(assistant) 序列
+  - 加载会话，验证消息顺序：`MessageBubble(user)` → `ToolCallCard` → `MessageBubble(user/tool_result)` → `MessageBubble(assistant)`
+
+### 现有测试适配（ChatItem API 重构影响）
+
+> 18.10 将 ChatArea 的 public API 从三个独立参数改为 `List<ChatItem> items`，现有测试需同步更新。
+
+- [x] 18.U1 更新 `test/widget/chat_area_test.dart`：将 `ChatArea(messages: [...], toolActivities: [...])` 替换为 `ChatArea(items: [ChatMessageItem(...), ChatToolCallItem(...)])`
+- [x] 18.U2 更新 `test/integration/*.dart` 中使用 ChatArea 的地方（如有）
 
 ### 🔎 Checkpoint 18: 工具调用卡片
 
@@ -570,7 +615,7 @@ DeepSeek 默认启用思考模式（`thinking: {"type":"enabled"}`），assistan
 | C | 结果可折叠 | 长结果默认折叠显示前 300 字符，点击展开查看完整内容 |
 | D | 视觉区分 | ToolCallCard 与 MessageBubble 有明显不同的背景色 / 边框 / 图标 |
 | E | 回归：单轮无工具 | 普通对话不受影响，不出现空卡片或异常空白 |
-| F | 工具卡片持久化 | 含工具调用的会话 → 切换到其他会话 → 切回来，工具卡片仍在原位 |
-| G | 重启后保留 | 关闭应用重新打开，含工具调用的会话中卡片仍然渲染 |
-| H | 多轮工具调用 | 同一会话多次工具调用，所有卡片按时间顺序排列，不清空 |
+| F | 工具卡片持久化 | 含工具调用的会话 → 切换到其他会话 → 切回来，工具卡片仍在原位 → **自动验证：18.T5** |
+| G | 重启后保留 | 关闭应用重新打开，含工具调用的会话中卡片仍然渲染 → **自动验证：18.T4** |
+| H | 多轮工具调用 | 同一会话多次工具调用，所有卡片按时间顺序排列，不清空 → **自动验证：18.T6** |
 | I | 有工具调用历史的会话继续对话 | 完成一次含工具调用的对话 → 在同会话发第二条消息 → API 收到完整历史（含 tool_use 和 tool_result），模型正常回复 |

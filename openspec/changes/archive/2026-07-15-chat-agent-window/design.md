@@ -293,6 +293,42 @@ class ChatStreamingItem extends ChatItem { final String text; }
 
 **Rationale**: enum + nullable 方案 (`type` + `message?` + `toolCall?`) 每个变体都带着不相关的 null 字段，穷尽匹配靠 `switch (type)` 而非语言级别检查。sealed class 消除 nullable、`switch` 穷尽保证编译期检查，发现新变体时编译器给出错误而非运行期漏掉。Phase 18 的工具卡片持久化是消息列表模型的第一次结构性重构，用更强的类型系统为后续扩展留余地。
 
+### 10. DB Schema 迁移策略（v1 → v2）
+
+**Decision**: 非破坏性渐进迁移。`_schemaVersion` 从 1 升到 2，`onUpgrade` 中按 `oldVersion` 分支处理：
+
+```
+oldVersion == 1 → ALTER TABLE messages ADD COLUMN tool_calls TEXT
+                   (保留所有现有数据)
+oldVersion == ? → DROP + 重建（仅用于无法识别的版本 gap）
+```
+
+`onCreate` 和 `openAt` 同步更新到 v2 schema（建表时直接包含 `tool_calls TEXT` 列）。
+
+**Rationale**: 当前 `database_service.dart:49-52` 的 `onUpgrade` 无条件 `DROP TABLE`，一旦 `_schemaVersion` 从 1 升到 2，所有用户聊天历史静默丢失。Spec `session-persistence` 明确要求："for known migration paths, a non-destructive migration is applied to preserve existing data"。旧会话升级后 tool_calls 列为 NULL，渲染时按无工具调用处理（向后兼容）。
+
+### 11. ChatItem 重构的向后兼容
+
+**Decision**: `ChatArea` 的 public API 从三个独立参数改为单一 `List<ChatItem> items`：
+
+```dart
+// Before (Phase 18.1-18.5)
+ChatArea(messages: [...], toolActivities: [...], streamingText: '...')
+
+// After (Phase 18.10)
+ChatArea(items: [ChatMessageItem(...), ChatToolCallItem(...), ChatStreamingItem(...)])
+```
+
+**Impact scope**:
+- `ChatArea` widget — 构造函数 + `ListView.builder` 分发逻辑
+- `_ChatScreenState` — `_messages` + `_toolActivities` → `_chatItems`；`_loadMessages()` 从 tool_calls JSON 重建 ChatToolCallItem
+- 现有 widget tests（`chat_area_test.dart` 等）— 调用点需同步更新
+- `tool_call_card_test.dart` — 不受影响（ToolCallCard 组件 API 不变）
+
+**`_endStreaming()` 新语义**: 只移除 `ChatStreamingItem`，保留 `ChatMessageItem` 和 `ChatToolCallItem`。不再执行 `_toolActivities = []`。
+
+**Rationale**: sealed class 重构是结构性变更，影响面可控（2 个源文件 + 若干测试）。现有测试的更新量小——主要是将 `messages:` + `toolActivities:` 参数替换为 `items:` 列表。
+
 ## Risks / Trade-offs
 
 | Risk | Mitigation |
@@ -300,6 +336,10 @@ class ChatStreamingItem extends ChatItem { final String text; }
 | C++ 动态库崩溃会带垮 Flutter 进程 | C++ 侧做好错误处理，避免未定义行为；后期可拆独立进程 |
 | SSE 解析在 C 侧，调试困难 | 加日志输出到文件（C++ 侧 log 到 `~/.aliasagent/logs/`） |
 | `NativeCallable.listener` 异步回调导致悬空指针 | 所有传给回调的字符串指针必须存储在 Impl 成员或静态存储中，不能是局部变量 `.c_str()` |
+| DB schema 升级丢失用户数据 | v1→v2 用 `ALTER TABLE ADD COLUMN` 非破坏性迁移（见 section 10）；不可识别版本才 DROP |
+| ChatItem sealed class 重构破坏现有测试 | 同步更新 `chat_area_test.dart`、integration tests 的 ChatArea 构造调用 |
+| FakeSidecar listDir stub 返回格式与真实 C++ 不一致 | stub 默认值从 `{"ok":true,"entries":[]}` 修正为 `{"ok":true,"content":"[]"}` |
+| Tool card 排列位置不穿插在消息之间 | ChatItem 模型按 turn 顺序插入，ToolCallCard 出现在对应 assistant message 之前 |
 | DeepSeek thinking 块必须透传 | `OnThinkingCallback` 捕获 thinking 块，Dart 侧在 assistant content 中原样回传；不传回会导致 HTTP 400 |
 | API 响应体错误信息不可见 | HTTP ≥400 时将响应体写入日志（debug-infra 提案项） |
 | flutter_markdown 对复杂内容渲染有限 | 一期接受，后续可换更丰富的渲染方案 |

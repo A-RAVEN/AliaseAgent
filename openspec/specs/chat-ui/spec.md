@@ -67,7 +67,7 @@ The system SHALL display tool call requests and results as distinct cards within
 
 #### Scenario: Tool call card appears
 - **WHEN** the model requests a tool invocation (on_tool_call callback)
-- **THEN** a tool call card is inserted into the message list showing the tool name and input parameters
+- **THEN** a tool call card is inserted into the message list showing the tool name and input parameters, positioned directly before the assistant message that triggered the tool call (interleaved with messages, NOT appended after all messages)
 
 #### Scenario: Tool result displayed
 - **WHEN** a tool execution completes with a result
@@ -75,7 +75,7 @@ The system SHALL display tool call requests and results as distinct cards within
 
 #### Scenario: Tool cards persist in session history
 - **WHEN** the user switches to a different session and back, or restarts the application
-- **THEN** all tool call cards from previous conversation turns are still rendered in their original positions within the message list
+- **THEN** all tool call cards from previous conversation turns are still rendered in their original positions within the message list (interleaved between user and assistant messages according to conversation turn order; NOT appended at the end of the list)
 
 ### Requirement: Session list sidebar
 The system SHALL display a sidebar listing all saved sessions, ordered by last update time descending, with the ability to switch between sessions and create new ones.
