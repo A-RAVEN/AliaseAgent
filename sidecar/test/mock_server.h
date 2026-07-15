@@ -43,8 +43,9 @@ public:
 
     /// Start the server thread.  Binds to a random port, then blocks inside
     /// the thread waiting for a single connection.
-    void start(const std::string& fixture_path) {
+    void start(const std::string& fixture_path, int http_status = 200) {
         fixture_path_ = fixture_path;
+        http_status_ = http_status;
         thread_ = std::thread(&MockServer::serve, this);
     }
 
@@ -296,7 +297,12 @@ private:
 
         // Build chunked HTTP response
         std::ostringstream resp;
-        resp << "HTTP/1.1 200 OK\r\n";
+        resp << "HTTP/1.1 " << http_status_ << " ";
+        if (http_status_ == 400) resp << "Bad Request";
+        else if (http_status_ == 401) resp << "Unauthorized";
+        else if (http_status_ == 500) resp << "Internal Server Error";
+        else resp << "OK";
+        resp << "\r\n";
         resp << "Content-Type: text/event-stream\r\n";
         resp << "Transfer-Encoding: chunked\r\n";
         resp << "\r\n";
@@ -325,6 +331,7 @@ private:
     std::promise<uint16_t> ready_;
     uint16_t port_ = 0;
     std::string fixture_path_;
+    int http_status_ = 200;
 
     mutable std::mutex mutex_;
     std::string last_method_;

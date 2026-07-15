@@ -5,6 +5,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# ASan build mode — applies to sidecar_tests only (NOT sidecar.dll)
+option(ENABLE_ASAN "Enable AddressSanitizer for sidecar_tests" OFF)
+
 # Platform detection
 if(WIN32)
   set(PLATFORM_LIB ws2_32)
@@ -38,6 +41,7 @@ set(SOURCES
   src/logger.cpp
   src/model_gateway.cpp
   src/tools.cpp
+  src/crash_handler.cpp
 )
 
 # Shared library
@@ -70,9 +74,11 @@ add_executable(sidecar_tests
   src/logger.cpp
   src/model_gateway.cpp
   src/tools.cpp
+  src/crash_handler.cpp
   test/sse_parser_test.cpp
   test/tool_execution_test.cpp
   test/http_client_test.cpp
+  test/ffi_tracing_test.cpp
 )
 target_include_directories(sidecar_tests PRIVATE include src test "${JSON_INCLUDE_DIR}")
 target_compile_definitions(sidecar_tests PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN NOMINMAX
@@ -80,3 +86,15 @@ target_compile_definitions(sidecar_tests PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_L
 target_link_libraries(sidecar_tests PRIVATE Catch2::Catch2 CURL::libcurl ${PLATFORM_LIB})
 
 add_test(NAME sidecar_tests COMMAND sidecar_tests)
+
+# Apply ASan to sidecar_tests target only (NOT sidecar DLL — Dart VM conflict)
+if(ENABLE_ASAN)
+  if(MSVC)
+    target_compile_options(sidecar_tests PRIVATE /fsanitize=address)
+    target_link_options(sidecar_tests PRIVATE /fsanitize=address)
+  else()
+    target_compile_options(sidecar_tests PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+    target_link_options(sidecar_tests PRIVATE -fsanitize=address)
+  endif()
+  message(STATUS "ASan enabled for sidecar_tests")
+endif()

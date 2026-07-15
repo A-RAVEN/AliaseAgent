@@ -4,15 +4,35 @@ REM ============================================================================
 REM AliasAgent Clean Rebuild Script (Batch)
 REM Rebuilds C++ sidecar DLL via Flutter CMake's sidecar_build target,
 REM then deploys the DLL to additional locations.
+REM
+REM Usage:
+REM   rebuild_sidecar.bat [Debug|Release] [--asan] [run]
 REM ============================================================================
 
-set "BUILD_TYPE=%~1"
-if "%BUILD_TYPE%"=="" set "BUILD_TYPE=Debug"
-set "RUN_AFTER=%~2"
+set "BUILD_TYPE=Debug"
+set "ENABLE_ASAN=0"
+set "RUN_AFTER="
+
+:parse_args
+if "%~1"=="" goto :args_done
+if /i "%~1"=="Debug"   set "BUILD_TYPE=Debug"   & shift & goto :parse_args
+if /i "%~1"=="Release"  set "BUILD_TYPE=Release"  & shift & goto :parse_args
+if /i "%~1"=="Profile"  set "BUILD_TYPE=Profile"  & shift & goto :parse_args
+if /i "%~1"=="--asan"   set "ENABLE_ASAN=1"       & shift & goto :parse_args
+if /i "%~1"=="run"      set "RUN_AFTER=run"       & shift & goto :parse_args
+shift & goto :parse_args
+:args_done
+
+REM Validate: --asan only with Debug
+if "%ENABLE_ASAN%"=="1" if /i not "%BUILD_TYPE%"=="Debug" (
+    echo [X] --asan is only supported with Debug build type
+    exit /b 1
+)
 
 set "PROJECT_ROOT=%~dp0.."
 set "SID_SRC=%PROJECT_ROOT%\sidecar"
 set "SID_BUILD=%SID_SRC%\build\windows"
+set "ASAN_BUILD_DIR=%SID_SRC%\build\asan"
 set "FLUTTER_BUILD_DIR=%PROJECT_ROOT%\build\windows\x64"
 set "RUNNER_DIR=%FLUTTER_BUILD_DIR%\runner\%BUILD_TYPE%"
 set "WINDOWS_DIR=%PROJECT_ROOT%\windows"
@@ -83,7 +103,31 @@ for %%d in (libcurl.dll zlib1.dll) do (
 echo [*] DLL deployed.
 
 REM ============================================================================
-REM 5. Optional: Flutter run
+REM 5.5 — ASan build (optional, Debug only)
+REM ============================================================================
+if "%ENABLE_ASAN%"=="1" (
+    echo [*] Building sidecar_tests with ASan...
+    if exist "%ASAN_BUILD_DIR%" rmdir /s /q "%ASAN_BUILD_DIR%"
+    mkdir "%ASAN_BUILD_DIR%"
+
+    pushd "%ASAN_BUILD_DIR%"
+    cmake "%SID_SRC%" -DENABLE_ASAN=ON
+    cmake --build . --config Debug
+    if %ERRORLEVEL% neq 0 ( echo [X] ASan build failed & popd & exit /b 1 )
+    popd
+
+    echo [*] Running ASan tests...
+    pushd "%ASAN_BUILD_DIR%"
+    ctest --output-on-failure -C Debug
+    set "ASAN_RESULT=%ERRORLEVEL%"
+    popd
+
+    if !ASAN_RESULT! neq 0 ( echo [X] ASan tests failed & exit /b 1 )
+    echo      ASan tests passed.
+)
+
+REM ============================================================================
+REM 7. Optional: Flutter run
 REM ============================================================================
 if /i "%RUN_AFTER%"=="run" (
     echo [*] Starting Flutter app...

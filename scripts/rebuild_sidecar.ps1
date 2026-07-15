@@ -7,8 +7,14 @@ param(
     [ValidateSet("Debug", "Release", "Profile")]
     [string]$BuildType = "Debug",
 
+    [switch]$Asan,
     [switch]$Run
 )
+
+if ($Asan -and $BuildType -ne "Debug") {
+    Write-Error "--asan is only supported with Debug build type"
+    exit 1
+}
 
 $ErrorActionPreference = "Stop"
 
@@ -88,7 +94,40 @@ foreach ($dll in @("libcurl.dll", "zlib1.dll")) {
 }
 
 # ============================================================================
-# 5. Optional: Flutter run
+# 5.5 — ASan build (optional, Debug only)
+# ============================================================================
+if ($Asan) {
+    $AsanBuildDir = "$SidSrc\build\asan"
+
+    Write-Host "[*] Building sidecar_tests with ASan..." -ForegroundColor Green
+    if (Test-Path $AsanBuildDir) {
+        Remove-Item -Recurse -Force $AsanBuildDir
+    }
+    New-Item -ItemType Directory -Force -Path $AsanBuildDir | Out-Null
+
+    Push-Location $AsanBuildDir
+    try {
+        cmake $SidSrc -DENABLE_ASAN=ON
+        if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
+        cmake --build . --config Debug
+        if ($LASTEXITCODE -ne 0) { throw "ASan build failed" }
+    } finally {
+        Pop-Location
+    }
+
+    Write-Host "[*] Running ASan tests..." -ForegroundColor Green
+    Push-Location $AsanBuildDir
+    try {
+        ctest --output-on-failure -C Debug
+        if ($LASTEXITCODE -ne 0) { throw "ASan tests failed" }
+    } finally {
+        Pop-Location
+    }
+    Write-Host "     ASan tests passed." -ForegroundColor Green
+}
+
+# ============================================================================
+# 6. Optional: Flutter run
 # ============================================================================
 Push-Location $ProjectRoot
 try {

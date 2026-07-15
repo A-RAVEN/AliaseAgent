@@ -249,6 +249,34 @@ TEST_CASE("HTTP: request_id monotonically increasing", "[http_client]") {
 }
 
 // ============================================================================
+// 4.9 — HTTP 400 error body logging: raw_body captured and on_done receives error
+// ============================================================================
+TEST_CASE("HTTP: 400 error body captured and logged", "[http_client]") {
+    MockServer server;
+    server.start(fixture("text_delta.txt"), 400);  // HTTP 400
+    server.wait_ready();
+
+    ModelGateway gw;
+    gw.set_timeout(5);
+
+    s_done_called = false;
+    s_done_code = 0;
+    s_done_err = "";
+
+    int rid = gw.execute(
+        "sk-key", server.base_url().c_str(), "claude-sonnet-4-6",
+        "", VALID_MSG, "",
+        nullptr, nullptr, nullptr, s_done_capture
+    );
+    server.join();
+
+    REQUIRE(s_done_called);
+    REQUIRE(s_done_code == -1);
+    REQUIRE(s_done_err.find("HTTP 400") != std::string::npos);
+    REQUIRE(rid > 0);  // request ID still assigned (error after HTTP response)
+}
+
+// ============================================================================
 // Additional: nullptr system + nullptr tools
 // ============================================================================
 TEST_CASE("HTTP: nullptr system and tools omitted", "[http_client]") {
