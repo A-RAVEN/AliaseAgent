@@ -1,23 +1,18 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-import '../models/message.dart';
-import '../models/tool_call_activity.dart';
+import '../models/chat_item.dart';
 import 'message_bubble.dart';
 import 'tool_call_card.dart';
 
 class ChatArea extends StatefulWidget {
-  final List<Message> messages;
-  final List<ToolCallActivity> toolActivities;
-  final String? streamingText;
+  final List<ChatItem> items;
   final bool isStreaming;
   final ValueChanged<String> onSendMessage;
 
   const ChatArea({
     super.key,
-    required this.messages,
-    this.toolActivities = const [],
-    this.streamingText,
+    this.items = const [],
     this.isStreaming = false,
     required this.onSendMessage,
   });
@@ -39,13 +34,11 @@ class _ChatAreaState extends State<ChatArea> {
   @override
   void didUpdateWidget(ChatArea old) {
     super.didUpdateWidget(old);
-    final oldLen = old.messages.length + old.toolActivities.length + (old.streamingText != null ? 1 : 0);
-    final newLen = widget.messages.length + widget.toolActivities.length + (widget.streamingText != null ? 1 : 0);
-    if (newLen > oldLen) {
+    if (widget.items.length > old.items.length) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
     }
-    // Also auto-scroll while streaming text updates (instant jump to avoid animation jank)
-    if (widget.isStreaming && widget.streamingText != null) {
+    // Auto-scroll while streaming (instant jump to avoid animation jank)
+    if (widget.isStreaming) {
       if (_scrollCtrl.hasClients) {
         _scrollCtrl.jumpTo(_scrollCtrl.position.maxScrollExtent);
       }
@@ -79,13 +72,14 @@ class _ChatAreaState extends State<ChatArea> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final msgs = widget.messages;
+    final items = widget.items;
+    final hasContent = items.isNotEmpty || widget.isStreaming;
 
     return Column(
       children: [
         // Message list
         Expanded(
-          child: msgs.isEmpty && !widget.isStreaming
+          child: !hasContent
               ? Center(
                   child: Text(
                     'No messages yet.\nType something to get started.',
@@ -98,27 +92,22 @@ class _ChatAreaState extends State<ChatArea> {
               : ListView.builder(
                   controller: _scrollCtrl,
                   padding: const EdgeInsets.symmetric(vertical: 8),
-                  itemCount:
-                      msgs.length + widget.toolActivities.length + (widget.isStreaming ? 1 : 0),
+                  itemCount: items.length,
                   itemBuilder: (context, i) {
-                    if (i < msgs.length) {
-                      return MessageBubble(
-                        role: msgs[i].role,
-                        content: msgs[i].content,
-                      );
-                    }
-                    final toolIdx = i - msgs.length;
-                    if (toolIdx < widget.toolActivities.length) {
-                      return ToolCallCard(
-                        activity: widget.toolActivities[toolIdx],
-                      );
-                    }
-                    // Streaming bubble
-                    return MessageBubble(
-                      role: 'assistant',
-                      content: widget.streamingText ?? '',
-                      isStreaming: true,
-                    );
+                    return switch (items[i]) {
+                      ChatMessageItem(:final message) => MessageBubble(
+                          role: message.role,
+                          content: message.content,
+                        ),
+                      ChatToolCallItem(:final activity) => ToolCallCard(
+                          activity: activity,
+                        ),
+                      ChatStreamingItem(:final text) => MessageBubble(
+                          role: 'assistant',
+                          content: text,
+                          isStreaming: true,
+                        ),
+                    };
                   },
                 ),
         ),

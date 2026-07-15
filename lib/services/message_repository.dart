@@ -10,6 +10,7 @@ class MessageRepository {
     required String sessionId,
     required String role,
     required String content,
+    String? toolCallsJson,
     int? tokenCount,
   }) async {
     final db = await DatabaseService.database;
@@ -18,6 +19,7 @@ class MessageRepository {
       sessionId: sessionId,
       role: role,
       content: content,
+      toolCallsJson: toolCallsJson,
       tokenCount: tokenCount,
       createdAt: DateTime.now().millisecondsSinceEpoch,
     );

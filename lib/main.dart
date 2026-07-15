@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'models/app_config.dart';
+import 'models/chat_item.dart';
 import 'models/message.dart';
 import 'models/session.dart';
 import 'models/tool_call_activity.dart';
@@ -154,12 +155,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
   List<Session> _sessions = [];
   String? _currentId;
-  List<Message> _messages = [];
+  List<ChatItem> _chatItems = [];
 
   // Streaming state
   bool _isStreaming = false;
-  String _streamingText = '';
-  List<ToolCallActivity> _toolActivities = [];
 
   bool _loading = true;
 
@@ -191,25 +190,55 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _loadMessages() async {
     if (_currentId == null) {
-      setState(() => _messages = []);
+      setState(() => _chatItems = []);
       return;
     }
     try {
       final msgs = await _msgRepo.queryBySession(_currentId!);
       if (!mounted) return;
-      setState(() => _messages = msgs);
+      setState(() => _chatItems = _buildChatItems(msgs));
     } catch (e) {
       debugPrint('[AliasAgent] _loadMessages error: $e');
       if (!mounted) return;
-      setState(() => _messages = []);
+      setState(() => _chatItems = []);
     }
+  }
+
+  /// Build ChatItem list from persisted messages, interleaving tool call cards
+  /// before each assistant message that has toolCallsJson.
+  List<ChatItem> _buildChatItems(List<Message> messages) {
+    final items = <ChatItem>[];
+    for (final msg in messages) {
+      if (msg.toolCallsJson != null && msg.toolCallsJson!.isNotEmpty) {
+        try {
+          final list = jsonDecode(msg.toolCallsJson!) as List<dynamic>;
+          for (final tcJson in list) {
+            final activity = ToolCallActivity.fromJson(
+                tcJson as Map<String, dynamic>);
+            items.add(ChatToolCallItem(activity));
+          }
+        } catch (e) {
+          debugPrint('[AliasAgent] Failed to parse toolCallsJson: $e');
+        }
+      }
+      items.add(ChatMessageItem(msg));
+    }
+    return items;
+  }
+
+  /// Extract Message objects from ChatItem list for API conversation building.
+  List<Message> _chatItemsToMessages() {
+    return _chatItems
+        .whereType<ChatMessageItem>()
+        .map((item) => item.message)
+        .toList();
   }
 
   void _selectSession(Session s) {
     _endStreaming();
     setState(() {
       _currentId = s.id;
-      _messages = [];
+      _chatItems = [];
     });
     _loadMessages();
   }
@@ -220,7 +249,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _endStreaming();
     setState(() {
       _currentId = s.id;
-      _messages = [];
+      _chatItems = [];
     });
     _loadSessions();
   }
@@ -234,7 +263,7 @@ class _ChatScreenState extends State<ChatScreen> {
       _sessions.removeWhere((x) => x.id == s.id);
       if (wasCurrent) {
         _currentId = _sessions.isNotEmpty ? _sessions.first.id : null;
-        _messages = [];
+        _chatItems = [];
         if (_currentId != null) _loadMessages();
       }
     });
@@ -257,10 +286,8 @@ class _ChatScreenState extends State<ChatScreen> {
     await _sessionRepo.touch(_currentId!);
 
     setState(() {
-      _messages.add(userMsg);
+      _chatItems.add(ChatMessageItem(userMsg));
       _isStreaming = true;
-      _streamingText = '';
-      _toolActivities = [];
     });
 
     // Auto-title: update "New Chat" from first user message
@@ -273,7 +300,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
     // Snapshot session state before async gap to prevent race conditions
     final sessionId = _currentId!;
-    final snapMessages = List<Message>.from(_messages);
+    final snapMessages = _chatItemsToMessages();
     await _callModel(sessionId: sessionId, messages: snapMessages);
   }
 
@@ -341,16 +368,11 @@ class _ChatScreenState extends State<ChatScreen> {
             .where((d) => d != null)
             .toList());
 
-    // Build API conversation from current DB messages
-    final apiMessages = <Map<String, dynamic>>[];
-    for (final msg in messages) {
-      apiMessages.add({
-        'role': msg.role,
-        'content': [
-          {'type': 'text', 'text': msg.content}
-        ],
-      });
-    }
+    // Build API conversation from persisted messages, reconstructing tool_use blocks
+    final apiMessages = _buildApiMessages(messages);
+
+    // Track all tool calls across turns for final assistant message
+    final allTurnToolCalls = <Map<String, dynamic>>[];
 
     for (int turn = 0; turn < 5; turn++) {
       final messagesJson = jsonEncode(apiMessages);
@@ -362,6 +384,11 @@ class _ChatScreenState extends State<ChatScreen> {
       String? doneError;
       String? doneStopReason;
 
+      // Add streaming item
+      if (_currentId == sessionId && mounted) {
+        setState(() => _chatItems.add(const ChatStreamingItem('')));
+      }
+
       await _sidecar.sendMessage(
         apiKey: provider.apiKey,
         baseUrl: baseUrl,
@@ -371,7 +398,14 @@ class _ChatScreenState extends State<ChatScreen> {
         toolsJson: toolsJson,
         onChunk: (text) {
           turnText += text;
-          if (_currentId == sessionId && mounted) setState(() => _streamingText = turnText);
+          if (_currentId == sessionId && mounted) {
+            setState(() {
+              final lastIdx = _chatItems.length - 1;
+              if (lastIdx >= 0 && _chatItems[lastIdx] is ChatStreamingItem) {
+                _chatItems[lastIdx] = ChatStreamingItem(turnText);
+              }
+            });
+          }
         },
         onToolCall: (json) {
           try {
@@ -379,13 +413,24 @@ class _ChatScreenState extends State<ChatScreen> {
             tc['id'] ??= 'tool_${turn}_${turnToolCalls.length}';
             turnToolCalls.add(tc);
             if (_currentId == sessionId) {
-              _toolActivities.add(ToolCallActivity(
+              final activity = ToolCallActivity(
                 id: tc['id'] as String,
                 toolName: (tc['name'] as String?) ?? 'unknown',
                 input: (tc['input'] as Map<String, dynamic>?) ?? {},
-              ));
+              );
+              if (mounted) {
+                setState(() {
+                  // Insert tool card before the streaming item
+                  final streamIdx = _chatItems.lastIndexWhere(
+                      (i) => i is ChatStreamingItem);
+                  if (streamIdx >= 0) {
+                    _chatItems.insert(streamIdx, ChatToolCallItem(activity));
+                  } else {
+                    _chatItems.add(ChatToolCallItem(activity));
+                  }
+                });
+              }
             }
-            if (_currentId == sessionId && mounted) setState(() {});
           } catch (e) {
             debugPrint('[AliasAgent] onToolCall parse error: $e\nraw: $json');
           }
@@ -411,28 +456,53 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
 
+      // Remove streaming item
+      if (_currentId == sessionId && mounted) {
+        setState(() {
+          _chatItems.removeWhere((i) => i is ChatStreamingItem);
+        });
+      }
+
       // No tool calls — store final assistant message and done
       if (turnToolCalls.isEmpty) {
         if (turnText.isNotEmpty) {
+          final toolCallsJson = allTurnToolCalls.isNotEmpty
+              ? jsonEncode(allTurnToolCalls)
+              : null;
           final assistantMsg = await _msgRepo.insert(
             sessionId: sessionId,
             role: 'assistant',
             content: turnText,
+            toolCallsJson: toolCallsJson,
           );
           await _sessionRepo.touch(sessionId);
           if (_currentId == sessionId && mounted) {
             setState(() {
-              _messages.add(assistantMsg);
+              _chatItems.add(ChatMessageItem(assistantMsg));
             });
           }
-          if (_currentId == sessionId) _endStreaming();
-        } else {
-          if (_currentId == sessionId) _endStreaming();
         }
+        if (_currentId == sessionId) _endStreaming();
         return;
       }
 
-      // Build assistant content blocks for the API
+      // Tool calls present — accumulate and persist intermediate assistant message
+      allTurnToolCalls.addAll(turnToolCalls);
+      final turnJson = jsonEncode(turnToolCalls);
+      final intermediateMsg = await _msgRepo.insert(
+        sessionId: sessionId,
+        role: 'assistant',
+        content: turnText,
+        toolCallsJson: turnJson,
+      );
+      await _sessionRepo.touch(sessionId);
+      if (_currentId == sessionId && mounted) {
+        setState(() {
+          _chatItems.add(ChatMessageItem(intermediateMsg));
+        });
+      }
+
+      // Build assistant content blocks for the API:
       // Order: thinking blocks first, then text, then tool_use
       final assistantBlocks = <Map<String, dynamic>>[];
       assistantBlocks.addAll(turnThinkingBlocks);
@@ -454,17 +524,26 @@ class _ChatScreenState extends State<ChatScreen> {
             ? (result['content'] as String? ?? '')
             : (result['error'] as String? ?? 'Tool failed');
 
-        // Update tool activity card
+        // Update tool activity card in _chatItems
         final toolId = (tc['id'] as String?) ?? '';
-        final idx = _toolActivities.indexWhere((a) => a.id == toolId);
-        if (_currentId == sessionId && idx >= 0) {
-          _toolActivities[idx] = _toolActivities[idx].copyWith(
-            status: result['ok'] == true ? ToolCallStatus.done : ToolCallStatus.error,
-            result: resultContent,
-            resultPreview: resultContent.length > 300
-                ? '${resultContent.substring(0, 300)}...'
-                : resultContent,
-          );
+        if (_currentId == sessionId && mounted) {
+          setState(() {
+            for (int i = 0; i < _chatItems.length; i++) {
+              final item = _chatItems[i];
+              if (item is ChatToolCallItem && item.activity.id == toolId) {
+                _chatItems[i] = ChatToolCallItem(item.activity.copyWith(
+                  status: result['ok'] == true
+                      ? ToolCallStatus.done
+                      : ToolCallStatus.error,
+                  result: resultContent,
+                  resultPreview: resultContent.length > 300
+                      ? '${resultContent.substring(0, 300)}...'
+                      : resultContent,
+                ));
+                break;
+              }
+            }
+          });
         }
 
         toolResults.add({
@@ -474,15 +553,12 @@ class _ChatScreenState extends State<ChatScreen> {
         });
       }
 
-      // Batch setState after all tools executed
-      if (_currentId == sessionId && mounted) setState(() {});
-
       apiMessages.add({
         'role': 'user',
         'content': toolResults,
       });
 
-      // Reset per-turn state; loop continues for model's tool-result reply
+      // Reset per-turn state
       turnText = '';
       turnToolCalls.clear();
       turnThinkingBlocks.clear();
@@ -491,6 +567,67 @@ class _ChatScreenState extends State<ChatScreen> {
     // Max tool turns exceeded
     if (_currentId == sessionId) _endStreaming();
     await _sessionRepo.touch(sessionId);
+  }
+
+  /// Build API conversation messages from persisted Message objects,
+  /// reconstructing tool_use content blocks and synthetic tool_result messages.
+  List<Map<String, dynamic>> _buildApiMessages(List<Message> messages) {
+    final apiMessages = <Map<String, dynamic>>[];
+    for (final msg in messages) {
+      final content = <Map<String, dynamic>>[
+        {'type': 'text', 'text': msg.content},
+      ];
+
+      // If assistant message has tool calls, add tool_use blocks
+      if (msg.role == 'assistant' &&
+          msg.toolCallsJson != null &&
+          msg.toolCallsJson!.isNotEmpty) {
+        try {
+          final toolCalls = jsonDecode(msg.toolCallsJson!) as List<dynamic>;
+          for (final tc in toolCalls) {
+            final tcMap = tc as Map<String, dynamic>;
+            content.add({
+              'type': 'tool_use',
+              'id': tcMap['id'] ?? '',
+              'name': tcMap['toolName'] ?? tcMap['name'] ?? '',
+              'input': tcMap['input'] ?? {},
+            });
+          }
+        } catch (e) {
+          debugPrint('[AliasAgent] Failed to parse toolCallsJson: $e');
+        }
+      }
+
+      apiMessages.add({
+        'role': msg.role,
+        'content': content,
+      });
+
+      // If assistant message has tool calls, add synthetic tool_result user message
+      if (msg.role == 'assistant' &&
+          msg.toolCallsJson != null &&
+          msg.toolCallsJson!.isNotEmpty) {
+        try {
+          final toolCalls = jsonDecode(msg.toolCallsJson!) as List<dynamic>;
+          final toolResults = <Map<String, dynamic>>[];
+          for (final tc in toolCalls) {
+            final tcMap = tc as Map<String, dynamic>;
+            toolResults.add({
+              'type': 'tool_result',
+              'tool_use_id': tcMap['id'] ?? '',
+              'content': tcMap['result'] ?? tcMap['resultPreview'] ?? '',
+            });
+          }
+          apiMessages.add({
+            'role': 'user',
+            'content': toolResults,
+          });
+        } catch (e) {
+          debugPrint('[AliasAgent] Failed to build tool_results: $e');
+        }
+      }
+    }
+    return apiMessages;
   }
 
   Map<String, dynamic> _executeTool(Map<String, dynamic> toolCall) {
@@ -516,13 +653,12 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  // NOTE: Will be refactored in Phase 18.9 when _chatItems replaces separate lists
+  /// Remove streaming indicator only; tool call cards and messages persist.
   void _endStreaming() {
     if (!mounted) return;
     setState(() {
       _isStreaming = false;
-      _streamingText = '';
-      _toolActivities = [];
+      _chatItems.removeWhere((i) => i is ChatStreamingItem);
     });
   }
 
@@ -536,7 +672,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (mounted) {
       setState(() {
         if (_currentId == sessionId) {
-          _messages.add(errorMsg);
+          _chatItems.add(ChatMessageItem(errorMsg));
         }
       });
     }
@@ -562,9 +698,7 @@ class _ChatScreenState extends State<ChatScreen> {
         const VerticalDivider(width: 1),
         Expanded(
           child: ChatArea(
-            messages: _messages,
-            toolActivities: _toolActivities,
-            streamingText: _isStreaming ? _streamingText : null,
+            items: _chatItems,
             isStreaming: _isStreaming,
             onSendMessage: _sendMessage,
           ),

@@ -3,6 +3,7 @@ class Message {
   final String sessionId;
   final String role; // 'user' or 'assistant'
   final String content;
+  final String? toolCallsJson;
   final int? tokenCount;
   final int createdAt;
 
@@ -11,6 +12,7 @@ class Message {
     required this.sessionId,
     required this.role,
     required this.content,
+    this.toolCallsJson,
     this.tokenCount,
     required this.createdAt,
   });
@@ -21,6 +23,7 @@ class Message {
       sessionId: row['session_id'] as String,
       role: row['role'] as String,
       content: row['content'] as String,
+      toolCallsJson: row['tool_calls'] as String?,
       tokenCount: row['token_count'] as int?,
       createdAt: row['created_at'] as int,
     );
@@ -31,6 +34,7 @@ class Message {
         'session_id': sessionId,
         'role': role,
         'content': content,
+        'tool_calls': toolCallsJson,
         'token_count': tokenCount,
         'created_at': createdAt,
       };

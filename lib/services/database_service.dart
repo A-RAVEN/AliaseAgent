@@ -6,7 +6,7 @@ import 'package:path/path.dart' as p;
 import 'config_service.dart';
 
 class DatabaseService {
-  static const _schemaVersion = 1;
+  static const _schemaVersion = 2;
   static Database? _db;
 
   static Future<Database> get database async {
@@ -37,6 +37,7 @@ class DatabaseService {
             session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
             role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
             content TEXT NOT NULL,
+            tool_calls TEXT,
             token_count INTEGER,
             created_at INTEGER NOT NULL
           )
@@ -47,8 +48,13 @@ class DatabaseService {
             'CREATE INDEX idx_sessions_updated ON sessions(updated_at DESC)');
       },
       onUpgrade: (db, oldV, newV) async {
-        await db.execute('DROP TABLE IF EXISTS messages');
-        await db.execute('DROP TABLE IF EXISTS sessions');
+        if (oldV == 1) {
+          await db.execute(
+              'ALTER TABLE messages ADD COLUMN tool_calls TEXT');
+        } else {
+          await db.execute('DROP TABLE IF EXISTS messages');
+          await db.execute('DROP TABLE IF EXISTS sessions');
+        }
       },
     );
   }
@@ -75,10 +81,20 @@ class DatabaseService {
             session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
             role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
             content TEXT NOT NULL,
+            tool_calls TEXT,
             token_count INTEGER,
             created_at INTEGER NOT NULL
           )
         ''');
+      },
+      onUpgrade: (db, oldV, newV) async {
+        if (oldV == 1) {
+          await db.execute(
+              'ALTER TABLE messages ADD COLUMN tool_calls TEXT');
+        } else {
+          await db.execute('DROP TABLE IF EXISTS messages');
+          await db.execute('DROP TABLE IF EXISTS sessions');
+        }
       },
     );
   }
