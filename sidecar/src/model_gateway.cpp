@@ -1,14 +1,46 @@
 #include "model_gateway.h"
 #include "logger.h"
+#include "crash_handler.h"
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
+#include <array>
 #include <sstream>
 #include <cstring>
 #include <atomic>
+#include <chrono>
 
 using json = nlohmann::json;
+
+// ---------------------------------------------------------------------------
+// FFI ring buffer — records recent C→Dart callback invocations
+// ---------------------------------------------------------------------------
+
+enum class FfiEventType { CHUNK, TOOL_CALL, THINKING, DONE };
+
+struct FfiEvent {
+  FfiEventType type;
+  size_t payload_size;
+  uint64_t timestamp_ms;
+};
+
+struct FfiRingBuffer {
+  static constexpr size_t CAPACITY = 256;
+  std::array<FfiEvent, CAPACITY> events{};
+  std::atomic<size_t> write_idx{0};
+  std::atomic_flag spinlock = ATOMIC_FLAG_INIT;
+
+  void push(FfiEventType type, size_t payload_size) {
+    // Spinlock — lightweight, no contention (callbacks are synchronous)
+    while (spinlock.test_and_set(std::memory_order_acquire)) {}
+    uint64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    size_t idx = write_idx.fetch_add(1, std::memory_order_relaxed) % CAPACITY;
+    events[idx] = {type, payload_size, ts};
+    spinlock.clear(std::memory_order_release);
+  }
+};
 
 // ---------------------------------------------------------------------------
 // Buffered SSE event (parsed after curl completes, while strings are alive)
@@ -40,11 +72,16 @@ struct ModelGateway::Impl {
   struct curl_slist* headers = nullptr;
   long timeout_secs = 120;
 
+  // FFI ring buffer (always on, independent of log level)
+  FfiRingBuffer ffi_ring;
+
   // Buffered events — populated during SSE parsing, dispatched after curl
   std::vector<SseEvent> events;
   // SSE parsing state
   std::string line_buf;
   bool done_dispatched = false;
+  // Raw response body buffer (capped at 64KB, logged on HTTP errors)
+  std::string raw_body;
   // Tool use assembly: accumulate input_json_delta partial_json per block index
   std::map<int, json> pending_tool_uses;
   std::map<int, std::string> partial_jsons;
@@ -60,6 +97,9 @@ struct ModelGateway::Impl {
 
 std::atomic<int> ModelGateway::Impl::next_request_id{1};
 
+// Global pointer for crash handler access (dump_ffi_ring_buffer)
+static FfiRingBuffer* g_ffi_ring = nullptr;
+
 // ---------------------------------------------------------------------------
 // CURL write callback — only accumulates lines + feeds SSE parser
 // Callbacks are NOT invoked here; events are buffered for dispatch after curl
@@ -68,6 +108,13 @@ std::atomic<int> ModelGateway::Impl::next_request_id{1};
 static size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
   auto* impl = static_cast<ModelGateway::Impl*>(userdata);
   size_t total = size * nmemb;
+
+  // Append to raw_body buffer (capped at 64KB) for error logging
+  if (impl->raw_body.size() < 64 * 1024) {
+    size_t remaining = 64 * 1024 - impl->raw_body.size();
+    size_t to_append = total < remaining ? total : remaining;
+    impl->raw_body.append(ptr, to_append);
+  }
 
   for (size_t i = 0; i < total; ++i) {
     char c = ptr[i];
@@ -236,18 +283,27 @@ static void dispatch_events(ModelGateway::Impl* impl,
                              OnToolCallCallback on_tool_call,
                              OnThinkingCallback on_thinking,
                              OnDoneCallback on_done) {
+  LOG_TRACE("dispatch_events: " + std::to_string(impl->events.size()) + " buffered events");
   for (auto& ev : impl->events) {
     switch (ev.kind) {
       case SseEventKind::CHUNK:
+        impl->ffi_ring.push(FfiEventType::CHUNK, ev.text.size());
+        LOG_TRACE("FFI: on_chunk(len=" + std::to_string(ev.text.size()) + ")");
         if (on_chunk) on_chunk(ev.text.c_str());
         break;
       case SseEventKind::TOOL_CALL:
+        impl->ffi_ring.push(FfiEventType::TOOL_CALL, ev.tool_json.size());
+        LOG_TRACE("FFI: on_tool_call(len=" + std::to_string(ev.tool_json.size()) + ")");
         if (on_tool_call) on_tool_call(ev.tool_json.c_str());
         break;
       case SseEventKind::THINKING:
+        impl->ffi_ring.push(FfiEventType::THINKING, ev.thinking_json.size());
+        LOG_TRACE("FFI: on_thinking(len=" + std::to_string(ev.thinking_json.size()) + ")");
         if (on_thinking) on_thinking(ev.thinking_json.c_str());
         break;
       case SseEventKind::DONE:
+        impl->ffi_ring.push(FfiEventType::DONE, 0);
+        LOG_TRACE("FFI: on_done(code=" + std::to_string(ev.done_code) + ")");
         if (on_done) on_done(ev.done_code, ev.done_err.empty() ? "" : ev.done_err.c_str(), ev.done_stop_reason.c_str());
         break;
     }
@@ -280,6 +336,7 @@ int ModelGateway::execute(
   impl_->request_id = rid;
   impl_->events.clear();
   impl_->line_buf.clear();
+  impl_->raw_body.clear();
   impl_->done_dispatched = false;
   impl_->last_stop_reason.clear();
   impl_->last_error.clear();
@@ -287,7 +344,10 @@ int ModelGateway::execute(
   impl_->pending_tool_uses.clear();
   impl_->partial_jsons.clear();
 
+  g_ffi_ring = &impl_->ffi_ring;  // register for crash handler visibility
+
   LOG_INFO("=== Request #" + std::to_string(rid) + " start ===");
+  LOG_TRACE("execute: model=" + std::string(model ? model : "null") + " msgs=" + std::to_string(messages_json ? std::strlen(messages_json) : 0) + " bytes");
 
   // 5.1 — Build JSON request body
   json body;
@@ -377,6 +437,12 @@ int ModelGateway::execute(
 
   if (http_code == 401) {
     LOG_ERR("Authentication failed (HTTP 401)");
+    if (!impl_->raw_body.empty()) {
+      std::string preview = impl_->raw_body.size() > 2048
+          ? impl_->raw_body.substr(0, 2048) + "..."
+          : impl_->raw_body;
+      LOG_ERR("API error body: " + preview);
+    }
     dispatch_events(impl_, on_chunk, on_tool_call, on_thinking, on_done);
     if (!impl_->done_dispatched && on_done) {
       on_done(-1, "Authentication failed — invalid API key", "");
@@ -387,6 +453,12 @@ int ModelGateway::execute(
   if (http_code >= 400) {
     std::string err = "API returned HTTP " + std::to_string(http_code);
     LOG_ERR(err);
+    if (!impl_->raw_body.empty()) {
+      std::string preview = impl_->raw_body.size() > 2048
+          ? impl_->raw_body.substr(0, 2048) + "..."
+          : impl_->raw_body;
+      LOG_ERR("API error body: " + preview);
+    }
     dispatch_events(impl_, on_chunk, on_tool_call, on_thinking, on_done);
     if (!impl_->done_dispatched && on_done) {
       impl_->last_error = err;
@@ -404,4 +476,45 @@ int ModelGateway::execute(
 
   LOG_INFO("=== Request #" + std::to_string(rid) + " complete ===");
   return rid;
+}
+
+// ---------------------------------------------------------------------------
+// dump_ffi_ring_buffer — called by crash handler to dump ring buffer contents
+// Lock-free snapshot read of the ring buffer → crash_log()
+// ---------------------------------------------------------------------------
+
+static const char* ffi_event_type_str(FfiEventType t) {
+  switch (t) {
+    case FfiEventType::CHUNK:     return "chunk";
+    case FfiEventType::TOOL_CALL: return "tool_call";
+    case FfiEventType::THINKING:  return "thinking";
+    case FfiEventType::DONE:      return "done";
+  }
+  return "?";
+}
+
+void dump_ffi_ring_buffer() {
+  if (!g_ffi_ring) {
+    crash_log("FFI ring buffer: empty");
+    return;
+  }
+
+  // Lock-free snapshot: read write_idx once, then iterate
+  size_t write_idx = g_ffi_ring->write_idx.load(std::memory_order_acquire);
+  size_t count = write_idx < FfiRingBuffer::CAPACITY ? write_idx : FfiRingBuffer::CAPACITY;
+
+  char header[128];
+  snprintf(header, sizeof(header), "Last %zu FFI calls:", count);
+  crash_log(header);
+
+  for (size_t i = 0; i < count; ++i) {
+    size_t idx = (write_idx - count + i) % FfiRingBuffer::CAPACITY;
+    const FfiEvent& ev = g_ffi_ring->events[idx];
+    char line[256];
+    snprintf(line, sizeof(line), "  [%llu] %s payload=%zu",
+             (unsigned long long)ev.timestamp_ms,
+             ffi_event_type_str(ev.type),
+             ev.payload_size);
+    crash_log(line);
+  }
 }

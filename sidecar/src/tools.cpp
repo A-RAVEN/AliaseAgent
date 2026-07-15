@@ -80,6 +80,7 @@ static bool is_dir(const std::string& path) {
 // ---------------------------------------------------------------------------
 
 std::string set_workspace(const std::string& path) {
+  LOG_TRACE("tools::set_workspace entry: " + path);
   if (path.empty()) {
     g_workspace.clear();
     return "Workspace path is empty";
@@ -191,6 +192,7 @@ static bool is_binary(const std::string& path) {
 }
 
 std::string read_file(const std::string& path) {
+  LOG_TRACE("tools::read_file entry: " + path);
   // Resolve and sandbox
   std::string resolved = resolve(path);
   if (resolved.empty()) {
@@ -235,6 +237,7 @@ std::string read_file(const std::string& path) {
 // ---------------------------------------------------------------------------
 
 std::string list_dir(const std::string& path) {
+  LOG_TRACE("tools::list_dir entry: " + path);
   // Resolve and sandbox
   std::string resolved = resolve(path);
   if (resolved.empty()) {

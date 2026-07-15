@@ -2,11 +2,13 @@
 #include "model_gateway.h"
 #include "tools.h"
 #include "logger.h"
+#include "crash_handler.h"
 #include <string>
 #include <cstring>
 
 static ModelGateway g_gateway;
 static bool g_log_initialized = false;
+static bool g_debug_infra_initialized = false;
 static std::string g_last_tool_result; // thread-unsafe but single-threaded usage
 
 static void ensure_log() {
@@ -22,6 +24,13 @@ static void ensure_log() {
   if (home) {
     Logger::instance().init(std::string(home) + "/.aliasagent/logs");
   }
+}
+
+static void ensure_debug_infra() {
+  if (g_debug_infra_initialized) return;
+  g_debug_infra_initialized = true;
+
+  crash_init(Logger::crash_dir().c_str());
 }
 
 extern "C" {
@@ -43,6 +52,8 @@ SIDECAR_API int send_message(
   OnDoneCallback on_done
 ) {
   ensure_log();
+  ensure_debug_infra();
+  LOG_TRACE("send_message: model=" + std::string(model ? model : "null") + " api_key=<REDACTED>");
 
   if (!api_key || std::strlen(api_key) == 0) {
     if (on_done) on_done(0, "", "");
@@ -60,6 +71,7 @@ SIDECAR_API int send_message(
 }
 
 SIDECAR_API const char* set_workspace(const char* path) {
+  LOG_TRACE("set_workspace: path=" + std::string(path ? path : "null"));
   std::string err = tools::set_workspace(path ? path : "");
   if (err.empty()) return "";
   g_last_tool_result = err;
@@ -67,6 +79,7 @@ SIDECAR_API const char* set_workspace(const char* path) {
 }
 
 SIDECAR_API const char* read_file(const char* path) {
+  LOG_TRACE("read_file: path=" + std::string(path ? path : "null"));
   if (!path) {
     g_last_tool_result = "{\"ok\":false,\"error\":\"No path provided\"}";
     return g_last_tool_result.c_str();
@@ -76,6 +89,7 @@ SIDECAR_API const char* read_file(const char* path) {
 }
 
 SIDECAR_API const char* list_dir(const char* path) {
+  LOG_TRACE("list_dir: path=" + std::string(path ? path : "null"));
   if (!path) {
     g_last_tool_result = "{\"ok\":false,\"error\":\"No path provided\"}";
     return g_last_tool_result.c_str();
