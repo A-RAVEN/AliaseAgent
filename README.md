@@ -64,5 +64,6 @@ flutter run -d windows
 │   └── src/                # 实现 (model_gateway, tools)
 ├── windows/                # Flutter Windows runner + DLL
 ├── scripts/                # 构建脚本
+├── DEBUGGING.md            # C++ sidecar 调试指南
 └── openspec/               # 变更规格说明
 ```
