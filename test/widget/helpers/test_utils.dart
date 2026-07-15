@@ -40,6 +40,23 @@ Message testMessage({
   );
 }
 
+Message testMessageWithToolCalls({
+  String id = 'm1',
+  String sessionId = 's1',
+  String role = 'assistant',
+  String content = 'Here is the file content.',
+  String toolCallsJson = '[{"id":"tc1","name":"read_file","input":{"path":"/test/file.txt"},"status":"done","result":"file content here"}]',
+}) {
+  return Message(
+    id: id,
+    sessionId: sessionId,
+    role: role,
+    content: content,
+    toolCallsJson: toolCallsJson,
+    createdAt: DateTime.now().millisecondsSinceEpoch,
+  );
+}
+
 ToolCallActivity testToolActivity({
   String id = 't1',
   String toolName = 'read_file',

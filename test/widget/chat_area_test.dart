@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:alias_agent/models/chat_item.dart';
 import 'package:alias_agent/ui/chat_area.dart';
 import 'helpers/test_utils.dart';
 
@@ -10,7 +11,7 @@ void main() {
       await tester.pumpWidget(MaterialApp(
         home: Scaffold(
           body: ChatArea(
-            messages: const [],
+            items: const [],
             onSendMessage: (_) {},
           ),
         ),
@@ -26,7 +27,7 @@ void main() {
       await tester.pumpWidget(MaterialApp(
         home: Scaffold(
           body: ChatArea(
-            messages: [msg],
+            items: [ChatMessageItem(msg)],
             onSendMessage: (_) {},
           ),
         ),
@@ -42,7 +43,7 @@ void main() {
       await tester.pumpWidget(MaterialApp(
         home: Scaffold(
           body: ChatArea(
-            messages: [msg],
+            items: [ChatMessageItem(msg)],
             onSendMessage: (_) {},
           ),
         ),
@@ -56,9 +57,7 @@ void main() {
       await tester.pumpWidget(MaterialApp(
         home: Scaffold(
           body: ChatArea(
-            messages: const [],
-            streamingText: 'Thinking...',
-            isStreaming: true,
+            items: const [ChatStreamingItem('Thinking...')],
             onSendMessage: (_) {},
           ),
         ),
@@ -74,7 +73,7 @@ void main() {
       await tester.pumpWidget(MaterialApp(
         home: Scaffold(
           body: ChatArea(
-            messages: const [],
+            items: const [],
             onSendMessage: (text) => sent = text,
           ),
         ),
@@ -91,7 +90,7 @@ void main() {
       await tester.pumpWidget(MaterialApp(
         home: Scaffold(
           body: ChatArea(
-            messages: const [],
+            items: const [],
             onSendMessage: (text) => sent = text,
           ),
         ),
@@ -105,22 +104,24 @@ void main() {
       expect(find.text('Test message'), findsNothing);
     });
 
-    testWidgets('renders both messages and tool activities', (tester) async {
+    testWidgets('renders both messages and tool activities interleaved', (tester) async {
       final msg = testMessage(role: 'user', content: 'Read file');
       final activity = testToolActivity(toolName: 'read_file');
 
       await tester.pumpWidget(MaterialApp(
         home: Scaffold(
           body: ChatArea(
-            messages: [msg],
-            toolActivities: [activity],
+            items: [
+              ChatMessageItem(msg),
+              ChatToolCallItem(activity),
+            ],
             onSendMessage: (_) {},
           ),
         ),
       ));
 
       expect(find.text('Read file'), findsOneWidget);
-      // Tool call card shows tool name + input preview
+      // Tool call card shows tool name
       expect(find.textContaining('read_file'), findsOneWidget);
     });
   });

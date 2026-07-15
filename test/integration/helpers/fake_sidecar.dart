@@ -92,7 +92,7 @@ class FakeSidecar implements ISidecar {
 
   @override
   String listDir(String path) =>
-      _listDirResult ?? '{"ok":true,"entries":[]}';
+      _listDirResult ?? '{"ok":true,"content":"[]"}';
 }
 
 // ---------------------------------------------------------------------------

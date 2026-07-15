@@ -8,7 +8,7 @@ Widget _chatArea({required void Function(String) onCapture}) {
   return MaterialApp(
     home: Scaffold(
       body: ChatArea(
-        messages: const [],
+        items: const [],
         onSendMessage: onCapture,
       ),
     ),

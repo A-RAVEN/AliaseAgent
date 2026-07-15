@@ -5,6 +5,7 @@ import 'package:alias_agent/main.dart';
 import 'package:alias_agent/models/agent_type_config.dart';
 import 'package:alias_agent/models/app_config.dart';
 import 'package:alias_agent/models/provider_config.dart';
+import 'package:alias_agent/ui/tool_call_card.dart';
 
 import 'package:alias_agent/services/provider_resolver.dart';
 
@@ -115,6 +116,40 @@ void main() {
       expect(find.textContaining('Error:'), findsNothing);
       // User message was inserted
       expect(find.text('Read file'), findsOneWidget);
+    });
+
+    // 18.T1 — Tool card appears during streaming
+    testWidgets('tool card appears during streaming', (tester) async {
+      _setupAgentRegistry();
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final sessions = testSessions(1);
+      final sessionRepo = FakeSessionRepository(sessions);
+      final msgRepo = FakeMessageRepository();
+      final sidecar = FakeSidecar()
+        ..stubReadFile('{"ok":true,"content":"hello world"}')
+        ..queueChunk('Let me check that file...')
+        ..queueToolCall('{"name":"read_file","input":{"path":"/test.txt"}}')
+        ..queueDone();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'Read test.txt');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      // Tool call card appears during streaming
+      expect(find.byType(ToolCallCard), findsOneWidget);
+      // Tool name visible
+      expect(find.textContaining('read_file'), findsOneWidget);
     });
   });
 }

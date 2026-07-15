@@ -69,6 +69,7 @@ class FakeMessageRepository implements MessageRepository {
     required String sessionId,
     required String role,
     required String content,
+    String? toolCallsJson,
     int? tokenCount,
   }) async {
     final msg = Message(
@@ -76,6 +77,7 @@ class FakeMessageRepository implements MessageRepository {
       sessionId: sessionId,
       role: role,
       content: content,
+      toolCallsJson: toolCallsJson,
       tokenCount: tokenCount,
       createdAt: DateTime.now().millisecondsSinceEpoch,
     );
