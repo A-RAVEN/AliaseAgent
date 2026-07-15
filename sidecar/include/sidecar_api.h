@@ -48,7 +48,7 @@ SIDECAR_API const char* set_workspace(const char* path);
 SIDECAR_API const char* read_file(const char* path);
 
 /// List directory contents within the workspace.
-/// Returns JSON: {"ok":true,"entries":[...]} or {"ok":false,"error":"..."}
+/// Returns JSON: {"ok":true,"content":"[...]"} or {"ok":false,"error":"..."}
 SIDECAR_API const char* list_dir(const char* path);
 
 #ifdef __cplusplus

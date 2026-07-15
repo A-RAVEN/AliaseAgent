@@ -49,3 +49,34 @@ target_link_libraries(sidecar PUBLIC CURL::libcurl ${PLATFORM_LIB})
 
 # Install
 install(TARGETS sidecar LIBRARY DESTINATION lib)
+
+# ============================================================================
+# Tests
+# ============================================================================
+enable_testing()
+
+include(FetchContent)
+FetchContent_Declare(
+  Catch2
+  GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+  GIT_TAG v3.11.0
+)
+FetchContent_MakeAvailable(Catch2)
+
+# Test executable — links production sources directly (NOT sidecar_api.cpp,
+# to avoid SIDECAR_API / __declspec(dllimport) conflicts)
+add_executable(sidecar_tests
+  test/test_main.cpp
+  src/logger.cpp
+  src/model_gateway.cpp
+  src/tools.cpp
+  test/sse_parser_test.cpp
+  test/tool_execution_test.cpp
+  test/http_client_test.cpp
+)
+target_include_directories(sidecar_tests PRIVATE include src test "${JSON_INCLUDE_DIR}")
+target_compile_definitions(sidecar_tests PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN NOMINMAX
+    FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/sse")
+target_link_libraries(sidecar_tests PRIVATE Catch2::Catch2 CURL::libcurl ${PLATFORM_LIB})
+
+add_test(NAME sidecar_tests COMMAND sidecar_tests)

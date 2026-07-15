@@ -1,0 +1,17 @@
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tool_u1","name":"read_file","input":{}}}
+
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.txt\"}"}}
+
+data: {"type":"content_block_stop","index":1}
+
+data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"tool_u2","name":"list_dir","input":{}}}
+
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\".\"}"}}
+
+data: {"type":"content_block_stop","index":2}
+
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null}}
+
+data: {"type":"message_stop"}
+
+data: [DONE]

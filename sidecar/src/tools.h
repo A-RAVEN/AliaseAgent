@@ -25,7 +25,7 @@ bool is_within_workspace(const std::string& resolved);
 std::string read_file(const std::string& path);
 
 /// List directory contents.
-/// Returns JSON: {"ok":true,"entries":[{"name":"...","type":"file|directory"},...]}
+/// Returns JSON: {"ok":true,"content":"[{\"name\":\"...\",\"type\":\"file|directory\"},...]"}
 /// or {"ok":false,"error":"..."}
 std::string list_dir(const std::string& path);
 

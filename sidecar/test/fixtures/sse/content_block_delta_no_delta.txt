@@ -1,0 +1,7 @@
+data: {"type":"content_block_delta","index":0}
+
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}}
+
+data: {"type":"message_stop"}
+
+data: [DONE]
