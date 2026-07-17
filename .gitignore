@@ -56,3 +56,6 @@ Screenshot*.png
 
 # Smoke test output
 test/smoke/output/
+
+# SearXNG local search engine (deployed by scripts/setup_searxng.bat)
+tools/searxng/
