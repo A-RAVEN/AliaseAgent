@@ -118,4 +118,11 @@ if(VCPKG_TOOLCHAIN AND EXISTS "${VCPKG_TOOLCHAIN}")
   install(FILES "${SIDECAR_BUILD_DIR}/$<CONFIG>/sidecar.dll"
     DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
     COMPONENT Runtime)
+  # Copy runtime dependencies of sidecar.dll (libcurl, zlib)
+  install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/"
+    DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+    COMPONENT Runtime
+    FILES_MATCHING
+    PATTERN "libcurl*.dll"
+    PATTERN "zlib*.dll")
 endif()

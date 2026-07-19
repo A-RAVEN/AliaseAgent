@@ -9,6 +9,17 @@ class FakeSidecar implements ISidecar {
   String? _readFileResult;
   String? _listDirResult;
 
+  // Search stubs (task 10.2)
+  String _searchProvidersResult = '[]';
+  String _webSearchResult = '{"ok":true,"results":{}}';
+  String _webFetchResult = '{"ok":true,"content":""}';
+  String _ensureSearchInfraResult = '{"ok":true}';
+
+  void stubSearchProviders(String json) { _searchProvidersResult = json; }
+  void stubWebSearch(String json) { _webSearchResult = json; }
+  void stubWebFetch(String json) { _webFetchResult = json; }
+  void stubEnsureSearchInfra(String json) { _ensureSearchInfraResult = json; }
+
   // ---------------------------------------------------------------------------
   // Queue API
   // ---------------------------------------------------------------------------
@@ -93,6 +104,18 @@ class FakeSidecar implements ISidecar {
   @override
   String listDir(String path) =>
       _listDirResult ?? '{"ok":true,"content":"[]"}';
+
+  @override
+  String ensureSearchInfra(String configJson) => _ensureSearchInfraResult;
+
+  @override
+  String getSearchProviders() => _searchProvidersResult;
+
+  @override
+  Future<String> webSearch(String requestJson) async => _webSearchResult;
+
+  @override
+  Future<String> webFetch(String requestJson) async => _webFetchResult;
 }
 
 // ---------------------------------------------------------------------------

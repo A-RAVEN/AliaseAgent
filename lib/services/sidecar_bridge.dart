@@ -46,6 +46,10 @@ typedef SendMessageDart = int Function(
 typedef SetWorkspaceDart = Pointer<Utf8> Function(Pointer<Utf8> path);
 typedef ReadFileDart = Pointer<Utf8> Function(Pointer<Utf8> path);
 typedef ListDirDart = Pointer<Utf8> Function(Pointer<Utf8> path);
+typedef EnsureSearchInfraDart = Pointer<Utf8> Function(Pointer<Utf8> configJson);
+typedef GetSearchProvidersDart = Pointer<Utf8> Function();
+typedef WebSearchDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
+typedef WebFetchDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 
 // ---------------------------------------------------------------------------
 // Dart-facing callback types
@@ -77,6 +81,12 @@ abstract class ISidecar {
   String? setWorkspace(String path);
   String readFile(String path);
   String listDir(String path);
+
+  // Search & web fetch
+  String ensureSearchInfra(String configJson);
+  String getSearchProviders();
+  Future<String> webSearch(String requestJson);
+  Future<String> webFetch(String requestJson);
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +100,10 @@ class SidecarBridge implements ISidecar {
   late final SetWorkspaceDart _setWorkspaceFn;
   late final ReadFileDart _readFileFn;
   late final ListDirDart _listDirFn;
+  late final EnsureSearchInfraDart _ensureSearchInfraFn;
+  late final GetSearchProvidersDart _getSearchProvidersFn;
+  late final WebSearchDart _webSearchFn;
+  late final WebFetchDart _webFetchFn;
 
   SidecarBridge._() {
     _lib = _openLibrary();
@@ -99,6 +113,14 @@ class SidecarBridge implements ISidecar {
         _lib.lookupFunction<SetWorkspaceNative, ReadFileDart>('read_file');
     _listDirFn =
         _lib.lookupFunction<SetWorkspaceNative, ListDirDart>('list_dir');
+    _ensureSearchInfraFn =
+        _lib.lookupFunction<SetWorkspaceNative, EnsureSearchInfraDart>('ensure_search_infra');
+    _getSearchProvidersFn =
+        _lib.lookupFunction<Pointer<Utf8> Function(), GetSearchProvidersDart>('get_search_providers');
+    _webSearchFn =
+        _lib.lookupFunction<SetWorkspaceNative, WebSearchDart>('web_search');
+    _webFetchFn =
+        _lib.lookupFunction<SetWorkspaceNative, WebFetchDart>('web_fetch');
   }
 
   static SidecarBridge get instance {
@@ -133,23 +155,30 @@ class SidecarBridge implements ISidecar {
       'toolsJson': toolsJson,
     });
 
-    await for (final msg in receivePort) {
-      final map = msg as Map<String, dynamic>;
-      switch (map['type'] as String) {
-        case 'chunk':
-          onChunk(map['text'] as String);
-        case 'tool_call':
-          onToolCall(map['json'] as String);
-        case 'thinking':
-          onThinking?.call(map['json'] as String);
-        case 'done':
-          final code = map['code'] as int;
-          final error = map['error'] as String?;
-          final stopReason = map['stopReason'] as String?;
-          onDone(code, error, stopReason);
-          receivePort.close();
-          return;
+    // Task 8.8a: .timeout(120s) prevents isolate hang if Sidecar crashes via SEH
+    try {
+      await for (final msg in receivePort.timeout(const Duration(seconds: 120))) {
+        final map = msg as Map<String, dynamic>;
+        switch (map['type'] as String) {
+          case 'chunk':
+            onChunk(map['text'] as String);
+          case 'tool_call':
+            onToolCall(map['json'] as String);
+          case 'thinking':
+            onThinking?.call(map['json'] as String);
+          case 'done':
+            final code = map['code'] as int;
+            final error = map['error'] as String?;
+            final stopReason = map['stopReason'] as String?;
+            onDone(code, error, stopReason);
+            receivePort.close();
+            return;
+        }
       }
+    } on TimeoutException {
+      print('[SidecarBridge] sendMessage ReceivePort timed out after 120s');
+      receivePort.close();
+      onDone(-1, 'Request timed out after 120s', null);
     }
   }
 
@@ -257,6 +286,76 @@ class SidecarBridge implements ISidecar {
     final resultPtr = _listDirFn(ptr);
     malloc.free(ptr);
     return resultPtr.toDartString();
+  }
+
+  // -- search & web fetch (task 8.7) --
+
+  @override
+  String ensureSearchInfra(String configJson) {
+    final ptr = configJson.toNativeUtf8();
+    final resultPtr = _ensureSearchInfraFn(ptr);
+    malloc.free(ptr);
+    return resultPtr.toDartString();
+  }
+
+  @override
+  String getSearchProviders() {
+    final resultPtr = _getSearchProvidersFn();
+    return resultPtr.toDartString();
+  }
+
+  @override
+  Future<String> webSearch(String requestJson) async {
+    final receivePort = ReceivePort();
+    await Isolate.spawn(_webWorkerMain, {
+      'sendPort': receivePort.sendPort,
+      'requestJson': requestJson,
+      'workerType': 'web_search',
+    });
+    final result = await receivePort.first.timeout(
+      const Duration(seconds: 120),
+      onTimeout: () => '{"ok":false,"error":"web_search timed out"}',
+    ) as String;
+    receivePort.close();
+    return result;
+  }
+
+  @override
+  Future<String> webFetch(String requestJson) async {
+    final receivePort = ReceivePort();
+    await Isolate.spawn(_webWorkerMain, {
+      'sendPort': receivePort.sendPort,
+      'requestJson': requestJson,
+      'workerType': 'web_fetch',
+    });
+    final result = await receivePort.first.timeout(
+      const Duration(seconds: 120),
+      onTimeout: () => '{"ok":false,"error":"web_fetch timed out"}',
+    ) as String;
+    receivePort.close();
+    return result;
+  }
+
+  /// Worker isolate entry point for web_search / web_fetch (tasks 8.5, 8.8)
+  static void _webWorkerMain(Map<String, dynamic> args) {
+    final sendPort = args['sendPort'] as SendPort;
+    final requestJson = args['requestJson'] as String;
+    final workerType = args['workerType'] as String;
+
+    final lib = _openLibrary();
+    final ptr = requestJson.toNativeUtf8();
+
+    try {
+      if (workerType == 'web_search') {
+        final fn = lib.lookupFunction<SetWorkspaceNative, WebSearchDart>('web_search');
+        sendPort.send(fn(ptr).toDartString());
+      } else {
+        final fn = lib.lookupFunction<SetWorkspaceNative, WebFetchDart>('web_fetch');
+        sendPort.send(fn(ptr).toDartString());
+      }
+    } finally {
+      malloc.free(ptr);
+    }
   }
 
   // -- internal --

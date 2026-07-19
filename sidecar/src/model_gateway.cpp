@@ -118,6 +118,11 @@ static size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdat
 
   for (size_t i = 0; i < total; ++i) {
     char c = ptr[i];
+    // 64KB line_buf cap — prevents unbounded memory growth on malicious streams
+    if (impl->line_buf.size() >= 64 * 1024) {
+      LOG_ERR("SSE line exceeded 64KB cap, aborting transfer");
+      return 0;
+    }
     if (c == '\n') {
       std::string line = impl->line_buf;
       impl->line_buf.clear();

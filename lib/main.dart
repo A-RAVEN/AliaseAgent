@@ -162,6 +162,9 @@ class _ChatScreenState extends State<ChatScreen> {
 
   bool _loading = true;
 
+  // Dynamic tool definitions (task 8.3 — was static const, now late final)
+  late final Map<String, Map<String, dynamic>> _toolDefs;
+
   @override
   void initState() {
     super.initState();
@@ -172,7 +175,136 @@ class _ChatScreenState extends State<ChatScreen> {
     if (widget.sidecar == null && widget.sessionRepo == null) {
       _sidecar.setWorkspace(ConfigService.homeDir);
     }
+    _initSearchAndTools();
     _loadSessions();
+  }
+
+  /// Initialize search infrastructure and build tool definitions (tasks 8.2, 8.3, 8.6)
+  void _initSearchAndTools() {
+    // Build base tool defs
+    final base = <String, Map<String, dynamic>>{
+      'read_file': const {
+        'name': 'read_file',
+        'description': 'Read the contents of a file within the workspace.',
+        'input_schema': {
+          'type': 'object',
+          'properties': {
+            'path': {
+              'type': 'string',
+              'description': 'Path to the file relative to the workspace root.',
+            },
+          },
+          'required': ['path'],
+        },
+      },
+      'list_dir': const {
+        'name': 'list_dir',
+        'description': 'List the contents of a directory within the workspace.',
+        'input_schema': {
+          'type': 'object',
+          'properties': {
+            'path': {
+              'type': 'string',
+              'description': 'Path to the directory relative to the workspace root.',
+            },
+          },
+          'required': ['path'],
+        },
+      },
+    };
+
+    // Initialize search infra from config (task 8.2)
+    try {
+      final searchConfig = widget.config.search;
+      final searchJson = searchConfig != null && searchConfig.isNotEmpty
+          ? jsonEncode(searchConfig)
+          : '{}';
+      _sidecar.ensureSearchInfra(searchJson);
+    } catch (e) {
+      debugPrint('[AliasAgent] Search infra init failed: $e');
+    }
+
+    // Query configured providers (task 8.6)
+    List<dynamic> providers = [];
+    try {
+      final providersJson = _sidecar.getSearchProviders();
+      final parsed = jsonDecode(providersJson);
+      if (parsed is List) providers = parsed;
+    } catch (e) {
+      debugPrint('[AliasAgent] get_search_providers failed: $e');
+    }
+
+    final hasProviders = providers.isNotEmpty;
+
+    // Conditionally add web_search (task 8.3, 8.6)
+    if (hasProviders) {
+      final providerNames = providers.map((p) => (p as Map<String, dynamic>)['name'] as String).toList();
+      final providerList = providerNames.join(', ');
+      final descriptions = StringBuffer('Search the web using available providers.\n\nAvailable: ');
+      for (final p in providers) {
+        final name = (p as Map<String, dynamic>)['name'] as String;
+        final desc = p['description'] as String? ?? '';
+        descriptions.write('\n- $name: $desc');
+      }
+
+      base['web_search'] = {
+        'name': 'web_search',
+        'description': descriptions.toString(),
+        'input_schema': {
+          'type': 'object',
+          'properties': {
+            'query': {
+              'type': 'string',
+              'description': 'The search query.',
+            },
+            'providers': {
+              'type': 'array',
+              'items': {'type': 'string', 'enum': providerNames},
+              'default': <String>[],
+              'description': 'Which search providers to use. Empty = use all configured providers ($providerList).',
+            },
+            'depth': {
+              'type': 'string',
+              'enum': ['basic', 'deep'],
+              'default': 'basic',
+              'description': 'basic = snippets only (fast). deep = full page extraction (higher latency).',
+            },
+            'max_results': {
+              'type': 'integer',
+              'minimum': 1,
+              'maximum': 10,
+              'default': 5,
+            },
+          },
+          'required': ['query'],
+        },
+      };
+
+      // Task 8.4: Add web_fetch tool definition
+      base['web_fetch'] = const {
+        'name': 'web_fetch',
+        'description': 'Fetch the text content of a web page by URL. '
+            'Use this to get full article text when search snippets are insufficient.',
+        'input_schema': {
+          'type': 'object',
+          'properties': {
+            'url': {
+              'type': 'string',
+              'description': 'The URL of the web page to fetch.',
+            },
+            'extract_mode': {
+              'type': 'string',
+              'enum': ['text'],
+              'default': 'text',
+              'description': 'Extraction mode. Only "text" is supported in v1.',
+            },
+          },
+          'required': ['url'],
+        },
+      };
+    }
+
+    _toolDefs = base;
   }
 
   Future<void> _loadSessions() async {
@@ -308,40 +440,6 @@ class _ChatScreenState extends State<ChatScreen> {
   // Model calling with tool execution loop
   // -------------------------------------------------------------------------
 
-  static const _toolDefs = {
-    'read_file': {
-      'name': 'read_file',
-      'description': 'Read the contents of a file within the workspace.',
-      'input_schema': {
-        'type': 'object',
-        'properties': {
-          'path': {
-            'type': 'string',
-            'description':
-                'Path to the file relative to the workspace root.',
-          },
-        },
-        'required': ['path'],
-      },
-    },
-    'list_dir': {
-      'name': 'list_dir',
-      'description':
-          'List the contents of a directory within the workspace.',
-      'input_schema': {
-        'type': 'object',
-        'properties': {
-          'path': {
-            'type': 'string',
-            'description':
-                'Path to the directory relative to the workspace root.',
-          },
-        },
-        'required': ['path'],
-      },
-    },
-  };
-
   Future<void> _callModel({required String sessionId, required List<Message> messages}) async {
     final agentType = registry.lookup('general');
     if (agentType == null) {
@@ -361,12 +459,11 @@ class _ChatScreenState extends State<ChatScreen> {
         ? provider.baseUrl
         : 'https://api.anthropic.com';
 
-    final toolsJson = agentType.tools.isEmpty
+    // Use all configured tool definitions (including dynamically added
+    // web_search / web_fetch when providers are available).
+    final toolsJson = _toolDefs.isEmpty
         ? '[]'
-        : jsonEncode(agentType.tools
-            .map((n) => _toolDefs[n])
-            .where((d) => d != null)
-            .toList());
+        : jsonEncode(_toolDefs.values.toList());
 
     // Build API conversation from persisted messages, reconstructing tool_use blocks
     final apiMessages = _buildApiMessages(messages);
@@ -519,7 +616,7 @@ class _ChatScreenState extends State<ChatScreen> {
       // Execute tools and build tool results
       final toolResults = <Map<String, dynamic>>[];
       for (final tc in turnToolCalls) {
-        final result = _executeTool(tc);
+        final result = await _executeTool(tc);
         final resultContent = result['ok'] == true
             ? (result['content'] as String? ?? '')
             : (result['error'] as String? ?? 'Tool failed');
@@ -630,7 +727,9 @@ class _ChatScreenState extends State<ChatScreen> {
     return apiMessages;
   }
 
-  Map<String, dynamic> _executeTool(Map<String, dynamic> toolCall) {
+  /// Execute a tool call. Returns a JSON-like result map.
+  /// Async because web_search/web_fetch run on worker isolates (tasks 8.3a, 8.5).
+  Future<Map<String, dynamic>> _executeTool(Map<String, dynamic> toolCall) async {
     final name = toolCall['name'] as String?;
     final input = (toolCall['input'] as Map<String, dynamic>?) ?? {};
     final path = (input['path'] as String?) ?? '';
@@ -641,16 +740,122 @@ class _ChatScreenState extends State<ChatScreen> {
         resultJson = _sidecar.readFile(path);
       case 'list_dir':
         resultJson = _sidecar.listDir(path);
+      case 'web_search':
+        final request = jsonEncode({
+          'query': input['query'] ?? '',
+          'providers': input['providers'] ?? <String>[],
+          'depth': input['depth'] ?? 'basic',
+          'max_results': input['max_results'] ?? 5,
+        });
+        resultJson = await _sidecar.webSearch(request);
+      case 'web_fetch':
+        final request = jsonEncode({
+          'url': input['url'] ?? '',
+          'extract_mode': input['extract_mode'] ?? 'text',
+        });
+        resultJson = await _sidecar.webFetch(request);
       default:
         resultJson = '{"ok":false,"error":"Unknown tool: $name"}';
     }
 
     try {
-      return jsonDecode(resultJson) as Map<String, dynamic>;
+      final parsed = jsonDecode(resultJson) as Map<String, dynamic>;
+      // Task 8.9: Format search results for display
+      if (name == 'web_search' || name == 'web_fetch') {
+        parsed['content'] = _formatSearchResultForDisplay(name!, parsed);
+      }
+      return parsed;
     } catch (e) {
       debugPrint('[AliasAgent] _executeTool parse error: $e');
       return {'ok': false, 'error': 'Failed to parse tool result'};
     }
+  }
+
+  /// Format search/fetch results into a human-readable string for tool card display (task 8.9).
+  String _formatSearchResultForDisplay(String toolName, Map<String, dynamic> result) {
+    if (result['ok'] != true) {
+      // Error — use the error message directly
+      final error = (result['error'] as String?) ?? 'Unknown error';
+      return error.length > 200 ? '${error.substring(0, 200)}...' : error;
+    }
+
+    final buf = StringBuffer();
+
+    if (toolName == 'web_search') {
+      final results = result['results'] as Map<String, dynamic>?;
+      if (results == null || results.isEmpty) {
+        return 'No results found.';
+      }
+
+      var totalLen = 0;
+      const maxLen = 2000;
+      var nsCount = 0;
+      var resultsBeyond = 0;
+
+      for (final ns in results.keys) {
+        nsCount++;
+        if (totalLen >= maxLen) { resultsBeyond++; continue; }
+
+        final nsData = results[ns] as Map<String, dynamic>?;
+        if (nsData == null) continue;
+
+        if (nsData.containsKey('error')) {
+          final err = (nsData['error'] as String?) ?? 'Unknown error';
+          final line = '$ns: ERROR — ${err.length > 200 ? '${err.substring(0, 200)}...' : err}\n';
+          if (totalLen + line.length > maxLen) { resultsBeyond++; continue; }
+          buf.write(line);
+          totalLen += line.length;
+        } else {
+          final items = nsData['results'] as List<dynamic>?;
+          final count = items?.length ?? 0;
+          final line = '$ns: $count results\n';
+          if (totalLen + line.length > maxLen) { resultsBeyond++; continue; }
+          buf.write(line);
+          totalLen += line.length;
+
+          // First result preview
+          if (items != null && items.isNotEmpty) {
+            final first = items[0] as Map<String, dynamic>?;
+            if (first != null) {
+              final title = (first['title'] as String?) ?? '';
+              final url = (first['url'] as String?) ?? '';
+              final content = (first['content'] as String?) ?? '';
+              var preview = '';
+              if (title.isNotEmpty) preview += title;
+              if (url.isNotEmpty) {
+                if (preview.isNotEmpty) preview += ' — ';
+                preview += url;
+              }
+              if (content.isNotEmpty) {
+                if (preview.isNotEmpty) preview += '\n';
+                preview += content.length > 200
+                    ? '${content.substring(0, 200)}...'
+                    : content;
+              }
+              if (preview.isNotEmpty) {
+                if (totalLen + preview.length + 2 > maxLen) {
+                  preview = '${preview.substring(0, maxLen - totalLen - 5)}...';
+                }
+                buf.write('$preview\n');
+                totalLen += preview.length + 1;
+              }
+            }
+          }
+        }
+      }
+
+      if (resultsBeyond > 0) {
+        buf.write('... ($resultsBeyond more providers not shown)');
+      }
+    } else if (toolName == 'web_fetch') {
+      final content = (result['content'] as String?) ?? '';
+      if (content.isEmpty) {
+        return '(fetched empty page)';
+      }
+      buf.write(content.length > 2000 ? '${content.substring(0, 2000)}...' : content);
+    }
+
+    return buf.toString().trimRight();
   }
 
   /// Remove streaming indicator only; tool call cards and messages persist.

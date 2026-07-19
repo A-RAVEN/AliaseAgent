@@ -5,6 +5,10 @@
 
 namespace tools {
 
+/// Escape special characters for JSON string embedding.
+/// Handles: " \ \n \r \t
+std::string json_escape(const std::string& s);
+
 /// Initialize the workspace and validate it exists.
 /// Returns empty string on success, error message on failure.
 std::string set_workspace(const std::string& path);

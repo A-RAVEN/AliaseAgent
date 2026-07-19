@@ -41,7 +41,11 @@ The system SHALL provide a C function `ensure_search_infra` callable from Dart v
 
 #### Scenario: Config not passed before provider query
 - **WHEN** `get_search_providers()` or `is_configured()` is called before `ensure_search_infra`
-- **THEN** C++ returns only SearXNG availability (if reachable); no crash or undefined behavior
+- **THEN** all providers return not configured (empty list / `false`); SearXNG defaults to unavailable because no cached TCP check result exists; no crash or undefined behavior
+
+#### Scenario: AppConfig.search is null (config.json has no search key)
+- **WHEN** `AppConfig.search` is null (config.json has no `search` top-level key)
+- **THEN** Dart SHALL pass `"{}"` to `ensure_search_infra` (not skip the call entirely); only SearXNG reachability determines tool availability
 
 ### Requirement: Search provider listing via FFI
 The system SHALL provide a C function `get_search_providers` callable from Dart via FFI. It SHALL return a JSON array of configured provider objects `[{"name":"searxng","description":"..."},...]`. Dart SHALL use this to dynamically build the `web_search` tool definition's provider enum.

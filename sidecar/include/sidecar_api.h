@@ -51,6 +51,25 @@ SIDECAR_API const char* read_file(const char* path);
 /// Returns JSON: {"ok":true,"content":"[...]"} or {"ok":false,"error":"..."}
 SIDECAR_API const char* list_dir(const char* path);
 
+/// Initialize search infrastructure with per-provider API keys from config.
+/// Idempotent — repeated calls return immediately.
+/// Returns JSON: {"ok":true} or {"ok":false,"error":"..."}
+SIDECAR_API const char* ensure_search_infra(const char* search_config_json);
+
+/// Return configured search providers as JSON array.
+/// Returns: [{"name":"...","description":"..."},...]
+SIDECAR_API const char* get_search_providers(void);
+
+/// Execute a web search across configured providers in parallel.
+/// @param request_json  {"query":"...","providers":[...],"depth":"basic|deep","max_results":5}
+/// Returns namespaced JSON result.
+SIDECAR_API const char* web_search(const char* request_json);
+
+/// Fetch a web page and extract text.
+/// @param request_json  {"url":"...","extract_mode":"text"}
+/// Returns JSON: {"ok":true,"content":"..."} or {"ok":false,"error":"..."}
+SIDECAR_API const char* web_fetch(const char* request_json);
+
 #ifdef __cplusplus
 }
 #endif

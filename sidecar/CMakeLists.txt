@@ -42,6 +42,12 @@ set(SOURCES
   src/model_gateway.cpp
   src/tools.cpp
   src/crash_handler.cpp
+  src/search_provider.cpp
+  src/openai_transport.cpp
+  src/web_fetch.cpp
+  src/zhipuai_search.cpp
+  src/searxng_search.cpp
+  src/kimi_search.cpp
 )
 
 # Shared library
@@ -75,10 +81,17 @@ add_executable(sidecar_tests
   src/model_gateway.cpp
   src/tools.cpp
   src/crash_handler.cpp
+  src/search_provider.cpp
+  src/openai_transport.cpp
+  src/web_fetch.cpp
+  src/zhipuai_search.cpp
+  src/searxng_search.cpp
+  src/kimi_search.cpp
   test/sse_parser_test.cpp
   test/tool_execution_test.cpp
   test/http_client_test.cpp
   test/ffi_tracing_test.cpp
+  test/search_provider_test.cpp
 )
 target_include_directories(sidecar_tests PRIVATE include src test "${JSON_INCLUDE_DIR}")
 target_compile_definitions(sidecar_tests PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN NOMINMAX

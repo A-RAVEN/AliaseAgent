@@ -140,3 +140,134 @@ The ASan build:
 ```bash
 vcpkg install --triplet x64-windows-asan-static
 ```
+
+## Search Provider Configuration
+
+### Config Keys (snake_case, per-provider)
+
+Search providers are configured in `%USERPROFILE%\.aliasagent\config.json` (Windows) or `~/.aliasagent/config.json` (Linux/macOS) under the `search` key:
+
+```json
+{
+  "search": {
+    "zhipuai": {
+      "api_key": "your-zhipuai-api-key",
+      "model": "glm-4-flash"
+    },
+    "kimi": {
+      "api_key": "sk-your-kimi-api-key",
+      "model": "moonshot-v1-auto"
+    },
+    "searxng": {
+      "base_url": "http://localhost:8888"
+    }
+  }
+}
+```
+
+| Key | Required | Default | Description |
+|-----|----------|---------|-------------|
+| `search.zhipuai.api_key` | Yes (for ZhipuAI) | — | ZhipuAI API key. If not set, ZhipuAI provider is disabled. |
+| `search.zhipuai.model` | No | `glm-4-flash` | ZhipuAI model for web search |
+| `search.kimi.api_key` | Yes (for Kimi) | — | Kimi API key. If not set, Kimi provider is disabled. |
+| `search.kimi.model` | No | `moonshot-v1-auto` | Kimi model for web search |
+| `search.searxng.base_url` | No | `http://localhost:8888` | Local SearXNG instance URL. No API key needed. |
+
+**Naming convention**: All config keys use `snake_case` (`api_key`, `base_url`), consistent with the existing `ProviderConfig.api_key` field.
+
+### SearXNG Deployment
+
+SearXNG runs locally as a Python dev-mode service. Use the setup script:
+
+**Windows:**
+```bat
+scripts\setup_searxng.bat
+```
+
+**Linux/macOS:**
+```bash
+bash scripts/setup_searxng.sh
+```
+
+The script will:
+1. Clone SearXNG to `tools/searxng/` (depth=1)
+2. Create a Python virtual environment
+3. Install dependencies
+4. Generate `settings.yml` with JSON format enabled and Bing engine configured
+
+**Start SearXNG:**
+```bash
+cd tools/searxng
+source venv/bin/activate   # or: venv\Scripts\activate
+python -m searx.webapp
+```
+
+Access at `http://localhost:8888`. Test the JSON API:
+```
+http://localhost:8888/search?q=test&format=json
+```
+
+**Stop**: Ctrl+C. **Update**: `cd tools/searxng && git pull`.
+
+### API Key Security
+
+- API keys are stored as **plaintext** in `config.json` (same protection level as the main model API key)
+- Crash dumps use `MiniDumpNormal` — **no heap memory** is included, so API keys are NOT in minidump files
+- HTTP request bodies are logged at `DEBUG` level (not `INFO`). Set `ALIASAGENT_LOG_LEVEL=warn` to suppress all body logging
+- Auth headers (`Authorization: Bearer`, `x-api-key`) are **never logged**
+- Config key naming uses `snake_case` (`api_key`), consistent with the existing `ProviderConfig.api_key`
+
+## Search Tool Usage Examples
+
+### web_search
+
+The model can invoke `web_search` to search across configured providers:
+
+```
+User: What's the latest news about Flutter 4.0?
+→ Model calls web_search(query="Flutter 4.0 latest news", providers=[], depth="basic")
+→ Sidecar queries all configured providers in parallel
+→ Results returned per-namespace: {zhipuai: [...], searxng: [...], kimi: "..."}
+```
+
+**Troubleshooting web_search:**
+
+1. **"No search providers configured"** — Check that at least one provider has a valid API key in `config.json`
+2. **Provider timeout** — The dispatcher waits 30s (basic) or 90s (deep). Check network connectivity.
+3. **ZhipuAI "did not invoke search tool"** — This indicates the model returned a text response without calling the search tool. Try rephrasing the query.
+
+### web_fetch
+
+The model can fetch web pages to get full article text:
+
+```
+→ Model calls web_fetch(url="https://example.com/article", extract_mode="text")
+→ Sidecar fetches with SSRF protection, strips HTML tags
+→ Returns extracted text (capped at 100KB)
+```
+
+**Troubleshooting web_fetch:**
+
+1. **"Fetch failed: URL scheme not allowed"** — Only `http://` and `https://` schemes are allowed
+2. **"Fetch failed: internal address not allowed"** — The URL resolved to a private/internal IP (SSRF protection)
+3. **"Fetch failed: timeout"** — The target site didn't respond within 15 seconds
+4. **"Fetch failed: HTTP 403/404/500"** — The target server returned an error
+
+### Log Examples
+
+Set `ALIASAGENT_LOG_LEVEL=trace` to see search-related logs:
+
+```
+2026-07-18 12:34:56.000 [TRACE] ensure_search_infra called
+2026-07-18 12:34:56.100 [INFO] SearXNG liveness check: reachable
+2026-07-18 12:34:56.200 [TRACE] get_search_providers called
+2026-07-18 12:34:57.000 [TRACE] web_search called
+2026-07-18 12:34:57.001 [INFO] web_search: query="test" depth=basic max_results=5 providers=2 deadline=30s
+2026-07-18 12:34:57.500 [INFO] SearXNG: GET http://localhost:8888/search?q=test&format=json
+2026-07-18 12:34:57.800 [INFO] ZhipuAI search: query="test" depth=basic max_results=5
+2026-07-18 12:34:58.200 [INFO] SearXNG: 3 results (from 10 total)
+2026-07-18 12:34:59.000 [INFO] ZhipuAI search: 5 results
+2026-07-18 12:35:00.000 [TRACE] web_fetch called
+2026-07-18 12:35:00.001 [INFO] web_fetch: url=https://example.com/article
+2026-07-18 12:35:02.000 [INFO] web_fetch: Content-Type=text/html; charset=utf-8 — stripping HTML tags
+```

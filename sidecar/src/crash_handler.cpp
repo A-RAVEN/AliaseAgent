@@ -3,6 +3,8 @@
 #include <ctime>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
+#include <algorithm>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -134,7 +136,7 @@ static LONG WINAPI unhandled_exception_filter(EXCEPTION_POINTERS* ex_info) {
   return EXCEPTION_EXECUTE_HANDLER;
 }
 
-static void terminate_handler() {
+static void on_terminate_handler() {
   crash_log("std::terminate called");
   dump_ffi_ring_buffer();
   crash_write_dump();
@@ -179,7 +181,7 @@ void crash_write_dump() {
     BOOL ok = mini_dump_write_dump(
         GetCurrentProcess(), GetCurrentProcessId(),
         file, MiniDumpNormal,
-        mei.ExceptionPointers, nullptr, nullptr);
+                &mei, nullptr, nullptr);
     if (ok) {
       char buf[512];
       snprintf(buf, sizeof(buf), "Minidump written: %s", filename);
@@ -211,7 +213,7 @@ void crash_init(const char* crash_dir) {
 
   // Register handlers
   SetUnhandledExceptionFilter(unhandled_exception_filter);
-  std::set_terminate(terminate_handler);
+  std::set_terminate(on_terminate_handler);
 }
 
 // ============================================================================
@@ -233,7 +235,7 @@ static void signal_handler(int sig, siginfo_t* info, void* ctx) {
   raise(sig);
 }
 
-static void terminate_handler() {
+static void on_terminate_handler() {
   crash_log("std::terminate called");
   dump_ffi_ring_buffer();
   crash_write_dump();
@@ -296,7 +298,7 @@ void crash_init(const char* crash_dir) {
   sigaction(SIGABRT, &sa, nullptr);
 
   // Register terminate handler
-  std::set_terminate(terminate_handler);
+  std::set_terminate(on_terminate_handler);
 }
 
 #endif

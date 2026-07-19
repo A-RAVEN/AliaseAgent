@@ -59,3 +59,6 @@ test/smoke/output/
 
 # SearXNG local search engine (deployed by scripts/setup_searxng.bat)
 tools/searxng/
+sidecar.dll
+libcurl.dll
+zlib1.dll

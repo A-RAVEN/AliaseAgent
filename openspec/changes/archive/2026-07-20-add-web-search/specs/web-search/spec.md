@@ -9,9 +9,9 @@ The system SHALL expose a `web_search` tool to the main model. The tool descript
 - **WHEN** the main model calls `web_search` with `{"query":"Flutter FFI","providers":["searxng"],"depth":"basic","max_results":5}`
 - **THEN** only the SearXNG provider is executed
 
-#### Scenario: Main model selects multiple providers with deep depth
-- **WHEN** the main model calls `web_search` with `{"query":"Flutter FFI","providers":["searxng","zhipuai"],"depth":"deep","max_results":3}`
-- **THEN** both providers execute in parallel, zhipuai receives `depth="deep"` (full page extraction), searxng ignores depth but still executes
+#### Scenario: Main model selects multiple providers
+- **WHEN** the main model calls `web_search` with `{"query":"Flutter FFI","providers":["searxng","zhipuai"],"depth":"basic","max_results":3}`
+- **THEN** both providers execute in parallel; zhipuai handles search+reading+synthesis via platform web_search tool; searxng returns snippet results via REST API
 
 #### Scenario: Tool description reflects configured providers
 - **WHEN** the tool definition is generated for the main model
@@ -32,6 +32,10 @@ Search results SHALL use per-namespace result objects rather than parallel conte
 - **WHEN** a search provider completes successfully but finds no matching results
 - **THEN** `results` is empty array and `error` is null (distinct from a failure where `error` is non-null)
 
+#### Scenario: All providers fail
+- **WHEN** `web_search` executes and ALL providers fail (e.g., SearXNG unreachable, ZhipuAI 401, Kimi timeout)
+- **THEN** `ok` SHALL be `false`; `error` SHALL contain a summary like "All search providers failed"; per-namespace errors are preserved in `content`
+
 ### Requirement: Provider timeout and overall deadline
 Each provider SHALL have a configurable timeout. The dispatcher SHALL enforce an overall deadline. Providers exceeding their individual timeout or the overall deadline SHALL return an error for that namespace only.
 
@@ -40,9 +44,9 @@ Each provider SHALL have a configurable timeout. The dispatcher SHALL enforce an
 - **AND** the overall deadline (30s) is reached
 - **THEN** `content.searxng` has valid results; `content.zhipuai.error` contains timeout error; other providers' results are returned immediately
 
-#### Scenario: Deep search round-trip timeout
-- **WHEN** ZhipuAI deep search exceeds 30s per SSE round-trip
-- **THEN** the provider returns partial results collected so far with a timeout error
+#### Scenario: ZhipuAI single-request timeout
+- **WHEN** ZhipuAI non-streaming POST exceeds 30s
+- **THEN** the provider returns a timeout error
 
 ### Requirement: Web search execution on worker isolate
 The `web_search` FFI call SHALL execute on a Dart worker isolate, NOT the main UI isolate. The pattern SHALL follow the existing `sendMessage` isolate model (`Isolate.spawn` + `SendPort`/`ReceivePort`).
@@ -59,27 +63,27 @@ All search results from any provider SHALL be normalized to `{title, url, conten
 - **THEN** the C++ side serializes content as `jsonEncode(namespaced_content)` before returning via FFI; Dart `_executeTool` receives a flat JSON string
 
 ### Requirement: Search depth control
-The `depth` parameter SHALL be specified by the main model. Providers that support depth differentiation SHALL respect it; providers that don't SHALL ignore it.
+The `depth` parameter SHALL be specified by the main model. All providers SHALL ignore `depth` in this change — ZhipuAI's web_search tool auto-determines depth, SearXNG and Kimi have no depth concept. The parameter is reserved for future differentiation.
 
-#### Scenario: ZhipuAI basic search
-- **WHEN** `depth="basic"` on ZhipuAI provider
-- **THEN** the provider executes only `msearch` and returns snippet-level results
+#### Scenario: ZhipuAI ignores depth
+- **WHEN** any `depth` value is passed to ZhipuAI provider
+- **THEN** the search proceeds normally — platform auto-determines search depth via `web_search` tool
 
-#### Scenario: ZhipuAI deep search with partial mclick failure
-- **WHEN** `depth="deep"` on ZhipuAI and some mclick pages fail to load
-- **THEN** results include full text for successful mclicks and snippet-only for failed ones; per-mclick errors are aggregated in the provider error
+#### Scenario: ZhipuAI returns structured results and synthesized answer
+- **WHEN** ZhipuAI search completes successfully
+- **THEN** `web_search[]` structured data is mapped to `SearchResult[]`; `message.content` synthesized answer is optionally captured
 
 #### Scenario: SearXNG and Kimi ignore depth
 - **WHEN** SearXNG or Kimi receive any `depth` value
 - **THEN** the search proceeds normally (depth has no effect)
 
-### Requirement: HTTP 429 rate limit handling
-Providers SHALL retry on HTTP 429 responses up to 2 times with exponential backoff (1s, 2s), respecting the `Retry-After` header if present.
+### Requirement: HTTP 429 rate limit handling (Kimi-only for v1)
+The Kimi provider SHALL retry on HTTP 429 responses up to 2 times with exponential backoff (1s, 2s), respecting the `Retry-After` header if present. SearXNG and ZhipuAI providers SHALL NOT retry on HTTP 429 in this change (deferred to future iteration).
 
-#### Scenario: Retry after 429
-- **WHEN** a search provider receives HTTP 429 with `Retry-After: 3`
+#### Scenario: Kimi retry after 429
+- **WHEN** the Kimi provider receives HTTP 429 with `Retry-After: 3`
 - **THEN** the provider waits 3 seconds and retries; on second 429, waits longer and retries; on third 429, returns an error
 
 #### Scenario: Permanent errors not retried
-- **WHEN** a search provider receives HTTP 401 or 403
+- **WHEN** any search provider receives HTTP 401 or 403
 - **THEN** the provider returns an error immediately without retrying

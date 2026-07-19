@@ -5,11 +5,13 @@ class AppConfig {
   final int version;
   final Map<String, ProviderConfig> providers;
   final Map<String, AgentTypeConfig> agentTypes;
+  final Map<String, dynamic>? search;
 
   const AppConfig({
     required this.version,
     this.providers = const {},
     this.agentTypes = const {},
+    this.search,
   });
 
   factory AppConfig.fromJson(Map<String, dynamic> json) {
@@ -34,14 +36,20 @@ class AppConfig {
       version: json['version'] as int? ?? 1,
       providers: providers,
       agentTypes: agentTypes,
+      search: json['search'] as Map<String, dynamic>?,
     );
   }
 
-  Map<String, dynamic> toJson() => {
-        'version': version,
-        'providers':
-            providers.map((k, v) => MapEntry(k, v.toJson())),
-        'agent_types':
-            agentTypes.map((k, v) => MapEntry(k, v.toJson())),
-      };
+  Map<String, dynamic> toJson() {
+    final m = <String, dynamic>{
+      'version': version,
+      'providers': providers.map((k, v) => MapEntry(k, v.toJson())),
+      'agent_types': agentTypes.map((k, v) => MapEntry(k, v.toJson())),
+    };
+    // Conditionally include search when non-null and non-empty
+    if (search != null && search!.isNotEmpty) {
+      m['search'] = search;
+    }
+    return m;
+  }
 }

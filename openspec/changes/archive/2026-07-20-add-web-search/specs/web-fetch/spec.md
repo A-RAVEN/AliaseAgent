@@ -30,11 +30,15 @@ The `web_fetch` tool SHALL validate connection targets at the socket level via `
 
 #### Scenario: IPv4 loopback blocked at socket level
 - **WHEN** `web_fetch` is called with `http://127.0.0.1:6379/`
-- **THEN** the `CURLOPT_OPENSOCKETFUNCTION` callback detects `127.0.0.1` in the blocklist and returns `CURL_SOCKOPT_ALREADY_CONNECTED`; fetch fails with internal address error
+- **THEN** the `CURLOPT_OPENSOCKETFUNCTION` callback detects `127.0.0.1` in the blocklist and returns `CURL_SOCKET_BAD`; fetch fails with internal address error
 
 #### Scenario: IPv6 loopback blocked at socket level
 - **WHEN** `web_fetch` is called with `http://[::1]:8080/admin`
 - **THEN** the socket callback detects `::1` in the IPv6 blocklist and blocks the connection
+
+#### Scenario: IPv4-mapped IPv6 blocked
+- **WHEN** `web_fetch` is called with a domain whose AAAA record resolves to `::ffff:127.0.0.1` (IPv4-mapped IPv6 encoding of loopback)
+- **THEN** the socket callback detects `::ffff:0:0/96` range, extracts the embedded IPv4 address, and blocks the connection per IPv4 blocklist
 
 #### Scenario: IPv6 link-local blocked
 - **WHEN** `web_fetch` is called with `http://[fe80::1]:8080/`
@@ -74,7 +78,11 @@ The `web_fetch` tool SHALL validate connection targets at the socket level via `
 
 #### Scenario: IPv6 blocklist completeness
 - **WHEN** the socket callback validates a resolved IPv6 address
-- **THEN** the following ranges SHALL be blocked: `::1/128`, `fe80::/10`, `fc00::/7`
+- **THEN** the following ranges SHALL be blocked: `::1/128`, `fe80::/10`, `fc00::/7`, `::ffff:0:0/96`, `64:ff9b::/96`
+
+#### Scenario: NAT64 encoded IPv4 blocked
+- **WHEN** DNS64 synthesizes a NAT64 address like `64:ff9b::c0a8:0101` (encoding `192.168.1.1` per RFC 6052)
+- **THEN** the socket callback detects `64:ff9b::/96` range, extracts the embedded IPv4 from the last 32 bits, and blocks the connection per IPv4 blocklist
 
 ### Requirement: Incremental size limit in write callback
 The curl write callback (`CURLOPT_WRITEFUNCTION`) SHALL enforce a 100KB cumulative size limit incrementally. After each write, if `accumulated_size + chunk_size > 100KB`, the callback SHALL return 0 to abort the transfer immediately. This prevents zip bomb and infinite chunked response attacks from exhausting memory before post-processing truncation.
@@ -99,11 +107,15 @@ The HTTP request SHALL follow redirects (`CURLOPT_FOLLOWLOCATION=1`, `CURLOPT_MA
 - **THEN** the socket callback blocks the redirect target; the tool returns `{"ok":false,"error":"Fetch failed: redirect to internal address not allowed"}`
 
 ### Requirement: Content-Type based extraction
-The extraction strategy SHALL depend on the response Content-Type. HTML content (`text/html`) SHALL be stripped of tags. Non-HTML content SHALL be returned as raw text without tag stripping.
+The extraction strategy SHALL depend on the response Content-Type. HTML content (`text/html`, including with charset suffix like `text/html; charset=utf-8`) SHALL be stripped of tags. Non-HTML content SHALL be returned as raw text without tag stripping. The Content-Type header value SHALL be matched by MIME type (exact equality match on the part before `;`), case-insensitively. If Content-Type header is absent or NULL, the response SHALL be treated as non-HTML (raw text, conservative default).
 
 #### Scenario: HTML page extracted to text
 - **WHEN** a page with `Content-Type: text/html` containing `<html><body><p>Hello world</p><script>alert(1)</script></body></html>` is fetched
 - **THEN** the returned content is `"Hello world"` (tags stripped, script removed)
+
+#### Scenario: HTML with charset suffix extracted to text
+- **WHEN** a page with `Content-Type: text/html; charset=utf-8` is fetched
+- **THEN** the Content-Type is parsed as `text/html` (charset stripped); tags are stripped and text is returned
 
 #### Scenario: JSON response returned raw
 - **WHEN** a response has `Content-Type: application/json` with body `{"key": "value"}`
@@ -113,8 +125,15 @@ The extraction strategy SHALL depend on the response Content-Type. HTML content 
 - **WHEN** a response has `Content-Type: text/plain`
 - **THEN** the raw body is returned without tag stripping
 
+#### Scenario: Missing Content-Type defaults to raw
+- **WHEN** a response has no Content-Type header (curl returns NULL)
+- **THEN** the response is treated as raw text without tag stripping (conservative default; NULL pointer check required before string comparison)
+
+### Requirement: Curl option configuration
+The HTTP request SHALL use `CURLOPT_ACCEPT_ENCODING=""` to enable transparent gzip/deflate/brotli decompression. Without this, compressed responses would pass raw binary data to the write callback, producing garbled output. `CURLOPT_SSL_VERIFYPEER` SHALL be set to `1L` (verify peer certificate, matching existing `model_gateway.cpp` pattern). `CURLOPT_CONNECTTIMEOUT` SHALL be set alongside `CURLOPT_TIMEOUT` (refer to existing `model_gateway.cpp:408-409`).
+
 ### Requirement: Fetch timeout and error handling
-The HTTP request SHALL have a 15-second timeout. Unreachable hosts, TLS errors, and HTTP 4xx/5xx SHALL return structured error results.
+The HTTP request SHALL have a 15-second timeout (`CURLOPT_TIMEOUT` and `CURLOPT_CONNECTTIMEOUT`). Unreachable hosts, TLS errors, and HTTP 4xx/5xx SHALL return structured error results.
 
 #### Scenario: Connection timeout
 - **WHEN** the target host does not respond within 15 seconds

@@ -3,6 +3,7 @@
 
 #include <string>
 #include <map>
+#include <vector>
 #include <thread>
 #include <mutex>
 #include <future>
@@ -36,13 +37,57 @@ public:
     MockServer() = default;
 
     ~MockServer() {
+        stop();
         if (thread_.joinable()) thread_.join();
+    }
+
+    // ---- configuration (task 9.0) ------------------------------------------
+
+    /// Set the Content-Type header for responses (default: text/event-stream).
+    void set_content_type(const std::string& ct) { content_type_ = ct; }
+
+    /// Enable plain (non-chunked) response body mode for SearXNG / web_fetch tests.
+    void set_plain_mode(bool v) { plain_mode_ = v; }
+
+    /// Enable multi-request loop mode — serves multiple connections sequentially.
+    void set_multi_request(bool v) { multi_request_ = v; }
+
+    /// Set an inline response body (no fixture file needed).
+    /// When set, the server uses this string as the response body instead of
+    /// reading a fixture file.
+    void set_response_body(const std::string& body) { response_body_ = body; }
+
+    /// Queue a response for multi-request mode (task 9.0d).
+    /// Responses are served in FIFO order. When the queue is exhausted,
+    /// the last queued response is repeated.
+    struct QueuedResponse {
+        int status = 200;
+        std::string content_type = "text/event-stream";
+        std::string body;
+        std::map<std::string, std::string> extra_headers;
+    };
+
+    void queue_response(int status, const std::string& content_type,
+                        const std::string& body,
+                        const std::map<std::string, std::string>& extra_headers = {}) {
+        QueuedResponse qr;
+        qr.status = status;
+        qr.content_type = content_type;
+        qr.body = body;
+        qr.extra_headers = extra_headers;
+        response_queue_.push_back(std::move(qr));
+    }
+
+    /// Number of HTTP requests served so far (task 9.0d).
+    int request_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return request_count_;
     }
 
     // ---- lifecycle ----------------------------------------------------------
 
     /// Start the server thread.  Binds to a random port, then blocks inside
-    /// the thread waiting for a single connection.
+    /// the thread waiting for connections.
     void start(const std::string& fixture_path, int http_status = 200) {
         fixture_path_ = fixture_path;
         http_status_ = http_status;
@@ -62,6 +107,23 @@ public:
     /// Return the base URL that ModelGateway should target.
     std::string base_url() const {
         return "http://localhost:" + std::to_string(port_);
+    }
+
+    /// Signal the server to stop (for multi-request mode).
+    /// Closes the listening socket to interrupt any blocking accept() call.
+    void stop() {
+        stop_ = true;
+#ifdef _WIN32
+        if (listen_sock_ != INVALID_SOCKET) {
+            closesocket(listen_sock_);
+            listen_sock_ = INVALID_SOCKET;
+        }
+#else
+        if (listen_sock_ >= 0) {
+            close(listen_sock_);
+            listen_sock_ = -1;
+        }
+#endif
     }
 
     /// Block until the server thread exits (after handling one connection).
@@ -109,6 +171,7 @@ private:
                 std::runtime_error("socket() failed")));
             return;
         }
+        listen_sock_ = sock;  // allow stop() to interrupt accept()
 
         int opt = 1;
 #ifdef _WIN32
@@ -128,6 +191,7 @@ private:
 #else
             close(sock);
 #endif
+            listen_sock_ = INVALID_SOCKET;
             ready_.set_exception(std::make_exception_ptr(
                 std::runtime_error("bind() failed")));
             return;
@@ -148,6 +212,7 @@ private:
 #else
             close(sock);
 #endif
+            listen_sock_ = INVALID_SOCKET;
             ready_.set_exception(std::make_exception_ptr(
                 std::runtime_error("listen() failed")));
             return;
@@ -156,42 +221,36 @@ private:
         // Signal the test thread — server is ready
         ready_.set_value(assigned_port);
 
-        // Accept exactly one connection (blocks until CURL connects)
+        // Accept connections — single or multi-request loop (task 9.0)
+        do {
 #ifdef _WIN32
-        SOCKET client = accept(sock, nullptr, nullptr);
+          SOCKET client = accept(sock, nullptr, nullptr);
 #else
-        int client = accept(sock, nullptr, nullptr);
+          int client = accept(sock, nullptr, nullptr);
 #endif
-        if (client < 0) {
+          if (client < 0) break;
+
+          // Read the HTTP request
+          std::string request = read_http_request(client);
+          parse_request(request);
+
+          // Build and send HTTP response
+          std::string response = build_response();
 #ifdef _WIN32
-            closesocket(sock);
+          send(client, response.c_str(), (int)response.size(), 0);
+          closesocket(client);
 #else
-            close(sock);
+          send(client, response.c_str(), response.size(), 0);
+          close(client);
 #endif
-            return;
-        }
+        } while (multi_request_ && !stop_);
 
-        // Read the HTTP request
-        std::string request = read_http_request(client);
-
-        // Parse and store for test inspection
-        parse_request(request);
-
-        // Build and send HTTP response with SSE fixture
-        std::string response = build_response();
 #ifdef _WIN32
-        send(client, response.c_str(), (int)response.size(), 0);
-#else
-        send(client, response.c_str(), response.size(), 0);
-#endif
-        // Close client socket immediately to prevent keep-alive reuse
-#ifdef _WIN32
-        closesocket(client);
         closesocket(sock);
 #else
-        close(client);
         close(sock);
 #endif
+        listen_sock_ = INVALID_SOCKET;  // prevent stop() from double-closing
     }
 
     // ---- HTTP helpers -------------------------------------------------------
@@ -289,29 +348,77 @@ private:
     }
 
     std::string build_response() {
-        // Read the fixture file
-        std::ifstream f(fixture_path_, std::ios::binary);
-        std::ostringstream ss;
-        ss << f.rdbuf();
-        std::string fixture = ss.str();
+        // Determine response parameters: use queue if available, else fall back
+        // to fixture / inline body
+        int resp_status = http_status_;
+        std::string resp_content_type = content_type_;
+        std::string body;
+        std::map<std::string, std::string> extra_headers;
 
-        // Build chunked HTTP response
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            request_count_++;
+            size_t idx = request_count_ - 1;
+            if (idx < response_queue_.size()) {
+                auto& qr = response_queue_[idx];
+                resp_status = qr.status;
+                resp_content_type = qr.content_type;
+                body = qr.body;
+                extra_headers = qr.extra_headers;
+            }
+        }
+
+        // Fall back to fixture / inline body if queue didn't supply one
+        if (body.empty() && !response_queue_.empty()) {
+            // Queue exhausted but body still empty — use last queued
+            auto& last = response_queue_.back();
+            resp_status = last.status;
+            resp_content_type = last.content_type;
+            body = last.body;
+            extra_headers = last.extra_headers;
+        }
+
+        if (body.empty()) {
+            if (!response_body_.empty()) {
+                body = response_body_;
+            } else {
+                std::ifstream f(fixture_path_, std::ios::binary);
+                std::ostringstream ss;
+                ss << f.rdbuf();
+                body = ss.str();
+            }
+        }
+
         std::ostringstream resp;
-        resp << "HTTP/1.1 " << http_status_ << " ";
-        if (http_status_ == 400) resp << "Bad Request";
-        else if (http_status_ == 401) resp << "Unauthorized";
-        else if (http_status_ == 500) resp << "Internal Server Error";
+        resp << "HTTP/1.1 " << resp_status << " ";
+        if (resp_status == 400) resp << "Bad Request";
+        else if (resp_status == 401) resp << "Unauthorized";
+        else if (resp_status == 403) resp << "Forbidden";
+        else if (resp_status == 429) resp << "Too Many Requests";
+        else if (resp_status == 500) resp << "Internal Server Error";
         else resp << "OK";
         resp << "\r\n";
-        resp << "Content-Type: text/event-stream\r\n";
-        resp << "Transfer-Encoding: chunked\r\n";
+        resp << "Content-Type: " << resp_content_type << "\r\n";
+        resp << "Content-Length: " << body.size() << "\r\n";
+
+        // Extra headers (e.g., Retry-After for 429 tests)
+        for (auto& kv : extra_headers) {
+            resp << kv.first << ": " << kv.second << "\r\n";
+        }
+
+        if (!plain_mode_) {
+            resp << "Transfer-Encoding: chunked\r\n";
+        }
         resp << "\r\n";
 
-        // Chunk the fixture data
-        resp << std::hex << fixture.size() << std::dec << "\r\n";
-        resp << fixture << "\r\n";
-        resp << "0\r\n";   // terminating chunk
-        resp << "\r\n";    // end of chunks
+        if (plain_mode_) {
+            resp << body;
+        } else {
+            // Chunked encoding
+            resp << std::hex << body.size() << std::dec << "\r\n";
+            resp << body << "\r\n";
+            resp << "0\r\n\r\n";
+        }
 
         return resp.str();
     }
@@ -333,11 +440,28 @@ private:
     std::string fixture_path_;
     int http_status_ = 200;
 
+    // Enhanced configuration (task 9.0)
+    std::string content_type_ = "text/event-stream";
+    bool plain_mode_ = false;
+    bool multi_request_ = false;
+    bool stop_ = false;
+    std::string response_body_;
+
+    // Multi-request response queue (task 9.0d)
+    std::vector<QueuedResponse> response_queue_;
+    int request_count_ = 0;
+
     mutable std::mutex mutex_;
     std::string last_method_;
     std::string last_path_;
     std::map<std::string, std::string> last_headers_;
     std::string last_body_;
+
+#ifdef _WIN32
+    SOCKET listen_sock_ = INVALID_SOCKET;
+#else
+    int listen_sock_ = -1;
+#endif
 };
 
 #endif // MOCK_SERVER_H

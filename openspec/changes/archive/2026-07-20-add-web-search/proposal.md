@@ -30,7 +30,7 @@
 
 ## Impact
 
-- **C++ Sidecar**: 新增 `search_provider.h/cpp`（`ISearchProvider` 接口 + `SearXNGSelfHost` + `ZhipuAISearch` + `KimiSearch` 实现 + `std::future` 并行调度）；新增独立 OpenAI SSE transport layer（不复用 ModelGateway）；新增 `web_fetch` 的 libcurl 网页抓取 + socket 层 SSRF 防护；异常安全（D9: extern "C" try/catch）
+- **C++ Sidecar**: 新增 `search_provider.h/cpp`（`ISearchProvider` 接口 + `SearXNGSelfHost` + `ZhipuAISearch` + `KimiSearch` 实现 + `std::future` + `wait_for` 并行调度）；新增独立 OpenAI SSE transport layer（不复用 ModelGateway，含 `function.arguments` delta 累积 + `line_buf` 64KB 上限 + `tool_choice` 强制调用 + per-provider model 配置）；新增 `web_fetch` 的 libcurl 网页抓取 + CURLOPT_OPENSOCKETFUNCTION socket 层 SSRF 防护（含 IPv4-mapped IPv6 `::ffff:0:0/96` + default-deny）；异常安全（D9: extern "C" try/catch + json_escape + SEH 缓解 + ReceivePort timeout）；`ensure_search_infra` 幂等性
 - **Dart sidecar_api**: 新增 `web_search` / `web_fetch` / `ensure_search_infra` / `get_search_providers` FFI 绑定（snake_case）
 - **Dart _ChatScreenState**: 新增 `web_search` / `web_fetch` 工具定义；`_executeTool` 新增 dispatch 分支；工具定义根据配置动态列出可用 provider
 - **配置**: `config.json` 新增各 provider 的 API key 字段（SearXNG 无 key 则始终可用）；至少一个 provider 可用的前提下注册搜索工具

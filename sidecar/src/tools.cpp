@@ -143,7 +143,7 @@ bool is_within_workspace(const std::string& resolved) {
 // JSON helpers (minimal — avoid pulling in nlohmann for two functions)
 // ---------------------------------------------------------------------------
 
-static std::string json_escape(const std::string& s) {
+std::string json_escape(const std::string& s) {
   std::string out;
   out.reserve(s.size() + 16);
   for (char c : s) {
