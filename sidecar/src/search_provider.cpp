@@ -70,13 +70,12 @@ void set_test_providers(const std::vector<std::shared_ptr<ISearchProvider>>& pro
 
 // Per-provider cached config
 static std::string g_zhipuai_api_key;
-static std::string g_zhipuai_model;
 static std::string g_kimi_api_key;
 static std::string g_kimi_model;
 static std::string g_searxng_base_url;
 static bool g_searxng_available = false; // cached TCP liveness result
 
-std::string ensure_search_infra(const std::string& search_config_json) {
+std::string ensure_search_infra_impl(const std::string& search_config_json) {
   // Idempotency guard — only run once
   bool already_done = false;
   std::call_once(g_search_infra_once, [&]() {
@@ -95,15 +94,14 @@ std::string ensure_search_infra(const std::string& search_config_json) {
       if (cfg.contains("zhipuai") && cfg["zhipuai"].is_object()) {
         auto& z = cfg["zhipuai"];
         if (z.contains("api_key")) g_zhipuai_api_key = z["api_key"].get<std::string>();
-        if (z.contains("model")) g_zhipuai_model = z["model"].get<std::string>();
 
         // Configure the ZhipuAI provider instance
         auto zhipuai = get_zhipuai_provider();
         if (!g_zhipuai_api_key.empty()) {
           zhipuai->set_api_key(g_zhipuai_api_key);
         }
-        if (!g_zhipuai_model.empty()) {
-          zhipuai->set_model(g_zhipuai_model);
+        if (z.contains("search_engine")) {
+          zhipuai->set_search_engine(z["search_engine"].get<std::string>());
         }
       }
 

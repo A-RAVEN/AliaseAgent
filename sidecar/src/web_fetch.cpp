@@ -274,7 +274,7 @@ std::string strip_html_tags(const std::string& html) {
 // Main web_fetch implementation (tasks 3.4, 3.5, 3.6)
 // ============================================================================
 
-std::string web_fetch(const std::string& request_json) {
+std::string web_fetch_impl(const std::string& request_json) {
   try {
     auto req = json::parse(request_json);
 

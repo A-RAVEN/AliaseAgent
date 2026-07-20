@@ -1,6 +1,6 @@
 ## Why
 
-ZhipuAI provider 当前使用 Chat Completions 的 `web_search` tool（对话中的网络搜索），但这要求模型支持 tool calling——用户使用的 `glm-4.7-flash` 不支持，导致模型忽略搜索工具直接凭训练记忆回答。ZhipuAI 有一个独立的 **Web Search API**（`/api/paas/v4/tools/web_search`），不依赖模型 tool calling，直接返回结构化搜索结果。本次将 ZhipuAI provider 切换到该独立 API。
+ZhipuAI provider 当前使用 Chat Completions 的 `web_search` tool（对话中的网络搜索），但这要求模型支持 tool calling——用户使用的 `glm-4.7-flash` 不支持，导致模型忽略搜索工具直接凭训练记忆回答。ZhipuAI 有一个独立的 **Web Search API**（`POST /api/paas/v4/web_search`），不依赖模型 tool calling，直接返回结构化搜索结果。本次将 ZhipuAI provider 切换到该独立 API。
 
 ## What Changes
 
@@ -20,7 +20,7 @@ ZhipuAI provider 当前使用 Chat Completions 的 `web_search` tool（对话中
 
 ## Impact
 
-- `sidecar/src/zhipuai_search.cpp` — 完全重写 `search()` 方法（HTTP GET 到 Web Search API，非流式 JSON 解析）
+- `sidecar/src/zhipuai_search.cpp` — 完全重写 `search()` 方法（HTTP POST 到 Web Search API，非流式 JSON 解析）
 - `sidecar/src/zhipuai_search.h` — 更新默认模型说明，base_url 改为 Web Search API 端点
 - `sidecar/test/search_provider_test.cpp` — 新增 ZhipuAI Web Search API mock 测试 + 更新 live 测试
-- `openspec/changes/add-web-search/design.md` — 更新 D4 描述
+- `openspec/changes/archive/2026-07-20-add-web-search/design.md` — 更新 D4 描述（archived change）

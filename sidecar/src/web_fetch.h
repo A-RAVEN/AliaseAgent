@@ -21,7 +21,7 @@
 ///
 /// @param request_json  {"url":"...", "extract_mode":"text"}
 ///                       extract_mode defaults to "text" (v1 only)
-std::string web_fetch(const std::string& request_json);
+std::string web_fetch_impl(const std::string& request_json);
 
 // ============================================================================
 // HTML tag stripping utility (exposed for testing)

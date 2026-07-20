@@ -342,19 +342,29 @@ class SidecarBridge implements ISidecar {
     final requestJson = args['requestJson'] as String;
     final workerType = args['workerType'] as String;
 
-    final lib = _openLibrary();
-    final ptr = requestJson.toNativeUtf8();
-
     try {
-      if (workerType == 'web_search') {
-        final fn = lib.lookupFunction<SetWorkspaceNative, WebSearchDart>('web_search');
-        sendPort.send(fn(ptr).toDartString());
-      } else {
-        final fn = lib.lookupFunction<SetWorkspaceNative, WebFetchDart>('web_fetch');
-        sendPort.send(fn(ptr).toDartString());
+      final lib = _openLibrary();
+      final ptr = requestJson.toNativeUtf8();
+      try {
+        Pointer<Utf8> resultPtr;
+        if (workerType == 'web_search') {
+          final fn = lib.lookupFunction<SetWorkspaceNative, WebSearchDart>('web_search');
+          resultPtr = fn(ptr);
+        } else {
+          final fn = lib.lookupFunction<SetWorkspaceNative, WebFetchDart>('web_fetch');
+          resultPtr = fn(ptr);
+        }
+        // Guard against null pointer — ACCESS_VIOLATION if toDartString() called on nullptr
+        if (resultPtr == nullptr) {
+          sendPort.send('{"ok":false,"error":"$workerType: FFI returned null pointer"}');
+        } else {
+          sendPort.send(resultPtr.toDartString());
+        }
+      } finally {
+        malloc.free(ptr);
       }
-    } finally {
-      malloc.free(ptr);
+    } catch (e, st) {
+      sendPort.send('{"ok":false,"error":"$workerType isolate error: $e"}');
     }
   }
 

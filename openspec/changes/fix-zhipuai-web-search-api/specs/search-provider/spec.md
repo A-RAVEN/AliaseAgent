@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: ZhipuAI search provider
-The ZhipuAI search provider SHALL use the standalone Web Search API (`POST /api/paas/v4/tools/web_search`) to perform searches, not the Chat Completions web_search tool.
+The ZhipuAI search provider SHALL use the standalone Web Search API (`POST /api/paas/v4/web_search`) to perform searches, not the Chat Completions web_search tool.
 
 #### Scenario: Search via Web Search API
 - **WHEN** `ZhipuAISearch::search(query, depth, max_results)` is called

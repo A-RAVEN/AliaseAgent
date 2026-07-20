@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <algorithm>
 
 using json = nlohmann::json;
 
@@ -19,7 +20,7 @@ static const long CONNECT_TIMEOUT_SEC = 15L;
 static const size_t MAX_RESPONSE_SIZE = 5 * 1024 * 1024; // 5MB
 
 // ============================================================================
-// Non-streaming write callback — simple body capture
+// Write callback — simple body capture
 // ============================================================================
 
 struct WriteCtx {
@@ -38,23 +39,12 @@ static size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdat
 }
 
 // ============================================================================
-// Tool definition
+// TODO: Deferred API features (see design.md Non-Goals)
+//   - search_domain_filter: whitelist domain filter (supported by search_pro_jina)
+//   - search_recency_filter: oneDay|oneWeek|oneMonth|oneYear|noLimit
+//   - request_id: 6-64 char unique request identifier
+//   - user_id: 6-128 char end-user identifier
 // ============================================================================
-
-/// Build the web_search tool definition for ZhipuAI Chat Completions.
-/// Per official docs (docs.bigmodel.cn), the tool requires a nested
-/// "web_search" object. search_result=true ensures the response includes
-/// the top-level web_search[] array.
-static std::string web_search_tool_json(int max_results) {
-  json tool;
-  tool["type"] = "web_search";
-  // Per official docs, the API expects string values for these fields
-  // (Python SDK uses "True"/"False" strings, not JSON booleans)
-  tool["web_search"]["enable"] = "True";
-  tool["web_search"]["search_result"] = "True";
-  tool["web_search"]["count"] = std::to_string(max_results);
-  return json::array({tool}).dump();
-}
 
 // ============================================================================
 // Global provider instance
@@ -78,7 +68,7 @@ bool ZhipuAISearch::is_configured() const {
 }
 
 // ============================================================================
-// Search implementation — non-streaming HTTP POST + JSON parsing
+// Search implementation — standalone Web Search API POST + JSON parsing
 // ============================================================================
 
 ProviderResult ZhipuAISearch::search(
@@ -87,26 +77,30 @@ ProviderResult ZhipuAISearch::search(
   int max_results
 ) {
   ProviderResult result;
-  (void)depth; // depth ignored — web_search controls depth automatically
+  (void)depth; // Web Search API does not support depth
 
+  // ---- Input validation ----
   if (api_key_.empty()) {
     result.error = {"ZhipuAI API key not configured", false};
     return result;
   }
 
+  if (query.empty()) {
+    result.error = {"ZhipuAI: search query is empty", false};
+    return result;
+  }
+
+  // Clamp max_results to API limit (1-50)
+  if (max_results < 1) max_results = 1;
+  if (max_results > 50) max_results = 50;
+
   LOG_INFO("ZhipuAI search: query=\"" + query + "\" max_results=" + std::to_string(max_results));
 
-  // ---- Build request body ----
+  // ---- Build request body (standalone Web Search API format) ----
   json body;
-  body["model"] = model_;
-  body["stream"] = false;
-  body["messages"] = json::array({
-    {{"role", "system"}, {"content", "You are a web search assistant. Use the web_search tool to find current, accurate information."}},
-    {{"role", "user"}, {"content", query}}
-  });
-  body["tools"] = json::parse(web_search_tool_json(max_results));
-  // Omit tool_choice — model decides whether to use web_search.
-  // Glm-4.7-flash automatically invokes web_search when the tool is registered.
+  body["search_engine"] = search_engine_;
+  body["search_query"] = query;
+  body["count"] = max_results;
 
   std::string body_str = body.dump();
 
@@ -157,15 +151,23 @@ ProviderResult ZhipuAISearch::search(
 
   if (http_code >= 400) {
     std::string err = "ZhipuAI: HTTP " + std::to_string(http_code);
-    // Try to extract error detail from response body
+    // Parse error body: the API may return either flat {"code":...,"message":"..."}
+    // or nested {"error":{"code":"...","message":"..."}} format. Try both.
     try {
       auto err_json = json::parse(ctx.body);
       if (err_json.contains("error") && err_json["error"].contains("message")) {
         err += " — " + err_json["error"]["message"].get<std::string>();
+      } else if (err_json.contains("message") && err_json["message"].is_string()) {
+        err += " — " + err_json["message"].get<std::string>();
       }
     } catch (...) {}
     LOG_ERR(err);
-    result.error = {err, http_code == 429 || http_code >= 500};
+    // 429 from billing (余额不足) is NOT transient; only rate-limit 429 is transient.
+    // Conservative: mark 429 as transient unless the body indicates billing error.
+    bool is_billing = (ctx.body.find("余额不足") != std::string::npos ||
+                       ctx.body.find("资源包") != std::string::npos ||
+                       ctx.body.find("1113") != std::string::npos);
+    result.error = {err, (http_code == 429 && !is_billing) || http_code >= 500};
     return result;
   }
 
@@ -174,34 +176,20 @@ ProviderResult ZhipuAISearch::search(
   try {
     auto resp = json::parse(ctx.body);
 
-    // Parse web_search[] — top-level array with structured search results
-    if (resp.contains("web_search") && resp["web_search"].is_array()) {
-      for (auto& item : resp["web_search"]) {
+    // Log top-level id/created for tracing (not exposed to upper layers)
+    if (resp.contains("id")) {
+      LOG_INFO("ZhipuAI: request id=" + resp["id"].get<std::string>());
+    }
+
+    // Parse search_result[] — the only result source (no synthesized answer)
+    if (resp.contains("search_result") && resp["search_result"].is_array()) {
+      for (auto& item : resp["search_result"]) {
         SearchResult r;
         if (item.contains("title")) r.title = item["title"].get<std::string>();
         if (item.contains("link")) r.url = item["link"].get<std::string>();
         if (item.contains("content")) r.content = item["content"].get<std::string>();
-        if (!r.content.empty() || !r.title.empty() || !r.url.empty()) {
-          result.results.push_back(std::move(r));
-        }
-      }
-    }
-
-    // Apply client-side truncation to web_search results
-    if (static_cast<int>(result.results.size()) > max_results) {
-      result.results.resize(max_results);
-    }
-
-    // Parse message.content — synthesized answer with [来源：ref_N] references
-    if (resp.contains("choices") && resp["choices"].is_array() && !resp["choices"].empty()) {
-      auto& choice = resp["choices"][0];
-      if (choice.contains("message") && choice["message"].contains("content")) {
-        std::string answer = choice["message"]["content"].get<std::string>();
-        if (!answer.empty()) {
-          SearchResult r;
-          r.title = "";
-          r.url = "";
-          r.content = std::move(answer);
+        // Include results that have at least title+link OR non-empty content
+        if (!r.content.empty() || (!r.title.empty() && !r.url.empty())) {
           result.results.push_back(std::move(r));
         }
       }

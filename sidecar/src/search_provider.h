@@ -65,7 +65,7 @@ public:
 /// Performs SearXNG liveness check once (TCP connect to localhost:8888, 2s timeout).
 /// Uses std::call_once to guarantee idempotency — repeated calls return immediately.
 /// Returns JSON: {"ok":true} or {"ok":false,"error":"..."}
-std::string ensure_search_infra(const std::string& search_config_json);
+std::string ensure_search_infra_impl(const std::string& search_config_json);
 
 /// Return list of configured providers as JSON array of {name, description}.
 /// Only returns providers whose is_configured() returns true.

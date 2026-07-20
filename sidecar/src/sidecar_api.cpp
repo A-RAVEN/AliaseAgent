@@ -120,7 +120,7 @@ static std::string g_search_providers_result;
 SIDECAR_API const char* ensure_search_infra(const char* search_config_json) {
   LOG_TRACE("ensure_search_infra called");
   try {
-    g_search_infra_result = ::ensure_search_infra(std::string(search_config_json ? search_config_json : "{}"));
+    g_search_infra_result = ensure_search_infra_impl(std::string(search_config_json ? search_config_json : "{}"));
     return g_search_infra_result.c_str();
   } catch (const std::exception& e) {
     static std::string err_static;
@@ -168,7 +168,10 @@ SIDECAR_API const char* web_search(const char* request_json) {
 SIDECAR_API const char* web_fetch(const char* request_json) {
   LOG_TRACE("web_fetch called");
   try {
-    g_fetch_result = ::web_fetch(request_json ? request_json : "{}");
+    // Must cast to std::string to force compiler to pick the C++ overload
+    // (std::string web_fetch(const std::string&)) instead of recursing into
+    // this very function (const char* web_fetch(const char*)).
+    g_fetch_result = web_fetch_impl(std::string(request_json ? request_json : "{}"));
     return g_fetch_result.c_str();
   } catch (const std::exception& e) {
     static std::string err_static;

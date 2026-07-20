@@ -5,13 +5,15 @@
 #include <string>
 
 // ============================================================================
-// ZhipuAISearch — search provider using ZhipuAI web_search tool
+// ZhipuAISearch — search provider using ZhipuAI standalone Web Search API
 //
-// Non-streaming HTTP POST to Chat Completions API with
-// tools: [{"type": "web_search", "web_search": {...}}].
-// Platform auto-executes search; results returned as top-level
-// web_search[] array + synthesized answer in message.content.
-// No SSE, no agent loop, no tool_result relay.
+// POST https://open.bigmodel.cn/api/paas/v4/web_search
+// with body {"search_engine":"search-prime","search_query":"...","count":N}.
+// Returns structured search_result[] array — no model, no tool calling, no SSE.
+//
+// Deferred features (see design.md Non-Goals):
+//   - search_domain_filter / search_recency_filter
+//   - request_id / user_id
 // ============================================================================
 
 class ZhipuAISearch : public ISearchProvider {
@@ -21,8 +23,8 @@ public:
   std::string name() const override { return "zhipuai"; }
 
   std::string description() const override {
-    return "ZhipuAI web_search — AI-driven search with synthesized answer "
-           "and structured results. Requires API key.";
+    return "ZhipuAI Web Search — standalone search API returning structured "
+           "results (title, URL, content). Requires API key.";
   }
 
   bool is_configured() const override;
@@ -36,18 +38,18 @@ public:
   // ---- Configuration setters (called by ensure_search_infra) ----
 
   void set_api_key(const std::string& key) { api_key_ = key; }
-  void set_model(const std::string& model) { model_ = model; }
+  void set_search_engine(const std::string& engine) { search_engine_ = engine; }
   void set_base_url(const std::string& url) { base_url_ = url; }
 
   // ---- Accessors for testing ----
 
   const std::string& api_key() const { return api_key_; }
-  const std::string& model() const { return model_; }
+  const std::string& search_engine() const { return search_engine_; }
 
 private:
   std::string api_key_;
-  std::string model_ = "glm-4.7-flash";
-  std::string base_url_ = "https://open.bigmodel.cn/api/paas/v4/chat/completions";
+  std::string search_engine_ = "search-prime";
+  std::string base_url_ = "https://open.bigmodel.cn/api/paas/v4/web_search";
 };
 
 // ============================================================================

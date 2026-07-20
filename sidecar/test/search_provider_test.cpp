@@ -237,7 +237,7 @@ TEST_CASE("Provider registry: only configured providers listed", "[search_regist
 
 TEST_CASE("Provider registry: ensure_search_infra with API key", "[search_registry]") {
   // ensure_search_infra is call_once — if already called, this is a no-op
-  std::string result = ensure_search_infra(R"({"zhipuai":{"api_key":"test_key"}})");
+  std::string result = ensure_search_infra_impl(R"({"zhipuai":{"api_key":"test_key"}})");
   auto j = parse(result);
   REQUIRE(j["ok"] == true);
 
@@ -425,14 +425,14 @@ TEST_CASE("web_fetch: iequals case-insensitive comparison", "[web_fetch][content
 // ============================================================================
 
 TEST_CASE("web_fetch: file:// scheme blocked", "[web_fetch][ssrf]") {
-  std::string result = web_fetch(R"({"url":"file:///etc/passwd","extract_mode":"text"})");
+  std::string result = web_fetch_impl(R"({"url":"file:///etc/passwd","extract_mode":"text"})");
   auto j = parse(result);
   REQUIRE(j["ok"] == false);
   REQUIRE(j["error"].get<std::string>().find("scheme") != std::string::npos);
 }
 
 TEST_CASE("web_fetch: localhost hostname blocked", "[web_fetch][ssrf]") {
-  std::string result = web_fetch(R"({"url":"http://localhost:8080/admin","extract_mode":"text"})");
+  std::string result = web_fetch_impl(R"({"url":"http://localhost:8080/admin","extract_mode":"text"})");
   auto j = parse(result);
   REQUIRE(j["ok"] == false);
   REQUIRE(j["error"].get<std::string>().find("internal address") != std::string::npos);
@@ -441,7 +441,7 @@ TEST_CASE("web_fetch: localhost hostname blocked", "[web_fetch][ssrf]") {
 TEST_CASE("web_fetch: case-insensitive scheme blocked", "[web_fetch][ssrf]") {
   // HTTP:// with uppercase should still match http:// after lowering
   // 169.254.169.254 is link-local — SSRF blocks it.
-  std::string result = web_fetch(R"({"url":"HTTP://169.254.169.254/","extract_mode":"text"})");
+  std::string result = web_fetch_impl(R"({"url":"HTTP://169.254.169.254/","extract_mode":"text"})");
   auto j = parse(result);
   REQUIRE(j["ok"] == false);
   // Any error means the request was blocked — the exact error wording is platform-specific
@@ -711,23 +711,19 @@ TEST_CASE("SearXNG: HTTP 403 returns clear error", "[searxng][mock]") {
 }
 
 // ============================================================================
-// 9.9 — ZhipuAI web_search success — JSON response parsing + SearchResult mapping
+// 2.1 — ZhipuAI Web Search API success — structured results only
 // ============================================================================
 
-TEST_CASE("ZhipuAI: web_search success — JSON response parsing", "[zhipuai][mock]") {
+TEST_CASE("ZhipuAI: web_search API success — structured results", "[zhipuai][mock]") {
   MockServer server;
   server.set_content_type("application/json");
   server.set_plain_mode(true);
 
-  // Simulate ZhipuAI non-streaming JSON response with web_search[] + synthesized answer
+  // Web Search API response: search_result[] only, no choices/synthesized answer
   json resp;
-  resp["choices"] = json::array({
-    {{"finish_reason", "stop"}, {"index", 0}, {"message", {
-      {"role", "assistant"},
-      {"content", "Based on search results, the answer is...[来源：ref_1]"}
-    }}}
-  });
-  resp["web_search"] = json::array({
+  resp["id"] = "req_abc123";
+  resp["created"] = 1720000000;
+  resp["search_result"] = json::array({
     {{"title", "Test Result 1"}, {"link", "https://test1.com"}, {"content", "Content one"}},
     {{"title", "Test Result 2"}, {"link", "https://test2.com"}, {"content", "Content two"}}
   });
@@ -742,31 +738,27 @@ TEST_CASE("ZhipuAI: web_search success — JSON response parsing", "[zhipuai][mo
 
   auto result = p->search("test query", "basic", 5);
   REQUIRE(result.error.message.empty());
-  // web_search results + synthesized answer = 3 total
-  REQUIRE(result.results.size() >= 2);
+  REQUIRE(result.results.size() == 2);
+  // All results are structured (no synthesized answer)
   REQUIRE(result.results[0].title == "Test Result 1");
   REQUIRE(result.results[0].url == "https://test1.com");
   REQUIRE(result.results[0].content == "Content one");
-  // Last result is the synthesized answer (empty title/url, non-empty content)
-  auto& last = result.results.back();
-  REQUIRE(last.title.empty());
-  REQUIRE(last.url.empty());
-  REQUIRE(!last.content.empty());
-  REQUIRE(last.content.find("ref_1") != std::string::npos);
+  REQUIRE(result.results[1].title == "Test Result 2");
+  REQUIRE(result.results[1].url == "https://test2.com");
+  REQUIRE(result.results[1].content == "Content two");
 }
 
 // ============================================================================
-// 9.9a — ZhipuAI empty web_search results (success state, no error)
+// 2.2 — ZhipuAI Web Search API empty results
 // ============================================================================
 
-TEST_CASE("ZhipuAI: empty web_search results — success, no error", "[zhipuai][mock]") {
+TEST_CASE("ZhipuAI: web_search API empty results — success, no error", "[zhipuai][mock]") {
   MockServer server;
   server.set_content_type("application/json");
   server.set_plain_mode(true);
 
-  // web_search[] empty, no choices (minimal response)
   json resp;
-  resp["web_search"] = json::array();
+  resp["search_result"] = json::array();
 
   server.set_response_body(resp.dump());
   server.start("", 200);
@@ -782,16 +774,18 @@ TEST_CASE("ZhipuAI: empty web_search results — success, no error", "[zhipuai][
 }
 
 // ============================================================================
-// 9.12b — ZhipuAI HTTP error handling
+// 2.3 — ZhipuAI Web Search API HTTP 401 — flat error format
 // ============================================================================
 
-TEST_CASE("ZhipuAI: HTTP 401 returns error", "[zhipuai][mock]") {
+TEST_CASE("ZhipuAI: web_search API HTTP 401 — flat error format", "[zhipuai][mock]") {
   MockServer server;
   server.set_content_type("application/json");
   server.set_plain_mode(true);
 
+  // Web Search API error format: {"code":<int>,"message":"<string>"} (flat, NOT nested)
   json err_body;
-  err_body["error"]["message"] = "Invalid API key";
+  err_body["code"] = 401;
+  err_body["message"] = "Invalid API key";
   server.set_response_body(err_body.dump());
   server.start("", 401);
   server.wait_ready();
@@ -803,40 +797,22 @@ TEST_CASE("ZhipuAI: HTTP 401 returns error", "[zhipuai][mock]") {
   auto result = p->search("test", "basic", 5);
   REQUIRE(!result.error.message.empty());
   REQUIRE(result.error.message.find("401") != std::string::npos);
-  REQUIRE(result.results.empty());
-}
-
-TEST_CASE("ZhipuAI: HTTP 500 returns transient error", "[zhipuai][mock]") {
-  MockServer server;
-  server.set_content_type("application/json");
-  server.set_plain_mode(true);
-  server.set_response_body("{}");
-  server.start("", 500);
-  server.wait_ready();
-
-  auto p = get_zhipuai_provider();
-  p->set_api_key("test_key");
-  p->set_base_url(server.base_url());
-
-  auto result = p->search("test", "basic", 5);
-  REQUIRE(!result.error.message.empty());
-  REQUIRE(result.error.message.find("500") != std::string::npos);
-  REQUIRE(result.error.is_transient == true);
+  REQUIRE(result.error.message.find("Invalid API key") != std::string::npos);
+  REQUIRE(result.error.is_transient == false);
   REQUIRE(result.results.empty());
 }
 
 // ============================================================================
-// 9.12c — ZhipuAI request body verification (non-streaming JSON POST)
+// 2.4 — ZhipuAI Web Search API request body verification
 // ============================================================================
 
-TEST_CASE("ZhipuAI: request body — stream=false, web_search tool, model", "[zhipuai][mock]") {
+TEST_CASE("ZhipuAI: web_search API request body — search_engine, query, count", "[zhipuai][mock]") {
   MockServer server;
   server.set_content_type("application/json");
   server.set_plain_mode(true);
 
-  // Return minimal valid response so search() doesn't error on parse
   json resp;
-  resp["web_search"] = json::array();
+  resp["search_result"] = json::array();
   server.set_response_body(resp.dump());
   server.start("", 200);
   server.wait_ready();
@@ -853,16 +829,200 @@ TEST_CASE("ZhipuAI: request body — stream=false, web_search tool, model", "[zh
   REQUIRE(!req_body.empty());
   auto j = parse(req_body);
 
-  REQUIRE(j["model"] == "glm-4.7-flash");
-  REQUIRE(j["stream"] == false);
-  REQUIRE(j["tool_choice"] == "auto");
-  REQUIRE(j["messages"].is_array());
-  REQUIRE(j["messages"].size() >= 1);
-  // Verify tool format: nested web_search object with search_result=true
-  REQUIRE(j["tools"].is_array());
-  REQUIRE(j["tools"].size() == 1);
-  REQUIRE(j["tools"][0]["type"] == "web_search");
-  REQUIRE(j["tools"][0]["web_search"]["search_result"] == "True");  // API expects string, not boolean
+  REQUIRE(j["search_engine"] == "search-prime");
+  REQUIRE(j["search_query"] == "test query");
+  REQUIRE(j["count"] == 5);
+  // No Chat Completions fields
+  REQUIRE(!j.contains("model"));
+  REQUIRE(!j.contains("stream"));
+  REQUIRE(!j.contains("messages"));
+  REQUIRE(!j.contains("tools"));
+  REQUIRE(!j.contains("tool_choice"));
+}
+
+// ============================================================================
+// 2.5 — ZhipuAI Web Search API HTTP 429 — rate limit transient
+// ============================================================================
+
+TEST_CASE("ZhipuAI: web_search API HTTP 429 — rate limit transient", "[zhipuai][mock]") {
+  MockServer server;
+  server.set_content_type("application/json");
+  server.set_plain_mode(true);
+
+  json err_body;
+  err_body["code"] = 429;
+  err_body["message"] = "Rate limit exceeded";
+  server.set_response_body(err_body.dump());
+  server.start("", 429);
+  server.wait_ready();
+
+  auto p = get_zhipuai_provider();
+  p->set_api_key("test_key");
+  p->set_base_url(server.base_url());
+
+  auto result = p->search("test", "basic", 5);
+  REQUIRE(!result.error.message.empty());
+  REQUIRE(result.error.message.find("429") != std::string::npos);
+  REQUIRE(result.error.is_transient == true);
+  REQUIRE(result.results.empty());
+}
+
+// ============================================================================
+// 2.6 — ZhipuAI Web Search API HTTP 500 — server error transient
+// ============================================================================
+
+TEST_CASE("ZhipuAI: web_search API HTTP 500 — server error transient", "[zhipuai][mock]") {
+  MockServer server;
+  server.set_content_type("application/json");
+  server.set_plain_mode(true);
+
+  json err_body;
+  err_body["code"] = 500;
+  err_body["message"] = "Internal server error";
+  server.set_response_body(err_body.dump());
+  server.start("", 500);
+  server.wait_ready();
+
+  auto p = get_zhipuai_provider();
+  p->set_api_key("test_key");
+  p->set_base_url(server.base_url());
+
+  auto result = p->search("test", "basic", 5);
+  REQUIRE(!result.error.message.empty());
+  REQUIRE(result.error.message.find("500") != std::string::npos);
+  REQUIRE(result.error.is_transient == true);
+  REQUIRE(result.results.empty());
+}
+
+// ============================================================================
+// 2.7 — ZhipuAI Web Search API connection timeout
+// ============================================================================
+
+TEST_CASE("ZhipuAI: web_search API connection timeout — transient", "[zhipuai][timeout_test]") {
+  auto p = get_zhipuai_provider();
+  p->set_api_key("test_key");
+  // Save original URL to restore after test (global singleton — avoid leaking to other tests)
+  const std::string original_url = "https://open.bigmodel.cn/api/paas/v4/web_search";
+  // Use unreachable host + low connect timeout to trigger connection failure quickly
+  // (Connection timeout via CURLOPT_CONNECTTIMEOUT is 15s — use unreachable IP instead
+  //  for faster failure, then check that it's transient)
+  p->set_base_url("http://127.0.0.1:19999"); // nothing listening, fails fast with Connection refused
+
+  auto result = p->search("test", "basic", 5);
+  REQUIRE(!result.error.message.empty());
+  REQUIRE(result.error.is_transient == true);
+  REQUIRE((result.error.message.find("timeout") != std::string::npos ||
+           result.error.message.find("Timeout") != std::string::npos ||
+           result.error.message.find("Connection") != std::string::npos ||
+           result.error.message.find("Couldn't connect") != std::string::npos ||
+           result.error.message.find("connect") != std::string::npos));
+  REQUIRE(result.results.empty());
+
+  // Restore base_url — global singleton shared across tests
+  p->set_base_url(original_url);
+}
+
+// ============================================================================
+// 2.8 — ZhipuAI Web Search API malformed JSON response
+// ============================================================================
+
+TEST_CASE("ZhipuAI: web_search API malformed JSON — error, no crash", "[zhipuai][mock]") {
+  MockServer server;
+  server.set_content_type("application/json");
+  server.set_plain_mode(true);
+  server.set_response_body("not valid json{{{{");
+  server.start("", 200);
+  server.wait_ready();
+
+  auto p = get_zhipuai_provider();
+  p->set_api_key("test_key");
+  p->set_base_url(server.base_url());
+
+  auto result = p->search("test", "basic", 5);
+  REQUIRE(!result.error.message.empty());
+  REQUIRE(result.error.message.find("invalid JSON") != std::string::npos);
+  REQUIRE(result.results.empty());
+}
+
+// ============================================================================
+// 2.9 — ZhipuAI Web Search API missing search_result field
+// ============================================================================
+
+TEST_CASE("ZhipuAI: web_search API missing search_result field", "[zhipuai][mock]") {
+  MockServer server;
+  server.set_content_type("application/json");
+  server.set_plain_mode(true);
+
+  // Valid JSON but no search_result key
+  json resp;
+  resp["id"] = "req_123";
+  resp["created"] = 1720000000;
+  resp["some_other_field"] = "unexpected";
+
+  server.set_response_body(resp.dump());
+  server.start("", 200);
+  server.wait_ready();
+
+  auto p = get_zhipuai_provider();
+  p->set_api_key("test_key");
+  p->set_base_url(server.base_url());
+
+  auto result = p->search("test", "basic", 5);
+  // Should not crash — empty results is acceptable
+  REQUIRE(result.error.message.empty());
+  REQUIRE(result.results.empty());
+}
+
+// ============================================================================
+// 2.10 — ZhipuAI Web Search API partial result fields
+// ============================================================================
+
+TEST_CASE("ZhipuAI: web_search API partial result fields", "[zhipuai][mock]") {
+  MockServer server;
+  server.set_content_type("application/json");
+  server.set_plain_mode(true);
+
+  json resp;
+  resp["search_result"] = json::array({
+    {{"title", "Full"}, {"link", "https://full.com"}, {"content", "Full content"}},
+    {{"title", "NoContent"}, {"link", "https://nocontent.com"}},            // missing content
+    {{"link", "https://onlylink.com"}, {"content", "Only link + content"}} // missing title
+    // Note: item with only title and link but empty content is filtered
+  });
+
+  server.set_response_body(resp.dump());
+  server.start("", 200);
+  server.wait_ready();
+
+  auto p = get_zhipuai_provider();
+  p->set_api_key("test_key");
+  p->set_base_url(server.base_url());
+
+  auto result = p->search("test", "basic", 10);
+  REQUIRE(result.error.message.empty());
+  // First item: has all three → included
+  // Second item: has title+link but no content → included (title+link check)
+  // Third item: has link+content but no title → included (content non-empty)
+  REQUIRE(result.results.size() == 3);
+}
+
+// ============================================================================
+// 2.11 — ZhipuAI Web Search API empty API key
+// ============================================================================
+
+TEST_CASE("ZhipuAI: web_search API empty key returns error", "[zhipuai]") {
+  auto p = get_zhipuai_provider();
+  // Don't set API key — verify clear error message
+  // Note: previous tests may have set a key, so we rely on a fresh instance
+  // The global instance persists across tests, but verify behavior
+
+  // Use a fresh instance with no key
+  auto fresh = std::make_shared<ZhipuAISearch>();
+  auto result = fresh->search("test", "basic", 5);
+  REQUIRE(!result.error.message.empty());
+  REQUIRE(result.error.message.find("API key not configured") != std::string::npos);
+  REQUIRE(result.error.is_transient == false);
+  REQUIRE(result.results.empty());
 }
 
 // ============================================================================
@@ -1384,7 +1544,7 @@ TEST_CASE("Kimi: 429 retry respects Retry-After header", "[kimi][mock][retry]") 
 
 TEST_CASE("web_fetch: timeout or connection error on unreachable host", "[web_fetch][timeout_test]") {
   // Connect to a non-routable IP that will timeout
-  std::string result = web_fetch(R"({"url":"http://10.255.255.1:9999/timeout","extract_mode":"text"})");
+  std::string result = web_fetch_impl(R"({"url":"http://10.255.255.1:9999/timeout","extract_mode":"text"})");
   auto j = parse(result);
   REQUIRE(j["ok"] == false);
   auto err = j["error"].get<std::string>();
@@ -1443,7 +1603,7 @@ static void inject_live_config() {
       if (z.contains("api_key")) {
         auto p = get_zhipuai_provider();
         p->set_api_key(z["api_key"].get<std::string>());
-        if (z.contains("model")) p->set_model(z["model"].get<std::string>());
+        if (z.contains("search_engine")) p->set_search_engine(z["search_engine"].get<std::string>());
       }
     }
     if (search.contains("kimi") && search["kimi"].is_object()) {
@@ -1487,7 +1647,7 @@ TEST_CASE("SearXNG live: basic search", "[searxng][live]") {
   }
 }
 
-TEST_CASE("ZhipuAI live: basic search", "[zhipuai][live]") {
+TEST_CASE("ZhipuAI live: Web Search API", "[zhipuai][live]") {
   inject_live_config();
   auto p = get_zhipuai_provider();
   if (!p->is_configured()) {
@@ -1495,7 +1655,7 @@ TEST_CASE("ZhipuAI live: basic search", "[zhipuai][live]") {
     return;
   }
 
-  std::cout << "[ZhipuAI live] model=" << p->model()
+  std::cout << "[ZhipuAI live] search_engine=" << p->search_engine()
             << " key=" << p->api_key().substr(0, 12) << "..." << std::endl;
   auto result = p->search("Python programming", "basic", 5);
 
@@ -1504,22 +1664,20 @@ TEST_CASE("ZhipuAI live: basic search", "[zhipuai][live]") {
     return;
   }
 
-  // Verify at minimum we got a synthesized answer
+  // Web Search API returns structured results only — no synthesized answer
   REQUIRE(result.error.message.empty());
   REQUIRE(!result.results.empty());
-  // At least one result must have non-empty content
-  bool has_content = false;
+  // Each result must have non-empty title, url, AND content
   for (auto& r : result.results) {
-    if (!r.content.empty()) has_content = true;
+    REQUIRE(!r.title.empty());
+    REQUIRE(!r.url.empty());
+    REQUIRE(!r.content.empty());
   }
-  REQUIRE(has_content);
 
-  std::cout << "[ZhipuAI live] got " << result.results.size() << " results" << std::endl;
+  std::cout << "[ZhipuAI live] got " << result.results.size() << " structured results" << std::endl;
   for (size_t i = 0; i < result.results.size(); i++) {
     auto& r = result.results[i];
-    bool is_structured = !r.title.empty() || !r.url.empty();
-    std::cout << "  [" << i << "] " << (is_structured ? "structured" : "synthesis")
-              << " title=\"" << r.title.substr(0, 60) << "\""
+    std::cout << "  [" << i << "] title=\"" << r.title.substr(0, 60) << "\""
               << " url=\"" << r.url.substr(0, 50) << "\""
               << " content_len=" << r.content.size() << std::endl;
     if (!r.content.empty()) {

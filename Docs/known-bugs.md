@@ -69,13 +69,16 @@ checkpoint C 要求 ChatScreen 至少 3 个测试场景，实际只写了 2 个�
 
 **来源**: `add-web-search` proposal
 **发现日期**: 2026-07-19
-**已修复**: 是
+**已修复**: 是 (2026-07-20 永久修复)
 **相关文件**: `sidecar/src/sidecar_api.cpp:123`
 
 ### 根因
 
-`sidecar_api.cpp` 中 `::ensure_search_infra(search_config_json)` 调用了自身（两个同名函数在全局命名空间，编译器选择了 `const char*` 精确匹配版本而非 `const std::string&`）。栈溢出导致进程崩溃。
+C API 包装函数 `ensure_search_infra` 和 C++ 实现函数 `ensure_search_infra` 都在全局命名空间。`::ensure_search_infra(const char*)` 被编译器解析为 C API 自身而非 C++ 实现 `ensure_search_infra(const std::string&)`。栈溢出 → ACCESS_VIOLATION。
+
+同一 bug 也影响了 `web_fetch`（sidecar_api.cpp:174），但直到 2026-07-20 AI 首次调用 web_fetch tool 才触发。
 
 ### 修复
 
-改为 `::ensure_search_infra(std::string(search_config_json))` 强制匹配 `const std::string&` 重载。
+- **临时** (2026-07-19): `::ensure_search_infra(std::string(...))` 强制重载选择。
+- **永久** (2026-07-20): C++ 实现函数重命名为 `ensure_search_infra_impl` 和 `web_fetch_impl`，彻底消除命名冲突。
