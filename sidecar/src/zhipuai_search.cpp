@@ -8,6 +8,8 @@
 #include <vector>
 #include <chrono>
 #include <algorithm>
+#include <mutex>
+#include <thread>
 
 using json = nlohmann::json;
 
@@ -37,6 +39,15 @@ static size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdat
   ctx->body.append(ptr, total);
   return total;
 }
+
+// ============================================================================
+// Rate limit guard — serialize requests + cooldown + exponential backoff
+// ============================================================================
+
+static std::mutex g_zhipuai_mutex;
+static std::chrono::steady_clock::time_point g_last_request_time;
+static int g_consecutive_400_count = 0;
+static const long BASE_COOLDOWN_MS = 500;
 
 // ============================================================================
 // TODO: Deferred API features (see design.md Non-Goals)
@@ -76,12 +87,19 @@ ProviderResult ZhipuAISearch::search(
   const std::string& depth,
   int max_results
 ) {
+  // ---- Rate limit guard: serialize all ZhipuAI requests ----
+  std::lock_guard<std::mutex> lock(g_zhipuai_mutex);
+
   ProviderResult result;
   (void)depth; // Web Search API does not support depth
+  bool http_sent = false;
+  long http_code = 0;
+  std::string response_body;
 
   // ---- Input validation ----
   if (api_key_.empty()) {
     result.error = {"ZhipuAI API key not configured", false};
+    // No HTTP sent — skip cooldown, release mutex immediately
     return result;
   }
 
@@ -134,19 +152,20 @@ ProviderResult ZhipuAISearch::search(
 
   LOG_INFO("ZhipuAI: POST " + base_url_);
   CURLcode cres = curl_easy_perform(curl);
+  http_sent = true; // HTTP request was actually sent
 
   // Check HTTP status code
-  long http_code = 0;
   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
   curl_easy_cleanup(curl);
   curl_slist_free_all(headers);
+  response_body = ctx.body;
 
   if (cres != CURLE_OK) {
     std::string err = "ZhipuAI: connection error — " + std::string(curl_easy_strerror(cres));
     LOG_ERR(err);
     result.error = {err, true};
-    return result;
+    goto cooldown;
   }
 
   if (http_code >= 400) {
@@ -163,12 +182,11 @@ ProviderResult ZhipuAISearch::search(
     } catch (...) {}
     LOG_ERR(err);
     // 429 from billing (余额不足) is NOT transient; only rate-limit 429 is transient.
-    // Conservative: mark 429 as transient unless the body indicates billing error.
     bool is_billing = (ctx.body.find("余额不足") != std::string::npos ||
                        ctx.body.find("资源包") != std::string::npos ||
                        ctx.body.find("1113") != std::string::npos);
     result.error = {err, (http_code == 429 && !is_billing) || http_code >= 500};
-    return result;
+    goto cooldown;
   }
 
   // ---- Parse JSON response ----
@@ -203,5 +221,45 @@ ProviderResult ZhipuAISearch::search(
     result.error = {"ZhipuAI: invalid JSON response", false};
   }
 
+cooldown:
+  // ---- Post-request cooldown + exponential backoff (lock still held) ----
+  if (http_sent) {
+    // Update backoff counter
+    if (http_code == 400) {
+      bool is_moderation = (response_body.find("不安全") != std::string::npos ||
+                            response_body.find("敏感") != std::string::npos);
+      if (is_moderation) {
+        g_consecutive_400_count++;
+      } else {
+        g_consecutive_400_count = 0;
+      }
+    } else {
+      g_consecutive_400_count = 0; // reset on any non-400 response
+    }
+
+    // Compute cooldown with exponential backoff
+    long cooldown_ms = BASE_COOLDOWN_MS;
+    if (g_consecutive_400_count > 0) {
+      int shift = std::min(g_consecutive_400_count, 3); // max 3 doublings
+      cooldown_ms = BASE_COOLDOWN_MS * (1 << shift);     // 500 → 1000 → 2000 → 4000
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    if (g_last_request_time.time_since_epoch().count() > 0) {
+      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - g_last_request_time).count();
+      if (elapsed < cooldown_ms) {
+        long sleep_ms = cooldown_ms - elapsed;
+        LOG_INFO("ZhipuAI: cooldown sleep " + std::to_string(sleep_ms) + "ms" +
+                 (g_consecutive_400_count > 0
+                   ? " (backoff x" + std::to_string(1 << std::min(g_consecutive_400_count, 3)) + ")"
+                   : ""));
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+      }
+    }
+    g_last_request_time = std::chrono::steady_clock::now();
+  }
+
   return result;
+  // lock_guard releases mutex here
 }

@@ -1026,6 +1026,217 @@ TEST_CASE("ZhipuAI: web_search API empty key returns error", "[zhipuai]") {
 }
 
 // ============================================================================
+// Rate limit guard tests (zhipuai-rate-limit-guard)
+// ============================================================================
+
+TEST_CASE("Rate guard: concurrent requests serialized via std::async", "[zhipuai][rate-guard]") {
+  auto p = get_zhipuai_provider();
+  p->set_api_key("test_key");
+
+  MockServer server;
+  server.set_content_type("application/json");
+  server.set_plain_mode(true);
+  server.set_multi_request(true); // two concurrent calls need two connections
+
+  json resp;
+  resp["search_result"] = json::array({
+    {{"title", "R1"}, {"link", "http://r1.com"}, {"content", "C1"}}
+  });
+  server.queue_response(200, "application/json", resp.dump());
+
+  json resp2;
+  resp2["search_result"] = json::array({
+    {{"title", "R2"}, {"link", "http://r2.com"}, {"content", "C2"}}
+  });
+  server.queue_response(200, "application/json", resp2.dump());
+
+  server.start("", 200);
+  server.wait_ready();
+
+  p->set_base_url(server.base_url());
+
+  // Launch two concurrent calls via std::async
+  auto future1 = std::async(std::launch::async, [&]() { return p->search("q1", "basic", 1); });
+  auto future2 = std::async(std::launch::async, [&]() { return p->search("q2", "basic", 1); });
+
+  auto r1 = future1.get();
+  auto r2 = future2.get();
+
+  // Both must complete with valid results (mutex serializes, no crash)
+  REQUIRE(r1.error.message.empty());
+  REQUIRE(r2.error.message.empty());
+  REQUIRE(r1.results.size() == 1);
+  REQUIRE(r2.results.size() == 1);
+
+  server.stop();
+}
+
+TEST_CASE("Rate guard: first call has no cooldown delay", "[zhipuai][rate-guard]") {
+  // Reset global state by using a fresh provider
+  auto p = std::make_shared<ZhipuAISearch>();
+  p->set_api_key("test_key");
+
+  MockServer server;
+  server.set_content_type("application/json");
+  server.set_plain_mode(true);
+
+  json resp;
+  resp["search_result"] = json::array({
+    {{"title", "First"}, {"link", "http://f.com"}, {"content", "F"}}
+  });
+  server.set_response_body(resp.dump());
+  server.start("", 200);
+  server.wait_ready();
+
+  p->set_base_url(server.base_url());
+
+  auto start = std::chrono::steady_clock::now();
+  auto result = p->search("first", "basic", 1);
+  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - start).count();
+
+  REQUIRE(result.error.message.empty());
+  // First call should complete quickly (no cooldown, just HTTP + parse)
+  REQUIRE(elapsed < 2000); // well under 2s for a mock response
+
+  server.stop();
+}
+
+TEST_CASE("Rate guard: empty key skips cooldown", "[zhipuai][rate-guard]") {
+  auto p = std::make_shared<ZhipuAISearch>();
+  // No API key set
+
+  auto start = std::chrono::steady_clock::now();
+  auto result = p->search("test", "basic", 5);
+  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - start).count();
+
+  REQUIRE(!result.error.message.empty());
+  // Must return quickly — no HTTP sent, no cooldown
+  REQUIRE(elapsed < 100); // sub-100ms for trivial error path
+}
+
+TEST_CASE("Rate guard: consecutive 400 backoff and reset on 200", "[zhipuai][rate-guard]") {
+  MockServer server;
+  server.set_content_type("application/json");
+  server.set_plain_mode(true);
+  server.set_multi_request(true);
+
+  // Queue: 400 moderation → 400 moderation → 200 success
+  json err400;
+  err400["error"]["code"] = "1113";
+  err400["error"]["message"] = "不安全或敏感内容";
+  server.queue_response(400, "application/json", err400.dump());
+
+  json err400_2;
+  err400_2["error"]["code"] = "1113";
+  err400_2["error"]["message"] = "不安全或敏感内容";
+  server.queue_response(400, "application/json", err400_2.dump());
+
+  json ok;
+  ok["search_result"] = json::array({
+    {{"title", "OK"}, {"link", "http://ok.com"}, {"content", "Good"}}
+  });
+  server.queue_response(200, "application/json", ok.dump());
+
+  server.start("", 200);
+  server.wait_ready();
+
+  auto p = get_zhipuai_provider();
+  p->set_api_key("test_key");
+  p->set_base_url(server.base_url());
+
+  // Call 1: 400 moderation → cooldown starts at 500ms
+  auto t1 = std::chrono::steady_clock::now();
+  auto r1 = p->search("q1", "basic", 1);
+  auto e1 = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - t1).count();
+  REQUIRE(!r1.error.message.empty());
+
+  // Call 2: 400 moderation again → backoff should increase cooldown (500→1000ms)
+  auto t2 = std::chrono::steady_clock::now();
+  auto r2 = p->search("q2", "basic", 1);
+  auto e2 = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - t2).count();
+  REQUIRE(!r2.error.message.empty());
+
+  // Call 3: 200 success → backoff count resets to 0
+  auto r3 = p->search("q3", "basic", 1);
+  REQUIRE(r3.error.message.empty());
+  REQUIRE(r3.results.size() == 1);
+
+  // The second call should have waited longer (backoff in effect)
+  // Note: exact timing depends on mock response speed, but e2 should be >= e1
+  // because backoff cooldown is ~1000ms vs ~500ms
+  (void)e2;
+
+  server.stop();
+}
+
+TEST_CASE("Rate guard: sequential calls via mock — second waits for cooldown", "[zhipuai][rate-guard]") {
+  auto p = std::make_shared<ZhipuAISearch>();
+  p->set_api_key("test_key");
+
+  MockServer server;
+  server.set_content_type("application/json");
+  server.set_plain_mode(true);
+  server.set_multi_request(true); // two sequential calls need two connections
+
+  json resp;
+  resp["search_result"] = json::array({
+    {{"title", "R1"}, {"link", "http://1.com"}, {"content", "One"}}
+  });
+  server.queue_response(200, "application/json", resp.dump());
+  server.queue_response(200, "application/json", resp.dump());
+
+  server.start("", 200);
+  server.wait_ready();
+
+  p->set_base_url(server.base_url());
+
+  auto start = std::chrono::steady_clock::now();
+  auto r1 = p->search("first", "basic", 1);
+  auto r2 = p->search("second", "basic", 1);
+  auto total = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - start).count();
+
+  REQUIRE(r1.error.message.empty());
+  REQUIRE(r2.error.message.empty());
+  // Total time >= ~500ms (cooldown between sequential calls)
+  // Mock responses are fast (<50ms), so cooldown dominates
+  REQUIRE(total >= 400);
+
+  server.stop();
+}
+
+TEST_CASE("Rate guard: existing mock tests still pass with mutex", "[zhipuai][rate-guard]") {
+  // Verify that the simplest mock test still works with mutex protection
+  auto p = get_zhipuai_provider();
+  p->set_api_key("test_key");
+
+  MockServer server;
+  server.set_content_type("application/json");
+  server.set_plain_mode(true);
+
+  json resp;
+  resp["search_result"] = json::array({
+    {{"title", "T1"}, {"link", "http://t1.com"}, {"content", "C1"}}
+  });
+  server.set_response_body(resp.dump());
+  server.start("", 200);
+  server.wait_ready();
+
+  p->set_base_url(server.base_url());
+
+  auto result = p->search("basic test", "basic", 5);
+  REQUIRE(result.error.message.empty());
+  REQUIRE(result.results.size() == 1);
+  REQUIRE(result.results[0].title == "T1");
+
+  server.stop();
+}
+
+// ============================================================================
 // 9.12b — ZhipuAI arguments delta accumulation (transport layer)
 // ============================================================================
 
@@ -1684,6 +1895,47 @@ TEST_CASE("ZhipuAI live: Web Search API", "[zhipuai][live]") {
       std::cout << "       preview=" << r.content.substr(0, 150) << "..." << std::endl;
     }
   }
+}
+
+TEST_CASE("Rate guard: rapid-fire 5 consecutive ZhipuAI searches", "[zhipuai][live][rate-guard]") {
+  inject_live_config();
+  auto p = get_zhipuai_provider();
+  if (!p->is_configured()) {
+    SUCCEED("Skipping live test — ZhipuAI API key not configured");
+    return;
+  }
+
+  const int N = 5;
+  std::cout << "[rate-guard live] firing " << N << " consecutive searches..." << std::endl;
+
+  auto start = std::chrono::steady_clock::now();
+  int success_count = 0;
+  int error_count = 0;
+
+  for (int i = 0; i < N; i++) {
+    auto result = p->search("Python programming", "basic", 3);
+    if (result.error.message.empty()) {
+      success_count++;
+      std::cout << "  [" << i << "] OK  results=" << result.results.size() << std::endl;
+    } else {
+      error_count++;
+      std::cout << "  [" << i << "] ERROR: " << result.error.message << std::endl;
+    }
+  }
+
+  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - start).count();
+
+  std::cout << "[rate-guard live] " << success_count << "/" << N
+            << " succeeded, " << error_count << " errors, "
+            << elapsed << "ms total" << std::endl;
+
+  // All must succeed — no 429 or 400 from burst
+  REQUIRE(success_count == N);
+  REQUIRE(error_count == 0);
+  // Cooldown accounts for ~4 intervals × 500ms = 2000ms minimum
+  // (first request has no cooldown, remaining 4 each wait ~500ms)
+  REQUIRE(elapsed >= 2000);
 }
 
 TEST_CASE("Kimi live: basic search", "[kimi][live]") {

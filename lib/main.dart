@@ -211,6 +211,15 @@ class _ChatScreenState extends State<ChatScreen> {
           'required': ['path'],
         },
       },
+      'get_current_time': const {
+        'name': 'get_current_time',
+        'description': 'Get the current date, time, and timezone. Use this when you need to know the actual current time for time-sensitive queries.',
+        'input_schema': {
+          'type': 'object',
+          'properties': {},
+          'required': [],
+        },
+      },
     };
 
     // Initialize search infra from config (task 8.2)
@@ -490,7 +499,7 @@ class _ChatScreenState extends State<ChatScreen> {
         apiKey: provider.apiKey,
         baseUrl: baseUrl,
         model: agentType.model,
-        systemPrompt: agentType.systemPrompt,
+        systemPrompt: '${agentType.systemPrompt}\nCurrent date: ${DateTime.now().toIso8601String().substring(0, 10)}. For precise time-sensitive queries, use the get_current_time tool.',
         messagesJson: messagesJson,
         toolsJson: toolsJson,
         onChunk: (text) {
@@ -754,6 +763,21 @@ class _ChatScreenState extends State<ChatScreen> {
           'extract_mode': input['extract_mode'] ?? 'text',
         });
         resultJson = await _sidecar.webFetch(request);
+      case 'get_current_time':
+        final now = DateTime.now();
+        final dt = now.toIso8601String();
+        final date = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+        final time = '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}';
+        final tz = now.timeZoneOffset;
+        final tzStr = '${tz.isNegative ? '-' : '+'}${tz.inHours.abs().toString().padLeft(2, '0')}:${tz.inMinutes.abs().remainder(60).toString().padLeft(2, '0')}';
+        resultJson = jsonEncode({
+          'ok': true,
+          'datetime': dt,
+          'date': date,
+          'time': time,
+          'timezone': tzStr,
+          'content': 'Current time: $date $time $tzStr',
+        });
       default:
         resultJson = '{"ok":false,"error":"Unknown tool: $name"}';
     }

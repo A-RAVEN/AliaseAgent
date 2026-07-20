@@ -17,6 +17,7 @@ if %ERRORLEVEL% neq 0 (
 echo [2/4] Building Release sidecar...
 cmake --build sidecar\build\windows --config Release > nul 2>&1
 copy /Y "sidecar\build\windows\Release\sidecar.dll" . > nul 2>&1
+copy /Y "sidecar.dll" "build\windows\x64\runner\Debug\" > nul 2>&1
 copy /Y "build\windows\x64\runner\Debug\libcurl.dll" . > nul 2>&1
 copy /Y "build\windows\x64\runner\Debug\zlib1.dll"  . > nul 2>&1
 
