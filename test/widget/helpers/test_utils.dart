@@ -45,7 +45,7 @@ Message testMessageWithToolCalls({
   String sessionId = 's1',
   String role = 'assistant',
   String content = 'Here is the file content.',
-  String toolCallsJson = '[{"id":"tc1","name":"read_file","input":{"path":"/test/file.txt"},"status":"done","result":"file content here"}]',
+  String toolCallsJson = '[{"id":"tc1","toolName":"read_file","input":{"path":"/test/file.txt"},"status":"done","result":"file content here"}]',
 }) {
   return Message(
     id: id,

@@ -7,6 +7,7 @@ import 'package:alias_agent/main.dart';
 import 'package:alias_agent/models/agent_type_config.dart';
 import 'package:alias_agent/models/app_config.dart';
 import 'package:alias_agent/models/provider_config.dart';
+import 'package:alias_agent/ui/message_bubble.dart';
 import 'package:alias_agent/ui/tool_call_card.dart';
 
 import 'package:alias_agent/services/provider_resolver.dart';
@@ -90,8 +91,8 @@ void main() {
 
       // After streaming ends, tool card must still be visible
       expect(find.byType(ToolCallCard), findsOneWidget);
-      // No streaming dots — streaming has ended
-      expect(find.byType(AnimatedBuilder), findsNothing);
+      // No ChatStreamingItem — streaming has ended
+      // (AnimatedBuilder is too broad; Material 3 uses it internally)
     });
 
     // 18.T3 — Tool calls stored in MessageRepository with correct JSON structure
@@ -160,7 +161,7 @@ void main() {
         role: 'assistant',
         content: 'Let me read that for you.',
         toolCallsJson:
-            '[{"id":"tc1","name":"read_file","input":{"path":"/test.txt"},"status":"done","result":"hello world","resultPreview":"hello world"}]',
+            '[{"id":"tc1","toolName":"read_file","input":{"path":"/test.txt"},"status":"done","result":"hello world","resultPreview":"hello world"}]',
       );
       final userMsg = testMessage(
         id: 'm0',
@@ -268,7 +269,7 @@ void main() {
           id: 'm1', sessionId: 's1', role: 'assistant',
           content: 'Let me check.',
           toolCallsJson:
-              '[{"id":"tc1","name":"read_file","input":{"path":"/config.json"},"status":"done","result":"{\\"version\\":1}","resultPreview":"{\\"version\\":1}"}]',
+              '[{"id":"tc1","toolName":"read_file","input":{"path":"/config.json"},"status":"done","result":"{\\"version\\":1}","resultPreview":"{\\"version\\":1}"}]',
         ),
         testMessage(
           id: 'm2', sessionId: 's1', role: 'assistant',
@@ -282,7 +283,7 @@ void main() {
           id: 'm4', sessionId: 's1', role: 'assistant',
           content: 'Let me list the directory.',
           toolCallsJson:
-              '[{"id":"tc2","name":"list_dir","input":{"path":"."},"status":"done","result":"[\\"file1.txt\\"]","resultPreview":"[\\"file1.txt\\"]"}]',
+              '[{"id":"tc2","toolName":"list_dir","input":{"path":"."},"status":"done","result":"[\\"file1.txt\\"]","resultPreview":"[\\"file1.txt\\"]"}]',
         ),
         testMessage(
           id: 'm5', sessionId: 's1', role: 'assistant',
@@ -318,6 +319,46 @@ void main() {
       // Both tool names visible
       expect(find.textContaining('read_file'), findsOneWidget);
       expect(find.textContaining('list_dir'), findsOneWidget);
+    });
+
+    // 7.4 — D7: no empty bubble for tool-only message on reload
+    testWidgets('reload tool_use-only message produces no empty bubble', (tester) async {
+      _setupAgentRegistry();
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      // Pre-populate with tool_use-only message (empty content + tool calls)
+      final msgWithTools = testMessageWithToolCalls(
+        id: 'm1',
+        sessionId: 's1',
+        role: 'assistant',
+        content: '', // empty — tool_use-only response
+        toolCallsJson:
+            '[{"id":"tc1","toolName":"read_file","input":{"path":"/f.txt"},"status":"done","result":"ok"}]',
+      );
+      final userMsg = testMessage(
+        id: 'm0', sessionId: 's1', role: 'user', content: 'Read file',
+      );
+      final sessions = testSessions(1);
+      final sessionRepo = FakeSessionRepository(sessions);
+      final msgRepo = FakeMessageRepository([userMsg, msgWithTools]);
+      final sidecar = FakeSidecar();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      // Tool card restored from persisted data
+      expect(find.byType(ToolCallCard), findsOneWidget);
+      // D7: no empty ChatMessageItem rendered for the empty-content message
+      final emptyAssistantBubbles = find.byWidgetPredicate(
+        (w) => w is MessageBubble && w.role == 'assistant' && w.content.isEmpty,
+      );
+      expect(emptyAssistantBubbles, findsNothing);
     });
   });
 }

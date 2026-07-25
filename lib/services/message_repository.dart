@@ -27,6 +27,16 @@ class MessageRepository {
     return msg;
   }
 
+  Future<void> updateToolCalls(String id, String toolCallsJson) async {
+    final db = await DatabaseService.database;
+    await db.update(
+      'messages',
+      {'tool_calls': toolCallsJson},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
   Future<List<Message>> queryBySession(String sessionId) async {
     final db = await DatabaseService.database;
     final rows = await db.query(

@@ -362,6 +362,12 @@ class _ChatScreenState extends State<ChatScreen> {
           debugPrint('[AliasAgent] Failed to parse toolCallsJson: $e');
         }
       }
+      // Skip empty ChatMessageItem when tool cards represent the response (D7)
+      if (msg.content.isEmpty &&
+          msg.toolCallsJson != null &&
+          msg.toolCallsJson!.isNotEmpty) {
+        continue;
+      }
       items.add(ChatMessageItem(msg));
     }
     return items;
@@ -480,7 +486,8 @@ class _ChatScreenState extends State<ChatScreen> {
     // Track all tool calls across turns for final assistant message
     final allTurnToolCalls = <Map<String, dynamic>>[];
 
-    for (int turn = 0; turn < 5; turn++) {
+    int turn = 0;
+    while (true) {
       final messagesJson = jsonEncode(apiMessages);
 
       String turnText = '';
@@ -489,11 +496,6 @@ class _ChatScreenState extends State<ChatScreen> {
       int doneCode = 0;
       String? doneError;
       String? doneStopReason;
-
-      // Add streaming item
-      if (_currentId == sessionId && mounted) {
-        setState(() => _chatItems.add(const ChatStreamingItem('')));
-      }
 
       await _sidecar.sendMessage(
         apiKey: provider.apiKey,
@@ -509,6 +511,9 @@ class _ChatScreenState extends State<ChatScreen> {
               final lastIdx = _chatItems.length - 1;
               if (lastIdx >= 0 && _chatItems[lastIdx] is ChatStreamingItem) {
                 _chatItems[lastIdx] = ChatStreamingItem(turnText);
+              } else {
+                // First text chunk — lazily create streaming item
+                _chatItems.add(ChatStreamingItem(turnText));
               }
             });
           }
@@ -602,7 +607,7 @@ class _ChatScreenState extends State<ChatScreen> {
         toolCallsJson: turnJson,
       );
       await _sessionRepo.touch(sessionId);
-      if (_currentId == sessionId && mounted) {
+      if (_currentId == sessionId && mounted && turnText.isNotEmpty) {
         setState(() {
           _chatItems.add(ChatMessageItem(intermediateMsg));
         });
@@ -637,6 +642,8 @@ class _ChatScreenState extends State<ChatScreen> {
             for (int i = 0; i < _chatItems.length; i++) {
               final item = _chatItems[i];
               if (item is ChatToolCallItem && item.activity.id == toolId) {
+                final toolName2 = (tc['name'] as String?) ?? '';
+                final isSearchTool = toolName2 == 'web_search' || toolName2 == 'web_fetch';
                 _chatItems[i] = ChatToolCallItem(item.activity.copyWith(
                   status: result['ok'] == true
                       ? ToolCallStatus.done
@@ -645,6 +652,9 @@ class _ChatScreenState extends State<ChatScreen> {
                   resultPreview: resultContent.length > 300
                       ? '${resultContent.substring(0, 300)}...'
                       : resultContent,
+                  resultSections: isSearchTool
+                      ? _buildResultSections(toolName2, result)
+                      : null,
                 ));
                 break;
               }
@@ -657,6 +667,23 @@ class _ChatScreenState extends State<ChatScreen> {
           'tool_use_id': tc['id'] ?? '',
           'content': resultContent,
         });
+
+        // Enrich turnToolCalls entry with result data for persistence (D6)
+        if (_currentId == sessionId) {
+          for (int j = 0; j < _chatItems.length; j++) {
+            final ci = _chatItems[j];
+            if (ci is ChatToolCallItem && ci.activity.id == toolId) {
+              tc.addAll(ci.activity.toJson());
+              break;
+            }
+          }
+        }
+      }
+
+      // Update intermediate message with enriched tool call data
+      if (_currentId == sessionId) {
+        await _msgRepo.updateToolCalls(
+            intermediateMsg.id, jsonEncode(turnToolCalls));
       }
 
       apiMessages.add({
@@ -668,11 +695,14 @@ class _ChatScreenState extends State<ChatScreen> {
       turnText = '';
       turnToolCalls.clear();
       turnThinkingBlocks.clear();
+      if (turn >= 50) {
+        debugPrint('[AliasAgent] Max tool turns (50) exceeded — aborting');
+        if (_currentId == sessionId) _endStreaming();
+        await _sessionRepo.touch(sessionId);
+        return;
+      }
+      turn++;
     }
-
-    // Max tool turns exceeded
-    if (_currentId == sessionId) _endStreaming();
-    await _sessionRepo.touch(sessionId);
   }
 
   /// Build API conversation messages from persisted Message objects,
@@ -882,7 +912,62 @@ class _ChatScreenState extends State<ChatScreen> {
     return buf.toString().trimRight();
   }
 
-  /// Remove streaming indicator only; tool call cards and messages persist.
+  /// Build structured result sections from raw tool result JSON (for ToolCallCard UI).
+  /// Returns empty list for no results; returns null only when called on non-search tools.
+  List<ResultSection> _buildResultSections(String toolName, Map<String, dynamic> result) {
+    if (result['ok'] != true) return [];
+    if (toolName == 'web_search') {
+      final results = result['results'] as Map<String, dynamic>?;
+      if (results == null || results.isEmpty) return [];
+
+      final sections = <ResultSection>[];
+      for (final ns in results.keys) {
+        final nsData = results[ns] as Map<String, dynamic>?;
+        if (nsData == null) continue;
+
+        if (nsData.containsKey('error')) {
+          sections.add(ResultSection(
+            label: ns.toString(),
+            error: (nsData['error'] as String?) ?? 'Unknown error',
+          ));
+        } else {
+          final items = <ResultItem>[];
+          final rawItems = nsData['results'] as List<dynamic>?;
+          if (rawItems != null) {
+            for (final item in rawItems) {
+              final m = item as Map<String, dynamic>?;
+              if (m != null) {
+                items.add(ResultItem(
+                  title: m['title'] as String?,
+                  url: m['url'] as String?,
+                  content: m['content'] as String?,
+                ));
+              }
+            }
+          }
+          sections.add(ResultSection(label: ns.toString(), items: items));
+        }
+      }
+      return sections;
+    } else if (toolName == 'web_fetch') {
+      final content = (result['content'] as String?) ?? '';
+      if (content.isEmpty) return [];
+      return [
+        ResultSection(
+          label: 'Fetched page',
+          items: [
+            ResultItem(
+              title: (result['url'] as String?) ?? '',
+              content: content,
+            ),
+          ],
+        ),
+      ];
+    }
+    return [];
+  }
+
+  /// Remove streaming indicator only; tool call cards and persistent messages persist.
   void _endStreaming() {
     if (!mounted) return;
     setState(() {

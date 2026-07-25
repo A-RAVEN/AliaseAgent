@@ -89,4 +89,20 @@ class FakeMessageRepository implements MessageRepository {
   Future<List<Message>> queryBySession(String sessionId) async {
     return messages.where((m) => m.sessionId == sessionId).toList();
   }
+
+  @override
+  Future<void> updateToolCalls(String id, String toolCallsJson) async {
+    final idx = messages.indexWhere((m) => m.id == id);
+    if (idx >= 0) {
+      messages[idx] = Message(
+        id: messages[idx].id,
+        sessionId: messages[idx].sessionId,
+        role: messages[idx].role,
+        content: messages[idx].content,
+        toolCallsJson: toolCallsJson,
+        tokenCount: messages[idx].tokenCount,
+        createdAt: messages[idx].createdAt,
+      );
+    }
+  }
 }

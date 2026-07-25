@@ -5,6 +5,7 @@ import 'package:alias_agent/main.dart';
 import 'package:alias_agent/models/agent_type_config.dart';
 import 'package:alias_agent/models/app_config.dart';
 import 'package:alias_agent/models/provider_config.dart';
+import 'package:alias_agent/ui/message_bubble.dart';
 import 'package:alias_agent/ui/tool_call_card.dart';
 
 import 'package:alias_agent/services/provider_resolver.dart';
@@ -150,6 +151,44 @@ void main() {
       expect(find.byType(ToolCallCard), findsOneWidget);
       // Tool name visible
       expect(find.textContaining('read_file'), findsOneWidget);
+    });
+
+    // 7.3 — D5 + D8: no empty bubble for tool_use-only response
+    testWidgets('tool_use-only response produces no empty bubble', (tester) async {
+      _setupAgentRegistry();
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final sessions = testSessions(1);
+      final sessionRepo = FakeSessionRepository(sessions);
+      final msgRepo = FakeMessageRepository();
+      final sidecar = FakeSidecar()
+        ..stubReadFile('{"ok":true,"content":"file content"}')
+        ..queueToolCall('{"name":"read_file","input":{"path":"/test.txt"}}')
+        ..queueDone();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'Read file');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+
+      // Tool card visible and done
+      expect(find.byType(ToolCallCard), findsOneWidget);
+      // No empty assistant bubble (D5: no ChatStreamingItem, D8: no ChatMessageItem)
+      final emptyAssistantBubbles = find.byWidgetPredicate(
+        (w) => w is MessageBubble && w.role == 'assistant' && w.content.isEmpty,
+      );
+      expect(emptyAssistantBubbles, findsNothing);
     });
   });
 }
