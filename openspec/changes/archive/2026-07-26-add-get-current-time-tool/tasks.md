@@ -7,4 +7,4 @@
 ## 2. Verification
 
 - [x] 2.1 Build and launch app: `run.bat`
-- [ ] 2.2 Ask AI "今天是什么日期" — verify it returns correct date without "未来" disclaimer
+- [x] 2.2 Ask AI "今天是什么日期" — verify it returns correct date without "未来" disclaimer
