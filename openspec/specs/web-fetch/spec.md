@@ -91,6 +91,55 @@ The system SHALL enforce a 30-second wall-clock timeout on the Python subprocess
 - **WHEN** the subprocess exits normally
 - **THEN** the system SHALL close all pipe handles and wait for the process to be reaped (preventing zombie processes)
 
+### Requirement: Concurrent pipe reading (deadlock prevention)
+The system SHALL read stdout and stderr pipes concurrently while waiting for the subprocess to exit, on both Windows and POSIX. The system SHALL NOT wait for the process to exit before reading pipe data. After the process exits or is killed, the system SHALL perform a final drain of both pipes (reading until no data remains) before closing handles. Pipe buffers SHALL be created with a size of at least 1MB to accommodate typical output volumes.
+
+#### Scenario: Large stdout does not deadlock
+- **WHEN** the subprocess writes >4KB to stdout (e.g., a 45KB JSON result for a large page)
+- **THEN** the parent process SHALL read stdout data concurrently via non-blocking I/O, the subprocess SHALL NOT block on stdout write, and the full output SHALL be captured
+
+#### Scenario: Large stderr does not deadlock
+- **WHEN** the subprocess writes >4KB to stderr (e.g., environment variable dump + progress logs)
+- **THEN** the parent process SHALL read stderr data concurrently via non-blocking I/O, the subprocess SHALL NOT block on stderr write
+
+#### Scenario: Final drain after process exit
+- **WHEN** the subprocess exits and there is still data in the stdout or stderr pipe buffer
+- **THEN** the system SHALL read all remaining data from both pipes before closing handles and processing the result
+
+#### Scenario: Final drain after timeout kill
+- **WHEN** the subprocess is killed after timeout and there is partial data in the pipe buffer
+- **THEN** the system SHALL read all available remaining data from both pipes before closing handles
+
+### Requirement: Subprocess stderr capture
+The system SHALL capture the subprocess's stderr output via a dedicated pipe and log it to sidecar.log. On success, stderr SHALL be logged at TRACE level. On failure or timeout, stderr SHALL be logged at WARN level. The stderr pipe read SHALL use non-blocking I/O to prevent hangs from orphaned descendant processes holding the write end.
+
+#### Scenario: Successful fetch logs stderr at DEBUG
+- **WHEN** the subprocess completes successfully and produced stderr output (e.g., crawl4ai progress logs)
+- **THEN** the stderr content SHALL be logged via LOG_DEBUG with prefix "web_fetch: subprocess stderr:"
+
+#### Scenario: Failed fetch logs stderr at WARN
+- **WHEN** the subprocess exits with non-zero code or times out
+- **THEN** the stderr content SHALL be logged via LOG_WARN with prefix "web_fetch: subprocess stderr:"
+
+#### Scenario: Orphaned descendant does not hang stderr read
+- **WHEN** the subprocess is killed but a Chromium descendant still holds the stderr write end
+- **THEN** the non-blocking stderr read SHALL return available data without blocking indefinitely
+
+### Requirement: Curl fallback size protection
+The curl fallback path SHALL use `CURLOPT_MAXFILESIZE` (10MB) to reject responses whose Content-Length exceeds the limit before transfer begins. The previous 100KB incremental write callback cap SHALL be removed. For chunked responses without Content-Length, the 15-second timeout SHALL serve as the transfer volume bound.
+
+#### Scenario: Response with large Content-Length rejected
+- **WHEN** the curl fallback fetches a URL whose server responds with `Content-Length: 50000000` (50MB)
+- **THEN** curl SHALL abort before downloading the body, and `web_fetch` SHALL return an error
+
+#### Scenario: Normal page under limit fetched fully
+- **WHEN** the curl fallback fetches a 500KB HTML page
+- **THEN** the full response body SHALL be received and processed without truncation
+
+#### Scenario: Chunked response bounded by timeout
+- **WHEN** the curl fallback fetches a chunked response (no Content-Length) that streams indefinitely
+- **THEN** the 15-second timeout SHALL terminate the transfer
+
 ### Requirement: Python worker URL validation
 The Python worker (`fetch_worker.py`) SHALL perform basic URL validation (scheme check for `http`/`https`) as defense-in-depth before passing the URL to crawl4ai. This SHALL NOT replace C++-side SSRF checks but SHALL prevent accidental misuse if the worker is invoked directly.
 

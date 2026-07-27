@@ -146,6 +146,69 @@ curl fallback 路径（与旧格式兼容，新增 `url` 和 `title` 字段保�
 - **正常退出**: 等待进程退出 → 读取 stdout → 关闭 handles → `waitpid` 回收
 - **已知风险**: 极端情况下 Chromium 子进程可能在被 kill 前脱离进程组（如 double-fork）。Playwright 通常不会这样做，但若发生会残留孤儿进程。进程组 ID 重用可以缓解但不能完全消除。若后续有问题可升级为 OS 级 cgroup/JobObject 隔离。
 
+### D8: 移除 100KB write callback cap
+
+curl fallback 路径的 `fetch_write_callback` 中有一个 100KB 累积上限（`FetchWriteCtx::MAX_RESPONSE_SIZE`），超过后返回 0 中断传输。
+
+**问题**: 100KB 对现代网页太小。B 站等 SPA 页面原始 HTML 轻松超过 100KB，导致 curl fallback 误杀正常请求（`CURLE_WRITE_ERROR` → "Failed writing received data"）。
+
+**分析**: 该 cap 的原始理由是防 zip bomb 和无限流。但 15s 超时已经是天然的流量上限——即使 1Gbps 带宽，15 秒也只能传 ~1.8GB。真正需要防的 gzip 解压炸弹，用 `CURLOPT_MAXFILESIZE`（基于 Content-Length 头）比在 write callback 里硬截断更精确。主观数字 cap 和写死 5 轮循环是同一类问题——用猜测的常量假设外部世界。
+
+**决定**: 移除 write callback 中的 100KB cap，同时添加 `CURLOPT_MAXFILESIZE`（10MB）作为替代防护。该选项基于 Content-Length 头，在传输开始前拒绝声明过大的响应，比在 write callback 里硬截断更精确。对于不发送 Content-Length 的 chunked 响应，15s 超时仍是兜底。crawl4ai 路径不受影响（输出是提取后的 Markdown，天然有界）。
+
+**测试影响**: `search_provider_test.cpp` 中 "write callback caps at 100KB" TEST_CASE（lines 559-577）引用 `FetchWriteCtx::MAX_RESPONSE_SIZE` 并断言 cap 行为。需更新为验证无 cap 行为（正常追加、返回 total）。需用户明确授权修改测试代码。
+
+**注释清理**: `web_fetch.h`（Features 注释、FetchWriteCtx 文档）和 `web_fetch.cpp`（section banner）中描述 100KB cap 的注释需同步更新。
+
+### D9: Python worker stdout 编码修复
+
+`fetch_worker.py` 使用 `print(json.dumps(resp, ensure_ascii=False))` 输出结果。在 Windows 上，stdout 默认编码为 cp1252（系统 locale），无法编码中文字符 → `UnicodeEncodeError` → 进程崩溃 → C++ 读到空 stdout → 误判为 "subprocess produced no output"。
+
+**决定**: 改为 `ensure_ascii=True`（Python json.dumps 默认值）。所有非 ASCII 字符转为 `\uXXXX` 转义序列，对任何 stdout 编码安全。C++ 端 nlohmann/json 能正确解析 `\uXXXX`。
+
+**替代方案**: 也可以用 `sys.stdout.buffer.write(json.dumps(...).encode('utf-8'))` 强制 UTF-8 输出。但 `ensure_ascii=True` 更简单，且 JSON 标准保证 `\uXXXX` 转义在所有解析器中等价。
+
+### D10: 捕获 subprocess stderr 到 sidecar.log
+
+当前 subprocess 的 stderr 直接继承父进程，输出到控制台（或黑洞）。crawl4ai/Python 的错误信息（如 UnicodeEncodeError 的 traceback）完全丢失，无法排查问题。
+
+**决定**: 创建第三个 pipe 捕获 stderr。subprocess 结束后读取 stderr 内容写入 sidecar.log。
+
+- **Windows**: `CreatePipe(&hStdErrRd, &hStdErrWr, &sa, 0)`，`SetHandleInformation(hStdErrRd, HANDLE_FLAG_INHERIT, 0)`（读端不可继承），`si.hStdError = hStdErrWr`。`CreateProcess` 后**立即** `CloseHandle(hStdErrWr)`（父进程关闭 write end，否则 ReadFile 等不到 EOF）。读取用 `PeekNamedPipe` 检查可用数据 + `ReadFile`，避免 blocking hang。
+- **POSIX**: `pipe(pipe_stderr)`，子进程 `dup2(pipe_stderr[1], STDERR_FILENO)` + `close(pipe_stderr[0])`，父进程 `close(pipe_stderr[1])`（关闭 write end）。读取用 `fcntl(O_NONBLOCK)` + `read()`，避免孤儿进程持有 write end 时 blocking hang。
+
+**日志级别**: 成功时 stderr 内容（crawl4ai 进度日志 `[INIT][FETCH][SCRAPE][COMPLETE]`）用 `LOG_DEBUG`；失败/超时时用 `LOG_WARN`。避免每次成功调用产生 WARN 噪音。
+
+stderr 内容仅用于日志，不参与结果解析。
+
+### D11: 修复 Windows pipe 死锁（stdout + stderr）
+
+当前 Windows 路径的读取顺序是：`WaitForSingleObject(进程退出)` → `ReadFile(stdout)` → `PeekNamedPipe(stderr)`。当 subprocess 的 stdout **或 stderr** 输出超过 pipe buffer（Windows 匿名管道默认 4KB）时，Python 端阻塞在 write，进程无法退出；C++ 端等待进程退出后才读——**双向等待，死锁**。30s 超时后 fallback 到 curl。
+
+**stderr 比 stdout 更早触发**：fetch_worker.py 在 import 阶段就 dump 全量环境变量到 stderr（>4KB），此时 stdin 还没读、stdout 还没写。即使只修 stdout 不修 stderr，死锁仍然发生。
+
+小页面（example.com ~300 bytes stdout）不触发，大页面（bilibili ~45KB stdout）必触发。env dump（>4KB stderr）在所有页面都触发。
+
+**决定**: 两层修复：
+
+**第一层：增大 pipe buffer**。`CreatePipe` 的 `nSize` 参数从默认 0（4KB）改为 1MB（stdin/stdout/stderr 三个管道都改）。这覆盖了绝大多数正常场景，一行代码。
+
+**第二层：并发轮询**。Windows 路径改为 `PeekNamedPipe` 同时轮询 stdout 和 stderr + 短间隔 `WaitForSingleObject`（100ms）交替循环。进程退出后做最终 drain（两个管道都读到 PeekNamedPipe 返回 0），确保不丢尾部数据。
+
+```
+loop:
+  PeekNamedPipe(hStdOutRd) → 有数据就 ReadFile → append to output
+  PeekNamedPipe(hStdErrRd) → 有数据就 ReadFile → append to stderr_output
+  WaitForSingleObject(hProcess, 100ms)
+    → WAIT_OBJECT_0: 做最终 drain（两个管道都 PeekNamedPipe+ReadFile 直到 avail==0）→ break
+    → WAIT_TIMEOUT: 继续循环
+  超时检查 → 30s 到就 kill → 做最终 drain → break
+```
+
+**POSIX 路径**：stdout 已有 `select()` 并发读取，不受影响。stderr 当前不在 `select()` 里，但 POSIX pipe buffer 是 64KB，env dump 通常不超。将 stderr 加入 `select()` 的 fd_set 作为加固。
+
+**替代方案考虑**：只增大 pipe buffer 不做并发轮询 → 如果页面内容 >1MB 仍然死锁。两层一起做才完整。
+
 ## Risks / Trade-offs
 
 - [crawl4ai 未安装] 用户没跑 `pip install crawl4ai` → C++ fallback 到旧 curl 实现，log info 提示

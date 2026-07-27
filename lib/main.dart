@@ -292,7 +292,7 @@ class _ChatScreenState extends State<ChatScreen> {
       // Task 8.4: Add web_fetch tool definition
       base['web_fetch'] = const {
         'name': 'web_fetch',
-        'description': 'Fetch the text content of a web page by URL. '
+        'description': 'Fetch a web page and return clean, structured content. '
             'Use this to get full article text when search snippets are insufficient.',
         'input_schema': {
           'type': 'object',
@@ -300,12 +300,6 @@ class _ChatScreenState extends State<ChatScreen> {
             'url': {
               'type': 'string',
               'description': 'The URL of the web page to fetch.',
-            },
-            'extract_mode': {
-              'type': 'string',
-              'enum': ['text'],
-              'default': 'text',
-              'description': 'Extraction mode. Only "text" is supported in v1.',
             },
           },
           'required': ['url'],
@@ -790,7 +784,6 @@ class _ChatScreenState extends State<ChatScreen> {
       case 'web_fetch':
         final request = jsonEncode({
           'url': input['url'] ?? '',
-          'extract_mode': input['extract_mode'] ?? 'text',
         });
         resultJson = await _sidecar.webFetch(request);
       case 'get_current_time':
@@ -952,12 +945,16 @@ class _ChatScreenState extends State<ChatScreen> {
     } else if (toolName == 'web_fetch') {
       final content = (result['content'] as String?) ?? '';
       if (content.isEmpty) return [];
+      final pageTitle = (result['title'] as String?) ?? '';
+      final pageUrl = (result['url'] as String?) ?? '';
+      final displayTitle = pageTitle.isNotEmpty ? pageTitle : (pageUrl.isNotEmpty ? pageUrl : 'Fetched page');
       return [
         ResultSection(
           label: 'Fetched page',
           items: [
             ResultItem(
-              title: (result['url'] as String?) ?? '',
+              title: displayTitle,
+              url: pageUrl.isNotEmpty ? pageUrl : null,
               content: content,
             ),
           ],

@@ -7,6 +7,26 @@
 #include <cstring>
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <chrono>
+#include <thread>
+
+// Platform-specific subprocess headers
+#ifdef _WIN32
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+#else
+#include <unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <sys/select.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#endif
 
 using json = nlohmann::json;
 
@@ -14,8 +34,8 @@ using json = nlohmann::json;
 // Constants
 // ============================================================================
 
-// Write callback cap (100KB)
-// MAX_RESPONSE_SIZE defined in FetchWriteCtx in web_fetch.h
+// Write callback — appends received data to FetchWriteCtx body.
+// Size protection via CURLOPT_MAXFILESIZE (pre-transfer) and 15s timeout.
 
 // Timeout values
 static const long FETCH_TIMEOUT_SEC = 15L;
@@ -23,6 +43,525 @@ static const long FETCH_CONNECT_TIMEOUT_SEC = 15L;
 
 // Max redirect hops
 static const long MAX_REDIRECTS = 5L;
+
+// Subprocess timeout (30s for crawl4ai — browser startup + render)
+static const long SUBPROCESS_TIMEOUT_SEC = 30L;
+
+// ============================================================================
+// Python availability detection (cached at startup)
+// ============================================================================
+
+static bool g_python_available = false;
+static bool g_python_checked = false;
+#ifdef _WIN32
+static const char* PYTHON_BINARIES[] = {"python", "python3", nullptr};
+#else
+static const char* PYTHON_BINARIES[] = {"python3", "python", nullptr};
+#endif
+
+static void detect_python() {
+  if (g_python_checked) return;
+  g_python_checked = true;
+  for (int i = 0; PYTHON_BINARIES[i] != nullptr; ++i) {
+    std::string cmd = std::string(PYTHON_BINARIES[i]) + " --version";
+#ifdef _WIN32
+    FILE* fp = _popen(cmd.c_str(), "r");
+#else
+    FILE* fp = popen(cmd.c_str(), "r");
+#endif
+    if (fp) {
+      char buf[128] = {0};
+      if (fgets(buf, sizeof(buf), fp) && buf[0] != '\0') {
+        int ret = -1;
+#ifdef _WIN32
+        ret = _pclose(fp);
+#else
+        ret = pclose(fp);
+#endif
+        if (ret == 0) {
+          g_python_available = true;
+          LOG_INFO("Python detected: " + std::string(buf));
+          return;
+        }
+      } else {
+#ifdef _WIN32
+        _pclose(fp);
+#else
+        pclose(fp);
+#endif
+      }
+    }
+  }
+  LOG_INFO("Python not found on PATH — web_fetch will use curl fallback");
+}
+
+// ============================================================================
+// Script path resolution
+// ============================================================================
+
+/// Locate fetch_worker.py relative to the sidecar DLL/SO location.
+/// Searches: ../scripts/ (dev layout), ../share/aliasagent/scripts/ (installed layout)
+static std::string resolve_script_path() {
+#ifdef _WIN32
+  char dll_path[MAX_PATH] = {0};
+  HMODULE hModule = nullptr;
+  // Get handle to this DLL — use a static variable address trick
+  static int dummy = 0;
+  GetModuleHandleExA(
+    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    (LPCSTR)&dummy, &hModule);
+  if (hModule) {
+    GetModuleFileNameA(hModule, dll_path, sizeof(dll_path));
+  }
+#else
+  char dll_path[4096] = {0};
+  // Read /proc/self/maps to find the .so path (simpler than dladdr for static builds)
+  FILE* maps = fopen("/proc/self/maps", "r");
+  if (maps) {
+    char line[4096];
+    while (fgets(line, sizeof(line), maps)) {
+      if (strstr(line, "sidecar.so") || strstr(line, "libsidecar")) {
+        char* path_start = strchr(line, '/');
+        if (path_start) {
+          char* end = strchr(path_start, '\n');
+          if (end) *end = '\0';
+          strncpy(dll_path, path_start, sizeof(dll_path) - 1);
+          break;
+        }
+      }
+    }
+    fclose(maps);
+  }
+#endif
+
+  std::string dir;
+  if (dll_path[0] != '\0') {
+    dir = dll_path;
+    size_t last_sep = dir.find_last_of("\\/");
+    if (last_sep != std::string::npos) {
+      dir = dir.substr(0, last_sep);
+    }
+  }
+
+  // Check candidate paths
+  const char* candidates[] = {
+    "/../scripts/fetch_worker.py",
+    "/scripts/fetch_worker.py",
+    "/../share/aliasagent/scripts/fetch_worker.py",
+    "/share/aliasagent/scripts/fetch_worker.py",
+  };
+
+  for (const auto* suffix : candidates) {
+    std::string candidate = dir + suffix;
+    FILE* test = fopen(candidate.c_str(), "r");
+    if (test) {
+      fclose(test);
+      LOG_INFO("Found fetch_worker.py at: " + candidate);
+      return candidate;
+    }
+  }
+
+  // Last resort: check CWD-relative
+  const char* cwd_candidates[] = {
+    "scripts/fetch_worker.py",
+    "../scripts/fetch_worker.py",
+  };
+  for (const auto* c : cwd_candidates) {
+    FILE* test = fopen(c, "r");
+    if (test) {
+      fclose(test);
+      LOG_INFO("Found fetch_worker.py at (CWD): " + std::string(c));
+      return c;
+    }
+  }
+
+  LOG_INFO("fetch_worker.py not found");
+  return "scripts/fetch_worker.py";  // best guess; launch will fail if missing
+}
+
+// ============================================================================
+// SSRF pre-spawn check (hostname → IP resolution + blocklist)
+// ============================================================================
+
+/// Check if a hostname (already extracted from URL) resolves to a blocked IP.
+/// Returns true if BLOCKED (SSRF), false if safe.
+static bool is_hostname_ssrf_blocked(const std::string& hostname) {
+  // First: check if it's a literal IPv4 address
+  struct in_addr ip4;
+#ifdef _WIN32
+  if (InetPtonA(AF_INET, hostname.c_str(), &ip4) == 1) {
+#else
+  if (inet_pton(AF_INET, hostname.c_str(), &ip4) == 1) {
+#endif
+    uint32_t ip = ntohl(ip4.s_addr);
+    if (is_blocked_ipv4(ip)) {
+      LOG_WARN("SSRF: blocked literal IPv4 address: " + hostname);
+      return true;
+    }
+    return false;  // valid public IP literal, allow
+  }
+
+  // Check if it's a literal IPv6 address (bracket notation stripped by caller)
+  struct in6_addr ip6;
+#ifdef _WIN32
+  if (InetPtonA(AF_INET6, hostname.c_str(), &ip6) == 1) {
+#else
+  if (inet_pton(AF_INET6, hostname.c_str(), &ip6) == 1) {
+#endif
+    if (is_blocked_ipv6(ip6.s6_addr)) {
+      LOG_WARN("SSRF: blocked literal IPv6 address: " + hostname);
+      return true;
+    }
+    return false;
+  }
+
+  // Not a literal IP — resolve via DNS and check ALL returned addresses
+  struct addrinfo hints = {};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo* result = nullptr;
+
+  int ret = getaddrinfo(hostname.c_str(), nullptr, &hints, &result);
+  if (ret != 0) {
+    LOG_WARN("SSRF: DNS resolution failed for " + hostname + " — " + gai_strerror(ret));
+    // Conservative: block on DNS failure (don't allow blind bypass)
+    return true;
+  }
+
+  bool blocked = false;
+  for (struct addrinfo* rp = result; rp != nullptr; rp = rp->ai_next) {
+    if (rp->ai_family == AF_INET) {
+      struct sockaddr_in* addr4 = reinterpret_cast<struct sockaddr_in*>(rp->ai_addr);
+      uint32_t ip = ntohl(addr4->sin_addr.s_addr);
+      if (is_blocked_ipv4(ip)) {
+        LOG_WARN("SSRF: DNS-resolved blocked IPv4: " + hostname);
+        blocked = true;
+        break;
+      }
+    } else if (rp->ai_family == AF_INET6) {
+      struct sockaddr_in6* addr6 = reinterpret_cast<struct sockaddr_in6*>(rp->ai_addr);
+      if (is_blocked_ipv6(addr6->sin6_addr.s6_addr)) {
+        LOG_WARN("SSRF: DNS-resolved blocked IPv6: " + hostname);
+        blocked = true;
+        break;
+      }
+    }
+  }
+
+  freeaddrinfo(result);
+  return blocked;
+}
+
+// ============================================================================
+// crawl4ai subprocess execution with timeout
+// ============================================================================
+
+/// Run the crawl4ai Python subprocess and return the JSON result string.
+/// On failure (timeout, subprocess error, script not found), returns empty string
+/// so the caller can fall back to curl.
+static std::string run_crawl4ai_subprocess(const std::string& url,
+                                            const std::string& script_path) {
+  // Detect Python binary
+  const char* python_bin = nullptr;
+  for (int i = 0; PYTHON_BINARIES[i] != nullptr; ++i) {
+    std::string cmd = std::string(PYTHON_BINARIES[i]) + " --version";
+#ifdef _WIN32
+    FILE* test = _popen(cmd.c_str(), "r");
+#else
+    FILE* test = popen(cmd.c_str(), "r");
+#endif
+    if (test) {
+#ifdef _WIN32
+      _pclose(test);
+#else
+      pclose(test);
+#endif
+      python_bin = PYTHON_BINARIES[i];
+      break;
+    }
+  }
+  if (!python_bin) {
+    LOG_WARN("web_fetch: Python not available at subprocess call time");
+    return "";
+  }
+
+  std::string cmd = std::string(python_bin) + " \"" + script_path + "\"";
+
+#ifdef _WIN32
+  // Windows: CreateProcess with pipes (stdin, stdout, stderr)
+  HANDLE hStdInRd = nullptr, hStdInWr = nullptr;
+  HANDLE hStdOutRd = nullptr, hStdOutWr = nullptr;
+  HANDLE hStdErrRd = nullptr, hStdErrWr = nullptr;
+  SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
+
+  if (!CreatePipe(&hStdInRd, &hStdInWr, &sa, 1024 * 1024) ||
+      !CreatePipe(&hStdOutRd, &hStdOutWr, &sa, 1024 * 1024) ||
+      !CreatePipe(&hStdErrRd, &hStdErrWr, &sa, 1024 * 1024)) {
+    LOG_WARN("web_fetch: failed to create pipes");
+    return "";
+  }
+  SetHandleInformation(hStdInWr, HANDLE_FLAG_INHERIT, 0);
+  SetHandleInformation(hStdOutRd, HANDLE_FLAG_INHERIT, 0);
+  SetHandleInformation(hStdErrRd, HANDLE_FLAG_INHERIT, 0);
+
+  PROCESS_INFORMATION pi = {};
+  STARTUPINFOA si = {};
+  si.cb = sizeof(si);
+  si.hStdInput = hStdInRd;
+  si.hStdOutput = hStdOutWr;
+  si.hStdError = hStdErrWr;
+  si.dwFlags |= STARTF_USESTDHANDLES;
+
+  // Create process in a job object for process-tree cleanup
+  HANDLE hJob = CreateJobObjectA(nullptr, nullptr);
+  if (hJob) {
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
+    jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+  }
+
+  std::vector<char> cmd_buf(cmd.begin(), cmd.end());
+  cmd_buf.push_back('\0');
+  BOOL ok = CreateProcessA(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE,
+                           CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+
+  CloseHandle(hStdInRd);
+  CloseHandle(hStdOutWr);
+  CloseHandle(hStdErrWr);  // parent closes write end so ReadFile gets EOF
+
+  if (!ok) {
+    LOG_WARN("web_fetch: CreateProcess failed: " + std::to_string(GetLastError()));
+    CloseHandle(hStdInWr);
+    CloseHandle(hStdOutRd);
+    CloseHandle(hStdErrRd);
+    if (hJob) CloseHandle(hJob);
+    return "";
+  }
+
+  if (hJob) {
+    AssignProcessToJobObject(hJob, pi.hProcess);
+  }
+  CloseHandle(pi.hThread);
+
+  // Write request to stdin
+  json req;
+  req["url"] = url;
+  std::string req_str = req.dump() + "\n";
+  DWORD written = 0;
+  WriteFile(hStdInWr, req_str.c_str(), (DWORD)req_str.size(), &written, nullptr);
+  CloseHandle(hStdInWr);
+
+  // Concurrent read loop: poll stdout + stderr while waiting for process exit
+  std::string output;
+  std::string stderr_output;
+  auto start_time = std::chrono::steady_clock::now();
+  bool process_exited = false;
+  bool timed_out = false;
+
+  auto drain_pipe = [](HANDLE hPipe, std::string& dest) {
+    DWORD avail = 0;
+    while (PeekNamedPipe(hPipe, nullptr, 0, nullptr, &avail, nullptr) && avail > 0) {
+      char buf[4096];
+      DWORD rd = 0;
+      DWORD to_read = (avail < sizeof(buf) - 1) ? avail : sizeof(buf) - 1;
+      if (!ReadFile(hPipe, buf, to_read, &rd, nullptr) || rd == 0) break;
+      buf[rd] = '\0';
+      dest += buf;
+    }
+  };
+
+  while (true) {
+    // Drain both pipes (non-blocking)
+    drain_pipe(hStdOutRd, output);
+    drain_pipe(hStdErrRd, stderr_output);
+
+    // Check process state
+    DWORD wr = WaitForSingleObject(pi.hProcess, 100);
+    if (wr == WAIT_OBJECT_0) {
+      // Process exited — final drain to capture remaining buffered data
+      drain_pipe(hStdOutRd, output);
+      drain_pipe(hStdErrRd, stderr_output);
+      process_exited = true;
+      break;
+    }
+
+    // Timeout check
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+      std::chrono::steady_clock::now() - start_time).count();
+    if (elapsed >= SUBPROCESS_TIMEOUT_SEC) {
+      timed_out = true;
+      LOG_WARN("web_fetch: subprocess timed out after " +
+               std::to_string(SUBPROCESS_TIMEOUT_SEC) + "s");
+      if (hJob) {
+        TerminateJobObject(hJob, 1);
+      } else {
+        TerminateProcess(pi.hProcess, 1);
+      }
+      WaitForSingleObject(pi.hProcess, 2000);
+      // Final drain after kill
+      drain_pipe(hStdOutRd, output);
+      drain_pipe(hStdErrRd, stderr_output);
+      break;
+    }
+  }
+
+  CloseHandle(hStdOutRd);
+  CloseHandle(hStdErrRd);
+  CloseHandle(pi.hProcess);
+  if (hJob) CloseHandle(hJob);
+
+  if (!stderr_output.empty()) {
+    if (process_exited) {
+      LOG_TRACE("web_fetch: subprocess stderr: " + stderr_output);
+    } else {
+      LOG_WARN("web_fetch: subprocess stderr: " + stderr_output);
+    }
+  }
+
+  if (timed_out) {
+    return "";  // timeout → fallback
+  }
+
+#else
+  // POSIX: fork + exec with pipes (stdin, stdout, stderr)
+  int pipe_stdin[2], pipe_stdout[2], pipe_stderr[2];
+  if (pipe(pipe_stdin) != 0 || pipe(pipe_stdout) != 0 || pipe(pipe_stderr) != 0) {
+    LOG_WARN("web_fetch: failed to create pipes");
+    return "";
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    LOG_WARN("web_fetch: fork failed");
+    close(pipe_stdin[0]); close(pipe_stdin[1]);
+    close(pipe_stdout[0]); close(pipe_stdout[1]);
+    close(pipe_stderr[0]); close(pipe_stderr[1]);
+    return "";
+  }
+
+  if (pid == 0) {
+    // Child: redirect stdin/stdout/stderr, exec Python
+    dup2(pipe_stdin[0], STDIN_FILENO);
+    dup2(pipe_stdout[1], STDOUT_FILENO);
+    dup2(pipe_stderr[1], STDERR_FILENO);
+    close(pipe_stdin[1]); close(pipe_stdout[0]);
+    close(pipe_stderr[0]);
+
+    // Create new process group for cleanup
+    setpgid(0, 0);
+
+    execlp(python_bin, python_bin, script_path.c_str(), (char*)nullptr);
+    _exit(127);  // exec failed
+  }
+
+  // Parent
+  close(pipe_stdin[0]);
+  close(pipe_stdout[1]);
+  close(pipe_stderr[1]);  // close write end so read gets EOF
+
+  // Write request to child's stdin
+  json req;
+  req["url"] = url;
+  std::string req_str = req.dump() + "\n";
+  write(pipe_stdin[1], req_str.c_str(), req_str.size());
+  close(pipe_stdin[1]);
+
+  // Read response with timeout using select (stdout + stderr concurrently)
+  std::string output;
+  std::string stderr_output;
+  auto start = std::chrono::steady_clock::now();
+  bool timed_out = false;
+  int maxfd = (pipe_stdout[0] > pipe_stderr[0] ? pipe_stdout[0] : pipe_stderr[0]) + 1;
+
+  while (true) {
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(pipe_stdout[0], &fds);
+    FD_SET(pipe_stderr[0], &fds);
+
+    struct timeval tv;
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+      std::chrono::steady_clock::now() - start).count();
+    long remaining = SUBPROCESS_TIMEOUT_SEC - static_cast<long>(elapsed);
+    if (remaining <= 0) {
+      timed_out = true;
+      break;
+    }
+    tv.tv_sec = remaining;
+    tv.tv_usec = 0;
+
+    int sel_ret = select(maxfd, &fds, nullptr, nullptr, &tv);
+    if (sel_ret < 0) break;
+    if (sel_ret == 0) {
+      timed_out = true;
+      break;
+    }
+
+    char buf[4096];
+    if (FD_ISSET(pipe_stdout[0], &fds)) {
+      ssize_t n = read(pipe_stdout[0], buf, sizeof(buf) - 1);
+      if (n <= 0) { FD_CLR(pipe_stdout[0], &fds); }
+      else { buf[n] = '\0'; output += buf; }
+    }
+    if (FD_ISSET(pipe_stderr[0], &fds)) {
+      ssize_t n = read(pipe_stderr[0], buf, sizeof(buf) - 1);
+      if (n <= 0) { FD_CLR(pipe_stderr[0], &fds); }
+      else { buf[n] = '\0'; stderr_output += buf; }
+    }
+  }
+
+  if (timed_out) {
+    LOG_WARN("web_fetch: subprocess timed out after " +
+             std::to_string(SUBPROCESS_TIMEOUT_SEC) + "s — sending SIGKILL to pgid");
+    killpg(pid, SIGKILL);
+  }
+
+  close(pipe_stdout[0]);
+  int status = 0;
+  waitpid(pid, &status, 0);
+
+  // Final drain of stderr (select loop may have left data)
+  {
+    int flags = fcntl(pipe_stderr[0], F_GETFL, 0);
+    fcntl(pipe_stderr[0], F_SETFL, flags | O_NONBLOCK);
+    char ebuf[4096];
+    ssize_t n;
+    while ((n = read(pipe_stderr[0], ebuf, sizeof(ebuf) - 1)) > 0) {
+      ebuf[n] = '\0';
+      stderr_output += ebuf;
+    }
+  }
+  close(pipe_stderr[0]);
+
+  bool success = !timed_out && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+  if (!stderr_output.empty()) {
+    if (success) {
+      LOG_TRACE("web_fetch: subprocess stderr: " + stderr_output);
+    } else {
+      LOG_WARN("web_fetch: subprocess stderr: " + stderr_output);
+    }
+  }
+
+  if (!success) {
+    LOG_WARN("web_fetch: subprocess failed (exit=" +
+             std::to_string(WIFEXITED(status) ? WEXITSTATUS(status) : -1) + ")");
+    return "";
+  }
+#endif
+
+  // Parse output — first line is JSON
+  if (output.empty()) {
+    LOG_WARN("web_fetch: subprocess produced no output");
+    return "";
+  }
+
+  // Strip trailing newline
+  while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
+    output.pop_back();
+  }
+  LOG_INFO("web_fetch: crawl4ai returned " + std::to_string(output.size()) + " bytes");
+  return output;
+}
 
 // ============================================================================
 // URL pre-flight helpers (task 3.2)
@@ -173,25 +712,12 @@ static curl_socket_t opensocket_callback(void* clientp, curlsocktype purpose,
 }
 
 // ============================================================================
-// Write callback with incremental size cap (task 3.3)
+// Write callback — appends received data
 // ============================================================================
 
 size_t fetch_write_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
   auto* ctx = static_cast<FetchWriteCtx*>(userdata);
   size_t total = size * nmemb;
-
-  // Incremental size check — abort if >100KB
-  if (ctx->accumulated + total > FetchWriteCtx::MAX_RESPONSE_SIZE) {
-    // Cap at exactly 100KB
-    size_t remaining = FetchWriteCtx::MAX_RESPONSE_SIZE - ctx->accumulated;
-    if (remaining > 0) {
-      ctx->body.append(ptr, remaining);
-      ctx->accumulated += remaining;
-    }
-    LOG_WARN("web_fetch: response exceeded 100KB cap — transfer aborted");
-    return 0; // abort transfer
-  }
-
   ctx->body.append(ptr, total);
   ctx->accumulated += total;
   return total;
@@ -288,11 +814,8 @@ std::string web_fetch_impl(const std::string& request_json) {
       return "{\"ok\":false,\"error\":\"URL is empty\"}";
     }
 
-    // Extract mode — v1 only supports "text"
-    std::string extract_mode = req.value("extract_mode", "text");
-    if (extract_mode != "text") {
-      return "{\"ok\":false,\"error\":\"extract_mode '\" + tools::json_escape(extract_mode) + \"' not supported (v1 only supports 'text')\"}";
-    }
+    // extract_mode is deprecated — crawl4ai always produces markdown, curl produces tag-stripped text
+    // Keep parameter parsing for backward compat but ignore the value
 
     // ---- URL pre-flight checks (task 3.2) ----
 
@@ -320,7 +843,60 @@ std::string web_fetch_impl(const std::string& request_json) {
 
     LOG_INFO("web_fetch: url=" + url);
 
-    // ---- Setup curl ----
+    // ---- Try crawl4ai subprocess if Python is available ----
+
+    detect_python();  // lazy-init at first web_fetch call
+
+    if (g_python_available) {
+      // SSRF pre-spawn check: validate resolved IPs before spawning subprocess
+      // Extract hostname (already done above for localhost, redo for IP check)
+      std::string ssrf_hostname;
+      size_t hs = url_lower.find("://");
+      if (hs != std::string::npos) {
+        hs += 3;
+        // Strip IPv6 bracket notation [::1] → ::1
+        std::string raw_host;
+        size_t he = url_lower.find_first_of("/:@", hs);
+        if (he == std::string::npos) he = url_lower.size();
+        raw_host = url_lower.substr(hs, he - hs);
+        if (!raw_host.empty() && raw_host.front() == '[' && raw_host.back() == ']') {
+          ssrf_hostname = raw_host.substr(1, raw_host.size() - 2);
+        } else {
+          ssrf_hostname = raw_host;
+        }
+      }
+
+      if (!ssrf_hostname.empty() && is_hostname_ssrf_blocked(ssrf_hostname)) {
+        return "{\"ok\":false,\"error\":\"Fetch failed: internal address not allowed\"}";
+      }
+
+      // Launch subprocess
+      std::string script_path = resolve_script_path();
+      std::string subprocess_result = run_crawl4ai_subprocess(url, script_path);
+
+      if (!subprocess_result.empty()) {
+        // Validate that the subprocess returned valid JSON
+        try {
+          auto parsed = json::parse(subprocess_result);
+          if (parsed.contains("ok") && parsed["ok"].is_boolean() && parsed["ok"].get<bool>()) {
+            // Ensure url field is present
+            if (!parsed.contains("url")) parsed["url"] = url;
+            if (!parsed.contains("title")) parsed["title"] = "";
+            LOG_INFO("web_fetch: crawl4ai success — " +
+                     std::to_string(parsed.value("content", "").size()) + " chars");
+            return parsed.dump();
+          }
+          // Subprocess returned ok:false — fall through to curl
+          LOG_WARN("web_fetch: crawl4ai returned error: " +
+                   parsed.value("error", "unknown"));
+        } catch (...) {
+          LOG_WARN("web_fetch: crawl4ai returned invalid JSON — falling back to curl");
+        }
+      }
+      LOG_INFO("web_fetch: crawl4ai path failed — falling back to curl");
+    }
+
+    // ---- Setup curl (fallback) ----
 
     CURL* curl = curl_easy_init();
     if (!curl) {
@@ -340,6 +916,7 @@ std::string web_fetch_impl(const std::string& request_json) {
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(curl, CURLOPT_MAXFILESIZE, 10L * 1024 * 1024);  // 10MB — reject oversized responses pre-transfer
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "AliasAgent/1.0 WebFetcher");
     curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, opensocket_callback);
@@ -408,9 +985,11 @@ std::string web_fetch_impl(const std::string& request_json) {
       }
     }
 
-    // Build result JSON
+    // Build result JSON (includes url + title for consistency with crawl4ai path)
     json result;
     result["ok"] = true;
+    result["url"] = url;
+    result["title"] = "";
     result["content"] = body;
     return result.dump();
 

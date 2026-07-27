@@ -553,31 +553,23 @@ TEST_CASE("SSRF: is_blocked_ipv6 public IP allowed", "[ssrf]") {
 }
 
 // ============================================================================
-// 9.7a — fetch_write_callback 100KB cap
+// 9.7a — fetch_write_callback accepts content beyond old 100KB limit
 // ============================================================================
 
-TEST_CASE("web_fetch: write callback caps at 100KB", "[web_fetch][write_callback]") {
+TEST_CASE("web_fetch: write callback accepts large content (no cap)", "[web_fetch][write_callback]") {
   FetchWriteCtx ctx;
-  const char* data = "A"; // 1 byte
-
-  // Write exactly 100KB — should succeed
-  for (size_t i = 0; i < FetchWriteCtx::MAX_RESPONSE_SIZE; ++i) {
-    size_t written = fetch_write_callback(const_cast<char*>(data), 1, 1, &ctx);
-    if (i < FetchWriteCtx::MAX_RESPONSE_SIZE - 1) {
-      // Before cap, each byte should be written (returns 1)
-      // The callback returns size * nmemb = 1
-    }
+  // Write 200KB in 2000 chunks of 100 bytes — exceeds old 100KB cap
+  std::string chunk(100, 'B');
+  for (int i = 0; i < 2000; ++i) {
+    size_t written = fetch_write_callback(const_cast<char*>(chunk.data()), 1, 100, &ctx);
+    REQUIRE(written == 100); // all chunks accepted
   }
-  REQUIRE(ctx.body.size() == FetchWriteCtx::MAX_RESPONSE_SIZE);
-
-  // Now write one more byte — should be rejected
-  size_t written = fetch_write_callback(const_cast<char*>(data), 1, 1, &ctx);
-  REQUIRE(written == 0); // transfer aborted
-  REQUIRE(ctx.body.size() == FetchWriteCtx::MAX_RESPONSE_SIZE); // no more added
+  REQUIRE(ctx.body.size() == 200000);
+  REQUIRE(ctx.accumulated == 200000);
 }
 
 // ============================================================================
-// 9.5c — Normal content under 100KB
+// 9.5c — Normal content append
 // ============================================================================
 
 TEST_CASE("web_fetch: write callback allows normal content", "[web_fetch][write_callback]") {

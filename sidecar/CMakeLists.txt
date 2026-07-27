@@ -59,6 +59,10 @@ target_link_libraries(sidecar PUBLIC CURL::libcurl ${PLATFORM_LIB})
 
 # Install
 install(TARGETS sidecar LIBRARY DESTINATION lib)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/fetch_worker.py"
+        DESTINATION share/aliasagent/scripts)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/requirements.txt"
+        DESTINATION share/aliasagent/scripts)
 
 # ============================================================================
 # Tests

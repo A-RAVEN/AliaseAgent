@@ -78,7 +78,7 @@ The system SHALL render all search results as individual items when the tool cal
 
 #### Scenario: Expanded card for web_fetch
 - **WHEN** a web_fetch card is expanded
-- **THEN** the fetched page URL and content SHALL be displayed, with the URL rendered as a clickable link
+- **THEN** the fetched page title (if available) SHALL be displayed as the result item title, the URL SHALL be displayed as a clickable link, and the markdown content SHALL be displayed as the result body
 
 ### Requirement: URL click interaction
 The system SHALL render result URLs as clickable elements that open the link in the system's default web browser.
