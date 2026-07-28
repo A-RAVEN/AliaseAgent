@@ -1,5 +1,12 @@
 ## ADDED Requirements
 
+### Requirement: ping FFI call returns pong
+The system SHALL verify that `ping` FFI function returns "pong", confirming basic FFI bridge connectivity.
+
+#### Scenario: ping returns pong
+- **WHEN** `ping` is called via FFI
+- **THEN** the function returns the string "pong"
+
 ### Requirement: set_workspace FFI call succeeds
 The system SHALL verify that `set_workspace` FFI function can be called and returns a valid result.
 
@@ -41,3 +48,29 @@ The system SHALL verify that `DynamicLibrary.open('sidecar.dll')` succeeds.
 #### Scenario: DLL loads successfully
 - **WHEN** `DynamicLibrary.open` is called with the path to `sidecar.dll`
 - **THEN** no `ArgumentError` is thrown, indicating all DLL dependencies are resolved, and `read_file` symbol can be looked up
+
+### Requirement: web_fetch SSRF pre-spawn check blocks internal IPs
+The system SHALL verify that `web_fetch` rejects internal/private IP addresses at the SSRF pre-spawn check stage, without making any network request.
+
+#### Scenario: Literal private IPv4 blocked
+- **WHEN** `web_fetch` is called with `{"url":"http://192.168.1.1/"}`
+- **THEN** the function returns `{"ok":false}` with an error containing "internal address" or "not allowed", without spawning a subprocess or making a network request
+
+#### Scenario: Loopback blocked
+- **WHEN** `web_fetch` is called with `{"url":"http://127.0.0.1:8080/"}`
+- **THEN** the function returns an SSRF error
+
+#### Scenario: file:// scheme blocked
+- **WHEN** `web_fetch` is called with `{"url":"file:///etc/passwd"}`
+- **THEN** the function returns a scheme error containing "not allowed"
+
+#### Scenario: localhost hostname blocked
+- **WHEN** `web_fetch` is called with `{"url":"http://localhost/admin"}`
+- **THEN** the function returns an SSRF error containing "internal address"
+
+### Requirement: read_file requires set_workspace first
+The system SHALL call `set_workspace` before `read_file` or `list_dir` in all tests, as these functions resolve paths relative to the workspace directory.
+
+#### Scenario: read_file after set_workspace
+- **WHEN** `set_workspace` is called with the project root, then `read_file` is called with `pubspec.yaml`
+- **THEN** the file content is returned successfully
