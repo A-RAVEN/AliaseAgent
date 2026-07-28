@@ -18,3 +18,4 @@ Flutter 桌面 AI 对话应用，通过 dart:ffi 调用 C++ Sidecar 动态库（
 - **不要写 STOP HERE 门禁** — tasks.md 中不要在 phase 之间插入 `⛔ STOP HERE` 标记。任务应写为连续的 checklist，一口气全部执行。
 - **调试参考** — 排查 C++ sidecar 问题时，参考 `DEBUGGING.md` 了解日志级别、崩溃诊断、API 错误日志、FFI 追踪和 ASan 构建模式。
 - **禁止修改验收标准** — 不得为了通过验收而修改测试代码、tasks.md、spec、design 或其他验收标准文件，除非经过用户明确允许。包括且不限于：隐藏测试用例、删除失败测试、批量打勾、降低断言标准、修改 spec 使代码"符合"规范。
+- **Git 提交需要明确授权** — 不得在用户没有明确说"提交/commit/交"的情况下执行 git commit/amend/reset/rebase。"任务做完了"不是提交授权。提交内容必须干净，不夹带调试文件或未确认的改动。

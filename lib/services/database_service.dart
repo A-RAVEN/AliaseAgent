@@ -103,4 +103,10 @@ class DatabaseService {
   static void reset() {
     _db = null;
   }
+
+  /// Close the database connection. Must be called before deleting temp DB files.
+  static Future<void> close() async {
+    await _db?.close();
+    _db = null;
+  }
 }
