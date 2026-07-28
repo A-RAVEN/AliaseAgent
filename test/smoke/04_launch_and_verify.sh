@@ -12,6 +12,13 @@ echo ""
 
 EXIT_CODE=0
 
+# Record log position before launch (only check new entries)
+LOG_START_LINE=1
+if [[ -f "$LOG_PATH" ]]; then
+  LOG_START_LINE=$(wc -l < "$LOG_PATH")
+  LOG_START_LINE=$((LOG_START_LINE + 1))
+fi
+
 # ── 4a. Launch ──
 echo "── 4a. Launching application ──"
 APP_PID=$(launch_app) || {
@@ -43,7 +50,7 @@ sleep 3
 
 # ── 4d. Log verification ──
 echo "── 4d. Log verification ──"
-verify_logs || EXIT_CODE=1
+verify_logs "$LOG_PATH" "$LOG_START_LINE" || EXIT_CODE=1
 echo ""
 
 # ── 4e. DB verification ──

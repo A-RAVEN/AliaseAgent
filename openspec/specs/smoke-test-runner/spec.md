@@ -75,15 +75,15 @@ The system SHALL launch the built executable, wait for the window to appear, and
 - **AND** the timeout duration and process status are recorded in the run log
 
 ### Requirement: Sidecar log verification
-The system SHALL check the sidecar log file for ERROR and unrecognized event entries.
+The system SHALL check the sidecar log file for ERROR and unrecognized event entries, scoped to the current session only (lines added after the app was launched, not the entire log history).
 
-#### Scenario: No errors in log
-- **WHEN** sidecar.log has been written during the session
-- **THEN** `grep -c "ERROR\|unrecognized"` returns 0
-- **AND** the step exits with code 0
+#### Scenario: No errors in current session
+- **WHEN** sidecar.log has been written during the current session
+- **THEN** lines added after the pre-launch log position are checked for "ERROR" or "unrecognized"
+- **AND** zero matches results in exit code 0
 
-#### Scenario: Errors found in log
-- **WHEN** sidecar.log contains ERROR lines or unrecognized event warnings
+#### Scenario: Errors found in current session
+- **WHEN** the current session's log lines contain ERROR entries
 - **THEN** the matching lines are printed to the run log
 - **AND** the step exits with code 1
 
@@ -99,3 +99,11 @@ The system SHALL verify the SQLite database has expected tables and at least one
 - **WHEN** the expected tables do not exist in the database
 - **THEN** the step exits with code 1
 - **AND** the missing table names are recorded in the run log
+
+### Requirement: Process cleanup after verification
+The system SHALL kill the launched application process and all its child processes after verification completes, leaving no orphan processes.
+
+#### Scenario: Clean shutdown
+- **WHEN** all verification steps complete (pass or fail)
+- **THEN** `taskkill /IM alias_agent.exe /F /T` is executed to kill the process tree
+- **AND** no alias_agent processes remain in tasklist

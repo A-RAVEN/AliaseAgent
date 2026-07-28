@@ -69,11 +69,11 @@ launch_app() {
 
 kill_app() {
   local pid="${1:-}"
+  # Kill by image name (reliable on Windows — $! gives bash PID, not exe PID)
+  taskkill //IM alias_agent.exe //F //T &>/dev/null && echo "  Killed alias_agent.exe (process tree)" || true
+  # Also kill the bash background job if PID given
   if [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]]; then
-    taskkill //PID "$pid" //F &>/dev/null && echo "Killed PID $pid" || true
-  else
-    # Fallback: kill by executable name
-    taskkill //IM alias_agent.exe //F &>/dev/null && echo "Killed alias_agent.exe" || true
+    kill "$pid" &>/dev/null 2>&1 || true
   fi
 }
 
@@ -140,9 +140,12 @@ Add-Type -AssemblyName System.Drawing
 }
 
 # ── Log Verification ──────────────────────────────────────
+# Usage: verify_logs [log_path] [start_line]
+# If start_line is given, only check lines from that point onward (current session).
 verify_logs() {
   local log="${1:-$LOG_PATH}"
-  echo "Checking logs: $log"
+  local start_line="${2:-1}"
+  echo "Checking logs: $log (from line $start_line)"
 
   if [[ ! -f "$log" ]]; then
     echo -e "  ${YELLOW}WARNING: Log file not found${NC}"
@@ -150,15 +153,15 @@ verify_logs() {
   fi
 
   local error_count
-  error_count=$(grep -c "ERROR\|unrecognized" "$log" 2>/dev/null || echo "0")
-  error_count=$(echo "$error_count" | tr -d ' ')
+  error_count=$(tail -n +"$start_line" "$log" | grep -c "ERROR\|unrecognized" 2>/dev/null) || error_count=0
+  error_count=$(echo "$error_count" | tr -d '[:space:]')
 
   if [[ "$error_count" -gt 0 ]]; then
-    echo -e "  ${RED}FAIL: Found $error_count ERROR/unrecognized line(s):${NC}"
-    grep -n "ERROR\|unrecognized" "$log" 2>/dev/null || true
+    echo -e "  ${RED}FAIL: Found $error_count ERROR/unrecognized line(s) in current session:${NC}"
+    tail -n +"$start_line" "$log" | grep -n "ERROR\|unrecognized" 2>/dev/null || true
     return 1
   else
-    echo -e "  ${GREEN}✓ No ERROR or unrecognized entries${NC}"
+    echo -e "  ${GREEN}✓ No ERROR or unrecognized entries in current session${NC}"
     return 0
   fi
 }
