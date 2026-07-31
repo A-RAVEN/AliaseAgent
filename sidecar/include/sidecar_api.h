@@ -70,6 +70,16 @@ SIDECAR_API const char* web_search(const char* request_json);
 /// Returns JSON: {"ok":true,"content":"..."} or {"ok":false,"error":"..."}
 SIDECAR_API const char* web_fetch(const char* request_json);
 
+/// Create or overwrite a file within the workspace.
+/// @param request_json  {"path":"...","content":"..."}
+/// Returns JSON: {"ok":true,"path":"...","bytes_written":N,"created":true|false}
+SIDECAR_API const char* write_file(const char* request_json);
+
+/// Edit a file by replacing exact text (with whitespace normalization).
+/// @param request_json  {"path":"...","old_text":"...","new_text":"...","replace_all":false}
+/// Returns JSON: {"ok":true,"replacements":N} or {"ok":false,"error":"...","diagnosis":{...}}
+SIDECAR_API const char* edit_file(const char* request_json);
+
 #ifdef __cplusplus
 }
 #endif

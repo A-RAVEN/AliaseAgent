@@ -50,6 +50,8 @@ typedef EnsureSearchInfraDart = Pointer<Utf8> Function(Pointer<Utf8> configJson)
 typedef GetSearchProvidersDart = Pointer<Utf8> Function();
 typedef WebSearchDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef WebFetchDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
+typedef WriteFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
+typedef EditFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 
 // ---------------------------------------------------------------------------
 // Dart-facing callback types
@@ -79,8 +81,12 @@ abstract class ISidecar {
   });
 
   String? setWorkspace(String path);
-  String readFile(String path);
+  String readFile(String requestJson);
   String listDir(String path);
+
+  // File edit tools
+  String writeFile(String requestJson);
+  String editFile(String requestJson);
 
   // Search & web fetch
   String ensureSearchInfra(String configJson);
@@ -104,6 +110,8 @@ class SidecarBridge implements ISidecar {
   late final GetSearchProvidersDart _getSearchProvidersFn;
   late final WebSearchDart _webSearchFn;
   late final WebFetchDart _webFetchFn;
+  late final WriteFileDart _writeFileFn;
+  late final EditFileDart _editFileFn;
 
   SidecarBridge._() {
     _lib = _openLibrary();
@@ -121,6 +129,10 @@ class SidecarBridge implements ISidecar {
         _lib.lookupFunction<SetWorkspaceNative, WebSearchDart>('web_search');
     _webFetchFn =
         _lib.lookupFunction<SetWorkspaceNative, WebFetchDart>('web_fetch');
+    _writeFileFn =
+        _lib.lookupFunction<SetWorkspaceNative, WriteFileDart>('write_file');
+    _editFileFn =
+        _lib.lookupFunction<SetWorkspaceNative, EditFileDart>('edit_file');
   }
 
   static SidecarBridge get instance {
@@ -273,11 +285,41 @@ class SidecarBridge implements ISidecar {
   }
 
   @override
-  String readFile(String path) {
-    final ptr = path.toNativeUtf8();
+  String readFile(String requestJson) {
+    // If input doesn't look like JSON, wrap it as {"path":"..."}
+    final json = requestJson.trimLeft().startsWith('{')
+        ? requestJson
+        : '{"path":"${_jsonEscape(requestJson)}"}';
+    final ptr = json.toNativeUtf8();
     final resultPtr = _readFileFn(ptr);
     malloc.free(ptr);
     return resultPtr.toDartString();
+  }
+
+  @override
+  String writeFile(String requestJson) {
+    final ptr = requestJson.toNativeUtf8();
+    final resultPtr = _writeFileFn(ptr);
+    malloc.free(ptr);
+    return resultPtr.toDartString();
+  }
+
+  @override
+  String editFile(String requestJson) {
+    final ptr = requestJson.toNativeUtf8();
+    final resultPtr = _editFileFn(ptr);
+    malloc.free(ptr);
+    return resultPtr.toDartString();
+  }
+
+  /// Minimal JSON string escape for path embedding.
+  static String _jsonEscape(String s) {
+    return s
+        .replaceAll('\\', '\\\\')
+        .replaceAll('"', '\\"')
+        .replaceAll('\n', '\\n')
+        .replaceAll('\r', '\\r')
+        .replaceAll('\t', '\\t');
   }
 
   @override

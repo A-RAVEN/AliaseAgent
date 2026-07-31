@@ -190,5 +190,61 @@ void main() {
       );
       expect(emptyAssistantBubbles, findsNothing);
     });
+
+    // 11.5 — write_file through ChatScreen+FakeSidecar
+    testWidgets('write_file tool call completes without error', (tester) async {
+      _setupAgentRegistry();
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final sessions = testSessions(1);
+      final sessionRepo = FakeSessionRepository(sessions);
+      final msgRepo = FakeMessageRepository();
+      final sidecar = FakeSidecar()
+        ..stubWriteFile('{"ok":true,"bytes_written":5,"created":true}')
+        ..queueToolCall('{"name":"write_file","input":{"path":"/new.txt","content":"hello"}}')
+        ..queueDone();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo, msgRepo: msgRepo, sidecar: sidecar,
+      ));
+      await tester.pump(); await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'Write file');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump(); await tester.pump();
+
+      expect(find.textContaining('Error:'), findsNothing);
+      expect(find.byType(ToolCallCard), findsOneWidget);
+      expect(find.textContaining('write_file'), findsOneWidget);
+    });
+
+    // 11.5 — edit_file through ChatScreen+FakeSidecar
+    testWidgets('edit_file tool call completes without error', (tester) async {
+      _setupAgentRegistry();
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final sessions = testSessions(1);
+      final sessionRepo = FakeSessionRepository(sessions);
+      final msgRepo = FakeMessageRepository();
+      final sidecar = FakeSidecar()
+        ..stubEditFile('{"ok":true,"replacements":1}')
+        ..queueToolCall('{"name":"edit_file","input":{"path":"/test.txt","old_text":"a","new_text":"b"}}')
+        ..queueDone();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo, msgRepo: msgRepo, sidecar: sidecar,
+      ));
+      await tester.pump(); await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'Edit file');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump(); await tester.pump();
+
+      expect(find.textContaining('Error:'), findsNothing);
+      expect(find.byType(ToolCallCard), findsOneWidget);
+      expect(find.textContaining('edit_file'), findsOneWidget);
+    });
   });
 }

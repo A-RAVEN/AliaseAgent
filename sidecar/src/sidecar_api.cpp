@@ -86,6 +86,7 @@ SIDECAR_API const char* read_file(const char* path) {
     g_last_tool_result = "{\"ok\":false,\"error\":\"No path provided\"}";
     return g_last_tool_result.c_str();
   }
+  // Pass through — Dart side now wraps into JSON {"path":"..."} as needed
   g_last_tool_result = tools::read_file(path);
   return g_last_tool_result.c_str();
 }
@@ -182,6 +183,30 @@ SIDECAR_API const char* web_fetch(const char* request_json) {
     LOG_ERR("web_fetch: unknown exception");
     return "{\"ok\":false,\"error\":\"Fetch failed: unknown error\"}";
   }
+}
+
+// Per-function static buffers for file edit tools
+static std::string g_write_file_result;
+static std::string g_edit_file_result;
+
+SIDECAR_API const char* write_file(const char* request_json) {
+  LOG_TRACE("write_file called");
+  if (!request_json) {
+    g_write_file_result = "{\"ok\":false,\"error\":\"No request provided\"}";
+    return g_write_file_result.c_str();
+  }
+  g_write_file_result = tools::write_file(request_json);
+  return g_write_file_result.c_str();
+}
+
+SIDECAR_API const char* edit_file(const char* request_json) {
+  LOG_TRACE("edit_file called");
+  if (!request_json) {
+    g_edit_file_result = "{\"ok\":false,\"error\":\"No request provided\"}";
+    return g_edit_file_result.c_str();
+  }
+  g_edit_file_result = tools::edit_file(request_json);
+  return g_edit_file_result.c_str();
 }
 
 } // extern "C"

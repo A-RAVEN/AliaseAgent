@@ -185,7 +185,9 @@ class _ChatScreenState extends State<ChatScreen> {
     final base = <String, Map<String, dynamic>>{
       'read_file': const {
         'name': 'read_file',
-        'description': 'Read the contents of a file within the workspace.',
+        'description': 'Read the contents of a file within the workspace. '
+            'Returns the file content with 1-indexed line numbers (cat -n format). '
+            'Files over 2000 lines are truncated; use offset/limit to read more.',
         'input_schema': {
           'type': 'object',
           'properties': {
@@ -193,8 +195,67 @@ class _ChatScreenState extends State<ChatScreen> {
               'type': 'string',
               'description': 'Path to the file relative to the workspace root.',
             },
+            'offset': {
+              'type': 'integer',
+              'description': 'Start line number (1-indexed). Default: 1.',
+            },
+            'limit': {
+              'type': 'integer',
+              'description': 'Number of lines to read. Default: 2000, max: 2000.',
+            },
           },
           'required': ['path'],
+        },
+      },
+      'write_file': const {
+        'name': 'write_file',
+        'description': 'Create or overwrite a file in the workspace. '
+            'Use this for creating new files or complete rewrites. '
+            'The response indicates whether the file was created or overwritten.',
+        'input_schema': {
+          'type': 'object',
+          'properties': {
+            'path': {
+              'type': 'string',
+              'description': 'File path relative to workspace root.',
+            },
+            'content': {
+              'type': 'string',
+              'description': 'Complete file content to write.',
+            },
+          },
+          'required': ['path', 'content'],
+        },
+      },
+      'edit_file': const {
+        'name': 'edit_file',
+        'description': 'Edit a file by replacing exact text. '
+            'You MUST read the file first to get the exact old_text. '
+            'old_text must match exactly (whitespace differences are auto-normalized). '
+            'If old_text matches multiple locations, the edit is rejected — '
+            'add more context to make it unique, or use replace_all:true.',
+        'input_schema': {
+          'type': 'object',
+          'properties': {
+            'path': {
+              'type': 'string',
+              'description': 'File path relative to workspace root.',
+            },
+            'old_text': {
+              'type': 'string',
+              'description': 'Exact text to find and replace. Must not be empty.',
+            },
+            'new_text': {
+              'type': 'string',
+              'description': 'Replacement text.',
+            },
+            'replace_all': {
+              'type': 'boolean',
+              'default': false,
+              'description': 'Replace all occurrences instead of just the first.',
+            },
+          },
+          'required': ['path', 'old_text', 'new_text'],
         },
       },
       'list_dir': const {
@@ -770,7 +831,25 @@ class _ChatScreenState extends State<ChatScreen> {
     String resultJson;
     switch (name) {
       case 'read_file':
-        resultJson = _sidecar.readFile(path);
+        // Build JSON request with optional offset/limit
+        final readReq = <String, dynamic>{'path': path};
+        final offset = input['offset'];
+        final limit = input['limit'];
+        if (offset is int) readReq['offset'] = offset;
+        if (limit is int) readReq['limit'] = limit;
+        resultJson = _sidecar.readFile(jsonEncode(readReq));
+      case 'write_file':
+        resultJson = _sidecar.writeFile(jsonEncode({
+          'path': path,
+          'content': input['content'] ?? '',
+        }));
+      case 'edit_file':
+        resultJson = _sidecar.editFile(jsonEncode({
+          'path': path,
+          'old_text': input['old_text'] ?? '',
+          'new_text': input['new_text'] ?? '',
+          'replace_all': input['replace_all'] ?? false,
+        }));
       case 'list_dir':
         resultJson = _sidecar.listDir(path);
       case 'web_search':
@@ -807,9 +886,22 @@ class _ChatScreenState extends State<ChatScreen> {
 
     try {
       final parsed = jsonDecode(resultJson) as Map<String, dynamic>;
-      // Task 8.9: Format search results for display
+      // Format tool results for display
       if (name == 'web_search' || name == 'web_fetch') {
         parsed['content'] = _formatSearchResultForDisplay(name!, parsed);
+      } else if (name == 'write_file') {
+        final bytes = parsed['bytes_written'] as int? ?? 0;
+        final created = parsed['created'] as bool? ?? false;
+        final p = (parsed['path'] as String?) ?? path;
+        parsed['content'] = created
+            ? 'Created $p ($bytes bytes)'
+            : 'Wrote $p ($bytes bytes)';
+      } else if (name == 'edit_file') {
+        final reps = parsed['replacements'] as int? ?? 0;
+        final matchedWith = parsed['matched_with'] as String?;
+        var content = 'Edited $path ($reps replacement${reps == 1 ? '' : 's'})';
+        if (matchedWith != null) content += ' — matched with $matchedWith';
+        parsed['content'] = content;
       }
       return parsed;
     } catch (e) {

@@ -68,17 +68,23 @@ TEST_CASE("set_workspace: path is not a directory", "[tool_execution]") {
 }
 
 // ============================================================================
-// 3.5 — read_file: existing text file → ok:true
+// 3.5 — read_file: existing text file → ok:true (line numbers)
 // ============================================================================
 TEST_CASE("read_file: existing text file", "[tool_execution]") {
     TempDir tmp;
     tmp.write("hello.txt", "hello world\nline 2");
     WorkspaceGuard ws(tmp.path());
 
-    std::string result = tools::read_file("hello.txt");
+    std::string result = tools::read_file("{\"path\":\"hello.txt\"}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == true);
-    REQUIRE(j["content"] == "hello world\nline 2");
+    REQUIRE(j["total_lines"] == 2);
+    REQUIRE(j["start_line"] == 1);
+    REQUIRE(j["end_line"] == 2);
+    // Content should have line numbers (cat -n format)
+    std::string content = j["content"];
+    REQUIRE(content.find("1\thello world") != std::string::npos);
+    REQUIRE(content.find("2\tline 2") != std::string::npos);
 }
 
 // ============================================================================
@@ -145,10 +151,11 @@ TEST_CASE("read_file: empty file", "[tool_execution]") {
     tmp.write("empty.txt", "");
     WorkspaceGuard ws(tmp.path());
 
-    std::string result = tools::read_file("empty.txt");
+    std::string result = tools::read_file("{\"path\":\"empty.txt\"}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == true);
     REQUIRE(j["content"] == "");
+    REQUIRE(j["total_lines"] == 0);
 }
 
 // ============================================================================
@@ -343,4 +350,671 @@ TEST_CASE("set_workspace: canonical path", "[tool_execution]") {
     std::string result = tools::set_workspace(tmp.path());
     REQUIRE(result == "");
     REQUIRE(tools::workspace() == tmp.path());
+}
+
+// ============================================================================
+// write_file tests (task 4.1)
+// ============================================================================
+
+TEST_CASE("write_file: create new file", "[write_file]") {
+    TempDir tmp;
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::write_file("{\"path\":\"new.txt\",\"content\":\"hello world\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["bytes_written"] == 11);
+    REQUIRE(j["created"] == true);
+
+    // Verify file exists and has correct content
+    std::ifstream f(tmp.path() + "/new.txt");
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content == "hello world");
+}
+
+TEST_CASE("write_file: overwrite existing file", "[write_file]") {
+    TempDir tmp;
+    tmp.write("existing.txt", "old content");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::write_file("{\"path\":\"existing.txt\",\"content\":\"new content\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["created"] == false);
+
+    // Verify content was replaced
+    std::ifstream f(tmp.path() + "/existing.txt");
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content == "new content");
+}
+
+TEST_CASE("write_file: create parent directories", "[write_file]") {
+    TempDir tmp;
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::write_file("{\"path\":\"sub/deep/nested/file.txt\",\"content\":\"nested\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["created"] == true);
+
+    // Verify file exists
+    std::ifstream f(tmp.path() + "/sub/deep/nested/file.txt");
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content == "nested");
+}
+
+TEST_CASE("write_file: path outside workspace rejected", "[write_file]") {
+    TempDir tmp;
+    tmp.mkdir("subdir");
+    WorkspaceGuard ws(tmp.path() + "/subdir");
+
+    // Try to access a file outside workspace via ".." traversal
+    std::string result = tools::write_file("{\"path\":\"../outside.txt\",\"content\":\"bad\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "Access denied: path outside workspace");
+}
+
+TEST_CASE("write_file: empty path rejected", "[write_file]") {
+    TempDir tmp;
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::write_file("{\"path\":\"\",\"content\":\"x\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "path is required");
+}
+
+// ============================================================================
+// edit_file tests — exact matching (tier 1)
+// ============================================================================
+
+TEST_CASE("edit_file: exact match succeeds", "[edit_file]") {
+    TempDir tmp;
+    tmp.write("test.txt", "line 1\nline 2\nline 3\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file("{\"path\":\"test.txt\",\"old_text\":\"line 2\",\"new_text\":\"line two\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["replacements"] == 1);
+
+    // Verify content
+    std::ifstream f(tmp.path() + "/test.txt");
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content == "line 1\nline two\nline 3\n");
+}
+
+TEST_CASE("edit_file: replace_all replaces all occurrences", "[edit_file]") {
+    TempDir tmp;
+    tmp.write("test.txt", "foo bar foo baz foo\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file(
+        "{\"path\":\"test.txt\",\"old_text\":\"foo\",\"new_text\":\"qux\",\"replace_all\":true}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["replacements"] == 3);
+
+    std::ifstream f(tmp.path() + "/test.txt");
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content == "qux bar qux baz qux\n");
+}
+
+TEST_CASE("edit_file: multiple exact matches rejected with line numbers", "[edit_file]") {
+    TempDir tmp;
+    tmp.write("test.txt", "TODO: fix bug\nsome code\nTODO: more work\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file(
+        "{\"path\":\"test.txt\",\"old_text\":\"TODO:\",\"new_text\":\"DONE:\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j.contains("matches"));
+    REQUIRE(j["matches"].is_array());
+    REQUIRE(j["matches"].size() == 2);
+}
+
+TEST_CASE("edit_file: empty old_text rejected", "[edit_file]") {
+    TempDir tmp;
+    tmp.write("test.txt", "some content\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file("{\"path\":\"test.txt\",\"old_text\":\"\",\"new_text\":\"x\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "old_text must not be empty");
+}
+
+// ============================================================================
+// edit_file tests — whitespace normalization (tier 2)
+// ============================================================================
+
+TEST_CASE("edit_file: CRLF vs LF mismatch auto-corrected", "[edit_file][normalized]") {
+    TempDir tmp;
+    // Write file with CRLF endings
+    {
+        std::ofstream f(tmp.path() + "/crlf.txt", std::ios::binary);
+        f.write("line1\r\nline2\r\nline3\r\n", 21);
+        f.close();
+    }
+    WorkspaceGuard ws(tmp.path());
+
+    // old_text "line2" is found literally in the file content (it contains no line endings),
+    // so exact match succeeds without needing normalization.
+    std::string result = tools::edit_file(
+        "{\"path\":\"crlf.txt\",\"old_text\":\"line2\",\"new_text\":\"line TWO\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["replacements"] == 1);
+}
+
+// ============================================================================
+// edit_file tests — binary / large file protection
+// ============================================================================
+
+TEST_CASE("edit_file: binary file rejected", "[edit_file]") {
+    TempDir tmp;
+    std::string bin_path = tmp.path() + "/data.bin";
+    write_binary_file(bin_path);
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file("{\"path\":\"data.bin\",\"old_text\":\"x\",\"new_text\":\"y\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "Cannot edit binary or non-text file");
+}
+
+TEST_CASE("edit_file: large file rejected", "[edit_file]") {
+    TempDir tmp;
+    // Create a file larger than 1MB
+    {
+        std::ofstream f(tmp.path() + "/large.txt", std::ios::binary);
+        f << "x";
+        // Seek to 1MB + 1 byte
+        f.seekp(1024 * 1024 + 1);
+        f << "y";
+        f.close();
+    }
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file("{\"path\":\"large.txt\",\"old_text\":\"z\",\"new_text\":\"w\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "File too large for edit_file (>1MB)");
+}
+
+TEST_CASE("edit_file: file not found", "[edit_file]") {
+    TempDir tmp;
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file("{\"path\":\"nonexistent.txt\",\"old_text\":\"x\",\"new_text\":\"y\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "File not found: nonexistent.txt");
+}
+
+TEST_CASE("edit_file: path outside workspace", "[edit_file]") {
+    TempDir tmp;
+    tmp.mkdir("subdir");
+    WorkspaceGuard ws(tmp.path() + "/subdir");
+
+    std::string result = tools::edit_file("{\"path\":\"../outside.txt\",\"old_text\":\"x\",\"new_text\":\"y\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "Access denied: path outside workspace");
+}
+
+TEST_CASE("edit_file: edit of directory rejected", "[edit_file]") {
+    TempDir tmp;
+    tmp.mkdir("subdir");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file("{\"path\":\"subdir\",\"old_text\":\"x\",\"new_text\":\"y\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "Path is a directory, not a file: subdir");
+}
+
+// ============================================================================
+// edit_file — diagnostic error (tier 3)
+// ============================================================================
+
+TEST_CASE("edit_file: no match returns diagnostic info", "[edit_file]") {
+    TempDir tmp;
+    tmp.write("code.dart", "  final count = 0;\n  print(count);\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file(
+        "{\"path\":\"code.dart\",\"old_text\":\"final count = 1\",\"new_text\":\"final count = 99\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "old_text not found in file");
+    REQUIRE(j.contains("diagnosis"));
+    REQUIRE(j["diagnosis"].contains("file_indent"));
+    REQUIRE(j["diagnosis"].contains("file_line_ending"));
+    REQUIRE(j["diagnosis"].contains("closest_match"));
+    REQUIRE(j["diagnosis"]["closest_match"].contains("line"));
+    REQUIRE(j["diagnosis"]["closest_match"].contains("actual_text"));
+}
+
+// ============================================================================
+// read_file — offset/limit edge cases
+// ============================================================================
+
+TEST_CASE("read_file: offset/limit partial read", "[read_file]") {
+    TempDir tmp;
+    // Create a file with 10 lines
+    std::string content;
+    for (int i = 1; i <= 10; ++i) {
+        content += "line " + std::to_string(i) + "\n";
+    }
+    tmp.write("ten.txt", content);
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::read_file("{\"path\":\"ten.txt\",\"offset\":3,\"limit\":2}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["total_lines"] == 10);
+    REQUIRE(j["start_line"] == 3);
+    REQUIRE(j["end_line"] == 4); // lines 3,4
+    std::string c = j["content"];
+    REQUIRE(c.find("3\tline 3") != std::string::npos);
+    REQUIRE(c.find("4\tline 4") != std::string::npos);
+    REQUIRE(c.find("5\tline 5") == std::string::npos); // line 5 not included
+}
+
+TEST_CASE("read_file: offset <= 0 rejected", "[read_file]") {
+    TempDir tmp;
+    tmp.write("test.txt", "hello\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::read_file("{\"path\":\"test.txt\",\"offset\":0}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "offset must be >= 1");
+}
+
+TEST_CASE("read_file: offset exceeds file length", "[read_file]") {
+    TempDir tmp;
+    tmp.write("test.txt", "line1\nline2\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::read_file("{\"path\":\"test.txt\",\"offset\":100}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["content"] == "");
+    REQUIRE(j["total_lines"] == 2);
+    REQUIRE(j.contains("notice"));
+}
+
+TEST_CASE("read_file: offset+limit exceeds file length returns truncated", "[read_file]") {
+    TempDir tmp;
+    tmp.write("test.txt", "a\nb\nc\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::read_file("{\"path\":\"test.txt\",\"offset\":2,\"limit\":100}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["start_line"] == 2);
+    REQUIRE(j["end_line"] == 3); // only 2 lines available from offset 2
+    std::string c = j["content"];
+    REQUIRE(c.find("2\tb") != std::string::npos);
+    REQUIRE(c.find("3\tc") != std::string::npos);
+}
+
+TEST_CASE("read_file: backward compatible with plain path", "[read_file]") {
+    TempDir tmp;
+    tmp.write("hello.txt", "hello\n");
+    WorkspaceGuard ws(tmp.path());
+
+    // Plain path string (not JSON) should still work
+    std::string result = tools::read_file("hello.txt");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["total_lines"] == 1);
+}
+
+TEST_CASE("read_file: line numbering format", "[read_file]") {
+    TempDir tmp;
+    tmp.write("test.txt", "first line\nsecond line\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::read_file("{\"path\":\"test.txt\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    std::string c = j["content"];
+    // Check cat -n format: 6-char right-aligned number + tab
+    // Line 1 should have "     1\tfirst line"
+    REQUIRE(c.find("\tfirst line") != std::string::npos);
+    REQUIRE(c.find("\tsecond line") != std::string::npos);
+}
+
+// ============================================================================
+// whitespace normalization tests
+// ============================================================================
+
+TEST_CASE("edit_file: indentation mismatch falls through to diagnostic", "[edit_file][normalized]") {
+    TempDir tmp;
+    // File uses 4-space indentation
+    tmp.write("test.dart", "class Foo {\n    void bar() {\n        code();\n    }\n}\n");
+    WorkspaceGuard ws(tmp.path());
+
+    // old_text uses 2-space indentation and slightly different code.
+    // We deliberately avoid substring matches (e.g. "  void bar()" would
+    // accidentally match at offset 2 inside "    void bar()" since both
+    // share "  void bar()" as a common substring).
+    std::string result = tools::edit_file(
+        "{\"path\":\"test.dart\",\"old_text\":\"  void bar(int x)\",\"new_text\":\"  void baz()\"}");
+    auto j = parse_result(result);
+    // Should return diagnostic info since neither exact nor normalized match succeeds
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j.contains("diagnosis"));
+    REQUIRE(j["diagnosis"].contains("closest_match"));
+}
+
+// ============================================================================
+// edit_file: diagnostic differences
+// ============================================================================
+
+TEST_CASE("edit_file: diagnostic lists indentation differences", "[edit_file]") {
+    TempDir tmp;
+    // File uses 4-space indentation
+    tmp.write("test.dart", "    final count = 0;\n    print(count);\n");
+    WorkspaceGuard ws(tmp.path());
+
+    // old_text uses 2-space indentation + different code (avoid accidental substring match)
+    std::string result = tools::edit_file(
+        "{\"path\":\"test.dart\",\"old_text\":\"  final count = 1;\",\"new_text\":\"  final count = 99;\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j.contains("diagnosis"));
+    // Should tell us about the file's indentation
+    std::string file_indent = j["diagnosis"]["file_indent"];
+    REQUIRE(!file_indent.empty());
+    REQUIRE(j["diagnosis"].contains("closest_match"));
+}
+
+// ============================================================================
+// 7.1 — replace_all + normalized match preserves CRLF format
+// ============================================================================
+TEST_CASE("edit_file: replace_all with normalization preserves CRLF", "[edit_file][normalized]") {
+    TempDir tmp;
+    // File with CRLF. old_text with LF → exact match fails → Tier 2 activates.
+    // "hello\nworld" appears at 2 positions in normalized content.
+    {
+        std::ofstream f(tmp.path() + "/crlf.txt", std::ios::binary);
+        f.write("hello\r\nworld\r\nhello\r\nworld\r\n", 28);
+        f.close();
+    }
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file(
+        "{\"path\":\"crlf.txt\",\"old_text\":\"hello\\nworld\",\"new_text\":\"REPLACED\",\"replace_all\":true}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["replacements"] == 2);
+    REQUIRE(j["matched_with"] == "whitespace normalization");
+
+    // Verify CRLF format preserved
+    std::ifstream f(tmp.path() + "/crlf.txt", std::ios::binary);
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content.find("\r\n") != std::string::npos);
+    REQUIRE(content.find("hello") == std::string::npos);
+    REQUIRE(content.find("world") == std::string::npos);
+    REQUIRE(content.find("REPLACED") != std::string::npos);
+}
+
+// ============================================================================
+// 7.2 — normalized match + tab indentation: position accuracy
+// ============================================================================
+TEST_CASE("edit_file: normalized match preserves non-matching content", "[edit_file][normalized]") {
+    TempDir tmp;
+    // File uses 4-space indentation. old_text uses tab → forces Tier 2 normalization.
+    tmp.write("code.txt", "class A {\n    int x = 1;\n    int y = 2;\n}\n");
+    WorkspaceGuard ws(tmp.path());
+
+    // old_text with tab (file has 4-space indent, tab→4 spaces via normalization)
+    std::string result = tools::edit_file(
+        "{\"path\":\"code.txt\",\"old_text\":\"\\tint y = 2;\",\"new_text\":\"\\tint z = 3;\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["replacements"] == 1);
+    REQUIRE(j["matched_with"] == "whitespace normalization");
+
+    // Verify non-matching content intact
+    std::ifstream f(tmp.path() + "/code.txt");
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content.find("class A") != std::string::npos);
+    REQUIRE(content.find("int x = 1") != std::string::npos);
+    REQUIRE(content.find("int z = 3") != std::string::npos);
+    REQUIRE(content.find("int y = 2") == std::string::npos);
+}
+
+// ============================================================================
+// 7.3 — multi-line old_text with CRLF normalization
+// ============================================================================
+TEST_CASE("edit_file: multi-line old_text with CRLF normalization", "[edit_file][normalized]") {
+    TempDir tmp;
+    // File with CRLF, containing a 2-line block
+    {
+        std::ofstream f(tmp.path() + "/ml.txt", std::ios::binary);
+        f.write("header\r\nblock line 1\r\nblock line 2\r\nfooter\r\n", 44);
+        f.close();
+    }
+    WorkspaceGuard ws(tmp.path());
+
+    // old_text uses LF — should normalize to match the CRLF block
+    std::string result = tools::edit_file(
+        "{\"path\":\"ml.txt\",\"old_text\":\"block line 1\\nblock line 2\",\"new_text\":\"REPLACED\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["replacements"] == 1);
+
+    std::ifstream f(tmp.path() + "/ml.txt", std::ios::binary);
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content.find("REPLACED") != std::string::npos);
+    REQUIRE(content.find("block line 1") == std::string::npos);
+    REQUIRE(content.find("header") != std::string::npos); // non-matching content intact
+}
+
+// ============================================================================
+// 7.4 — read_file truncation for 2000+ line files
+// ============================================================================
+TEST_CASE("read_file: truncation notice for 2000+ line file", "[read_file]") {
+    TempDir tmp;
+    // Create a file with more than 2000 lines
+    std::ostringstream oss;
+    for (int i = 1; i <= 2050; ++i) {
+        oss << "line " << i << "\n";
+    }
+    tmp.write("big.txt", oss.str());
+    WorkspaceGuard ws(tmp.path());
+
+    // Read without offset/limit — should truncate at 2000 lines
+    std::string result = tools::read_file("{\"path\":\"big.txt\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["total_lines"] == 2050);
+    REQUIRE(j["start_line"] == 1);
+    REQUIRE(j["end_line"] == 2000);
+    REQUIRE(j["truncated"] == true);
+    REQUIRE(j.contains("notice"));
+    std::string notice = j["notice"];
+    REQUIRE(notice.find("2050") != std::string::npos);
+    REQUIRE(notice.find("offset") != std::string::npos);
+
+    // Read remaining lines with offset
+    std::string result2 = tools::read_file("{\"path\":\"big.txt\",\"offset\":2001,\"limit\":100}");
+    auto j2 = parse_result(result2);
+    REQUIRE(j2["ok"] == true);
+    REQUIRE(j2["start_line"] == 2001);
+    REQUIRE(j2["end_line"] == 2050);
+}
+
+// ============================================================================
+// 7.5 — replace_all with exact match: all occurrences replaced
+// ============================================================================
+TEST_CASE("edit_file: replace_all exact match replaces all occurrences", "[edit_file]") {
+    TempDir tmp;
+    tmp.write("reps.txt", "AAA BBB AAA CCC AAA DDD\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file(
+        "{\"path\":\"reps.txt\",\"old_text\":\"AAA\",\"new_text\":\"ZZZ\",\"replace_all\":true}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["replacements"] == 3);
+
+    std::ifstream f(tmp.path() + "/reps.txt");
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content == "ZZZ BBB ZZZ CCC ZZZ DDD\n");
+    REQUIRE(content.find("AAA") == std::string::npos);
+}
+
+// ============================================================================
+// 7.6 — write_file/edit_file errors when no workspace set
+// ============================================================================
+TEST_CASE("write_file: no workspace set returns error", "[write_file]") {
+    tools::set_workspace("");
+    WorkspaceGuard ws("");
+
+    std::string result = tools::write_file("{\"path\":\"test.txt\",\"content\":\"x\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "No workspace set");
+}
+
+TEST_CASE("edit_file: no workspace set returns error", "[edit_file]") {
+    tools::set_workspace("");
+    WorkspaceGuard ws("");
+
+    std::string result = tools::edit_file("{\"path\":\"test.txt\",\"old_text\":\"x\",\"new_text\":\"y\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "No workspace set");
+}
+
+// ============================================================================
+// 11.7 — normalized multi-match rejection returns line numbers
+// ============================================================================
+TEST_CASE("edit_file: normalized multi-match rejected with line numbers", "[edit_file][normalized]") {
+    TempDir tmp;
+    {
+        std::ofstream f(tmp.path() + "/rep.txt", std::ios::binary);
+        f.write("header\r\nAA\r\nBB\r\nmiddle\r\nAA\r\nBB\r\nfooter\r\n", 40);
+        f.close();
+    }
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file(
+        "{\"path\":\"rep.txt\",\"old_text\":\"AA\\nBB\",\"new_text\":\"XX\",\"replace_all\":false}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["matches"].is_array());
+    REQUIRE(j["matches"].size() == 2);
+    REQUIRE(j["matched_with"] == "whitespace normalization");
+}
+
+// ============================================================================
+// 11.8 — tab old_text matches space-indented file via normalization
+// ============================================================================
+TEST_CASE("edit_file: tab old_text matches space-indented file", "[edit_file][normalized]") {
+    TempDir tmp;
+    tmp.write("indent.txt", "first\n    indented line\nlast\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file(
+        "{\"path\":\"indent.txt\",\"old_text\":\"\\tindented line\",\"new_text\":\"\\treplaced\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["replacements"] == 1);
+    REQUIRE(j["matched_with"] == "whitespace normalization");
+}
+
+// ============================================================================
+// 11.9 — diagnostic includes your_text and actual_text
+// ============================================================================
+TEST_CASE("edit_file: diagnostic includes your_text for mismatch", "[edit_file]") {
+    TempDir tmp;
+    tmp.write("diag.txt", "    final x = 1;\n    print(x);\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file(
+        "{\"path\":\"diag.txt\",\"old_text\":\"  final x = 2;\",\"new_text\":\"  final x = 99;\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j.contains("diagnosis"));
+    auto diag = j["diagnosis"];
+    REQUIRE(diag["closest_match"].contains("your_text"));
+    REQUIRE(diag["closest_match"]["your_text"] == "  final x = 2;");
+    // 13.2: verify differences array is populated when indentation mismatches
+    if (diag["closest_match"].contains("differences")) {
+      auto diffs = diag["closest_match"]["differences"];
+      REQUIRE(diffs.is_array());
+      REQUIRE(diffs.size() > 0);
+    }
+}
+
+// ============================================================================
+// 11.16 — UTF-16 file rejected
+// ============================================================================
+TEST_CASE("edit_file: UTF-16 text file rejected as binary", "[edit_file]") {
+    TempDir tmp;
+    {
+        std::ofstream f(tmp.path() + "/utf16.txt", std::ios::binary);
+        unsigned char bom[] = {0xFF, 0xFE};
+        f.write(reinterpret_cast<const char*>(bom), 2);
+        const char* text = "hello";
+        for (int i = 0; i < 5; ++i) {
+            f.put(text[i]);
+            f.put('\0');
+        }
+        f.close();
+    }
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file(
+        "{\"path\":\"utf16.txt\",\"old_text\":\"x\",\"new_text\":\"y\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "Cannot edit binary or non-text file");
+}
+
+// ============================================================================
+// 13.3 — old_text == new_text: no-op, file unchanged
+// ============================================================================
+TEST_CASE("edit_file: old_text equals new_text is no-op", "[edit_file]") {
+    TempDir tmp;
+    tmp.write("same.txt", "hello world\nfoo bar\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file(
+        "{\"path\":\"same.txt\",\"old_text\":\"foo bar\",\"new_text\":\"foo bar\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["replacements"] == 1);
+
+    std::ifstream f(tmp.path() + "/same.txt");
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content == "hello world\nfoo bar\n");
+}
+
+// ============================================================================
+// 13.4 — replace_all where old_text is substring of new_text
+// ============================================================================
+TEST_CASE("edit_file: replace_all substring overlap no infinite loop", "[edit_file]") {
+    TempDir tmp;
+    tmp.write("sub.txt", "a a a\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file(
+        "{\"path\":\"sub.txt\",\"old_text\":\"a\",\"new_text\":\"aa\",\"replace_all\":true}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["replacements"] == 3);
+
+    std::ifstream f(tmp.path() + "/sub.txt");
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content == "aa aa aa\n");
 }

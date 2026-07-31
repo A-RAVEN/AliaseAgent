@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -9,6 +10,7 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:alias_agent/main.dart';
 import 'package:alias_agent/services/config_service.dart';
 import 'package:alias_agent/services/database_service.dart';
+import 'package:alias_agent/services/sidecar_bridge.dart';
 import 'package:alias_agent/ui/message_bubble.dart';
 import 'package:alias_agent/ui/tool_call_card.dart';
 import 'package:alias_agent/models/tool_call_activity.dart';
@@ -205,6 +207,112 @@ void main() {
     debugPrint('[TEST] Assistant replied after web_fetch: ${text.length > 200 ? '${text.substring(0, 200)}...' : text}');
 
     // Let the reply render visually before teardown
+    await tester.pump(const Duration(seconds: 1));
+  }, timeout: const Timeout(Duration(seconds: 300)));
+
+  // =========================================================================
+  // 3.3 write_file + edit_file live tool call
+  // =========================================================================
+  testWidgets('write_file + edit_file: AI creates then edits a file',
+      (tester) async {
+    if (!configExists) {
+      markTestSkipped('Config not found');
+      return;
+    }
+    if (!apiAvailable) {
+      markTestSkipped('API unavailable (detected in previous test)');
+      return;
+    }
+
+    final homeDir = ConfigService.homeDir;
+    final testFilePath = '${homeDir}${Platform.pathSeparator}_aliasagent_live_test.txt';
+    final testFileRelPath = '_aliasagent_live_test.txt';
+
+    // Create the test file outside of the widget tree using real SidecarBridge
+    final bridge = SidecarBridge.instance;
+    bridge.setWorkspace(homeDir);
+    final writeResult = bridge.writeFile(jsonEncode({
+      'path': testFileRelPath,
+      'content': 'hello from AliasAgent live test\nline two\nline three\n',
+    }));
+    final writeParsed = jsonDecode(writeResult);
+    if (writeParsed['ok'] != true) {
+      fail('Failed to create test file: ${writeParsed['error']}');
+    }
+    debugPrint('[TEST] Created test file at $testFilePath');
+
+    // Pump full AppShell
+    await tester.pumpWidget(const MyApp());
+    await tester.pump(const Duration(seconds: 2));
+
+    // Tell AI to edit the file
+    final textField = find.byType(TextField);
+    await tester.enterText(
+      textField,
+      '请使用 edit_file 工具修改 $testFileRelPath，把 "line two" 改成 "LINE TWO MODIFIED"。改完告诉我结果。',
+    );
+
+    final sendButton = find.byTooltip('Send');
+    await tester.tap(sendButton);
+    await tester.pump();
+
+    // Wait for ToolCallCard to appear
+    try {
+      await pumpUntilFound(tester, find.byType(ToolCallCard), timeoutSec: 150);
+    } on TimeoutException {
+      final text = latestAssistantText(tester);
+      if (text != null && text.startsWith('Error:')) {
+        markTestSkipped('API unavailable: $text');
+        // Cleanup
+        try { File(testFilePath).deleteSync(); } catch (_) {}
+        return;
+      }
+      fail('No ToolCallCard within 150s — AI may not have called edit_file');
+    }
+
+    // Wait for ToolCallCard to reach Done status
+    final doneCard = find.byWidgetPredicate(
+      (w) => w is ToolCallCard && w.activity.status == ToolCallStatus.done,
+    );
+    try {
+      await pumpUntilFound(tester, doneCard, timeoutSec: 60);
+    } on TimeoutException {
+      final errorCard = find.byWidgetPredicate(
+        (w) => w is ToolCallCard && w.activity.status == ToolCallStatus.error,
+      );
+      if (errorCard.evaluate().isNotEmpty) {
+        fail('ToolCallCard shows Error status — internal bug in edit_file');
+      }
+      fail('ToolCallCard did not reach Done within 60s');
+    }
+
+    // Wait for completed assistant reply
+    try {
+      await pumpUntilFound(tester, completedAssistant, timeoutSec: 150);
+    } on TimeoutException {
+      fail('No completed assistant reply after edit_file');
+    }
+
+    final text = latestAssistantText(tester);
+    expect(text, isNotNull);
+    expect(text!.trim(), isNotEmpty, reason: 'Reply after edit_file should be non-empty');
+    debugPrint('[TEST] Assistant replied after edit_file: ${text.length > 200 ? '${text.substring(0, 200)}...' : text}');
+
+    // Verify the file was actually edited
+    try {
+      final actualContent = File(testFilePath).readAsStringSync();
+      expect(actualContent, contains('LINE TWO MODIFIED'),
+          reason: 'File should contain the edited text');
+      expect(actualContent, isNot(contains('line two')),
+          reason: 'File should NOT contain the original text');
+      debugPrint('[TEST] File edit verified: $testFilePath');
+    } catch (e) {
+      fail('Failed to verify file content: $e');
+    }
+
+    // Cleanup
+    try { File(testFilePath).deleteSync(); } catch (_) {}
+
     await tester.pump(const Duration(seconds: 1));
   }, timeout: const Timeout(Duration(seconds: 300)));
 }

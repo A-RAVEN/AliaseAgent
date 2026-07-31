@@ -15,10 +15,16 @@ class FakeSidecar implements ISidecar {
   String _webFetchResult = '{"ok":true,"content":""}';
   String _ensureSearchInfraResult = '{"ok":true}';
 
+  // File edit stubs
+  String _writeFileResult = '{"ok":true,"bytes_written":0,"created":true}';
+  String _editFileResult = '{"ok":true,"replacements":1}';
+
   void stubSearchProviders(String json) { _searchProvidersResult = json; }
   void stubWebSearch(String json) { _webSearchResult = json; }
   void stubWebFetch(String json) { _webFetchResult = json; }
   void stubEnsureSearchInfra(String json) { _ensureSearchInfraResult = json; }
+  void stubWriteFile(String json) { _writeFileResult = json; }
+  void stubEditFile(String json) { _editFileResult = json; }
 
   // ---------------------------------------------------------------------------
   // Queue API
@@ -98,8 +104,8 @@ class FakeSidecar implements ISidecar {
   String? setWorkspace(String path) => null;
 
   @override
-  String readFile(String path) =>
-      _readFileResult ?? '{"ok":true,"content":"fake content"}';
+  String readFile(String requestJson) =>
+      _readFileResult ?? '{"ok":true,"content":"fake content","total_lines":1,"start_line":1,"end_line":1}';
 
   @override
   String listDir(String path) =>
@@ -116,6 +122,12 @@ class FakeSidecar implements ISidecar {
 
   @override
   Future<String> webFetch(String requestJson) async => _webFetchResult;
+
+  @override
+  String writeFile(String requestJson) => _writeFileResult;
+
+  @override
+  String editFile(String requestJson) => _editFileResult;
 }
 
 // ---------------------------------------------------------------------------

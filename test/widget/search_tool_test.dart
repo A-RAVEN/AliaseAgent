@@ -76,6 +76,36 @@ void main() {
       expect(tester.takeException(), isNull);
     });
 
+    // 11.6 — write_file and edit_file always appear in tool defs
+    testWidgets('write_file and edit_file tools always present', (tester) async {
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final sessions = testSessions(1);
+      final msgs = [testMessage(sessionId: 's1', role: 'user', content: 'Hello')];
+      final sidecar = FakeSidecar();
+      sidecar.stubSearchProviders('[]'); // explicitly no search providers
+
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(body: ChatScreen(
+          config: _configNoSearch,
+          sessionRepo: FakeSessionRepository(sessions),
+          msgRepo: FakeMessageRepository(),
+          sidecar: sidecar,
+        )),
+      ));
+      await tester.pump(); await tester.pump();
+
+      // Should not crash due to missing tool definitions
+      expect(tester.takeException(), isNull);
+
+      // Verify unconditional tools are callable via FakeSidecar
+      final wf = sidecar.writeFile('{"path":"x","content":"y"}');
+      expect(jsonDecode(wf)['ok'], isTrue);
+      final ef = sidecar.editFile('{"path":"x","old_text":"a","new_text":"b"}');
+      expect(jsonDecode(ef)['ok'], isTrue);
+    });
+
     // 10.4 — Multiple providers → all in enum
     testWidgets('multiple providers appear in tool definition', (tester) async {
       tester.view.physicalSize = const Size(1280, 720);

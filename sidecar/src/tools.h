@@ -6,7 +6,7 @@
 namespace tools {
 
 /// Escape special characters for JSON string embedding.
-/// Handles: " \ \n \r \t
+/// Handles: " \ \n \r \t and control characters (0x00-0x1F → \uXXXX)
 std::string json_escape(const std::string& s);
 
 /// Initialize the workspace and validate it exists.
@@ -24,9 +24,31 @@ std::string resolve(const std::string& path);
 /// Check whether a resolved path is within the workspace boundary.
 bool is_within_workspace(const std::string& resolved);
 
-/// Read a text file, returning its content.
-/// Returns JSON: {"ok":true,"content":"..."} or {"ok":false,"error":"..."}
-std::string read_file(const std::string& path);
+/// Read a text file with line numbers, returning its content.
+/// Request JSON: {"path":"...", "offset":N, "limit":M}
+///   offset (optional, 1-indexed, default 1)
+///   limit  (optional, default 2000)
+/// Returns JSON:
+///   {"ok":true,"content":"...","total_lines":N,"start_line":M,"end_line":K}
+///   or {"ok":false,"error":"..."}
+/// Content uses cat -n format: right-aligned 6-digit line number + tab + text.
+/// Files >2000 lines are truncated with a notice when read without offset/limit.
+std::string read_file(const std::string& request_json);
+
+/// Create or overwrite a file within the workspace.
+/// Request JSON: {"path":"...", "content":"..."}
+/// Returns JSON:
+///   {"ok":true,"path":"...","bytes_written":N,"created":true|false}
+///   or {"ok":false,"error":"..."}
+std::string write_file(const std::string& request_json);
+
+/// Edit a file by replacing text using three-tier matching.
+/// Request JSON: {"path":"...", "old_text":"...", "new_text":"...", "replace_all":false}
+/// Returns JSON:
+///   {"ok":true,"replacements":N}  (N >= 1)
+///   or {"ok":false,"error":"...", "diagnosis":{...}}
+/// Matches: exact → whitespace-normalized → diagnostic error.
+std::string edit_file(const std::string& request_json);
 
 /// List directory contents.
 /// Returns JSON: {"ok":true,"content":"[{\"name\":\"...\",\"type\":\"file|directory\"},...]"}
