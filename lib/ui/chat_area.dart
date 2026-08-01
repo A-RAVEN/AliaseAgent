@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 
 import '../models/chat_item.dart';
 import 'message_bubble.dart';
+import 'thinking_card.dart';
 import 'tool_call_card.dart';
 
 class ChatArea extends StatefulWidget {
@@ -101,6 +102,9 @@ class _ChatAreaState extends State<ChatArea> {
                         ),
                       ChatToolCallItem(:final activity) => ToolCallCard(
                           activity: activity,
+                        ),
+                      ChatThinkingItem item => ThinkingCard(
+                          item: item,
                         ),
                       ChatStreamingItem(:final text) => MessageBubble(
                           role: 'assistant',

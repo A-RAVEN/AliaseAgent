@@ -75,6 +75,8 @@ class FakeSidecar implements ISidecar {
     required String systemPrompt,
     required String messagesJson,
     required String toolsJson,
+    required String thinkingMode,
+    required String thinkingEffort,
     required OnChunkCallback onChunk,
     required OnToolCallCallback onToolCall,
     OnThinkingCallback? onThinking,

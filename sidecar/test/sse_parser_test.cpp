@@ -60,7 +60,7 @@ static SseResult run_fixture(const std::string& fixture_name) {
 
     gw.execute(
         "sk-test", server.base_url().c_str(), "claude-sonnet-4-6",
-        "", R"([{"role":"user","content":"hello"}])", "",
+        "", R"([{"role":"user","content":"hello"}])", "", "", "",
         s_on_chunk, s_on_tool_call, s_on_thinking, s_on_done
     );
 

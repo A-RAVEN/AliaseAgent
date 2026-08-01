@@ -23,6 +23,8 @@ public:
     const char* system_prompt,
     const char* messages_json,
     const char* tools_json,
+    const char* thinking_mode,
+    const char* thinking_effort,
     OnChunkCallback on_chunk,
     OnToolCallCallback on_tool_call,
     OnThinkingCallback on_thinking,

@@ -6,7 +6,7 @@ import 'package:path/path.dart' as p;
 import 'config_service.dart';
 
 class DatabaseService {
-  static const _schemaVersion = 2;
+  static const _schemaVersion = 3;
   static Database? _db;
 
   static Future<Database> get database async {
@@ -38,6 +38,7 @@ class DatabaseService {
             role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
             content TEXT NOT NULL,
             tool_calls TEXT,
+            thinking_json TEXT,
             token_count INTEGER,
             created_at INTEGER NOT NULL
           )
@@ -48,10 +49,15 @@ class DatabaseService {
             'CREATE INDEX idx_sessions_updated ON sessions(updated_at DESC)');
       },
       onUpgrade: (db, oldV, newV) async {
-        if (oldV == 1) {
+        if (oldV <= 1) {
           await db.execute(
               'ALTER TABLE messages ADD COLUMN tool_calls TEXT');
-        } else {
+        }
+        if (oldV <= 2) {
+          await db.execute(
+              'ALTER TABLE messages ADD COLUMN thinking_json TEXT');
+        }
+        if (oldV < 1 || oldV > _schemaVersion) {
           await db.execute('DROP TABLE IF EXISTS messages');
           await db.execute('DROP TABLE IF EXISTS sessions');
         }
@@ -82,16 +88,22 @@ class DatabaseService {
             role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
             content TEXT NOT NULL,
             tool_calls TEXT,
+            thinking_json TEXT,
             token_count INTEGER,
             created_at INTEGER NOT NULL
           )
         ''');
       },
       onUpgrade: (db, oldV, newV) async {
-        if (oldV == 1) {
+        if (oldV <= 1) {
           await db.execute(
               'ALTER TABLE messages ADD COLUMN tool_calls TEXT');
-        } else {
+        }
+        if (oldV <= 2) {
+          await db.execute(
+              'ALTER TABLE messages ADD COLUMN thinking_json TEXT');
+        }
+        if (oldV < 1 || oldV > _schemaVersion) {
           await db.execute('DROP TABLE IF EXISTS messages');
           await db.execute('DROP TABLE IF EXISTS sessions');
         }

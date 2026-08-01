@@ -50,11 +50,15 @@ set(SIDECAR_BUILD_DIR "${SIDECAR_DIR}/build/windows")
 
 # Detect vcpkg toolchain
 set(VCPKG_TOOLCHAIN "" CACHE FILEPATH "Path to vcpkg.cmake toolchain file")
-if(NOT VCPKG_TOOLCHAIN)
-  if(DEFINED ENV{VCPKG_ROOT})
+# A cached value that doesn't exist on disk is treated as unset (e.g. a stale
+# "-DVCPKG_TOOLCHAIN=NONE" hack left in CMakeCache) — re-run the detection.
+if(NOT VCPKG_TOOLCHAIN OR NOT EXISTS "${VCPKG_TOOLCHAIN}")
+  if(DEFINED ENV{VCPKG_ROOT} AND EXISTS "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
     set(VCPKG_TOOLCHAIN "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
   elseif(EXISTS "$ENV{USERPROFILE}/vcpkg/scripts/buildsystems/vcpkg.cmake")
     set(VCPKG_TOOLCHAIN "$ENV{USERPROFILE}/vcpkg/scripts/buildsystems/vcpkg.cmake")
+  elseif(EXISTS "E:/vcpkg/scripts/buildsystems/vcpkg.cmake")
+    set(VCPKG_TOOLCHAIN "E:/vcpkg/scripts/buildsystems/vcpkg.cmake")
   endif()
 endif()
 

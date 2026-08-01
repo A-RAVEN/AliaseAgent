@@ -133,8 +133,11 @@ static size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdat
       if (line.rfind("data: ", 0) == 0) {
         std::string data = line.substr(6);
 
+        // [DONE] is an OpenAI-format marker, NOT part of the Anthropic wire format
+        // (which terminates with message_stop — platform.claude.com/docs/en/build-with-claude/streaming).
+        // Kept as a compatibility redundancy for proxies that inject it.
         if (data == "[DONE]") {
-          LOG_INFO("SSE: [DONE] marker");
+          LOG_INFO("SSE: [DONE] marker (OpenAI-format redundancy)");
           impl->events.push_back({SseEventKind::DONE, "", "", "", 0, "", impl->last_stop_reason});
           impl->done_dispatched = true;
           continue;
@@ -287,7 +290,8 @@ static void dispatch_events(ModelGateway::Impl* impl,
                              OnChunkCallback on_chunk,
                              OnToolCallCallback on_tool_call,
                              OnThinkingCallback on_thinking,
-                             OnDoneCallback on_done) {
+                             OnDoneCallback on_done,
+                             bool suppress_done = false) {
   LOG_TRACE("dispatch_events: " + std::to_string(impl->events.size()) + " buffered events");
   for (auto& ev : impl->events) {
     switch (ev.kind) {
@@ -307,6 +311,7 @@ static void dispatch_events(ModelGateway::Impl* impl,
         if (on_thinking) on_thinking(ev.thinking_json.c_str());
         break;
       case SseEventKind::DONE:
+        if (suppress_done) break;  // HTTP error path: don't emit a false "success" done
         impl->ffi_ring.push(FfiEventType::DONE, 0);
         LOG_TRACE("FFI: on_done(code=" + std::to_string(ev.done_code) + ")");
         if (on_done) on_done(ev.done_code, ev.done_err.empty() ? "" : ev.done_err.c_str(), ev.done_stop_reason.c_str());
@@ -326,6 +331,8 @@ int ModelGateway::execute(
   const char* system_prompt,
   const char* messages_json,
   const char* tools_json,
+  const char* thinking_mode,
+  const char* thinking_effort,
   OnChunkCallback on_chunk,
   OnToolCallCallback on_tool_call,
   OnThinkingCallback on_thinking,
@@ -358,7 +365,27 @@ int ModelGateway::execute(
   json body;
   body["model"] = model;
   body["stream"] = true;
-  body["max_tokens"] = 4096;
+
+  // Thinking format (unified for DeepSeek + Anthropic):
+  // Per DeepSeek official docs (api-docs.deepseek.com/guides/anthropic_api/):
+  //   thinking      | Supported (`budget_tokens` is ignored)
+  //   output_config | Only `effort` is supported
+  // So the ONLY effective thinking control is output_config.effort.
+  // Anthropic's adaptive thinking (platform.claude.com/docs/en/build-with-claude/extended-thinking)
+  // uses the same shape: thinking.type="adaptive" + output_config.effort.
+  const bool thinking_enabled = (thinking_mode && std::string(thinking_mode) == "adaptive");
+  if (thinking_enabled) {
+    body["thinking"]["type"] = "adaptive";
+    body["thinking"]["display"] = "summarized";
+    if (thinking_effort && std::strlen(thinking_effort) > 0) {
+      body["output_config"]["effort"] = thinking_effort;
+    }
+    body["max_tokens"] = 16000;
+    LOG_INFO("Thinking: adaptive, effort=" + std::string(thinking_effort ? thinking_effort : "default"));
+  } else {
+    body["max_tokens"] = 4096;
+    LOG_INFO("Thinking: disabled");
+  }
 
   if (system_prompt && std::strlen(system_prompt) > 0) {
     body["system"] = system_prompt;
@@ -428,8 +455,10 @@ int ModelGateway::execute(
   if (res != CURLE_OK) {
     std::string err = "Connection error: " + std::string(curl_easy_strerror(res));
     LOG_ERR(err);
-    dispatch_events(impl_, on_chunk, on_tool_call, on_thinking, on_done);
-    if (!impl_->done_dispatched && on_done) {
+    // Suppress buffered DONE: a partial stream must not mask the connection
+    // error as a fake success.
+    dispatch_events(impl_, on_chunk, on_tool_call, on_thinking, on_done, /*suppress_done=*/true);
+    if (on_done) {
       impl_->last_error = err;
       on_done(-1, impl_->last_error.c_str(), "");
     }
@@ -448,8 +477,10 @@ int ModelGateway::execute(
           : impl_->raw_body;
       LOG_ERR("API error body: " + preview);
     }
-    dispatch_events(impl_, on_chunk, on_tool_call, on_thinking, on_done);
-    if (!impl_->done_dispatched && on_done) {
+    // Suppress buffered DONE events (a stream's message_stop must not mask the
+    // HTTP error as a fake success) — the error is reported unconditionally.
+    dispatch_events(impl_, on_chunk, on_tool_call, on_thinking, on_done, /*suppress_done=*/true);
+    if (on_done) {
       on_done(-1, "Authentication failed — invalid API key", "");
     }
     return rid;
@@ -464,8 +495,9 @@ int ModelGateway::execute(
           : impl_->raw_body;
       LOG_ERR("API error body: " + preview);
     }
-    dispatch_events(impl_, on_chunk, on_tool_call, on_thinking, on_done);
-    if (!impl_->done_dispatched && on_done) {
+    // Same suppression as 401: HTTP errors always surface as errors.
+    dispatch_events(impl_, on_chunk, on_tool_call, on_thinking, on_done, /*suppress_done=*/true);
+    if (on_done) {
       impl_->last_error = err;
       on_done(-1, impl_->last_error.c_str(), "");
     }

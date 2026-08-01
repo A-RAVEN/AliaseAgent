@@ -56,3 +56,18 @@ The configuration file structure SHALL support adding new providers by adding en
 #### Scenario: Adding a new provider
 - **WHEN** user adds an "openai" entry with api_key in the config file
 - **THEN** the provider is available for Agent Types to reference (even if runtime adapter not yet implemented for API calls)
+
+### Requirement: Thinking effort in Agent Type config
+Each Agent Type entry in the configuration MAY include an optional `thinking_effort` field (string). When set to one of `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"`, adaptive extended thinking SHALL be enabled for that agent type. When absent or set to any other value, extended thinking SHALL be disabled.
+
+#### Scenario: Thinking enabled with effort level
+- **WHEN** the "general" Agent Type is defined with `thinking_effort: "high"`
+- **THEN** adaptive thinking is enabled for conversations using that agent type with high effort
+
+#### Scenario: Thinking disabled (absent)
+- **WHEN** an Agent Type does not include `thinking_effort`
+- **THEN** extended thinking is disabled for conversations using that agent type
+
+#### Scenario: Thinking disabled (unrecognized value)
+- **WHEN** an Agent Type has `thinking_effort: "unknown"` or any non-standard value
+- **THEN** extended thinking is disabled (same as absent)

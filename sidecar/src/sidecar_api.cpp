@@ -48,6 +48,8 @@ SIDECAR_API int send_message(
   const char* system_prompt,
   const char* messages_json,
   const char* tools_json,
+  const char* thinking_mode,
+  const char* thinking_effort,
   OnChunkCallback on_chunk,
   OnToolCallCallback on_tool_call,
   OnThinkingCallback on_thinking,
@@ -68,6 +70,8 @@ SIDECAR_API int send_message(
     system_prompt ? system_prompt : "",
     messages_json ? messages_json : "",
     tools_json ? tools_json : "",
+    thinking_mode ? thinking_mode : "",
+    thinking_effort ? thinking_effort : "",
     on_chunk, on_tool_call, on_thinking, on_done
   );
 }

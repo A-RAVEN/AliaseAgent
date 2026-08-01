@@ -83,6 +83,45 @@ void main() {
       expect(result!.apiKey, 'key');
     });
 
+    group('AgentTypeConfig thinking effort', () {
+      test('parses valid thinking_effort from JSON', () {
+        final config = AgentTypeConfig.fromJson('coder', {
+          'provider': 'anthropic',
+          'model': 'claude-sonnet-4-6',
+          'system_prompt': '',
+          'thinking_effort': 'high',
+        });
+        expect(config.thinkingEffort, 'high');
+      });
+
+      test('thinkingEffort is null when absent from JSON', () {
+        final config = AgentTypeConfig.fromJson('basic', {
+          'provider': 'anthropic',
+          'model': 'claude-sonnet-4-6',
+          'system_prompt': '',
+        });
+        expect(config.thinkingEffort, isNull);
+      });
+
+      test('toJson includes thinking_effort when non-null', () {
+        const config = AgentTypeConfig(
+          name: 'coder', provider: 'a', model: 'm',
+          systemPrompt: '', thinkingEffort: 'max',
+        );
+        final json = config.toJson();
+        expect(json['thinking_effort'], 'max');
+      });
+
+      test('toJson omits thinking_effort when null', () {
+        const config = AgentTypeConfig(
+          name: 'basic', provider: 'a', model: 'm',
+          systemPrompt: '',
+        );
+        final json = config.toJson();
+        expect(json.containsKey('thinking_effort'), isFalse);
+      });
+    });
+
     test('resolve returns null for unknown provider name', () {
       final config = AppConfig(
         version: 1,

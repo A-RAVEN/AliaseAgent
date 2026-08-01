@@ -12,6 +12,7 @@ import 'package:alias_agent/services/config_service.dart';
 import 'package:alias_agent/services/database_service.dart';
 import 'package:alias_agent/services/sidecar_bridge.dart';
 import 'package:alias_agent/ui/message_bubble.dart';
+import 'package:alias_agent/ui/thinking_card.dart';
 import 'package:alias_agent/ui/tool_call_card.dart';
 import 'package:alias_agent/models/tool_call_activity.dart';
 
@@ -293,6 +294,9 @@ void main() {
       fail('No completed assistant reply after edit_file');
     }
 
+    // Pump extra to ensure all tool turns complete before verification
+    await tester.pump(const Duration(seconds: 2));
+
     final text = latestAssistantText(tester);
     expect(text, isNotNull);
     expect(text!.trim(), isNotEmpty, reason: 'Reply after edit_file should be non-empty');
@@ -312,6 +316,87 @@ void main() {
 
     // Cleanup
     try { File(testFilePath).deleteSync(); } catch (_) {}
+
+    await tester.pump(const Duration(seconds: 1));
+  }, timeout: const Timeout(Duration(seconds: 300)));
+
+  // =========================================================================
+  // 3.4 Extended thinking: AI shows thinking then responds
+  // =========================================================================
+  testWidgets('extended thinking: AI shows thinking then responds',
+      (tester) async {
+    if (!configExists) {
+      markTestSkipped('Config not found');
+      return;
+    }
+    if (!apiAvailable) {
+      markTestSkipped('API unavailable (detected in previous test)');
+      return;
+    }
+
+    // Check if any agent type has thinking_effort configured
+    final agentTypes = configResult.config!.agentTypes;
+    final thinkingAgentName = agentTypes.keys.firstWhere(
+      (k) {
+        final eff = agentTypes[k]!.thinkingEffort;
+        return eff != null && eff.isNotEmpty;
+      },
+      orElse: () => '',
+    );
+    if (thinkingAgentName.isEmpty) {
+      markTestSkipped(
+        'No agent type has thinking_effort. '
+        'Add "thinking_effort": "high" to an agent type in config.json.',
+      );
+      return;
+    }
+
+    // Pump full AppShell
+    await tester.pumpWidget(const MyApp());
+    await tester.pump(const Duration(seconds: 2));
+
+    // Send message requiring reasoning
+    final textField = find.byType(TextField);
+    await tester.enterText(
+      textField,
+      '请仔细计算 (15 * 37 + 42) / 3 + 11 * 5 - 8，逐步推导每一步的中间结果。',
+    );
+
+    final sendButton = find.byTooltip('Send');
+    await tester.tap(sendButton);
+    await tester.pump();
+
+    // Wait for ThinkingCard to appear
+    try {
+      await pumpUntilFound(tester, find.byType(ThinkingCard), timeoutSec: 150);
+    } on TimeoutException {
+      final text = latestAssistantText(tester);
+      if (text != null && text.startsWith('Error:')) {
+        markTestSkipped('API error: $text');
+        return;
+      }
+      fail('No ThinkingCard within 150s — thinking may not have been triggered');
+    }
+
+    // Wait for turn to complete
+    try {
+      await pumpUntilFound(tester, completedAssistant, timeoutSec: 150);
+    } on TimeoutException {
+      fail('No completed assistant reply after thinking');
+    }
+
+    // Verify ThinkingCard still present and collapsed after turn
+    expect(find.byType(ThinkingCard), findsOneWidget);
+    expect(find.byIcon(Icons.keyboard_arrow_down), findsOneWidget);
+    // Verify header shows char count (not still-animated dots)
+    expect(find.textContaining('chars'), findsOneWidget);
+
+    // Verify assistant reply
+    final text = latestAssistantText(tester);
+    expect(text, isNotNull);
+    expect(text!.trim(), isNotEmpty,
+        reason: 'Reply after thinking should be non-empty');
+    debugPrint('[TEST] Reply after thinking: ${text.length > 200 ? '${text.substring(0, 200)}...' : text}');
 
     await tester.pump(const Duration(seconds: 1));
   }, timeout: const Timeout(Duration(seconds: 300)));

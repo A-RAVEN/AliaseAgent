@@ -45,7 +45,7 @@ TEST_CASE("FFI: ring buffer populated during dispatch", "[ffi_tracing]") {
 
     int rid = gw.execute(
         "sk-key", server.base_url().c_str(), "claude-sonnet-4-6",
-        "", VALID_MSG, "",
+        "", VALID_MSG, "", "", "",
         on_chunk_cb, on_tool_cb, on_thinking_cb, on_done_cb
     );
     server.join();
@@ -72,7 +72,7 @@ TEST_CASE("FFI: ring buffer records tool calls", "[ffi_tracing]") {
 
     int rid = gw.execute(
         "sk-key", server.base_url().c_str(), "claude-sonnet-4-6",
-        "", VALID_MSG, "",
+        "", VALID_MSG, "", "", "",
         on_chunk_cb, on_tool_cb, on_thinking_cb, on_done_cb
     );
     server.join();
@@ -97,7 +97,7 @@ TEST_CASE("FFI: ring buffer records thinking", "[ffi_tracing]") {
 
     int rid = gw.execute(
         "sk-key", server.base_url().c_str(), "claude-sonnet-4-6",
-        "", VALID_MSG, "",
+        "", VALID_MSG, "", "", "",
         on_chunk_cb, on_tool_cb, on_thinking_cb, on_done_cb
     );
     server.join();

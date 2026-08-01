@@ -21,6 +21,8 @@ typedef SendMessageNative = Int32 Function(
   Pointer<Utf8> systemPrompt,
   Pointer<Utf8> messagesJson,
   Pointer<Utf8> toolsJson,
+  Pointer<Utf8> thinkingMode,
+  Pointer<Utf8> thinkingEffort,
   Pointer<NativeFunction<OnChunkNative>> onChunk,
   Pointer<NativeFunction<OnToolCallNative>> onToolCall,
   Pointer<NativeFunction<OnThinkingNative>> onThinking,
@@ -37,6 +39,8 @@ typedef SendMessageDart = int Function(
   Pointer<Utf8> systemPrompt,
   Pointer<Utf8> messagesJson,
   Pointer<Utf8> toolsJson,
+  Pointer<Utf8> thinkingMode,
+  Pointer<Utf8> thinkingEffort,
   Pointer<NativeFunction<OnChunkNative>> onChunk,
   Pointer<NativeFunction<OnToolCallNative>> onToolCall,
   Pointer<NativeFunction<OnThinkingNative>> onThinking,
@@ -74,6 +78,8 @@ abstract class ISidecar {
     required String systemPrompt,
     required String messagesJson,
     required String toolsJson,
+    required String thinkingMode,
+    required String thinkingEffort,
     required OnChunkCallback onChunk,
     required OnToolCallCallback onToolCall,
     OnThinkingCallback? onThinking,
@@ -150,6 +156,8 @@ class SidecarBridge implements ISidecar {
     required String systemPrompt,
     required String messagesJson,
     required String toolsJson,
+    required String thinkingMode,
+    required String thinkingEffort,
     required OnChunkCallback onChunk,
     required OnToolCallCallback onToolCall,
     OnThinkingCallback? onThinking,
@@ -165,6 +173,8 @@ class SidecarBridge implements ISidecar {
       'systemPrompt': systemPrompt,
       'messagesJson': messagesJson,
       'toolsJson': toolsJson,
+      'thinkingMode': thinkingMode,
+      'thinkingEffort': thinkingEffort,
     });
 
     // Task 8.8a: .timeout(120s) prevents isolate hang if Sidecar crashes via SEH
@@ -204,6 +214,8 @@ class SidecarBridge implements ISidecar {
     final systemPrompt = args['systemPrompt'] as String;
     final messagesJson = args['messagesJson'] as String;
     final toolsJson = args['toolsJson'] as String;
+    final thinkingMode = args['thinkingMode'] as String;
+    final thinkingEffort = args['thinkingEffort'] as String;
 
     final lib = _openLibrary();
     final sendMessageFn =
@@ -215,6 +227,8 @@ class SidecarBridge implements ISidecar {
     final systemPromptPtr = systemPrompt.toNativeUtf8();
     final messagesJsonPtr = messagesJson.toNativeUtf8();
     final toolsJsonPtr = toolsJson.toNativeUtf8();
+    final thinkingModePtr = thinkingMode.toNativeUtf8();
+    final thinkingEffortPtr = thinkingEffort.toNativeUtf8();
 
     final onChunkCallable = NativeCallable<OnChunkNative>.listener(
       (Pointer<Utf8> ptr) {
@@ -251,6 +265,8 @@ class SidecarBridge implements ISidecar {
       systemPromptPtr,
       messagesJsonPtr,
       toolsJsonPtr,
+      thinkingModePtr,
+      thinkingEffortPtr,
       onChunkCallable.nativeFunction,
       onToolCallCallable.nativeFunction,
       onThinkingCallable.nativeFunction,
@@ -263,6 +279,8 @@ class SidecarBridge implements ISidecar {
     malloc.free(systemPromptPtr);
     malloc.free(messagesJsonPtr);
     malloc.free(toolsJsonPtr);
+    malloc.free(thinkingModePtr);
+    malloc.free(thinkingEffortPtr);
 
     // Schedule cleanup after queued callbacks have fired on this isolate
     Timer.run(() {

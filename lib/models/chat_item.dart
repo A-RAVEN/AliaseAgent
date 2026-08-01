@@ -19,3 +19,14 @@ class ChatStreamingItem extends ChatItem {
   final String text;
   const ChatStreamingItem(this.text);
 }
+
+class ChatThinkingItem extends ChatItem {
+  final String thinking;
+  final String? signature;
+  final bool isStreaming;
+  const ChatThinkingItem({
+    required this.thinking,
+    this.signature,
+    this.isStreaming = true,
+  });
+}

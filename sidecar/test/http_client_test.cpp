@@ -43,7 +43,7 @@ TEST_CASE("HTTP: request headers", "[http_client]") {
     gw.execute(
         "sk-ant-test123", server.base_url().c_str(), "claude-sonnet-4-6",
         "", VALID_MSG, "",
-        nullptr, nullptr, nullptr, s_done_nop
+        "", "", nullptr, nullptr, nullptr, s_done_nop
     );
     server.join();
 
@@ -69,7 +69,7 @@ TEST_CASE("HTTP: request body with all fields", "[http_client]") {
         "sk-key", server.base_url().c_str(), "claude-opus-4-8",
         "You are helpful.", VALID_MSG,
         R"([{"name":"read_file","description":"Read a file","input_schema":{"type":"object"}}])",
-        nullptr, nullptr, nullptr, s_done_nop
+        "", "", nullptr, nullptr, nullptr, s_done_nop
     );
     server.join();
 
@@ -99,7 +99,7 @@ TEST_CASE("HTTP: system omitted when empty", "[http_client]") {
         "",
         VALID_MSG,
         nullptr,
-        nullptr, nullptr, nullptr, s_done_nop
+        "", "", nullptr, nullptr, nullptr, s_done_nop
     );
     server.join();
 
@@ -121,7 +121,7 @@ TEST_CASE("HTTP: tools omitted when empty string", "[http_client]") {
         "You are helpful.",
         VALID_MSG,
         "",
-        nullptr, nullptr, nullptr, s_done_nop
+        "", "", nullptr, nullptr, nullptr, s_done_nop
     );
     server.join();
 
@@ -160,7 +160,7 @@ TEST_CASE("HTTP: empty api_key sends request with empty header", "[http_client]"
         "",
         server.base_url().c_str(), "claude-sonnet-4-6",
         "", VALID_MSG, "",
-        nullptr, nullptr, nullptr, s_done_nop
+        "", "", nullptr, nullptr, nullptr, s_done_nop
     );
     server.join();
 
@@ -182,7 +182,7 @@ TEST_CASE("HTTP: invalid messages_json", "[http_client]") {
     int rid = gw.execute(
         "sk-key", "", "claude-sonnet-4-6",
         "", "NOT VALID JSON {{{", "",
-        nullptr, nullptr, nullptr, s_done_capture
+        "", "", nullptr, nullptr, nullptr, s_done_capture
     );
 
     REQUIRE(s_done_called);
@@ -205,7 +205,7 @@ TEST_CASE("HTTP: invalid tools_json", "[http_client]") {
     int rid = gw.execute(
         "sk-key", "", "claude-sonnet-4-6",
         "", VALID_MSG, "NOT VALID JSON {{{",
-        nullptr, nullptr, nullptr, s_done_capture
+        "", "", nullptr, nullptr, nullptr, s_done_capture
     );
 
     REQUIRE(s_done_called);
@@ -228,7 +228,7 @@ TEST_CASE("HTTP: request_id monotonically increasing", "[http_client]") {
     int id1 = gw.execute(
         "sk-key", server.base_url().c_str(), "claude-sonnet-4-6",
         "", VALID_MSG, "",
-        nullptr, nullptr, nullptr, s_done_nop
+        "", "", nullptr, nullptr, nullptr, s_done_nop
     );
     server.join();
 
@@ -239,7 +239,7 @@ TEST_CASE("HTTP: request_id monotonically increasing", "[http_client]") {
     int id2 = gw.execute(
         "sk-key", server2.base_url().c_str(), "claude-sonnet-4-6",
         "", VALID_MSG, "",
-        nullptr, nullptr, nullptr, s_done_nop
+        "", "", nullptr, nullptr, nullptr, s_done_nop
     );
     server2.join();
 
@@ -266,7 +266,7 @@ TEST_CASE("HTTP: 400 error body captured and logged", "[http_client]") {
     int rid = gw.execute(
         "sk-key", server.base_url().c_str(), "claude-sonnet-4-6",
         "", VALID_MSG, "",
-        nullptr, nullptr, nullptr, s_done_capture
+        "", "", nullptr, nullptr, nullptr, s_done_capture
     );
     server.join();
 
@@ -292,7 +292,7 @@ TEST_CASE("HTTP: nullptr system and tools omitted", "[http_client]") {
         nullptr,
         VALID_MSG,
         nullptr,
-        nullptr, nullptr, nullptr, s_done_nop
+        "", "", nullptr, nullptr, nullptr, s_done_nop
     );
     server.join();
 
@@ -301,4 +301,137 @@ TEST_CASE("HTTP: nullptr system and tools omitted", "[http_client]") {
     REQUIRE(!body.contains("tools"));
     REQUIRE(body["model"] == "claude-sonnet-4-6");
     REQUIRE(body.contains("messages"));
+}
+
+// ============================================================================
+// 11.2-11.4 — Adaptive thinking request body tests
+// ============================================================================
+TEST_CASE("HTTP: adaptive thinking request body", "[http_client][thinking]") {
+    MockServer server;
+    server.start(fixture("text_delta.txt"));
+    server.wait_ready();
+
+    ModelGateway gw;
+    gw.set_timeout(5);
+
+    gw.execute(
+        "sk-key", server.base_url().c_str(), "claude-sonnet-4-6",
+        "", VALID_MSG, "",
+        "adaptive", "high",
+        nullptr, nullptr, nullptr, s_done_nop
+    );
+    server.join();
+
+    auto body = json::parse(server.last_body());
+    REQUIRE(body.contains("thinking"));
+    REQUIRE(body["thinking"]["type"] == "adaptive");
+    REQUIRE(body["thinking"]["display"] == "summarized");
+    REQUIRE(body.contains("output_config"));
+    REQUIRE(body["output_config"]["effort"] == "high");
+    REQUIRE(body["max_tokens"] == 16000);
+}
+
+TEST_CASE("HTTP: thinking disabled when mode is not adaptive", "[http_client][thinking]") {
+    MockServer server;
+    server.start(fixture("text_delta.txt"));
+    server.wait_ready();
+
+    ModelGateway gw;
+    gw.set_timeout(5);
+
+    gw.execute(
+        "sk-key", server.base_url().c_str(), "claude-sonnet-4-6",
+        "", VALID_MSG, "",
+        "disabled", "",
+        nullptr, nullptr, nullptr, s_done_nop
+    );
+    server.join();
+
+    auto body = json::parse(server.last_body());
+    REQUIRE(!body.contains("thinking"));
+    REQUIRE(!body.contains("output_config"));
+    REQUIRE(body["max_tokens"] == 4096);
+}
+
+TEST_CASE("HTTP: thinking disabled with empty mode string", "[http_client][thinking]") {
+    MockServer server;
+    server.start(fixture("text_delta.txt"));
+    server.wait_ready();
+
+    ModelGateway gw;
+    gw.set_timeout(5);
+
+    gw.execute(
+        "sk-key", server.base_url().c_str(), "claude-sonnet-4-6",
+        "", VALID_MSG, "",
+        "", "",
+        nullptr, nullptr, nullptr, s_done_nop
+    );
+    server.join();
+
+    auto body = json::parse(server.last_body());
+    REQUIRE(!body.contains("thinking"));
+    REQUIRE(body["max_tokens"] == 4096);
+}
+
+TEST_CASE("HTTP: max_tokens 16000 when thinking enabled, 4096 when disabled", "[http_client][thinking]") {
+    // Enabled
+    {
+        MockServer server;
+        server.start(fixture("text_delta.txt"));
+        server.wait_ready();
+        ModelGateway gw;
+        gw.set_timeout(5);
+        gw.execute(
+            "sk-key", server.base_url().c_str(), "claude-sonnet-4-6",
+            "", VALID_MSG, "",
+            "adaptive", "max",
+            nullptr, nullptr, nullptr, s_done_nop
+        );
+        server.join();
+        auto body = json::parse(server.last_body());
+        REQUIRE(body["max_tokens"] == 16000);
+        REQUIRE(body["thinking"]["type"] == "adaptive");
+    }
+    // Disabled
+    {
+        MockServer server;
+        server.start(fixture("text_delta.txt"));
+        server.wait_ready();
+        ModelGateway gw;
+        gw.set_timeout(5);
+        gw.execute(
+            "sk-key", server.base_url().c_str(), "claude-sonnet-4-6",
+            "", VALID_MSG, "",
+            "", "",
+            nullptr, nullptr, nullptr, s_done_nop
+        );
+        server.join();
+        auto body = json::parse(server.last_body());
+        REQUIRE(body["max_tokens"] == 4096);
+        REQUIRE(!body.contains("thinking"));
+    }
+}
+
+TEST_CASE("HTTP: adaptive thinking without explicit effort still enables thinking", "[http_client][thinking]") {
+    MockServer server;
+    server.start(fixture("text_delta.txt"));
+    server.wait_ready();
+
+    ModelGateway gw;
+    gw.set_timeout(5);
+
+    gw.execute(
+        "sk-key", server.base_url().c_str(), "claude-sonnet-4-6",
+        "", VALID_MSG, "",
+        "adaptive", "",
+        nullptr, nullptr, nullptr, s_done_nop
+    );
+    server.join();
+
+    auto body = json::parse(server.last_body());
+    REQUIRE(body["thinking"]["type"] == "adaptive");
+    REQUIRE(body["thinking"]["display"] == "summarized");
+    REQUIRE(body["max_tokens"] == 16000);
+    // output_config.effort may be absent when empty
 }

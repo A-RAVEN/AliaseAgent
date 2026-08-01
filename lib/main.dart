@@ -405,6 +405,23 @@ class _ChatScreenState extends State<ChatScreen> {
   List<ChatItem> _buildChatItems(List<Message> messages) {
     final items = <ChatItem>[];
     for (final msg in messages) {
+      // Reconstruct thinking blocks (before tool calls, matching API content order)
+      if (msg.thinkingJson != null && msg.thinkingJson!.isNotEmpty) {
+        try {
+          final thinkingBlocks =
+              jsonDecode(msg.thinkingJson!) as List<dynamic>;
+          for (final thJson in thinkingBlocks) {
+            final th = thJson as Map<String, dynamic>;
+            items.add(ChatThinkingItem(
+              thinking: (th['thinking'] as String?) ?? '',
+              signature: th['signature'] as String?,
+              isStreaming: false,
+            ));
+          }
+        } catch (e) {
+          debugPrint('[AliasAgent] Failed to parse thinkingJson: $e');
+        }
+      }
       if (msg.toolCallsJson != null && msg.toolCallsJson!.isNotEmpty) {
         try {
           final list = jsonDecode(msg.toolCallsJson!) as List<dynamic>;
@@ -552,6 +569,16 @@ class _ChatScreenState extends State<ChatScreen> {
       String? doneError;
       String? doneStopReason;
 
+      // Determine thinking mode/effort from agent config
+      const validEfforts = {'low', 'medium', 'high', 'xhigh', 'max'};
+      final thinkingMode = (agentType.thinkingEffort != null &&
+              validEfforts.contains(agentType.thinkingEffort))
+          ? 'adaptive'
+          : 'disabled';
+      final thinkingEffort = thinkingMode == 'adaptive'
+          ? agentType.thinkingEffort!
+          : '';
+
       await _sidecar.sendMessage(
         apiKey: provider.apiKey,
         baseUrl: baseUrl,
@@ -559,6 +586,8 @@ class _ChatScreenState extends State<ChatScreen> {
         systemPrompt: '${agentType.systemPrompt}\nCurrent date: ${DateTime.now().toIso8601String().substring(0, 10)}. For precise time-sensitive queries, use the get_current_time tool.',
         messagesJson: messagesJson,
         toolsJson: toolsJson,
+        thinkingMode: thinkingMode,
+        thinkingEffort: thinkingEffort,
         onChunk: (text) {
           turnText += text;
           if (_currentId == sessionId && mounted) {
@@ -603,7 +632,17 @@ class _ChatScreenState extends State<ChatScreen> {
         },
         onThinking: (json) {
           try {
-            turnThinkingBlocks.add(jsonDecode(json) as Map<String, dynamic>);
+            final th = jsonDecode(json) as Map<String, dynamic>;
+            turnThinkingBlocks.add(th);
+            if (_currentId == sessionId && mounted) {
+              setState(() {
+                _chatItems.add(ChatThinkingItem(
+                  thinking: (th['thinking'] as String?) ?? '',
+                  signature: th['signature'] as String?,
+                  isStreaming: true,
+                ));
+              });
+            }
           } catch (e) {
             debugPrint('[AliasAgent] onThinking parse error: $e\nraw: $json');
           }
@@ -622,10 +661,24 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
 
-      // Remove streaming item
+      // Transition thinking cards to non-streaming + remove streaming item
+      final thinkingJsonStr = turnThinkingBlocks.isNotEmpty
+          ? jsonEncode(turnThinkingBlocks)
+          : null;
       if (_currentId == sessionId && mounted) {
         setState(() {
           _chatItems.removeWhere((i) => i is ChatStreamingItem);
+          // Transition all ChatThinkingItems from streaming to done
+          for (int i = 0; i < _chatItems.length; i++) {
+            if (_chatItems[i] is ChatThinkingItem) {
+              final old = _chatItems[i] as ChatThinkingItem;
+              _chatItems[i] = ChatThinkingItem(
+                thinking: old.thinking,
+                signature: old.signature,
+                isStreaming: false,
+              );
+            }
+          }
         });
       }
 
@@ -640,6 +693,7 @@ class _ChatScreenState extends State<ChatScreen> {
             role: 'assistant',
             content: turnText,
             toolCallsJson: toolCallsJson,
+            thinkingJson: thinkingJsonStr,
           );
           await _sessionRepo.touch(sessionId);
           if (_currentId == sessionId && mounted) {
@@ -660,6 +714,7 @@ class _ChatScreenState extends State<ChatScreen> {
         role: 'assistant',
         content: turnText,
         toolCallsJson: turnJson,
+        thinkingJson: thinkingJsonStr,
       );
       await _sessionRepo.touch(sessionId);
       if (_currentId == sessionId && mounted && turnText.isNotEmpty) {
@@ -768,6 +823,20 @@ class _ChatScreenState extends State<ChatScreen> {
       final content = <Map<String, dynamic>>[
         {'type': 'text', 'text': msg.content},
       ];
+
+      // If assistant message has thinking blocks, prepend them before text
+      if (msg.role == 'assistant' &&
+          msg.thinkingJson != null &&
+          msg.thinkingJson!.isNotEmpty) {
+        try {
+          final thinkingBlocks =
+              jsonDecode(msg.thinkingJson!) as List<dynamic>;
+          content.insertAll(
+              0, thinkingBlocks.cast<Map<String, dynamic>>());
+        } catch (e) {
+          debugPrint('[AliasAgent] Failed to parse thinkingJson: $e');
+        }
+      }
 
       // If assistant message has tool calls, add tool_use blocks
       if (msg.role == 'assistant' &&
