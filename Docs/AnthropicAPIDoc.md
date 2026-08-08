@@ -43,10 +43,24 @@
 | `container` | string \| null | 否 | 跨请求复用的容器标识符 |
 | `mcp_servers` | object[] | 否 | MCP 服务器配置 |
 
-#### thinking 参数（扩展思考）
+#### thinking 参数（扩展思考 / Adaptive Thinking）
 
-当启用扩展思考时，Claude 会先输出思考过程再给出最终答案。需要至少 1,024 token 预算。
+Claude 支持两种 thinking 模式（`thinking.type`），由 `output_config.effort` 控制推理深度：
 
+**1. Adaptive thinking（Claude 4.6+ 推荐，本项目的格式）**：
+```json
+{
+  "thinking": { "type": "adaptive", "display": "summarized" },
+  "output_config": { "effort": "high" },
+  "max_tokens": 16000
+}
+```
+- `thinking.type`: `adaptive` —— 模型根据任务复杂度自动决定推理量，无需 token 预算
+- `thinking.display`: `summarized`（返回思考内容摘要，Claude 4+ 默认）或 `omitted`（不返回思考文本，仅 signature，最快首 token）
+- `output_config.effort`: `low` / `medium` / `high`（默认）/ `xhigh` / `max`（Opus 4.6/Sonnet 4.6 仅，其他模型回退 `high`）
+- `max_tokens`: 顶层必需字段；adaptive 模式不设 budget，建议留足空间
+
+**2. Extended thinking / budget-based（旧模式，4.6+ 弃用）**：
 ```json
 {
   "thinking": {
@@ -55,9 +69,15 @@
   }
 }
 ```
-
 - `type`: `enabled`（固定值）
 - `budget_tokens`: integer, >= 1024，且必须小于 `max_tokens`
+- 4.6+ 模型弃用；旧模型（Opus 4.5、Sonnet 4.5、Haiku 4.5、Claude 3.7 等）仍需此格式
+
+**3. 禁用**：`{"thinking": {"type": "disabled"}}`——4.6+ 模型省略 thinking 参数即默认 adaptive
+
+**迁移路径（4.6+）**：`{"type":"enabled","budget_tokens":N}` → `{"type":"adaptive"}` + `output_config.effort`；删除 `{"type":"disabled"}`（省略即默认启用）。
+
+**多轮 / 工具调用要求**：使用工具时，必须将最后一条 assistant 消息的 thinking 块（含 `signature`）**完整原样**回传给 API 以保持推理连续性。
 
 #### system 参数格式
 

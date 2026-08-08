@@ -1,6 +1,6 @@
 # DeepSeek API 参考文档
 
-> **抓取时间**: 2026-05-24
+> **抓取时间**: 2026-05-24（2026-08-02 更新：补充 Thinking Mode 指南，来源 WebFetch 官方页面）
 > **来源**: [DeepSeek API 官方文档](https://api-docs.deepseek.com/zh-cn/)
 
 ---
@@ -157,6 +157,54 @@ DeepSeek 提供 Anthropic API 格式支持，base_url 为 `https://api.deepseek.
 | | array, type="container_upload" | - | **Not Supported** |
 
 ---
+
+### 2.5 Thinking Mode 指南（Anthropic 格式，2026-08-02 抓取）
+
+来源: https://api-docs.deepseek.com/guides/thinking_mode/
+
+#### 控制参数（Anthropic 格式）
+
+**Thinking 开关**（`none` 禁用思考模式）：
+
+```json
+{"reasoning": {"effort": "none/low/high/max"}}
+```
+
+**思考强度**：
+
+```json
+{"output_config": {"effort": "low/high/max"}}
+```
+
+#### 默认行为
+
+- **Thinking 默认启用**，默认 effort 为 `high`
+- Thinking 模式下不支持 `temperature`、`top_p`、`presence_penalty`、`frequency_penalty`——设置不会报错但**不生效**
+
+#### Effort 映射表（请求值 → 实际映射值）
+
+| 请求 effort | deepseek-v4-flash 实际 | deepseek-v4-pro 实际 |
+| --- | --- | --- |
+| `low` | low | high |
+| `high` | high | high |
+| `xhigh` | high | max |
+| `max` | max | max |
+
+> 注：deepseek-v4-pro 的实际映射预计 2026 年 8 月初更新。
+
+#### 思考内容返回
+
+- CoT 通过 `reasoning_content` 参数返回（与 `content` 同级）
+- **无工具调用**时：两条 `user` 消息之间，之前的 `reasoning_content` 被忽略，无需回传
+- **有工具调用**时：`reasoning_content` **必须在后续所有请求中完整回传**，否则 API 返回 400 错误
+
+#### OpenAI 格式等价参数
+
+- 开关: `{"thinking": {"type": "enabled/disabled"}}`
+- 强度: `{"reasoning_effort": "low/high/max"}`
+- OpenAI SDK 中 `thinking` 参数必须放在 `extra_body` 中传递，如 `extra_body={"thinking": {"type": "enabled"}}`
+
+> **注意**：DeepSeek 官方文档（anthropic_api 指南 + thinking_mode 指南）均未记载 `thinking.type="adaptive"`、`display`、`summarized` 字段。本项目实现发送 `{"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"..."}}`（Anthropic 原生 adaptive 格式）——live 实测被端点接受并返回完整 thinking 流（thinking_delta 增量），但该格式无 DeepSeek 官方文档依据，仅 `output_config.effort` 有文档确认。
 
 ## 3. 对话补全 API
 
