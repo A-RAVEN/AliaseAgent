@@ -33,6 +33,11 @@ public:
 
   /// Set network timeout in seconds (default 120).
   void set_timeout(long seconds);
+
+  /// Cancel the in-flight request (if any). Thread-safe; returns immediately.
+  /// The curl thread observes the flag (XFERINFO callback), aborts the
+  /// transfer (CURLE_ABORTED_BY_CALLBACK) and delivers on_done(-1,"cancelled").
+  void cancel();
 };
 
 #endif

@@ -41,6 +41,11 @@ SIDECAR_API const char* ping(void) {
   return "pong";
 }
 
+SIDECAR_API void cancel_request(void) {
+  ensure_log();
+  g_gateway.cancel();
+}
+
 SIDECAR_API int send_message(
   const char* api_key,
   const char* base_url,

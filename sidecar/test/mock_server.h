@@ -12,6 +12,7 @@
 #include <sstream>
 #include <cstring>
 #include <stdexcept>
+#include <algorithm>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -56,6 +57,14 @@ public:
     /// When set, the server uses this string as the response body instead of
     /// reading a fixture file.
     void set_response_body(const std::string& body) { response_body_ = body; }
+
+    /// Enable streaming-with-delay mode: the response body is sent in pieces
+    /// of up to chunk_bytes, sleeping chunk_delay_ms between pieces. Used to
+    /// verify that callbacks fire in real-time (before curl completes).
+    void set_streaming_chunks(size_t chunk_bytes, int chunk_delay_ms) {
+        streaming_chunk_bytes_ = chunk_bytes;
+        streaming_delay_ms_ = chunk_delay_ms;
+    }
 
     /// Queue a response for multi-request mode (task 9.0d).
     /// Responses are served in FIFO order. When the queue is exhausted,
@@ -236,11 +245,32 @@ private:
 
           // Build and send HTTP response
           std::string response = build_response();
+          if (streaming_chunk_bytes_ > 0) {
+            // Streaming-with-delay mode: send in pieces to exercise real-time
+            // callback delivery (callbacks must fire before curl completes)
+            size_t pos = 0;
+            while (pos < response.size()) {
+              size_t n = std::min(streaming_chunk_bytes_, response.size() - pos);
 #ifdef _WIN32
-          send(client, response.c_str(), (int)response.size(), 0);
+              send(client, response.c_str() + pos, (int)n, 0);
+#else
+              send(client, response.c_str() + pos, n, 0);
+#endif
+              pos += n;
+              if (pos < response.size() && streaming_delay_ms_ > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(streaming_delay_ms_));
+              }
+            }
+          } else {
+#ifdef _WIN32
+            send(client, response.c_str(), (int)response.size(), 0);
+#else
+            send(client, response.c_str(), response.size(), 0);
+#endif
+          }
+#ifdef _WIN32
           closesocket(client);
 #else
-          send(client, response.c_str(), response.size(), 0);
           close(client);
 #endif
         } while (multi_request_ && !stop_);
@@ -446,6 +476,10 @@ private:
     bool multi_request_ = false;
     bool stop_ = false;
     std::string response_body_;
+
+    // Streaming-with-delay mode (realtime callback tests)
+    size_t streaming_chunk_bytes_ = 0;
+    int streaming_delay_ms_ = 0;
 
     // Multi-request response queue (task 9.0d)
     std::vector<QueuedResponse> response_queue_;

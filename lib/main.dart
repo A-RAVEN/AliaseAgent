@@ -410,12 +410,16 @@ class _ChatScreenState extends State<ChatScreen> {
         try {
           final thinkingBlocks =
               jsonDecode(msg.thinkingJson!) as List<dynamic>;
-          for (final thJson in thinkingBlocks) {
-            final th = thJson as Map<String, dynamic>;
+          // index is derived from array position (0..N-1) — NOT persisted (D6);
+          // this also makes history written by add-extended-thinking (blocks
+          // without an index field) rebuild correctly with derived indexes.
+          for (var i = 0; i < thinkingBlocks.length; i++) {
+            final th = thinkingBlocks[i] as Map<String, dynamic>;
             items.add(ChatThinkingItem(
               thinking: (th['thinking'] as String?) ?? '',
               signature: th['signature'] as String?,
               isStreaming: false,
+              index: i,
             ));
           }
         } catch (e) {
@@ -453,7 +457,19 @@ class _ChatScreenState extends State<ChatScreen> {
         .toList();
   }
 
+  /// Request generation counter (15.1): every _sendMessage increments it and
+  /// passes the value into _callModel; a session switch records the current
+  /// generation in _switchEpoch. A call whose epoch <= _switchEpoch was
+  /// invalidated by a switch — its remaining tool loop is aborted (whether or
+  /// not the user switches back) and its done is treated as a switch-cancel.
+  /// This replaces the earlier _cancelSwitchSessionId flag, whose
+  /// single-slot semantics could not distinguish "my request was switched
+  /// away" from "a newer request was switched away".
+  int _requestEpoch = 0;
+  int _switchEpoch = -1;
+
   void _selectSession(Session s) {
+    if (_isStreaming) _switchEpoch = _requestEpoch;
     _endStreaming();
     setState(() {
       _currentId = s.id;
@@ -465,6 +481,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _newChat() async {
     final s = await _sessionRepo.create();
     if (!mounted) return;
+    if (_isStreaming) _switchEpoch = _requestEpoch;
     _endStreaming();
     setState(() {
       _currentId = s.id;
@@ -477,7 +494,10 @@ class _ChatScreenState extends State<ChatScreen> {
     await _sessionRepo.delete(s.id);
     if (!mounted) return;
     final wasCurrent = _currentId == s.id;
-    if (wasCurrent) _endStreaming();
+    if (wasCurrent) {
+      if (_isStreaming) _switchEpoch = _requestEpoch;
+      _endStreaming();
+    }
     setState(() {
       _sessions.removeWhere((x) => x.id == s.id);
       if (wasCurrent) {
@@ -496,13 +516,21 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     if (_currentId == null) return;
 
+    // 17.5 (FINAL-R10-01): capture session + epoch BEFORE any async gap —
+    // a session switch during the inserts below must not redirect this
+    // message to the new session (user message persisted into the wrong
+    // session) or lose the epoch association. A switch after this point
+    // invalidates the call via _switchEpoch and the loop-top abort check.
+    final sessionId = _currentId!;
+    final epoch = ++_requestEpoch;
+
     // Insert user message
     final userMsg = await _msgRepo.insert(
-      sessionId: _currentId!,
+      sessionId: sessionId,
       role: 'user',
       content: text,
     );
-    await _sessionRepo.touch(_currentId!);
+    await _sessionRepo.touch(sessionId);
 
     setState(() {
       _chatItems.add(ChatMessageItem(userMsg));
@@ -510,24 +538,38 @@ class _ChatScreenState extends State<ChatScreen> {
     });
 
     // Auto-title: update "New Chat" from first user message
-    final titleUpdated = await _sessionRepo.updateTitleIfDefault(_currentId!, text);
+    final titleUpdated = await _sessionRepo.updateTitleIfDefault(sessionId, text);
     if (titleUpdated && mounted) {
       setState(() {
         _sessions.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
       });
     }
 
-    // Snapshot session state before async gap to prevent race conditions
-    final sessionId = _currentId!;
+    // Snapshot conversation state before the model call
     final snapMessages = _chatItemsToMessages();
-    await _callModel(sessionId: sessionId, messages: snapMessages);
+    try {
+      await _callModel(sessionId: sessionId, messages: snapMessages, epoch: epoch);
+    } catch (e, st) {
+      // 13.6: an unexpected exception inside _callModel (e.g. DB insert
+      // failing) must not leave _isStreaming stuck true — that would block
+      // all future sends with no error surfaced.
+      debugPrint('[AliasAgent] _callModel error: $e\n$st');
+      // 16.4 (E4): only restore streaming state if THIS call was not
+      // invalidated by a switch — a stale call's exception must not cancel
+      // the newer in-flight request (whose done(-1,'cancelled') would then be
+      // misclassified as a switch-cancel and silently dropped).
+      if (_switchEpoch < epoch && mounted) _endStreaming();
+    }
   }
 
   // -------------------------------------------------------------------------
   // Model calling with tool execution loop
   // -------------------------------------------------------------------------
 
-  Future<void> _callModel({required String sessionId, required List<Message> messages}) async {
+  Future<void> _callModel(
+      {required String sessionId,
+      required List<Message> messages,
+      required int epoch}) async {
     final agentType = registry.lookup('general');
     if (agentType == null) {
       setState(() => _isStreaming = false);
@@ -560,6 +602,12 @@ class _ChatScreenState extends State<ChatScreen> {
 
     int turn = 0;
     while (true) {
+      // 12.1/15.1: abort the remaining tool loop if the user switched
+      // sessions while this call was in flight — either away (12.1) or back
+      // (15.1 epoch check: a switched-away call is invalidated for good).
+      // Further turns would stream into the wrong session, interleave DB
+      // history, and tear down a newer request's streaming state.
+      if (_switchEpoch >= epoch || _currentId != sessionId) return;
       final messagesJson = jsonEncode(apiMessages);
 
       String turnText = '';
@@ -567,7 +615,6 @@ class _ChatScreenState extends State<ChatScreen> {
       final turnThinkingBlocks = <Map<String, dynamic>>[];
       int doneCode = 0;
       String? doneError;
-      String? doneStopReason;
 
       // Determine thinking mode/effort from agent config
       const validEfforts = {'low', 'medium', 'high', 'xhigh', 'max'};
@@ -590,7 +637,8 @@ class _ChatScreenState extends State<ChatScreen> {
         thinkingEffort: thinkingEffort,
         onChunk: (text) {
           turnText += text;
-          if (_currentId == sessionId && mounted) {
+          // 16.2 (E2): late chunks from a switched-away call must not render
+          if (_currentId == sessionId && _switchEpoch < epoch && mounted) {
             setState(() {
               final lastIdx = _chatItems.length - 1;
               if (lastIdx >= 0 && _chatItems[lastIdx] is ChatStreamingItem) {
@@ -607,7 +655,7 @@ class _ChatScreenState extends State<ChatScreen> {
             final tc = jsonDecode(json) as Map<String, dynamic>;
             tc['id'] ??= 'tool_${turn}_${turnToolCalls.length}';
             turnToolCalls.add(tc);
-            if (_currentId == sessionId) {
+            if (_currentId == sessionId && _switchEpoch < epoch) {
               final activity = ToolCallActivity(
                 id: tc['id'] as String,
                 toolName: (tc['name'] as String?) ?? 'unknown',
@@ -633,15 +681,82 @@ class _ChatScreenState extends State<ChatScreen> {
         onThinking: (json) {
           try {
             final th = jsonDecode(json) as Map<String, dynamic>;
-            turnThinkingBlocks.add(th);
-            if (_currentId == sessionId && mounted) {
-              setState(() {
-                _chatItems.add(ChatThinkingItem(
-                  thinking: (th['thinking'] as String?) ?? '',
-                  signature: th['signature'] as String?,
-                  isStreaming: true,
-                ));
-              });
+            final type = th['type'] as String?;
+            final idx = (th['index'] as num?)?.toInt() ?? 0;
+            if (type == 'thinking_delta') {
+              // Incremental event — UI only, NEVER persisted (D8): find the
+              // active (streaming) card for this index in the current turn and
+              // append the delta; create the card on first delta (D4/D6).
+              if (_currentId == sessionId && _switchEpoch < epoch && mounted) {
+                final delta = (th['delta'] as String?) ?? '';
+                setState(() {
+                  var target = -1;
+                  for (int i = _chatItems.length - 1; i >= 0; i--) {
+                    final item = _chatItems[i];
+                    if (item is ChatThinkingItem &&
+                        item.isStreaming &&
+                        item.index == idx) {
+                      target = i;
+                      break;
+                    }
+                  }
+                  if (target >= 0) {
+                    final old = _chatItems[target] as ChatThinkingItem;
+                    _chatItems[target] = ChatThinkingItem(
+                      thinking: old.thinking + delta,
+                      signature: old.signature,
+                      isStreaming: true,
+                      index: idx,
+                    );
+                  } else {
+                    _chatItems.add(ChatThinkingItem(
+                      thinking: delta,
+                      isStreaming: true,
+                      index: idx,
+                    ));
+                  }
+                });
+              }
+            } else if (type == 'thinking') {
+              // Final block (content_block_stop): complete text + signature.
+              // ONLY final blocks enter turnThinkingBlocks → thinking_json →
+              // API context reconstruction (D8 / F4 fix). The `index` key is
+              // stripped before persisting/replay (9.2): per D6 the index is
+              // not a persisted field and is undocumented in the API's
+              // thinking content block schema.
+              turnThinkingBlocks.add(_thinkingBlockWithoutIndex(th));
+              if (_currentId == sessionId && _switchEpoch < epoch && mounted) {
+                setState(() {
+                  var target = -1;
+                  for (int i = _chatItems.length - 1; i >= 0; i--) {
+                    final item = _chatItems[i];
+                    if (item is ChatThinkingItem &&
+                        item.isStreaming &&
+                        item.index == idx) {
+                      target = i;
+                      break;
+                    }
+                  }
+                  if (target >= 0) {
+                    _chatItems[target] = ChatThinkingItem(
+                      thinking: (th['thinking'] as String?) ?? '',
+                      signature: th['signature'] as String?,
+                      isStreaming: true,
+                      index: idx,
+                    );
+                  } else {
+                    _chatItems.add(ChatThinkingItem(
+                      thinking: (th['thinking'] as String?) ?? '',
+                      signature: th['signature'] as String?,
+                      isStreaming: true,
+                      index: idx,
+                    ));
+                  }
+                });
+              }
+            } else {
+              // Unknown thinking event type — never persist or render (9.7)
+              debugPrint('[AliasAgent] onThinking: unknown event type: $type');
             }
           } catch (e) {
             debugPrint('[AliasAgent] onThinking parse error: $e\nraw: $json');
@@ -650,14 +765,43 @@ class _ChatScreenState extends State<ChatScreen> {
         onDone: (code, error, stopReason) {
           doneCode = code;
           doneError = error;
-          doneStopReason = stopReason;
-          debugPrint('[AliasAgent] stop_reason: $doneStopReason');
         },
       );
 
       if (doneCode != 0) {
-        if (_currentId == sessionId) _endStreaming();
+        // 12.2 (RTD-R4-02): decide switch-cancellation FIRST (context captured
+        // at switch time, race-free) so the _endStreaming call is guarded too —
+        // a stale cancelled done must not tear down a newer request's
+        // streaming state (rapid A→B→A + new message).
+        final switchCancelled = _switchEpoch >= epoch || doneError == 'cancelled';
+        if (_currentId == sessionId && !switchCancelled) _endStreaming();
+        // 9.5/10.2/15.1: cancellation (session switch / new chat / delete)
+        // must not pollute the old session's history with an error card.
+        if (switchCancelled) {
+          return;
+        }
         await _storeError(doneError ?? 'Unknown error', sessionId: sessionId);
+        return;
+      }
+
+      // 11.1 (R3-F1/R3-F6): a request whose cancellation was triggered by a
+      // session switch may still complete successfully (lost-cancel window,
+      // stream already finished, or cancel during a tool-loop gap). The flag
+      // MUST be cleared on the success path too (otherwise a later real error
+      // in this session would be misjudged as a switch-cancel and silently
+      // dropped), and this turn's _endStreaming calls must be skipped — the
+      // user may have switched back and already started a new request, whose
+      // streaming state must not be torn down by the stale request's done.
+      final wasSwitchCancelled = _switchEpoch >= epoch;
+      // 16.1 (E1): a switch invalidated this call — even if it completed
+      // successfully (lost-cancel window), its late reply must NOT be
+      // persisted (it would land after a newer message in DB history and get
+      // replayed to the API), rendered, or tear down the newer request's
+      // streaming cards. Return immediately. Release the streaming flag too
+      // (17.2): the stale completion must not block a new send when the user
+      // has switched back to this session.
+      if (wasSwitchCancelled) {
+        if (_currentId == sessionId) _endStreaming();
         return;
       }
 
@@ -668,7 +812,8 @@ class _ChatScreenState extends State<ChatScreen> {
       if (_currentId == sessionId && mounted) {
         setState(() {
           _chatItems.removeWhere((i) => i is ChatStreamingItem);
-          // Transition all ChatThinkingItems from streaming to done
+          // Transition all ChatThinkingItems from streaming to done,
+          // preserving their derived index (D6: index survives instance rebuild)
           for (int i = 0; i < _chatItems.length; i++) {
             if (_chatItems[i] is ChatThinkingItem) {
               final old = _chatItems[i] as ChatThinkingItem;
@@ -676,6 +821,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 thinking: old.thinking,
                 signature: old.signature,
                 isStreaming: false,
+                index: old.index,
               );
             }
           }
@@ -702,9 +848,14 @@ class _ChatScreenState extends State<ChatScreen> {
             });
           }
         }
-        if (_currentId == sessionId) _endStreaming();
+        if (_currentId == sessionId && !wasSwitchCancelled) _endStreaming();
         return;
       }
+
+      // 15.5 (F2): a switch invalidated this call — do NOT execute the
+      // received tool_use (side-effect tools like write_file must not run
+      // after the user switched away).
+      if (_switchEpoch >= epoch) return;
 
       // Tool calls present — accumulate and persist intermediate assistant message
       allTurnToolCalls.addAll(turnToolCalls);
@@ -740,6 +891,11 @@ class _ChatScreenState extends State<ChatScreen> {
       // Execute tools and build tool results
       final toolResults = <Map<String, dynamic>>[];
       for (final tc in turnToolCalls) {
+        // 16.3 (E3/F3): per-tool epoch check — a switch during a long tool
+        // await (web_search/web_fetch up to 120s) must abort the remaining
+        // batch so side-effect tools (write_file/edit_file) don't run after
+        // the user switched away.
+        if (_switchEpoch >= epoch) break;
         final result = await _executeTool(tc);
         final resultContent = result['ok'] == true
             ? (result['content'] as String? ?? '')
@@ -807,12 +963,22 @@ class _ChatScreenState extends State<ChatScreen> {
       turnThinkingBlocks.clear();
       if (turn >= 50) {
         debugPrint('[AliasAgent] Max tool turns (50) exceeded — aborting');
-        if (_currentId == sessionId) _endStreaming();
+        if (_currentId == sessionId && !wasSwitchCancelled) _endStreaming();
         await _sessionRepo.touch(sessionId);
         return;
       }
       turn++;
     }
+  }
+
+  /// Strip the internal `index` key from a thinking block before persisting
+  /// or replaying it to the API (9.2): per D6 the index is not a persisted
+  /// field, and it is undocumented in the API's thinking content-block schema.
+  static Map<String, dynamic> _thinkingBlockWithoutIndex(
+      Map<String, dynamic> th) {
+    if (!th.containsKey('index')) return th;
+    final cleaned = Map<String, dynamic>.from(th)..remove('index');
+    return cleaned;
   }
 
   /// Build API conversation messages from persisted Message objects,
@@ -831,8 +997,10 @@ class _ChatScreenState extends State<ChatScreen> {
         try {
           final thinkingBlocks =
               jsonDecode(msg.thinkingJson!) as List<dynamic>;
-          content.insertAll(
-              0, thinkingBlocks.cast<Map<String, dynamic>>());
+          // Strip any persisted index keys (9.2) — old rows may carry them
+          content.insertAll(0,
+              thinkingBlocks.map((b) => _thinkingBlockWithoutIndex(
+                  b as Map<String, dynamic>)));
         } catch (e) {
           debugPrint('[AliasAgent] Failed to parse thinkingJson: $e');
         }
@@ -1126,11 +1294,33 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   /// Remove streaming indicator only; tool call cards and persistent messages persist.
+  /// Also cancels any in-flight C++ request (D7): the session switch / new chat
+  /// / timeout paths must truly terminate the previous request instead of
+  /// letting it stream into the next one (F1 fix — the Dart serialization gate
+  /// in SidecarBridge then releases once the cancelled done is delivered).
+  /// On the error/cancel path, residual streaming ChatThinkingItems are
+  /// transitioned to done (9.1): otherwise the animated dots run forever AND a
+  /// later turn's thinking_delta with the same index would match the stale
+  /// card (cross-turn index collision violating the chat-ui spec).
   void _endStreaming() {
+    _sidecar.cancelRequest();
     if (!mounted) return;
     setState(() {
       _isStreaming = false;
       _chatItems.removeWhere((i) => i is ChatStreamingItem);
+      for (int i = 0; i < _chatItems.length; i++) {
+        if (_chatItems[i] is ChatThinkingItem) {
+          final old = _chatItems[i] as ChatThinkingItem;
+          if (old.isStreaming) {
+            _chatItems[i] = ChatThinkingItem(
+              thinking: old.thinking,
+              signature: old.signature,
+              isStreaming: false,
+              index: old.index,
+            );
+          }
+        }
+      }
     });
   }
 

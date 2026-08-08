@@ -101,12 +101,14 @@ Example log output:
 
 Set `ALIASAGENT_LOG_LEVEL=trace` to enable FFI boundary tracing:
 
-**C→Dart callbacks** (each invocation logged):
+**C→Dart callbacks**: every callback invocation is recorded in the crash-handler
+ring buffer (dumped on crash); the log only emits a TRACE line for `on_done`:
 ```
-2026-07-15 12:34:56.123 [TRACE] FFI: on_chunk(len=42)
-2026-07-15 12:34:56.456 [TRACE] FFI: on_tool_call(len=512)
 2026-07-15 12:34:56.789 [TRACE] FFI: on_done(code=0)
 ```
+
+**SSE wire diagnostics** (per-event, also TRACE): text/thinking deltas,
+content_block events, message_stop, request body — all off by default.
 
 **Dart→C entry points** (sensitive data redacted):
 ```
@@ -213,7 +215,7 @@ http://localhost:8888/search?q=test&format=json
 
 - API keys are stored as **plaintext** in `config.json` (same protection level as the main model API key)
 - Crash dumps use `MiniDumpNormal` — **no heap memory** is included, so API keys are NOT in minidump files
-- HTTP request bodies are logged at `DEBUG` level (not `INFO`). Set `ALIASAGENT_LOG_LEVEL=warn` to suppress all body logging
+- HTTP request bodies and per-event SSE diagnostics are logged at `TRACE` level (the logger has TRACE/INFO/WARN/ERR — no DEBUG level), so they are off by default. Set `ALIASAGENT_LOG_LEVEL=trace` to enable them
 - Auth headers (`Authorization: Bearer`, `x-api-key`) are **never logged**
 - Config key naming uses `snake_case` (`api_key`), consistent with the existing `ProviderConfig.api_key`
 

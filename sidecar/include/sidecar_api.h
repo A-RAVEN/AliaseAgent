@@ -24,6 +24,11 @@ typedef void (*OnDoneCallback)(int code, const char* err, const char* stop_reaso
 /// Ping: verify FFI bridge is working
 SIDECAR_API const char* ping(void);
 
+/// Cancel the in-flight send_message request (if any). Thread-safe, returns
+/// immediately; no-op when no request is active. The curl thread aborts the
+/// transfer and delivers on_done(-1, "cancelled") before the request returns.
+SIDECAR_API void cancel_request(void);
+
 /// Send a message to the model, stream response via callbacks
 /// Returns a request_id (integer)
 SIDECAR_API int send_message(

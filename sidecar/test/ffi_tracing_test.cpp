@@ -30,7 +30,7 @@ static void reset_callbacks() {
 }
 
 // ============================================================================
-// 6.7.1 — Ring buffer populated during dispatch_events()
+// 6.7.1 — Ring buffer populated during real-time callback dispatch
 // ============================================================================
 TEST_CASE("FFI: ring buffer populated during dispatch", "[ffi_tracing]") {
     reset_callbacks();

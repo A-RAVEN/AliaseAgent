@@ -30,6 +30,7 @@ typedef SendMessageNative = Int32 Function(
 );
 
 typedef SetWorkspaceNative = Pointer<Utf8> Function(Pointer<Utf8> path);
+typedef CancelRequestNative = Void Function();
 
 // Dart-facing types
 typedef SendMessageDart = int Function(
@@ -47,6 +48,8 @@ typedef SendMessageDart = int Function(
   Pointer<NativeFunction<OnDoneNative>> onDone,
 );
 
+typedef OnDoneDart = void Function(int code, Pointer<Utf8> err, Pointer<Utf8> stopReason);
+
 typedef SetWorkspaceDart = Pointer<Utf8> Function(Pointer<Utf8> path);
 typedef ReadFileDart = Pointer<Utf8> Function(Pointer<Utf8> path);
 typedef ListDirDart = Pointer<Utf8> Function(Pointer<Utf8> path);
@@ -56,6 +59,7 @@ typedef WebSearchDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef WebFetchDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef WriteFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef EditFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
+typedef CancelRequestDart = void Function();
 
 // ---------------------------------------------------------------------------
 // Dart-facing callback types
@@ -85,6 +89,11 @@ abstract class ISidecar {
     OnThinkingCallback? onThinking,
     required OnDoneCallback onDone,
   });
+
+  /// Cancel the in-flight send_message request (if any). Thread-safe, returns
+  /// immediately; no-op when idle. The C++ side aborts the stream and delivers
+  /// on_done(-1, "cancelled") before the request returns.
+  void cancelRequest();
 
   String? setWorkspace(String path);
   String readFile(String requestJson);
@@ -118,6 +127,13 @@ class SidecarBridge implements ISidecar {
   late final WebFetchDart _webFetchFn;
   late final WriteFileDart _writeFileFn;
   late final EditFileDart _editFileFn;
+  late final CancelRequestDart _cancelRequestFn;
+
+  // Serialization gate (D3): all sendMessage calls execute strictly one at a
+  // time. A new request starts only after the previous request's done callback
+  // has been processed by this isolate — which is exactly what the C++ side's
+  // pending_strings cleanup barrier (D3) depends on.
+  Future<void>? _chain;
 
   SidecarBridge._() {
     _lib = _openLibrary();
@@ -139,6 +155,8 @@ class SidecarBridge implements ISidecar {
         _lib.lookupFunction<SetWorkspaceNative, WriteFileDart>('write_file');
     _editFileFn =
         _lib.lookupFunction<SetWorkspaceNative, EditFileDart>('edit_file');
+    _cancelRequestFn =
+        _lib.lookupFunction<CancelRequestNative, CancelRequestDart>('cancel_request');
   }
 
   static SidecarBridge get instance {
@@ -146,7 +164,8 @@ class SidecarBridge implements ISidecar {
     return _instance!;
   }
 
-  // -- non-blocking model call (runs FFI on a worker isolate) --
+  // -- non-blocking model call (FFI runs on a worker isolate; callbacks are
+  //    delivered to THIS isolate in real-time via NativeCallable) --
 
   @override
   Future<void> sendMessage({
@@ -162,11 +181,114 @@ class SidecarBridge implements ISidecar {
     required OnToolCallCallback onToolCall,
     OnThinkingCallback? onThinking,
     required OnDoneCallback onDone,
-  }) async {
-    final receivePort = ReceivePort();
+  }) {
+    return _enqueue(() => _sendMessageInner(
+          apiKey: apiKey,
+          baseUrl: baseUrl,
+          model: model,
+          systemPrompt: systemPrompt,
+          messagesJson: messagesJson,
+          toolsJson: toolsJson,
+          thinkingMode: thinkingMode,
+          thinkingEffort: thinkingEffort,
+          onChunk: onChunk,
+          onToolCall: onToolCall,
+          onThinking: onThinking,
+          onDone: onDone,
+        ));
+  }
 
+  Future<T> _enqueue<T>(Future<T> Function() task) {
+    final prev = _chain ?? Future<void>.value();
+    final result = prev.then((_) => task());
+    // Keep the chain alive even if this request errors
+    _chain = result.then((_) {}, onError: (_) {});
+    return result;
+  }
+
+  @override
+  void cancelRequest() {
+    _cancelRequestFn();
+  }
+
+  Future<void> _sendMessageInner({
+    required String apiKey,
+    required String baseUrl,
+    required String model,
+    required String systemPrompt,
+    required String messagesJson,
+    required String toolsJson,
+    required String thinkingMode,
+    required String thinkingEffort,
+    required OnChunkCallback onChunk,
+    required OnToolCallCallback onToolCall,
+    OnThinkingCallback? onThinking,
+    required OnDoneCallback onDone,
+  }) async {
+    // ---- NativeCallable listeners created on THIS isolate (D2) -----------
+    // .listener callbacks are delivered to the creating isolate's event loop.
+    // The C++ curl thread invokes them in real-time during the stream; the
+    // messages land directly on this isolate's queue (previously they were
+    // queued behind the worker isolate blocked in the FFI call).
+    final completer = Completer<void>();
+    var finished = false;
+    var timedOut = false;
+
+    // late final: finish() closes the callables, and the done callable invokes
+    // finish() — the closures only run asynchronously, after assignment.
+    late final NativeCallable<OnChunkNative> onChunkCallable;
+    late final NativeCallable<OnToolCallNative> onToolCallCallable;
+    late final NativeCallable<OnThinkingNative> onThinkingCallable;
+    late final NativeCallable<OnDoneNative> onDoneCallable;
+
+    void finish(int code, String error, String stopReason,
+        {bool closeCallables = true}) {
+      if (finished) return; // idempotent: ignore duplicate done (F5)
+      finished = true;
+      // Close callables only after a real done (success or cancellation):
+      // by the time this callback is processed, the curl thread has already
+      // terminated (done is its last action before join), so no callback can
+      // fire after close (F6). The defensive fallback path (9.3) passes
+      // closeCallables: false — if the cancel path failed to terminate the
+      // curl thread within the fallback window, closing would be UB while it
+      // may still invoke callbacks; leaking the callables is the safe trade-off.
+      if (closeCallables) {
+        Timer.run(() {
+          onChunkCallable.close();
+          onToolCallCallable.close();
+          onThinkingCallable.close();
+          onDoneCallable.close();
+        });
+      }
+      completer.complete();
+      onDone(code,
+          error.isEmpty ? null : (timedOut && code != 0 ? 'Request timed out after 120s' : error),
+          stopReason.isEmpty ? null : stopReason);
+    }
+
+    onChunkCallable = NativeCallable<OnChunkNative>.listener(
+      (Pointer<Utf8> ptr) {
+        onChunk(ptr.toDartString());
+      },
+    );
+    onToolCallCallable = NativeCallable<OnToolCallNative>.listener(
+      (Pointer<Utf8> ptr) {
+        onToolCall(ptr.toDartString());
+      },
+    );
+    onThinkingCallable = NativeCallable<OnThinkingNative>.listener(
+      (Pointer<Utf8> ptr) {
+        onThinking?.call(ptr.toDartString());
+      },
+    );
+    onDoneCallable = NativeCallable<OnDoneNative>.listener(
+      (int code, Pointer<Utf8> errPtr, Pointer<Utf8> stopReasonPtr) {
+        finish(code, errPtr.toDartString(), stopReasonPtr.toDartString());
+      },
+    );
+
+    // ---- Worker isolate: rebuild pointers from addresses, call FFI --------
     await Isolate.spawn(_workerMain, {
-      'sendPort': receivePort.sendPort,
       'apiKey': apiKey,
       'baseUrl': baseUrl,
       'model': model,
@@ -175,39 +297,57 @@ class SidecarBridge implements ISidecar {
       'toolsJson': toolsJson,
       'thinkingMode': thinkingMode,
       'thinkingEffort': thinkingEffort,
+      'onChunkAddr': onChunkCallable.nativeFunction.address,
+      'onToolCallAddr': onToolCallCallable.nativeFunction.address,
+      'onThinkingAddr': onThinkingCallable.nativeFunction.address,
+      'onDoneAddr': onDoneCallable.nativeFunction.address,
     });
 
-    // Task 8.8a: .timeout(120s) prevents isolate hang if Sidecar crashes via SEH
-    try {
-      await for (final msg in receivePort.timeout(const Duration(seconds: 120))) {
-        final map = msg as Map<String, dynamic>;
-        switch (map['type'] as String) {
-          case 'chunk':
-            onChunk(map['text'] as String);
-          case 'tool_call':
-            onToolCall(map['json'] as String);
-          case 'thinking':
-            onThinking?.call(map['json'] as String);
-          case 'done':
-            final code = map['code'] as int;
-            final error = map['error'] as String?;
-            final stopReason = map['stopReason'] as String?;
-            onDone(code, error, stopReason);
-            receivePort.close();
-            return;
+    // ---- Timeout: real cancellation, never a fake done (8.5) --------------
+    // On timeout we ask the C++ side to abort; the curl thread then delivers
+    // on_done(-1, "cancelled") which flows through finish() above — the bridge
+    // closes callables only after that real done.
+    final timeoutTimer = Timer(const Duration(seconds: 120), () {
+      if (finished) return;
+      timedOut = true;
+      // ignore: avoid_print
+      print('[SidecarBridge] request timed out after 120s — cancelling');
+      _cancelRequestFn();
+      // Fallback in case the cancel path never delivers a done (defensive).
+      // closeCallables: false (9.3) — the curl thread may still be alive if
+      // cancellation failed to terminate it; closing would be UB. We complete
+      // the Future and surface the error; any late real done is ignored by
+      // finish()'s idempotency guard, and the callables are deliberately
+      // leaked (safe) rather than closed (UB).
+      // Residual window (11.3, R3-F2): if the stuck request eventually
+      // completes after this fallback released the gate, its post-perform
+      // done delivers an error string through the C++ pending_strings pool —
+      // which a NEW request's execute() clears under request_mutex while this
+      // old done message is still queued on the main isolate (the D3 barrier
+      // is broken by the fallback). The listener would then read freed
+      // memory. Accepted as a documented low-probability edge (requires
+      // cancel to fail completely + the stuck request to terminate >30s
+      // later + a new message in between); not structurally fixable without
+      // request-scoped string ownership, which is out of scope.
+      final fallback = Timer(const Duration(seconds: 30), () {
+        if (!finished) {
+          // ignore: avoid_print
+          print('[SidecarBridge] FALLBACK: no done 30s after cancel — '
+              'releasing gate without closing callables (leaked, 10.3)');
+          finish(-1, 'Request timed out after 120s (no done after cancel)', '',
+              closeCallables: false);
         }
-      }
-    } on TimeoutException {
-      print('[SidecarBridge] sendMessage ReceivePort timed out after 120s');
-      receivePort.close();
-      onDone(-1, 'Request timed out after 120s', null);
-    }
+      });
+      completer.future.whenComplete(fallback.cancel);
+    });
+
+    await completer.future;
+    timeoutTimer.cancel();
   }
 
-  // -- worker isolate entry point --
+  // -- worker isolate entry point (FFI call only; callbacks bypass the worker)
 
   static void _workerMain(Map<String, dynamic> args) {
-    final sendPort = args['sendPort'] as SendPort;
     final apiKey = args['apiKey'] as String;
     final baseUrl = args['baseUrl'] as String;
     final model = args['model'] as String;
@@ -216,79 +356,89 @@ class SidecarBridge implements ISidecar {
     final toolsJson = args['toolsJson'] as String;
     final thinkingMode = args['thinkingMode'] as String;
     final thinkingEffort = args['thinkingEffort'] as String;
+    final onChunkAddr = args['onChunkAddr'] as int;
+    final onToolCallAddr = args['onToolCallAddr'] as int;
+    final onThinkingAddr = args['onThinkingAddr'] as int;
+    final onDoneAddr = args['onDoneAddr'] as int;
 
-    final lib = _openLibrary();
-    final sendMessageFn =
-        lib.lookupFunction<SendMessageNative, SendMessageDart>('send_message');
+    // Rebuild native function pointers from their addresses (D2): the address
+    // integer is trivially sendable across isolates, the Pointer object itself
+    // has no documented sendability guarantee.
+    final onChunkPtr = Pointer<NativeFunction<OnChunkNative>>.fromAddress(onChunkAddr);
+    final onToolCallPtr = Pointer<NativeFunction<OnToolCallNative>>.fromAddress(onToolCallAddr);
+    final onThinkingPtr = Pointer<NativeFunction<OnThinkingNative>>.fromAddress(onThinkingAddr);
+    final onDonePtr = Pointer<NativeFunction<OnDoneNative>>.fromAddress(onDoneAddr);
 
-    final apiKeyPtr = apiKey.toNativeUtf8();
-    final baseUrlPtr = baseUrl.toNativeUtf8();
-    final modelPtr = model.toNativeUtf8();
-    final systemPromptPtr = systemPrompt.toNativeUtf8();
-    final messagesJsonPtr = messagesJson.toNativeUtf8();
-    final toolsJsonPtr = toolsJson.toNativeUtf8();
-    final thinkingModePtr = thinkingMode.toNativeUtf8();
-    final thinkingEffortPtr = thinkingEffort.toNativeUtf8();
+    // Fast-fail (9.6): any Dart exception in this worker (DLL load, symbol
+    // lookup, FFI call) would otherwise kill the isolate silently, leaving
+    // the serialization gate stalled until the 120s+30s timeout. Deliver a
+    // synthetic done(-1) through the on_done pointer instead so the gate
+    // releases immediately and the UI surfaces the real error.
+    try {
+      final lib = _openLibrary();
+      final sendMessageFn =
+          lib.lookupFunction<SendMessageNative, SendMessageDart>('send_message');
 
-    final onChunkCallable = NativeCallable<OnChunkNative>.listener(
-      (Pointer<Utf8> ptr) {
-        sendPort.send({'type': 'chunk', 'text': ptr.toDartString()});
-      },
-    );
-    final onToolCallCallable = NativeCallable<OnToolCallNative>.listener(
-      (Pointer<Utf8> ptr) {
-        sendPort.send({'type': 'tool_call', 'json': ptr.toDartString()});
-      },
-    );
-    final onThinkingCallable = NativeCallable<OnThinkingNative>.listener(
-      (Pointer<Utf8> ptr) {
-        sendPort.send({'type': 'thinking', 'json': ptr.toDartString()});
-      },
-    );
-    final onDoneCallable = NativeCallable<OnDoneNative>.listener(
-      (int code, Pointer<Utf8> errPtr, Pointer<Utf8> stopReasonPtr) {
-        final err = errPtr.toDartString();
-        final stopReason = stopReasonPtr.toDartString();
-        sendPort.send({
-          'type': 'done',
-          'code': code,
-          'error': err.isEmpty ? null : err,
-          'stopReason': stopReason.isEmpty ? null : stopReason,
-        });
-      },
-    );
+      final apiKeyPtr = apiKey.toNativeUtf8();
+      final baseUrlPtr = baseUrl.toNativeUtf8();
+      final modelPtr = model.toNativeUtf8();
+      final systemPromptPtr = systemPrompt.toNativeUtf8();
+      final messagesJsonPtr = messagesJson.toNativeUtf8();
+      final toolsJsonPtr = toolsJson.toNativeUtf8();
+      final thinkingModePtr = thinkingMode.toNativeUtf8();
+      final thinkingEffortPtr = thinkingEffort.toNativeUtf8();
 
-    sendMessageFn(
-      apiKeyPtr,
-      baseUrlPtr,
-      modelPtr,
-      systemPromptPtr,
-      messagesJsonPtr,
-      toolsJsonPtr,
-      thinkingModePtr,
-      thinkingEffortPtr,
-      onChunkCallable.nativeFunction,
-      onToolCallCallable.nativeFunction,
-      onThinkingCallable.nativeFunction,
-      onDoneCallable.nativeFunction,
-    );
-
-    malloc.free(apiKeyPtr);
-    malloc.free(baseUrlPtr);
-    malloc.free(modelPtr);
-    malloc.free(systemPromptPtr);
-    malloc.free(messagesJsonPtr);
-    malloc.free(toolsJsonPtr);
-    malloc.free(thinkingModePtr);
-    malloc.free(thinkingEffortPtr);
-
-    // Schedule cleanup after queued callbacks have fired on this isolate
-    Timer.run(() {
-      onChunkCallable.close();
-      onToolCallCallable.close();
-      onThinkingCallable.close();
-      onDoneCallable.close();
-    });
+      try {
+        sendMessageFn(
+          apiKeyPtr,
+          baseUrlPtr,
+          modelPtr,
+          systemPromptPtr,
+          messagesJsonPtr,
+          toolsJsonPtr,
+          thinkingModePtr,
+          thinkingEffortPtr,
+          onChunkPtr,
+          onToolCallPtr,
+          onThinkingPtr,
+          onDonePtr,
+        );
+      } finally {
+        malloc.free(apiKeyPtr);
+        malloc.free(baseUrlPtr);
+        malloc.free(modelPtr);
+        malloc.free(systemPromptPtr);
+        malloc.free(messagesJsonPtr);
+        malloc.free(toolsJsonPtr);
+        malloc.free(thinkingModePtr);
+        malloc.free(thinkingEffortPtr);
+      }
+    } catch (e, st) {
+      // Deliver done(-1) via the on_done native pointer so the main isolate
+      // completes the request and the serialization gate releases.
+      // ignore: avoid_print
+      print('[SidecarBridge] worker error: $e\n$st');
+      try {
+        final onDoneDart = onDonePtr
+            .cast<NativeFunction<OnDoneNative>>()
+            .asFunction<OnDoneDart>();
+        // NEVER free these strings (R2-F1 fix): the NativeCallable listener
+        // reads them asynchronously on the main isolate's event loop after
+        // this worker has already exited — freeing here is a use-after-free.
+        // A deliberate leak on this (rare) error path mirrors the C++ side's
+        // pending_strings lifetime approach.
+        final errPtr = e.toString().toNativeUtf8();
+        // A nullptr stopReason would make the listener's toDartString() throw
+        // (ffi's toDartString rejects nullptr), swallowing the done delivery
+        // and stalling the gate until the 150s fallback. Pass a non-null
+        // (deliberately leaked) empty string instead.
+        final stopPtr = ''.toNativeUtf8();
+        onDoneDart(-1, errPtr, stopPtr);
+      } catch (_) {
+        // Nothing more we can do — the 120s+30s timeout path still releases
+        // the gate as a last resort.
+      }
+    }
   }
 
   // -- tools (run on main isolate — they're fast, local calls) --
@@ -414,7 +564,8 @@ class SidecarBridge implements ISidecar {
           final fn = lib.lookupFunction<SetWorkspaceNative, WebFetchDart>('web_fetch');
           resultPtr = fn(ptr);
         }
-        // Guard against null pointer — ACCESS_VIOLATION if toDartString() called on nullptr
+        // Guard against null pointer — ffi's toDartString() rejects nullptr
+        // with UnsupportedError (11.2); dereferencing the result would crash
         if (resultPtr == nullptr) {
           sendPort.send('{"ok":false,"error":"$workerType: FFI returned null pointer"}');
         } else {

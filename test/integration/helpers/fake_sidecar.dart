@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:alias_agent/services/sidecar_bridge.dart';
 
 /// A programmable fake sidecar for integration testing.
@@ -67,6 +69,37 @@ class FakeSidecar implements ISidecar {
   // ISidecar implementation
   // ---------------------------------------------------------------------------
 
+  /// Records cancelRequest() invocations (for tests asserting the cancel path).
+  int cancelCount = 0;
+
+  /// Suspends the NEXT sendMessage's event delivery until [releaseGate] is
+  /// called — lets tests interleave a mid-stream session switch (11.4).
+  /// Queue semantics (16.6): each gateNextSend() pushes a gate; each
+  /// sendMessage pops its own gate and registers it as awaiting; each
+  /// releaseGate() completes the OLDEST awaiting sendMessage, so multiple
+  /// suspended sends can be sequenced in order.
+  final List<Completer<void>> _gates = [];
+  final List<Completer<void>> _awaitingGates = [];
+
+  void gateNextSend() {
+    _gates.add(Completer<void>());
+  }
+
+  void releaseGate() {
+    if (_awaitingGates.isNotEmpty) {
+      _awaitingGates.removeAt(0).complete();
+    }
+  }
+
+  /// True when events remain queued (e.g. a tool-loop turn was aborted
+  /// before consuming its events — 12.4).
+  bool get hasQueuedEvents => _events.isNotEmpty;
+
+  @override
+  void cancelRequest() {
+    cancelCount++;
+  }
+
   @override
   Future<void> sendMessage({
     required String apiKey,
@@ -82,10 +115,21 @@ class FakeSidecar implements ISidecar {
     OnThinkingCallback? onThinking,
     required OnDoneCallback onDone,
   }) async {
-    // Snapshot and clear — events are consumed per sendMessage() call
-    final events = List<_FakeEvent>.from(_events);
-    _events.clear();
-    for (final event in events) {
+    // Gate (11.4): suspend event delivery until the test releases it.
+    // Per-send semantics (17.1): each sendMessage pops ITS OWN gate — the
+    // oldest pending send waits on the oldest gate, so releaseGate() releases
+    // exactly one sendMessage in FIFO order.
+    if (_gates.isNotEmpty) {
+      final gate = _gates.removeAt(0);
+      _awaitingGates.add(gate);
+      await gate.future;
+    }
+    // Consume events up to (and including) the first done — events queued for
+    // LATER sendMessage calls (multi-turn tool loops) stay queued.
+    var consumed = 0;
+    final snapshot = List<_FakeEvent>.from(_events);
+    for (final event in snapshot) {
+      consumed++;
       switch (event.type) {
         case 'chunk':
           onChunk(event.text!);
@@ -95,10 +139,12 @@ class FakeSidecar implements ISidecar {
           onThinking?.call(event.json!);
         case 'done':
           onDone(event.code, event.error, event.stopReason);
+          _events.removeRange(0, consumed);
           return;
       }
     }
-    // If no done event queued, fire a default done
+    // If no done event queued, consume everything and fire a default done
+    _events.clear();
     onDone(0, null, 'end_turn');
   }
 
