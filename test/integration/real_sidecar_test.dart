@@ -103,7 +103,7 @@ void main() {
     // First create a file to edit
     bridge.writeFile('{"path":"_test_edit.txt","content":"line one\\nline two\\nline three\\n"}');
     final result = bridge.editFile(
-        '{"path":"_test_edit.txt","old_text":"line two","new_text":"line TWO"}');
+        '{"path":"_test_edit.txt","edits":[{"old_text":"line two","new_text":"line TWO"}]}');
     final parsed = jsonDecode(result);
     expect(parsed['ok'], isTrue);
     expect(parsed['replacements'], 1);
@@ -118,7 +118,7 @@ void main() {
   test('edit_file rejects empty old_text', () {
     bridge.writeFile('{"path":"_test_edit2.txt","content":"some content\\n"}');
     final result = bridge.editFile(
-        '{"path":"_test_edit2.txt","old_text":"","new_text":"replacement"}');
+        '{"path":"_test_edit2.txt","edits":[{"old_text":"","new_text":"replacement"}]}');
     final parsed = jsonDecode(result);
     expect(parsed['ok'], isFalse);
     expect(parsed['error'], contains('old_text must not be empty'));
@@ -127,7 +127,7 @@ void main() {
   test('edit_file returns diagnostic when no match found', () {
     bridge.writeFile('{"path":"_test_edit3.txt","content":"hello world\\n"}');
     final result = bridge.editFile(
-        '{"path":"_test_edit3.txt","old_text":"nonexistent text","new_text":"replacement"}');
+        '{"path":"_test_edit3.txt","edits":[{"old_text":"nonexistent text","new_text":"replacement"}]}');
     final parsed = jsonDecode(result);
     expect(parsed['ok'], isFalse);
     expect(parsed['error'], 'old_text not found in file');

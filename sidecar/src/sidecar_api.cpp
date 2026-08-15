@@ -218,4 +218,28 @@ SIDECAR_API const char* edit_file(const char* request_json) {
   return g_edit_file_result.c_str();
 }
 
+// Per-function static buffers for ripgrep-backed search tools
+static std::string g_glob_file_result;
+static std::string g_grep_file_result;
+
+SIDECAR_API const char* glob_file(const char* request_json) {
+  LOG_TRACE("glob_file called");
+  if (!request_json) {
+    g_glob_file_result = "{\"ok\":false,\"error\":\"No request provided\"}";
+    return g_glob_file_result.c_str();
+  }
+  g_glob_file_result = tools::glob_file(request_json);
+  return g_glob_file_result.c_str();
+}
+
+SIDECAR_API const char* grep_file(const char* request_json) {
+  LOG_TRACE("grep_file called");
+  if (!request_json) {
+    g_grep_file_result = "{\"ok\":false,\"error\":\"No request provided\"}";
+    return g_grep_file_result.c_str();
+  }
+  g_grep_file_result = tools::grep_file(request_json);
+  return g_grep_file_result.c_str();
+}
+
 } // extern "C"

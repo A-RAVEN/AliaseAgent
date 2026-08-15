@@ -20,6 +20,8 @@ class FakeSidecar implements ISidecar {
   // File edit stubs
   String _writeFileResult = '{"ok":true,"bytes_written":0,"created":true}';
   String _editFileResult = '{"ok":true,"replacements":1}';
+  String _globFileResult = '{"ok":true,"paths":[],"count":0}';
+  String _grepFileResult = '{"ok":true,"matches":[],"count":0}';
 
   void stubSearchProviders(String json) { _searchProvidersResult = json; }
   void stubWebSearch(String json) { _webSearchResult = json; }
@@ -27,6 +29,8 @@ class FakeSidecar implements ISidecar {
   void stubEnsureSearchInfra(String json) { _ensureSearchInfraResult = json; }
   void stubWriteFile(String json) { _writeFileResult = json; }
   void stubEditFile(String json) { _editFileResult = json; }
+  void stubGlobFile(String json) { _globFileResult = json; }
+  void stubGrepFile(String json) { _grepFileResult = json; }
 
   // ---------------------------------------------------------------------------
   // Queue API
@@ -176,6 +180,12 @@ class FakeSidecar implements ISidecar {
 
   @override
   String editFile(String requestJson) => _editFileResult;
+
+  @override
+  String globFile(String requestJson) => _globFileResult;
+
+  @override
+  String grepFile(String requestJson) => _grepFileResult;
 }
 
 // ---------------------------------------------------------------------------

@@ -34,6 +34,16 @@ void main() {
       returnsNormally,
       reason: 'read_file symbol should resolve',
     );
+    expect(
+      () => lib!.lookupFunction<Pointer<Utf8> Function(Pointer<Utf8>), Pointer<Utf8> Function(Pointer<Utf8>)>('glob_file'),
+      returnsNormally,
+      reason: 'glob_file symbol should resolve',
+    );
+    expect(
+      () => lib!.lookupFunction<Pointer<Utf8> Function(Pointer<Utf8>), Pointer<Utf8> Function(Pointer<Utf8>)>('grep_file'),
+      returnsNormally,
+      reason: 'grep_file symbol should resolve',
+    );
   });
 
   // =========================================================================

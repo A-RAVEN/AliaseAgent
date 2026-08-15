@@ -1,6 +1,7 @@
 #include "web_fetch.h"
 #include "tools.h"
 #include "logger.h"
+#include "subprocess.h"
 #include <nlohmann/json.hpp>
 #include <curl/curl.h>
 #include <string>
@@ -285,282 +286,55 @@ static std::string run_crawl4ai_subprocess(const std::string& url,
     return "";
   }
 
-  std::string cmd = std::string(python_bin) + " \"" + script_path + "\"";
+  std::vector<std::string> argv;
+  argv.push_back(python_bin);
+  argv.push_back(script_path);
 
-#ifdef _WIN32
-  // Windows: CreateProcess with pipes (stdin, stdout, stderr)
-  HANDLE hStdInRd = nullptr, hStdInWr = nullptr;
-  HANDLE hStdOutRd = nullptr, hStdOutWr = nullptr;
-  HANDLE hStdErrRd = nullptr, hStdErrWr = nullptr;
-  SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
-
-  if (!CreatePipe(&hStdInRd, &hStdInWr, &sa, 1024 * 1024) ||
-      !CreatePipe(&hStdOutRd, &hStdOutWr, &sa, 1024 * 1024) ||
-      !CreatePipe(&hStdErrRd, &hStdErrWr, &sa, 1024 * 1024)) {
-    LOG_WARN("web_fetch: failed to create pipes");
-    return "";
-  }
-  SetHandleInformation(hStdInWr, HANDLE_FLAG_INHERIT, 0);
-  SetHandleInformation(hStdOutRd, HANDLE_FLAG_INHERIT, 0);
-  SetHandleInformation(hStdErrRd, HANDLE_FLAG_INHERIT, 0);
-
-  PROCESS_INFORMATION pi = {};
-  STARTUPINFOA si = {};
-  si.cb = sizeof(si);
-  si.hStdInput = hStdInRd;
-  si.hStdOutput = hStdOutWr;
-  si.hStdError = hStdErrWr;
-  si.dwFlags |= STARTF_USESTDHANDLES;
-
-  // Create process in a job object for process-tree cleanup
-  HANDLE hJob = CreateJobObjectA(nullptr, nullptr);
-  if (hJob) {
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
-    jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
-  }
-
-  std::vector<char> cmd_buf(cmd.begin(), cmd.end());
-  cmd_buf.push_back('\0');
-  BOOL ok = CreateProcessA(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE,
-                           CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-
-  CloseHandle(hStdInRd);
-  CloseHandle(hStdOutWr);
-  CloseHandle(hStdErrWr);  // parent closes write end so ReadFile gets EOF
-
-  if (!ok) {
-    LOG_WARN("web_fetch: CreateProcess failed: " + std::to_string(GetLastError()));
-    CloseHandle(hStdInWr);
-    CloseHandle(hStdOutRd);
-    CloseHandle(hStdErrRd);
-    if (hJob) CloseHandle(hJob);
-    return "";
-  }
-
-  if (hJob) {
-    AssignProcessToJobObject(hJob, pi.hProcess);
-  }
-  CloseHandle(pi.hThread);
-
-  // Write request to stdin
   json req;
   req["url"] = url;
   std::string req_str = req.dump() + "\n";
-  DWORD written = 0;
-  WriteFile(hStdInWr, req_str.c_str(), (DWORD)req_str.size(), &written, nullptr);
-  CloseHandle(hStdInWr);
 
-  // Concurrent read loop: poll stdout + stderr while waiting for process exit
-  std::string output;
-  std::string stderr_output;
-  auto start_time = std::chrono::steady_clock::now();
-  bool process_exited = false;
-  bool timed_out = false;
+  subprocess::Options opts;
+  opts.stdin_data = req_str;
+  opts.timeout_seconds = SUBPROCESS_TIMEOUT_SEC;
+  subprocess::Result res = subprocess::run(argv, opts);
 
-  auto drain_pipe = [](HANDLE hPipe, std::string& dest) {
-    DWORD avail = 0;
-    while (PeekNamedPipe(hPipe, nullptr, 0, nullptr, &avail, nullptr) && avail > 0) {
-      char buf[4096];
-      DWORD rd = 0;
-      DWORD to_read = (avail < sizeof(buf) - 1) ? avail : sizeof(buf) - 1;
-      if (!ReadFile(hPipe, buf, to_read, &rd, nullptr) || rd == 0) break;
-      buf[rd] = '\0';
-      dest += buf;
-    }
-  };
-
-  while (true) {
-    // Drain both pipes (non-blocking)
-    drain_pipe(hStdOutRd, output);
-    drain_pipe(hStdErrRd, stderr_output);
-
-    // Check process state
-    DWORD wr = WaitForSingleObject(pi.hProcess, 100);
-    if (wr == WAIT_OBJECT_0) {
-      // Process exited — final drain to capture remaining buffered data
-      drain_pipe(hStdOutRd, output);
-      drain_pipe(hStdErrRd, stderr_output);
-      process_exited = true;
-      break;
-    }
-
-    // Timeout check
-    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-      std::chrono::steady_clock::now() - start_time).count();
-    if (elapsed >= SUBPROCESS_TIMEOUT_SEC) {
-      timed_out = true;
-      LOG_WARN("web_fetch: subprocess timed out after " +
-               std::to_string(SUBPROCESS_TIMEOUT_SEC) + "s");
-      if (hJob) {
-        TerminateJobObject(hJob, 1);
-      } else {
-        TerminateProcess(pi.hProcess, 1);
-      }
-      WaitForSingleObject(pi.hProcess, 2000);
-      // Final drain after kill
-      drain_pipe(hStdOutRd, output);
-      drain_pipe(hStdErrRd, stderr_output);
-      break;
-    }
-  }
-
-  CloseHandle(hStdOutRd);
-  CloseHandle(hStdErrRd);
-  CloseHandle(pi.hProcess);
-  if (hJob) CloseHandle(hJob);
-
-  if (!stderr_output.empty()) {
-    if (process_exited) {
-      LOG_TRACE("web_fetch: subprocess stderr: " + stderr_output);
-    } else {
-      LOG_WARN("web_fetch: subprocess stderr: " + stderr_output);
-    }
-  }
-
-  if (timed_out) {
-    return "";  // timeout → fallback
-  }
-
-#else
-  // POSIX: fork + exec with pipes (stdin, stdout, stderr)
-  int pipe_stdin[2], pipe_stdout[2], pipe_stderr[2];
-  if (pipe(pipe_stdin) != 0 || pipe(pipe_stdout) != 0 || pipe(pipe_stderr) != 0) {
-    LOG_WARN("web_fetch: failed to create pipes");
+  if (!res.started) {
+    LOG_WARN("web_fetch: failed to start subprocess");
     return "";
   }
-
-  pid_t pid = fork();
-  if (pid < 0) {
-    LOG_WARN("web_fetch: fork failed");
-    close(pipe_stdin[0]); close(pipe_stdin[1]);
-    close(pipe_stdout[0]); close(pipe_stdout[1]);
-    close(pipe_stderr[0]); close(pipe_stderr[1]);
-    return "";
-  }
-
-  if (pid == 0) {
-    // Child: redirect stdin/stdout/stderr, exec Python
-    dup2(pipe_stdin[0], STDIN_FILENO);
-    dup2(pipe_stdout[1], STDOUT_FILENO);
-    dup2(pipe_stderr[1], STDERR_FILENO);
-    close(pipe_stdin[1]); close(pipe_stdout[0]);
-    close(pipe_stderr[0]);
-
-    // Create new process group for cleanup
-    setpgid(0, 0);
-
-    execlp(python_bin, python_bin, script_path.c_str(), (char*)nullptr);
-    _exit(127);  // exec failed
-  }
-
-  // Parent
-  close(pipe_stdin[0]);
-  close(pipe_stdout[1]);
-  close(pipe_stderr[1]);  // close write end so read gets EOF
-
-  // Write request to child's stdin
-  json req;
-  req["url"] = url;
-  std::string req_str = req.dump() + "\n";
-  write(pipe_stdin[1], req_str.c_str(), req_str.size());
-  close(pipe_stdin[1]);
-
-  // Read response with timeout using select (stdout + stderr concurrently)
-  std::string output;
-  std::string stderr_output;
-  auto start = std::chrono::steady_clock::now();
-  bool timed_out = false;
-  int maxfd = (pipe_stdout[0] > pipe_stderr[0] ? pipe_stdout[0] : pipe_stderr[0]) + 1;
-
-  while (true) {
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET(pipe_stdout[0], &fds);
-    FD_SET(pipe_stderr[0], &fds);
-
-    struct timeval tv;
-    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-      std::chrono::steady_clock::now() - start).count();
-    long remaining = SUBPROCESS_TIMEOUT_SEC - static_cast<long>(elapsed);
-    if (remaining <= 0) {
-      timed_out = true;
-      break;
-    }
-    tv.tv_sec = remaining;
-    tv.tv_usec = 0;
-
-    int sel_ret = select(maxfd, &fds, nullptr, nullptr, &tv);
-    if (sel_ret < 0) break;
-    if (sel_ret == 0) {
-      timed_out = true;
-      break;
-    }
-
-    char buf[4096];
-    if (FD_ISSET(pipe_stdout[0], &fds)) {
-      ssize_t n = read(pipe_stdout[0], buf, sizeof(buf) - 1);
-      if (n <= 0) { FD_CLR(pipe_stdout[0], &fds); }
-      else { buf[n] = '\0'; output += buf; }
-    }
-    if (FD_ISSET(pipe_stderr[0], &fds)) {
-      ssize_t n = read(pipe_stderr[0], buf, sizeof(buf) - 1);
-      if (n <= 0) { FD_CLR(pipe_stderr[0], &fds); }
-      else { buf[n] = '\0'; stderr_output += buf; }
-    }
-  }
-
-  if (timed_out) {
+  if (res.timed_out) {
     LOG_WARN("web_fetch: subprocess timed out after " +
-             std::to_string(SUBPROCESS_TIMEOUT_SEC) + "s — sending SIGKILL to pgid");
-    killpg(pid, SIGKILL);
-  }
-
-  close(pipe_stdout[0]);
-  int status = 0;
-  waitpid(pid, &status, 0);
-
-  // Final drain of stderr (select loop may have left data)
-  {
-    int flags = fcntl(pipe_stderr[0], F_GETFL, 0);
-    fcntl(pipe_stderr[0], F_SETFL, flags | O_NONBLOCK);
-    char ebuf[4096];
-    ssize_t n;
-    while ((n = read(pipe_stderr[0], ebuf, sizeof(ebuf) - 1)) > 0) {
-      ebuf[n] = '\0';
-      stderr_output += ebuf;
-    }
-  }
-  close(pipe_stderr[0]);
-
-  bool success = !timed_out && WIFEXITED(status) && WEXITSTATUS(status) == 0;
-  if (!stderr_output.empty()) {
-    if (success) {
-      LOG_TRACE("web_fetch: subprocess stderr: " + stderr_output);
-    } else {
-      LOG_WARN("web_fetch: subprocess stderr: " + stderr_output);
-    }
-  }
-
-  if (!success) {
-    LOG_WARN("web_fetch: subprocess failed (exit=" +
-             std::to_string(WIFEXITED(status) ? WEXITSTATUS(status) : -1) + ")");
+             std::to_string(SUBPROCESS_TIMEOUT_SEC) + "s");
     return "";
   }
-#endif
+  if (!res.stderr_data.empty()) {
+    if (res.exit_code == 0) {
+      LOG_TRACE("web_fetch: subprocess stderr: " + res.stderr_data);
+    } else {
+      LOG_WARN("web_fetch: subprocess stderr: " + res.stderr_data);
+    }
+  }
+  // crawl4ai uses non-zero exit = failure (this skeleton's semantics — the
+  // rg search tools use rg's 0/1/2 three-state exit codes instead).
+  if (res.exit_code != 0) {
+    LOG_WARN("web_fetch: subprocess failed (exit=" + std::to_string(res.exit_code) + ")");
+    return "";
+  }
 
   // Parse output — first line is JSON
-  if (output.empty()) {
+  if (res.stdout_data.empty()) {
     LOG_WARN("web_fetch: subprocess produced no output");
     return "";
   }
 
   // Strip trailing newline
-  while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
-    output.pop_back();
+  while (!res.stdout_data.empty() &&
+         (res.stdout_data.back() == '\n' || res.stdout_data.back() == '\r')) {
+    res.stdout_data.pop_back();
   }
-  LOG_INFO("web_fetch: crawl4ai returned " + std::to_string(output.size()) + " bytes");
-  return output;
+  LOG_INFO("web_fetch: crawl4ai returned " + std::to_string(res.stdout_data.size()) + " bytes");
+  return res.stdout_data;
 }
 
 // ============================================================================

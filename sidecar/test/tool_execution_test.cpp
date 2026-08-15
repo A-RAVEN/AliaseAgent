@@ -434,7 +434,7 @@ TEST_CASE("edit_file: exact match succeeds", "[edit_file]") {
     tmp.write("test.txt", "line 1\nline 2\nline 3\n");
     WorkspaceGuard ws(tmp.path());
 
-    std::string result = tools::edit_file("{\"path\":\"test.txt\",\"old_text\":\"line 2\",\"new_text\":\"line two\"}");
+    std::string result = tools::edit_file("{\"path\":\"test.txt\",\"edits\":[{\"old_text\":\"line 2\",\"new_text\":\"line two\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == true);
     REQUIRE(j["replacements"] == 1);
@@ -451,7 +451,7 @@ TEST_CASE("edit_file: replace_all replaces all occurrences", "[edit_file]") {
     WorkspaceGuard ws(tmp.path());
 
     std::string result = tools::edit_file(
-        "{\"path\":\"test.txt\",\"old_text\":\"foo\",\"new_text\":\"qux\",\"replace_all\":true}");
+        "{\"path\":\"test.txt\",\"edits\":[{\"old_text\":\"foo\",\"new_text\":\"qux\",\"replace_all\":true}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == true);
     REQUIRE(j["replacements"] == 3);
@@ -467,7 +467,7 @@ TEST_CASE("edit_file: multiple exact matches rejected with line numbers", "[edit
     WorkspaceGuard ws(tmp.path());
 
     std::string result = tools::edit_file(
-        "{\"path\":\"test.txt\",\"old_text\":\"TODO:\",\"new_text\":\"DONE:\"}");
+        "{\"path\":\"test.txt\",\"edits\":[{\"old_text\":\"TODO:\",\"new_text\":\"DONE:\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == false);
     REQUIRE(j.contains("matches"));
@@ -480,7 +480,7 @@ TEST_CASE("edit_file: empty old_text rejected", "[edit_file]") {
     tmp.write("test.txt", "some content\n");
     WorkspaceGuard ws(tmp.path());
 
-    std::string result = tools::edit_file("{\"path\":\"test.txt\",\"old_text\":\"\",\"new_text\":\"x\"}");
+    std::string result = tools::edit_file("{\"path\":\"test.txt\",\"edits\":[{\"old_text\":\"\",\"new_text\":\"x\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == false);
     REQUIRE(j["error"] == "old_text must not be empty");
@@ -503,7 +503,7 @@ TEST_CASE("edit_file: CRLF vs LF mismatch auto-corrected", "[edit_file][normaliz
     // old_text "line2" is found literally in the file content (it contains no line endings),
     // so exact match succeeds without needing normalization.
     std::string result = tools::edit_file(
-        "{\"path\":\"crlf.txt\",\"old_text\":\"line2\",\"new_text\":\"line TWO\"}");
+        "{\"path\":\"crlf.txt\",\"edits\":[{\"old_text\":\"line2\",\"new_text\":\"line TWO\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == true);
     REQUIRE(j["replacements"] == 1);
@@ -519,7 +519,7 @@ TEST_CASE("edit_file: binary file rejected", "[edit_file]") {
     write_binary_file(bin_path);
     WorkspaceGuard ws(tmp.path());
 
-    std::string result = tools::edit_file("{\"path\":\"data.bin\",\"old_text\":\"x\",\"new_text\":\"y\"}");
+    std::string result = tools::edit_file("{\"path\":\"data.bin\",\"edits\":[{\"old_text\":\"x\",\"new_text\":\"y\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == false);
     REQUIRE(j["error"] == "Cannot edit binary or non-text file");
@@ -538,7 +538,7 @@ TEST_CASE("edit_file: large file rejected", "[edit_file]") {
     }
     WorkspaceGuard ws(tmp.path());
 
-    std::string result = tools::edit_file("{\"path\":\"large.txt\",\"old_text\":\"z\",\"new_text\":\"w\"}");
+    std::string result = tools::edit_file("{\"path\":\"large.txt\",\"edits\":[{\"old_text\":\"z\",\"new_text\":\"w\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == false);
     REQUIRE(j["error"] == "File too large for edit_file (>1MB)");
@@ -548,7 +548,7 @@ TEST_CASE("edit_file: file not found", "[edit_file]") {
     TempDir tmp;
     WorkspaceGuard ws(tmp.path());
 
-    std::string result = tools::edit_file("{\"path\":\"nonexistent.txt\",\"old_text\":\"x\",\"new_text\":\"y\"}");
+    std::string result = tools::edit_file("{\"path\":\"nonexistent.txt\",\"edits\":[{\"old_text\":\"x\",\"new_text\":\"y\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == false);
     REQUIRE(j["error"] == "File not found: nonexistent.txt");
@@ -559,7 +559,7 @@ TEST_CASE("edit_file: path outside workspace", "[edit_file]") {
     tmp.mkdir("subdir");
     WorkspaceGuard ws(tmp.path() + "/subdir");
 
-    std::string result = tools::edit_file("{\"path\":\"../outside.txt\",\"old_text\":\"x\",\"new_text\":\"y\"}");
+    std::string result = tools::edit_file("{\"path\":\"../outside.txt\",\"edits\":[{\"old_text\":\"x\",\"new_text\":\"y\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == false);
     REQUIRE(j["error"] == "Access denied: path outside workspace");
@@ -570,7 +570,7 @@ TEST_CASE("edit_file: edit of directory rejected", "[edit_file]") {
     tmp.mkdir("subdir");
     WorkspaceGuard ws(tmp.path());
 
-    std::string result = tools::edit_file("{\"path\":\"subdir\",\"old_text\":\"x\",\"new_text\":\"y\"}");
+    std::string result = tools::edit_file("{\"path\":\"subdir\",\"edits\":[{\"old_text\":\"x\",\"new_text\":\"y\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == false);
     REQUIRE(j["error"] == "Path is a directory, not a file: subdir");
@@ -586,7 +586,7 @@ TEST_CASE("edit_file: no match returns diagnostic info", "[edit_file]") {
     WorkspaceGuard ws(tmp.path());
 
     std::string result = tools::edit_file(
-        "{\"path\":\"code.dart\",\"old_text\":\"final count = 1\",\"new_text\":\"final count = 99\"}");
+        "{\"path\":\"code.dart\",\"edits\":[{\"old_text\":\"final count = 1\",\"new_text\":\"final count = 99\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == false);
     REQUIRE(j["error"] == "old_text not found in file");
@@ -705,7 +705,7 @@ TEST_CASE("edit_file: indentation mismatch falls through to diagnostic", "[edit_
     // accidentally match at offset 2 inside "    void bar()" since both
     // share "  void bar()" as a common substring).
     std::string result = tools::edit_file(
-        "{\"path\":\"test.dart\",\"old_text\":\"  void bar(int x)\",\"new_text\":\"  void baz()\"}");
+        "{\"path\":\"test.dart\",\"edits\":[{\"old_text\":\"  void bar(int x)\",\"new_text\":\"  void baz()\"}]}");
     auto j = parse_result(result);
     // Should return diagnostic info since neither exact nor normalized match succeeds
     REQUIRE(j["ok"] == false);
@@ -725,7 +725,7 @@ TEST_CASE("edit_file: diagnostic lists indentation differences", "[edit_file]") 
 
     // old_text uses 2-space indentation + different code (avoid accidental substring match)
     std::string result = tools::edit_file(
-        "{\"path\":\"test.dart\",\"old_text\":\"  final count = 1;\",\"new_text\":\"  final count = 99;\"}");
+        "{\"path\":\"test.dart\",\"edits\":[{\"old_text\":\"  final count = 1;\",\"new_text\":\"  final count = 99;\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == false);
     REQUIRE(j.contains("diagnosis"));
@@ -750,7 +750,7 @@ TEST_CASE("edit_file: replace_all with normalization preserves CRLF", "[edit_fil
     WorkspaceGuard ws(tmp.path());
 
     std::string result = tools::edit_file(
-        "{\"path\":\"crlf.txt\",\"old_text\":\"hello\\nworld\",\"new_text\":\"REPLACED\",\"replace_all\":true}");
+        "{\"path\":\"crlf.txt\",\"edits\":[{\"old_text\":\"hello\\nworld\",\"new_text\":\"REPLACED\",\"replace_all\":true}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == true);
     REQUIRE(j["replacements"] == 2);
@@ -776,7 +776,7 @@ TEST_CASE("edit_file: normalized match preserves non-matching content", "[edit_f
 
     // old_text with tab (file has 4-space indent, tab→4 spaces via normalization)
     std::string result = tools::edit_file(
-        "{\"path\":\"code.txt\",\"old_text\":\"\\tint y = 2;\",\"new_text\":\"\\tint z = 3;\"}");
+        "{\"path\":\"code.txt\",\"edits\":[{\"old_text\":\"\\tint y = 2;\",\"new_text\":\"\\tint z = 3;\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == true);
     REQUIRE(j["replacements"] == 1);
@@ -806,7 +806,7 @@ TEST_CASE("edit_file: multi-line old_text with CRLF normalization", "[edit_file]
 
     // old_text uses LF — should normalize to match the CRLF block
     std::string result = tools::edit_file(
-        "{\"path\":\"ml.txt\",\"old_text\":\"block line 1\\nblock line 2\",\"new_text\":\"REPLACED\"}");
+        "{\"path\":\"ml.txt\",\"edits\":[{\"old_text\":\"block line 1\\nblock line 2\",\"new_text\":\"REPLACED\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == true);
     REQUIRE(j["replacements"] == 1);
@@ -861,7 +861,7 @@ TEST_CASE("edit_file: replace_all exact match replaces all occurrences", "[edit_
     WorkspaceGuard ws(tmp.path());
 
     std::string result = tools::edit_file(
-        "{\"path\":\"reps.txt\",\"old_text\":\"AAA\",\"new_text\":\"ZZZ\",\"replace_all\":true}");
+        "{\"path\":\"reps.txt\",\"edits\":[{\"old_text\":\"AAA\",\"new_text\":\"ZZZ\",\"replace_all\":true}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == true);
     REQUIRE(j["replacements"] == 3);
@@ -889,7 +889,7 @@ TEST_CASE("edit_file: no workspace set returns error", "[edit_file]") {
     tools::set_workspace("");
     WorkspaceGuard ws("");
 
-    std::string result = tools::edit_file("{\"path\":\"test.txt\",\"old_text\":\"x\",\"new_text\":\"y\"}");
+    std::string result = tools::edit_file("{\"path\":\"test.txt\",\"edits\":[{\"old_text\":\"x\",\"new_text\":\"y\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == false);
     REQUIRE(j["error"] == "No workspace set");
@@ -908,7 +908,7 @@ TEST_CASE("edit_file: normalized multi-match rejected with line numbers", "[edit
     WorkspaceGuard ws(tmp.path());
 
     std::string result = tools::edit_file(
-        "{\"path\":\"rep.txt\",\"old_text\":\"AA\\nBB\",\"new_text\":\"XX\",\"replace_all\":false}");
+        "{\"path\":\"rep.txt\",\"edits\":[{\"old_text\":\"AA\\nBB\",\"new_text\":\"XX\",\"replace_all\":false}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == false);
     REQUIRE(j["matches"].is_array());
@@ -925,7 +925,7 @@ TEST_CASE("edit_file: tab old_text matches space-indented file", "[edit_file][no
     WorkspaceGuard ws(tmp.path());
 
     std::string result = tools::edit_file(
-        "{\"path\":\"indent.txt\",\"old_text\":\"\\tindented line\",\"new_text\":\"\\treplaced\"}");
+        "{\"path\":\"indent.txt\",\"edits\":[{\"old_text\":\"\\tindented line\",\"new_text\":\"\\treplaced\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == true);
     REQUIRE(j["replacements"] == 1);
@@ -941,7 +941,7 @@ TEST_CASE("edit_file: diagnostic includes your_text for mismatch", "[edit_file]"
     WorkspaceGuard ws(tmp.path());
 
     std::string result = tools::edit_file(
-        "{\"path\":\"diag.txt\",\"old_text\":\"  final x = 2;\",\"new_text\":\"  final x = 99;\"}");
+        "{\"path\":\"diag.txt\",\"edits\":[{\"old_text\":\"  final x = 2;\",\"new_text\":\"  final x = 99;\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == false);
     REQUIRE(j.contains("diagnosis"));
@@ -975,7 +975,7 @@ TEST_CASE("edit_file: UTF-16 text file rejected as binary", "[edit_file]") {
     WorkspaceGuard ws(tmp.path());
 
     std::string result = tools::edit_file(
-        "{\"path\":\"utf16.txt\",\"old_text\":\"x\",\"new_text\":\"y\"}");
+        "{\"path\":\"utf16.txt\",\"edits\":[{\"old_text\":\"x\",\"new_text\":\"y\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == false);
     REQUIRE(j["error"] == "Cannot edit binary or non-text file");
@@ -990,7 +990,7 @@ TEST_CASE("edit_file: old_text equals new_text is no-op", "[edit_file]") {
     WorkspaceGuard ws(tmp.path());
 
     std::string result = tools::edit_file(
-        "{\"path\":\"same.txt\",\"old_text\":\"foo bar\",\"new_text\":\"foo bar\"}");
+        "{\"path\":\"same.txt\",\"edits\":[{\"old_text\":\"foo bar\",\"new_text\":\"foo bar\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == true);
     REQUIRE(j["replacements"] == 1);
@@ -1009,7 +1009,7 @@ TEST_CASE("edit_file: replace_all substring overlap no infinite loop", "[edit_fi
     WorkspaceGuard ws(tmp.path());
 
     std::string result = tools::edit_file(
-        "{\"path\":\"sub.txt\",\"old_text\":\"a\",\"new_text\":\"aa\",\"replace_all\":true}");
+        "{\"path\":\"sub.txt\",\"edits\":[{\"old_text\":\"a\",\"new_text\":\"aa\",\"replace_all\":true}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == true);
     REQUIRE(j["replacements"] == 3);
@@ -1017,4 +1017,259 @@ TEST_CASE("edit_file: replace_all substring overlap no infinite loop", "[edit_fi
     std::ifstream f(tmp.path() + "/sub.txt");
     std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     REQUIRE(content == "aa aa aa\n");
+}
+
+// ============================================================================
+// edit_file batch tests — edits array schema (task 1.8)
+// ============================================================================
+
+TEST_CASE("edit_file: multiple replacements in one call", "[edit_file][batch]") {
+    TempDir tmp;
+    tmp.write("multi.txt", "alpha\nbeta\ngamma\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file(
+        "{\"path\":\"multi.txt\",\"edits\":["
+        "{\"old_text\":\"alpha\",\"new_text\":\"ALPHA\"},"
+        "{\"old_text\":\"beta\",\"new_text\":\"BETA\"},"
+        "{\"old_text\":\"gamma\",\"new_text\":\"GAMMA\"}"
+        "]}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["replacements"] == 3);
+
+    std::ifstream f(tmp.path() + "/multi.txt");
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content == "ALPHA\nBETA\nGAMMA\n");
+}
+
+TEST_CASE("edit_file: any failed match aborts all", "[edit_file][batch]") {
+    TempDir tmp;
+    tmp.write("abort.txt", "aaa\nbbb\n");
+    WorkspaceGuard ws(tmp.path());
+
+    // Second pair's old_text does not exist — whole request fails, zero changes
+    std::string result = tools::edit_file(
+        "{\"path\":\"abort.txt\",\"edits\":["
+        "{\"old_text\":\"aaa\",\"new_text\":\"AAA\"},"
+        "{\"old_text\":\"zzz\",\"new_text\":\"ZZZ\"}"
+        "]}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["pair"] == 1);
+    REQUIRE(j["error"] == "old_text not found in file");
+    REQUIRE(j.contains("diagnosis"));
+
+    // Verify NO edit applied (zero modifications)
+    std::ifstream f(tmp.path() + "/abort.txt");
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content == "aaa\nbbb\n");
+}
+
+TEST_CASE("edit_file: batch pair non-unique match rejected with pair index", "[edit_file][batch]") {
+    TempDir tmp;
+    tmp.write("dup.txt", "x\nTODO\ny\nTODO\nz\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file(
+        "{\"path\":\"dup.txt\",\"edits\":["
+        "{\"old_text\":\"TODO\",\"new_text\":\"DONE\"}"
+        "]}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["pair"] == 0);
+    REQUIRE(j["matches"].is_array());
+    REQUIRE(j["matches"].size() == 2);
+}
+
+TEST_CASE("edit_file: overlapping edits rejected", "[edit_file][batch]") {
+    TempDir tmp;
+    tmp.write("overlap.txt", "hello world\n");
+    WorkspaceGuard ws(tmp.path());
+
+    // Ranges [0,5) "hello" and [4,9) "o wor" overlap
+    std::string result = tools::edit_file(
+        "{\"path\":\"overlap.txt\",\"edits\":["
+        "{\"old_text\":\"hello\",\"new_text\":\"X\"},"
+        "{\"old_text\":\"o wor\",\"new_text\":\"Y\"}"
+        "]}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "edits overlap");
+
+    // Verify NO edit applied
+    std::ifstream f(tmp.path() + "/overlap.txt");
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content == "hello world\n");
+}
+
+TEST_CASE("edit_file: per-pair replace_all semantics", "[edit_file][batch]") {
+    TempDir tmp;
+    tmp.write("per.txt", "a a b a\n");
+    WorkspaceGuard ws(tmp.path());
+
+    // Pair 0 replace_all replaces all 3 'a'; pair 1 (single, unique) replaces 'b'
+    std::string result = tools::edit_file(
+        "{\"path\":\"per.txt\",\"edits\":["
+        "{\"old_text\":\"a\",\"new_text\":\"A\",\"replace_all\":true},"
+        "{\"old_text\":\"b\",\"new_text\":\"B\"}"
+        "]}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["replacements"] == 4);  // 3 'a' hits + 1 'b' hit
+
+    std::ifstream f(tmp.path() + "/per.txt");
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content == "A A B A\n");
+}
+
+TEST_CASE("edit_file: empty edits array rejected", "[edit_file][batch]") {
+    TempDir tmp;
+    tmp.write("e.txt", "content\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file("{\"path\":\"e.txt\",\"edits\":[]}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "edits must contain at least one replacement");
+}
+
+TEST_CASE("edit_file: missing edits field rejected", "[edit_file][batch]") {
+    TempDir tmp;
+    tmp.write("m.txt", "content\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file("{\"path\":\"m.txt\"}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "edits must contain at least one replacement");
+}
+
+TEST_CASE("edit_file: edits length limit exceeded", "[edit_file][batch]") {
+    TempDir tmp;
+    tmp.write("limit.txt", "aaaa\n");
+    WorkspaceGuard ws(tmp.path());
+
+    // Build 101 pairs (limit is 100)
+    std::string edits;
+    for (int i = 0; i < 101; ++i) {
+      if (i > 0) edits += ",";
+      edits += "{\"old_text\":\"a\",\"new_text\":\"b\"}";
+    }
+    std::string result = tools::edit_file(
+        "{\"path\":\"limit.txt\",\"edits\":[" + edits + "]}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"].get<std::string>().find("too many edits") != std::string::npos);
+}
+
+TEST_CASE("edit_file: array order differs from position order", "[edit_file][batch]") {
+    TempDir tmp;
+    tmp.write("order.txt", "one two three\n");
+    WorkspaceGuard ws(tmp.path());
+
+    // Pairs given in REVERSE position order — apply must still be correct
+    std::string result = tools::edit_file(
+        "{\"path\":\"order.txt\",\"edits\":["
+        "{\"old_text\":\"three\",\"new_text\":\"3\"},"
+        "{\"old_text\":\"two\",\"new_text\":\"2\"},"
+        "{\"old_text\":\"one\",\"new_text\":\"1\"}"
+        "]}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["replacements"] == 3);
+
+    std::ifstream f(tmp.path() + "/order.txt");
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content == "1 2 3\n");
+}
+
+TEST_CASE("edit_file: replace_all pair with hit after another pair's range (per-hit reverse)", "[edit_file][batch]") {
+    TempDir tmp;
+    tmp.write("cross.txt", "X middle X end\n");
+    WorkspaceGuard ws(tmp.path());
+
+    // Pair 0: replace_all "X" → hits at [0,1) and [9,10)
+    // Pair 1: "middle" → hit at [2,8)
+    // Pair 0's replacement "YY" (length 2) changes length. A per-pair ordering
+    // that applies [0,1) before [2,8) would shift pair 1's target by +1 and
+    // corrupt it. Per-hit global reverse applies [9,10) → [2,8) → [0,1),
+    // keeping every target position valid.
+    std::string result = tools::edit_file(
+        "{\"path\":\"cross.txt\",\"edits\":["
+        "{\"old_text\":\"X\",\"new_text\":\"YY\",\"replace_all\":true},"
+        "{\"old_text\":\"middle\",\"new_text\":\"M\"}"
+        "]}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["replacements"] == 3);
+
+    std::ifstream f(tmp.path() + "/cross.txt");
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content == "YY M YY end\n");
+}
+
+TEST_CASE("edit_file: empty old_text in a later pair rejected", "[edit_file][batch]") {
+    TempDir tmp;
+    tmp.write("e2.txt", "content\n");
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file(
+        "{\"path\":\"e2.txt\",\"edits\":["
+        "{\"old_text\":\"content\",\"new_text\":\"c\"},"
+        "{\"old_text\":\"\",\"new_text\":\"x\"}"
+        "]}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "old_text must not be empty");
+    REQUIRE(j["pair"] == 1);
+}
+
+TEST_CASE("edit_file: batch with normalized pair and matched_with", "[edit_file][batch][normalized]") {
+    TempDir tmp;
+    {
+        std::ofstream f(tmp.path() + "/bn.txt", std::ios::binary);
+        f.write("A\r\nB\r\nC\r\n", 9);
+        f.close();
+    }
+    WorkspaceGuard ws(tmp.path());
+
+    // Pair 0 exact, pair 1 uses LF old_text against a CRLF file → normalized
+    std::string result = tools::edit_file(
+        "{\"path\":\"bn.txt\",\"edits\":["
+        "{\"old_text\":\"A\",\"new_text\":\"AAA\"},"
+        "{\"old_text\":\"B\\nC\",\"new_text\":\"BC\"}"
+        "]}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["replacements"] == 2);
+    REQUIRE(j["matched_with"] == "whitespace normalization");
+
+    std::ifstream f(tmp.path() + "/bn.txt");
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content.find("BC") != std::string::npos);
+}
+
+TEST_CASE("edit_file: bare CR line boundary with trailing whitespace (8.4 regression)", "[edit_file][batch][normalized]") {
+    TempDir tmp;
+    // "x  \rY": two spaces before a BARE \r (not CRLF). normalize_whitespace
+    // strips those spaces (bare \r -> \n first), so old_text "x\r" matches
+    // with trailing-whitespace stripping. The mapped original range must cover
+    // "x  \r" (4 bytes) — a too-short range would orphan the spaces and \r.
+    {
+        std::ofstream f(tmp.path() + "/barecr.txt", std::ios::binary);
+        f.write("x  \rY", 5);
+        f.close();
+    }
+    WorkspaceGuard ws(tmp.path());
+
+    std::string result = tools::edit_file(
+        "{\"path\":\"barecr.txt\",\"edits\":[{\"old_text\":\"x\\r\",\"new_text\":\"z\"}]}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["replacements"] == 1);
+
+    std::ifstream f(tmp.path() + "/barecr.txt", std::ios::binary);
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(content == "zY");
 }

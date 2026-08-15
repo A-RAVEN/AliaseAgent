@@ -229,11 +229,15 @@ class _ChatScreenState extends State<ChatScreen> {
       },
       'edit_file': const {
         'name': 'edit_file',
-        'description': 'Edit a file by replacing exact text. '
-            'You MUST read the file first to get the exact old_text. '
-            'old_text must match exactly (whitespace differences are auto-normalized). '
-            'If old_text matches multiple locations, the edit is rejected — '
-            'add more context to make it unique, or use replace_all:true.',
+        'description': 'Edit a file by replacing text. Accepts a batch of '
+            'replacement pairs in one call. You MUST read the file first to get '
+            'the exact old_text. Each old_text must match exactly (whitespace '
+            'differences are auto-normalized) and must not be empty. If an '
+            'old_text matches multiple locations and its replace_all is false, '
+            'the whole request is rejected — add more context to make it unique '
+            'or set replace_all:true. All pairs are validated against the '
+            'original content first; if any pair fails, no changes are applied. '
+            'Overlapping edits are rejected. Up to 100 pairs per call.',
         'input_schema': {
           'type': 'object',
           'properties': {
@@ -241,21 +245,31 @@ class _ChatScreenState extends State<ChatScreen> {
               'type': 'string',
               'description': 'File path relative to workspace root.',
             },
-            'old_text': {
-              'type': 'string',
-              'description': 'Exact text to find and replace. Must not be empty.',
-            },
-            'new_text': {
-              'type': 'string',
-              'description': 'Replacement text.',
-            },
-            'replace_all': {
-              'type': 'boolean',
-              'default': false,
-              'description': 'Replace all occurrences instead of just the first.',
+            'edits': {
+              'type': 'array',
+              'items': {
+                'type': 'object',
+                'properties': {
+                  'old_text': {
+                    'type': 'string',
+                    'description': 'Exact text to find and replace. Must not be empty.',
+                  },
+                  'new_text': {
+                    'type': 'string',
+                    'description': 'Replacement text. May be empty to delete text.',
+                  },
+                  'replace_all': {
+                    'type': 'boolean',
+                    'default': false,
+                    'description': 'Replace all occurrences instead of just the first.',
+                  },
+                },
+                'required': ['old_text', 'new_text'],
+              },
+              'description': 'Replacement pairs. At least one required; max 100.',
             },
           },
-          'required': ['path', 'old_text', 'new_text'],
+          'required': ['path', 'edits'],
         },
       },
       'list_dir': const {
@@ -279,6 +293,65 @@ class _ChatScreenState extends State<ChatScreen> {
           'type': 'object',
           'properties': {},
           'required': [],
+        },
+      },
+      'glob_file': const {
+        'name': 'glob_file',
+        'description': 'Find files within the workspace matching a glob pattern '
+            '(gitignore-style: supports *, **, ?, and ! negation). '
+            'Returns workspace-relative paths, one per line, limited to '
+            'max_results (default 200). Use this when you need to discover '
+            'which files exist before reading or searching them.',
+        'input_schema': {
+          'type': 'object',
+          'properties': {
+            'pattern': {
+              'type': 'string',
+              'description': 'Glob pattern relative to the workspace root, e.g. "lib/**/*.dart".',
+            },
+            'max_results': {
+              'type': 'integer',
+              'minimum': 1,
+              'default': 200,
+              'description': 'Maximum number of paths to return.',
+            },
+          },
+          'required': ['pattern'],
+        },
+      },
+      'grep_file': const {
+        'name': 'grep_file',
+        'description': 'Search file contents within the workspace using a '
+            'regular expression. Returns matches as "path:line: text", with '
+            'workspace-relative paths, limited to max_results (default 100). '
+            'Supports an optional glob filter and case-insensitive search. '
+            'Note: when glob is non-empty it overrides gitignore rules — files '
+            'matching the glob are searched even if they would otherwise be ignored.',
+        'input_schema': {
+          'type': 'object',
+          'properties': {
+            'pattern': {
+              'type': 'string',
+              'description': 'Regular expression to search for.',
+            },
+            'glob': {
+              'type': 'string',
+              'description': 'Optional glob restricting which files are searched '
+                  '(e.g. "sidecar/src/*.cpp"). When set, it overrides gitignore rules.',
+            },
+            'ignore_case': {
+              'type': 'boolean',
+              'default': false,
+              'description': 'Case-insensitive search.',
+            },
+            'max_results': {
+              'type': 'integer',
+              'minimum': 1,
+              'default': 100,
+              'description': 'Maximum number of matches to return.',
+            },
+          },
+          'required': ['pattern'],
         },
       },
     };
@@ -1081,14 +1154,26 @@ class _ChatScreenState extends State<ChatScreen> {
           'content': input['content'] ?? '',
         }));
       case 'edit_file':
-        resultJson = _sidecar.editFile(jsonEncode({
-          'path': path,
-          'old_text': input['old_text'] ?? '',
-          'new_text': input['new_text'] ?? '',
-          'replace_all': input['replace_all'] ?? false,
-        }));
+        final edits = input['edits'];
+        if (edits is! List || edits.isEmpty) {
+          resultJson = '{"ok":false,"error":"edits must contain at least one replacement"}';
+        } else {
+          resultJson = _sidecar.editFile(jsonEncode({'path': path, 'edits': edits}));
+        }
       case 'list_dir':
         resultJson = _sidecar.listDir(path);
+      case 'glob_file':
+        resultJson = _sidecar.globFile(jsonEncode({
+          'pattern': input['pattern'] ?? '',
+          'max_results': input['max_results'] ?? 200,
+        }));
+      case 'grep_file':
+        resultJson = _sidecar.grepFile(jsonEncode({
+          'pattern': input['pattern'] ?? '',
+          'glob': input['glob'] ?? '',
+          'ignore_case': input['ignore_case'] ?? false,
+          'max_results': input['max_results'] ?? 100,
+        }));
       case 'web_search':
         final request = jsonEncode({
           'query': input['query'] ?? '',
@@ -1139,6 +1224,42 @@ class _ChatScreenState extends State<ChatScreen> {
         var content = 'Edited $path ($reps replacement${reps == 1 ? '' : 's'})';
         if (matchedWith != null) content += ' — matched with $matchedWith';
         parsed['content'] = content;
+      } else if (name == 'glob_file') {
+        // Model-facing content: one relative path per line. Show the full
+        // requested result set (C++ already bounds paths to max_results) — a
+        // smaller hard cap would silently drop results without a marker.
+        final maxResults = (input['max_results'] as int?) ?? 200;
+        final paths = parsed['paths'] as List? ?? [];
+        final count = parsed['count'] as int? ?? paths.length;
+        final truncated = parsed['truncated'] == true;
+        final sb = StringBuffer();
+        for (final p in paths.take(maxResults)) {
+          sb.writeln(p);
+        }
+        if (truncated) sb.writeln('... (truncated, showing ${paths.length} of $count)');
+        parsed['content'] = sb.toString().trim().isEmpty
+            ? '(no files matched)'
+            : sb.toString().trim();
+      } else if (name == 'grep_file') {
+        // Model-facing content: "path:line: text" per match. Show the full
+        // requested result set; only strip the trailing newline rg adds, not
+        // leading indentation (which is meaningful in code lines).
+        final maxResults = (input['max_results'] as int?) ?? 100;
+        final matches = parsed['matches'] as List? ?? [];
+        final count = parsed['count'] as int? ?? matches.length;
+        final truncated = parsed['truncated'] == true;
+        final sb = StringBuffer();
+        for (final m in matches.take(maxResults)) {
+          final mm = m is Map<String, dynamic> ? m : <String, dynamic>{};
+          final p = mm['path'] ?? '?';
+          final l = mm['line'];
+          final t = (mm['text'] ?? '').toString().trimRight();
+          sb.writeln('$p:${l ?? '?'}: $t');
+        }
+        if (truncated) sb.writeln('... (truncated, showing ${matches.length} of $count)');
+        parsed['content'] = sb.toString().trim().isEmpty
+            ? '(no matches)'
+            : sb.toString().trim();
       }
       return parsed;
     } catch (e) {

@@ -230,7 +230,7 @@ void main() {
       final msgRepo = FakeMessageRepository();
       final sidecar = FakeSidecar()
         ..stubEditFile('{"ok":true,"replacements":1}')
-        ..queueToolCall('{"name":"edit_file","input":{"path":"/test.txt","old_text":"a","new_text":"b"}}')
+        ..queueToolCall('{"name":"edit_file","input":{"path":"/test.txt","edits":[{"old_text":"a","new_text":"b"}]}}')
         ..queueDone();
 
       await tester.pumpWidget(_buildApp(
@@ -245,6 +245,62 @@ void main() {
       expect(find.textContaining('Error:'), findsNothing);
       expect(find.byType(ToolCallCard), findsOneWidget);
       expect(find.textContaining('edit_file'), findsOneWidget);
+    });
+
+    // glob_file dispatch through ChatScreen+FakeSidecar
+    testWidgets('glob_file tool call completes without error', (tester) async {
+      _setupAgentRegistry();
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final sessions = testSessions(1);
+      final sessionRepo = FakeSessionRepository(sessions);
+      final msgRepo = FakeMessageRepository();
+      final sidecar = FakeSidecar()
+        ..stubGlobFile('{"ok":true,"paths":["lib/main.dart","lib/models/app_config.dart"],"count":2}')
+        ..queueToolCall('{"name":"glob_file","input":{"pattern":"lib/**/*.dart"}}')
+        ..queueDone();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo, msgRepo: msgRepo, sidecar: sidecar,
+      ));
+      await tester.pump(); await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'Find files');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump(); await tester.pump();
+
+      expect(find.textContaining('Error:'), findsNothing);
+      expect(find.byType(ToolCallCard), findsOneWidget);
+      expect(find.textContaining('lib/main.dart'), findsWidgets);
+    });
+
+    // grep_file dispatch through ChatScreen+FakeSidecar
+    testWidgets('grep_file tool call completes without error', (tester) async {
+      _setupAgentRegistry();
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final sessions = testSessions(1);
+      final sessionRepo = FakeSessionRepository(sessions);
+      final msgRepo = FakeMessageRepository();
+      final sidecar = FakeSidecar()
+        ..stubGrepFile('{"ok":true,"matches":[{"path":"lib/main.dart","line":42,"text":"TODO: fix"}],"count":1}')
+        ..queueToolCall('{"name":"grep_file","input":{"pattern":"TODO"}}')
+        ..queueDone();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo, msgRepo: msgRepo, sidecar: sidecar,
+      ));
+      await tester.pump(); await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'Search TODO');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump(); await tester.pump();
+
+      expect(find.textContaining('Error:'), findsNothing);
+      expect(find.byType(ToolCallCard), findsOneWidget);
+      expect(find.textContaining('TODO: fix'), findsWidgets);
     });
   });
 }

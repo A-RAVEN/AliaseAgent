@@ -59,6 +59,8 @@ typedef WebSearchDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef WebFetchDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef WriteFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef EditFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
+typedef GlobFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
+typedef GrepFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef CancelRequestDart = void Function();
 
 // ---------------------------------------------------------------------------
@@ -103,6 +105,10 @@ abstract class ISidecar {
   String writeFile(String requestJson);
   String editFile(String requestJson);
 
+  // Ripgrep-backed search tools
+  String globFile(String requestJson);
+  String grepFile(String requestJson);
+
   // Search & web fetch
   String ensureSearchInfra(String configJson);
   String getSearchProviders();
@@ -127,6 +133,8 @@ class SidecarBridge implements ISidecar {
   late final WebFetchDart _webFetchFn;
   late final WriteFileDart _writeFileFn;
   late final EditFileDart _editFileFn;
+  late final GlobFileDart _globFileFn;
+  late final GrepFileDart _grepFileFn;
   late final CancelRequestDart _cancelRequestFn;
 
   // Serialization gate (D3): all sendMessage calls execute strictly one at a
@@ -155,6 +163,10 @@ class SidecarBridge implements ISidecar {
         _lib.lookupFunction<SetWorkspaceNative, WriteFileDart>('write_file');
     _editFileFn =
         _lib.lookupFunction<SetWorkspaceNative, EditFileDart>('edit_file');
+    _globFileFn =
+        _lib.lookupFunction<SetWorkspaceNative, GlobFileDart>('glob_file');
+    _grepFileFn =
+        _lib.lookupFunction<SetWorkspaceNative, GrepFileDart>('grep_file');
     _cancelRequestFn =
         _lib.lookupFunction<CancelRequestNative, CancelRequestDart>('cancel_request');
   }
@@ -476,6 +488,22 @@ class SidecarBridge implements ISidecar {
   String editFile(String requestJson) {
     final ptr = requestJson.toNativeUtf8();
     final resultPtr = _editFileFn(ptr);
+    malloc.free(ptr);
+    return resultPtr.toDartString();
+  }
+
+  @override
+  String globFile(String requestJson) {
+    final ptr = requestJson.toNativeUtf8();
+    final resultPtr = _globFileFn(ptr);
+    malloc.free(ptr);
+    return resultPtr.toDartString();
+  }
+
+  @override
+  String grepFile(String requestJson) {
+    final ptr = requestJson.toNativeUtf8();
+    final resultPtr = _grepFileFn(ptr);
     malloc.free(ptr);
     return resultPtr.toDartString();
   }

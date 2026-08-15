@@ -102,8 +102,12 @@ void main() {
       // Verify unconditional tools are callable via FakeSidecar
       final wf = sidecar.writeFile('{"path":"x","content":"y"}');
       expect(jsonDecode(wf)['ok'], isTrue);
-      final ef = sidecar.editFile('{"path":"x","old_text":"a","new_text":"b"}');
+      final ef = sidecar.editFile('{"path":"x","edits":[{"old_text":"a","new_text":"b"}]}');
       expect(jsonDecode(ef)['ok'], isTrue);
+      final gf = sidecar.globFile('{"pattern":"lib/**/*.dart"}');
+      expect(jsonDecode(gf)['ok'], isTrue);
+      final grf = sidecar.grepFile('{"pattern":"TODO"}');
+      expect(jsonDecode(grf)['ok'], isTrue);
     });
 
     // 10.4 — Multiple providers → all in enum

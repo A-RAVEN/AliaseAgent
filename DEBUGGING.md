@@ -255,6 +255,27 @@ The model can fetch web pages to get full article text:
 3. **"Fetch failed: timeout"** — The target site didn't respond within 15 seconds
 4. **"Fetch failed: HTTP 403/404/500"** — The target server returned an error
 
+### glob_file / grep_file (ripgrep-backed file search)
+
+The model can discover files (`glob_file`) and search file contents (`grep_file`) within the workspace. Both run `rg` as a subprocess with a 30s timeout.
+
+```
+→ Model calls glob_file(pattern="lib/**/*.dart", max_results=200)
+→ Sidecar runs rg --files --no-require-git -g "lib/**/*.dart" <workspace>
+→ Returns workspace-relative paths
+
+→ Model calls grep_file(pattern="request_mutex", glob="sidecar/src/*.cpp", ignore_case=false)
+→ Sidecar runs rg --json -n --no-require-git --glob ... -- <pattern> <workspace>
+→ Returns path:line:text matches
+```
+
+**Troubleshooting glob_file / grep_file:**
+
+1. **"rg not found — install ripgrep or place rg.exe in tools/"** — The rg binary is missing. Windows: place `rg.exe` in `tools/` (or `../share/aliasagent/tools/`) relative to the DLL. Linux/macOS: install via package manager (`apt/dnf/brew install ripgrep`).
+2. **"glob_file timed out after 30 seconds"** — The search exceeded the 30s subprocess timeout (large workspace or pathological regex).
+3. **"invalid regex: ..."** — The pattern is not a valid regex for rg's engine (rg exit code 2 with a regex parse error).
+4. **"search failed: ..."** — rg exit code 2 from a soft error (e.g., unreadable file); stderr is included.
+
 ### Log Examples
 
 Set `ALIASAGENT_LOG_LEVEL=trace` to see search-related logs:

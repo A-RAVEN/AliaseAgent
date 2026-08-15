@@ -2,6 +2,7 @@
 #define TOOLS_H
 
 #include <string>
+#include <nlohmann/json.hpp>
 
 namespace tools {
 
@@ -54,6 +55,34 @@ std::string edit_file(const std::string& request_json);
 /// Returns JSON: {"ok":true,"content":"[{\"name\":\"...\",\"type\":\"file|directory\"},...]"}
 /// or {"ok":false,"error":"..."}
 std::string list_dir(const std::string& path);
+
+/// Find files within the workspace matching a glob pattern (ripgrep-backed).
+/// Request JSON: {"pattern":"...", "max_results":N}
+/// Returns JSON: {"ok":true,"paths":["..."],"count":N,"truncated":true|false}
+/// or {"ok":false,"error":"..."}
+std::string glob_file(const std::string& request_json);
+
+/// Search file contents with a regular expression (ripgrep-backed).
+/// Request JSON: {"pattern":"...", "glob":"...", "ignore_case":bool, "max_results":N}
+/// Returns JSON: {"ok":true,"matches":[{"path":"...","line":N,"text":"..."}],
+///                "count":N,"truncated":true|false}
+/// or {"ok":false,"error":"..."}
+std::string grep_file(const std::string& request_json);
+
+// ============================================================================
+// Testable helpers (exposed for unit tests, like web_fetch.h)
+// ============================================================================
+
+/// Classify rg's exit-2 stderr: true = regex parse error ("invalid regex"),
+/// false = other/soft error ("search failed"). rg exit 2 covers both
+/// (Docs/ripgrepDoc.md section 4).
+bool classify_grep_regex_error(const std::string& stderr_data);
+
+/// Build a grep match entry {path, line?, text?} from an --json match message's
+/// `data` object, de-rooting the path. Degrades when fields are absent
+/// (path/lines via base64 `bytes`, missing line_number omitted).
+/// Schema per Docs/ripgrepDoc.md section 1.1.
+nlohmann::json build_match_entry(const nlohmann::json& data, const std::string& root);
 
 } // namespace tools
 

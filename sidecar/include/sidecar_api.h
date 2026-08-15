@@ -82,10 +82,21 @@ SIDECAR_API const char* web_fetch(const char* request_json);
 /// Returns JSON: {"ok":true,"path":"...","bytes_written":N,"created":true|false}
 SIDECAR_API const char* write_file(const char* request_json);
 
-/// Edit a file by replacing exact text (with whitespace normalization).
-/// @param request_json  {"path":"...","old_text":"...","new_text":"...","replace_all":false}
+/// Edit a file with a batch of replacement pairs.
+/// @param request_json  {"path":"...","edits":[{"old_text":"...","new_text":"...","replace_all":false}]}
 /// Returns JSON: {"ok":true,"replacements":N} or {"ok":false,"error":"...","diagnosis":{...}}
 SIDECAR_API const char* edit_file(const char* request_json);
+
+/// Find files within the workspace matching a glob pattern (ripgrep-backed).
+/// @param request_json  {"pattern":"...","max_results":N}
+/// Returns JSON: {"ok":true,"paths":[...],"count":N,"truncated":true|false}
+SIDECAR_API const char* glob_file(const char* request_json);
+
+/// Search file contents within the workspace using a regular expression (ripgrep-backed).
+/// @param request_json  {"pattern":"...","glob":"...","ignore_case":bool,"max_results":N}
+/// Returns JSON: {"ok":true,"matches":[{"path":"...","line":N,"text":"..."}],
+///                "count":N,"truncated":true|false}
+SIDECAR_API const char* grep_file(const char* request_json);
 
 #ifdef __cplusplus
 }

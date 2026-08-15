@@ -1,5 +1,6 @@
 #include "tools.h"
 #include "logger.h"
+#include "subprocess.h"
 
 #include <string>
 #include <vector>
@@ -7,6 +8,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cstring>
+#include <cctype>
 #include <nlohmann/json.hpp>
 
 #ifdef _WIN32
@@ -16,6 +18,7 @@
 #else
 #include <limits.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #define mkdir_impl(p) mkdir(p, 0755)
@@ -709,32 +712,185 @@ static json diagnostic_match(const std::string& content, const std::string& old_
 }
 
 // ---------------------------------------------------------------------------
-// edit_file — three-tier matching
+// edit_file batch — per-pair resolution & helpers
+// ---------------------------------------------------------------------------
+
+struct EditPair {
+  std::string old_text;
+  std::string new_text;
+  bool replace_all = false;
+};
+
+enum class MatchTier { None, Exact, Normalized };
+
+struct HitRange {
+  size_t start;
+  size_t end;
+};
+
+/// Line number (1-based) of a byte offset within content.
+static int line_of(const std::string& content, size_t offset) {
+  int line = 1;
+  for (size_t i = 0; i < offset && i < content.size(); ++i) {
+    if (content[i] == '\n') line++;
+  }
+  return line;
+}
+
+/// Resolve `old_text` against `content`, returning hit ranges in ORIGINAL byte
+/// coordinates. Exact matches are used when present; otherwise whitespace
+/// normalization is tried. Returns the tier that matched (None if neither).
+/// Empty `old_text` is guaranteed rejected by the caller before this runs.
+static MatchTier resolve_edit_hits(const std::string& content,
+                                   const std::string& old_text,
+                                   const FileMeta& meta,
+                                   std::vector<HitRange>& ranges) {
+  ranges.clear();
+
+  // ---- Tier 1: Exact match ----
+  std::vector<size_t> positions;
+  size_t pos = 0;
+  while ((pos = content.find(old_text, pos)) != std::string::npos) {
+    positions.push_back(pos);
+    pos += old_text.size();
+  }
+  if (!positions.empty()) {
+    for (size_t p : positions) ranges.push_back({p, p + old_text.size()});
+    return MatchTier::Exact;
+  }
+
+  // ---- Tier 2: Whitespace-normalized match ----
+  std::string norm_content = normalize_whitespace(content, meta);
+  std::string norm_old = normalize_whitespace(old_text, meta);
+  if (norm_old.empty()) return MatchTier::None;
+
+  std::vector<size_t> norm_positions;
+  pos = 0;
+  while ((pos = norm_content.find(norm_old, pos)) != std::string::npos) {
+    norm_positions.push_back(pos);
+    pos += norm_old.size();
+  }
+  if (norm_positions.empty()) return MatchTier::None;
+
+  // Map normalized positions back to original content coordinates by
+  // simulating normalization and tracking both positions simultaneously.
+  auto map_norm_to_orig = [&](size_t target_norm_pos) -> size_t {
+    size_t oi = 0, ni = 0;
+    while (oi < content.size() && ni < target_norm_pos) {
+      char c = content[oi];
+      if (c == '\r' && oi + 1 < content.size() && content[oi + 1] == '\n') {
+        oi += 2; ni += 1;           // CRLF → LF
+      } else if (c == '\r') {
+        oi += 1; ni += 1;           // bare CR → LF
+      } else if (c == ' ' || c == '\t') {
+        // Trailing-whitespace check MUST come before tab→spaces expansion:
+        // peek ahead to see if this space/tab block is followed by a line
+        // boundary or EOF, which means normalize_whitespace would strip it
+        // entirely. A bare \r counts as a boundary too: normalize_whitespace
+        // converts bare \r to \n FIRST and then strips trailing whitespace.
+        size_t peek = oi;
+        while (peek < content.size() &&
+               (content[peek] == ' ' || content[peek] == '\t')) {
+          peek++;
+        }
+        if (peek >= content.size() || content[peek] == '\n' ||
+            content[peek] == '\r') {
+          oi = peek; // skip all trailing whitespace, no ni advance
+          if (peek < content.size() && content[peek] == '\r') {
+            if (peek + 1 < content.size() && content[peek + 1] == '\n') {
+              oi += 2; ni += 1;  // CRLF → \n
+            } else {
+              oi += 1; ni += 1;  // bare \r → \n
+            }
+          } else if (peek < content.size()) {
+            oi += 1; ni += 1;    // \n
+          }
+        } else if (c == '\t' && meta.indent_style == "spaces") {
+          oi += 1; ni += meta.indent_width; // non-trailing tab → N spaces
+        } else {
+          oi += 1; ni += 1;
+        }
+      } else {
+        oi += 1; ni += 1;
+      }
+    }
+    return oi;
+  };
+
+  for (size_t np : norm_positions) {
+    size_t s = map_norm_to_orig(np);
+    size_t e = map_norm_to_orig(np + norm_old.size());
+    if (e > s) ranges.push_back({s, e});
+  }
+
+  // Merge overlapping ranges (can happen with whitespace stripping).
+  if (ranges.size() > 1) {
+    std::sort(ranges.begin(), ranges.end(),
+              [](const HitRange& a, const HitRange& b) { return a.start < b.start; });
+    std::vector<HitRange> merged;
+    for (const auto& r : ranges) {
+      if (!merged.empty() && r.start <= merged.back().end) {
+        merged.back().end = std::max(merged.back().end, r.end);
+      } else {
+        merged.push_back(r);
+      }
+    }
+    ranges = std::move(merged);
+  }
+  return MatchTier::Normalized;
+}
+
+// ---------------------------------------------------------------------------
+// edit_file — batch edits array, three-tier matching
 // ---------------------------------------------------------------------------
 
 std::string edit_file(const std::string& request_json) {
   LOG_TRACE("tools::edit_file entry");
 
   std::string path;
-  std::string old_text;
-  std::string new_text;
-  bool replace_all = false;
+  std::vector<EditPair> pairs;
 
   try {
     auto req = json::parse(request_json);
     path = req.value("path", "");
-    old_text = req.value("old_text", "");
-    new_text = req.value("new_text", "");
-    replace_all = req.value("replace_all", false);
+    if (!req.contains("edits") || !req["edits"].is_array() || req["edits"].empty()) {
+      return error_result("edits must contain at least one replacement");
+    }
+    const auto& edits = req["edits"];
+    constexpr int kMaxEdits = 100;
+    if (edits.size() > kMaxEdits) {
+      json resp;
+      resp["ok"] = false;
+      resp["error"] = "too many edits (max " + std::to_string(kMaxEdits) + ")";
+      return resp.dump();
+    }
+    for (const auto& e : edits) {
+      if (!e.is_object()) {
+        return error_result("edits entries must be objects");
+      }
+      EditPair p;
+      p.old_text = e.value("old_text", "");
+      p.new_text = e.value("new_text", "");
+      p.replace_all = e.value("replace_all", false);
+      pairs.push_back(std::move(p));
+    }
   } catch (const json::parse_error& e) {
     return error_result("Invalid request JSON: " + std::string(e.what()));
   }
 
   if (path.empty()) return error_result("path is required");
 
-  // ---- Empty old_text guard (D2) ----
-  if (old_text.empty()) {
-    return error_result("old_text must not be empty");
+  // ---- Per-pair structural validation: empty old_text → immediate reject ----
+  // (prevents find() empty-string infinite loop; each hit advances by
+  // old_text.size(), which is 0 for an empty old_text)
+  for (size_t i = 0; i < pairs.size(); ++i) {
+    if (pairs[i].old_text.empty()) {
+      json resp;
+      resp["ok"] = false;
+      resp["error"] = "old_text must not be empty";
+      resp["pair"] = i;
+      return resp.dump();
+    }
   }
 
   // ---- Resolve and sandbox ----
@@ -750,8 +906,7 @@ std::string edit_file(const std::string& request_json) {
     return error_result("Path is a directory, not a file: " + path);
   }
 
-  // ---- Non-text / large file protection (1.7) ----
-  // Check file size (1MB limit)
+  // ---- Non-text / large file protection (whole request level) ----
   {
     std::ifstream fs(resolved, std::ios::binary | std::ios::ate);
     if (fs) {
@@ -762,7 +917,6 @@ std::string edit_file(const std::string& request_json) {
     }
   }
 
-  // Check binary (NUL in first 512 bytes)
   {
     std::ifstream fs(resolved, std::ios::binary);
     if (fs) {
@@ -787,212 +941,106 @@ std::string edit_file(const std::string& request_json) {
   std::string content = ss.str();
   f.close();
 
-  // ---- Detect file metadata (1.3) ----
+  // ---- Detect file metadata ----
   FileMeta meta = detect_file_meta(content);
 
-  // ---- Tier 1: Exact match ----
-  {
-    std::vector<size_t> positions;
-    size_t pos = 0;
-    while ((pos = content.find(old_text, pos)) != std::string::npos) {
-      positions.push_back(pos);
-      pos += old_text.size();
-    }
+  // ---- Validation phase: resolve every pair against ORIGINAL content ----
+  struct AppliedHit {
+    size_t start;
+    size_t end;
+    size_t pair;
+  };
 
-    if (!positions.empty()) {
-      if (positions.size() > 1 && !replace_all) {
-        // Multiple matches — reject with line numbers
-        std::vector<int> match_lines;
-        for (size_t p : positions) {
-          int line_num = 1;
-          for (size_t i = 0; i < p && i < content.size(); ++i) {
-            if (content[i] == '\n') line_num++;
-          }
-          match_lines.push_back(line_num);
-        }
-        json resp;
-        resp["ok"] = false;
-        resp["error"] = "old_text matches " + std::to_string(positions.size()) + " locations";
-        resp["matches"] = match_lines;
-        resp["hint"] = "Use replace_all:true to replace all, or provide more context to make old_text unique";
-        return resp.dump();
-      }
+  std::vector<HitRange> ranges;
+  std::vector<AppliedHit> hits;
+  bool any_normalized = false;
 
-      // Single match or replace_all — perform replacement
-      int replacements = 0;
-      std::string result;
-      if (replace_all) {
-        size_t last = 0;
-        while ((pos = content.find(old_text, last)) != std::string::npos) {
-          result.append(content, last, pos - last);
-          result.append(new_text);
-          last = pos + old_text.size();
-          replacements++;
-        }
-        result.append(content, last, content.size() - last);
-      } else {
-        pos = positions[0];
-        result = content.substr(0, pos) + new_text + content.substr(pos + old_text.size());
-        replacements = 1;
-      }
-
-      // Write back
-      {
-        std::ofstream out(resolved, std::ios::binary | std::ios::trunc);
-        if (!out) return error_result("Cannot write file: " + path);
-        out.write(result.data(), result.size());
-      }
-
-      LOG_INFO("edit_file: " + resolved + " exact match, " + std::to_string(replacements) + " replacements");
+  for (size_t i = 0; i < pairs.size(); ++i) {
+    const EditPair& p = pairs[i];
+    MatchTier tier = resolve_edit_hits(content, p.old_text, meta, ranges);
+    if (tier == MatchTier::None) {
+      // Tier 3: diagnostic error identifying the failing pair
+      json diagnosis = diagnostic_match(content, p.old_text, meta);
       json resp;
-      resp["ok"] = true;
-      resp["replacements"] = replacements;
+      resp["ok"] = false;
+      resp["error"] = "old_text not found in file";
+      resp["pair"] = i;
+      resp["diagnosis"] = diagnosis;
       return resp.dump();
     }
+    if (tier == MatchTier::Normalized) {
+      any_normalized = true;
+    }
+    if (!p.replace_all && ranges.size() > 1) {
+      // Multiple matches — reject with line numbers
+      std::vector<int> match_lines;
+      for (const auto& r : ranges) {
+        match_lines.push_back(line_of(content, r.start));
+      }
+      json resp;
+      resp["ok"] = false;
+      resp["error"] = "old_text matches " + std::to_string(ranges.size()) + " locations";
+      resp["pair"] = i;
+      resp["matches"] = match_lines;
+      resp["hint"] = "Use replace_all:true to replace all, or provide more context to make old_text unique";
+      if (tier == MatchTier::Normalized) {
+        resp["matched_with"] = "whitespace normalization";
+      }
+      return resp.dump();
+    }
+    size_t n = p.replace_all ? ranges.size() : 1;
+    for (size_t k = 0; k < n; ++k) {
+      hits.push_back({ranges[k].start, ranges[k].end, i});
+    }
   }
 
-  // ---- Tier 2: Whitespace-normalized match (1.5) ----
-  {
-    std::string norm_content = normalize_whitespace(content, meta);
-    std::string norm_old = normalize_whitespace(old_text, meta);
-
-    std::vector<size_t> norm_positions;
-    size_t pos = 0;
-    while ((pos = norm_content.find(norm_old, pos)) != std::string::npos) {
-      norm_positions.push_back(pos);
-      pos += norm_old.size();
-    }
-
-    if (!norm_positions.empty()) {
-      if (norm_positions.size() > 1 && !replace_all) {
-        // Multiple normalized matches — reject with line numbers
-        std::vector<int> match_lines;
-        for (size_t np : norm_positions) {
-          int line_num = 1;
-          for (size_t i = 0; i < np && i < norm_content.size(); ++i) {
-            if (norm_content[i] == '\n') line_num++;
-          }
-          match_lines.push_back(line_num);
-        }
+  // ---- Overlap detection: different pairs' hit ranges must not overlap ----
+  if (hits.size() > 1) {
+    std::vector<AppliedHit> sorted = hits;
+    std::sort(sorted.begin(), sorted.end(),
+              [](const AppliedHit& a, const AppliedHit& b) {
+                if (a.start != b.start) return a.start < b.start;
+                return a.end < b.end;
+              });
+    // Interval lemma: sorted by start, ANY overlap implies some ADJACENT pair
+    // overlaps. Same-pair ranges never overlap (find-advance / merged), so an
+    // adjacent overlap here necessarily crosses pairs.
+    for (size_t i = 1; i < sorted.size(); ++i) {
+      if (sorted[i].start < sorted[i - 1].end) {
         json resp;
         resp["ok"] = false;
-        resp["error"] = "old_text matches " + std::to_string(norm_positions.size()) + " locations (with whitespace normalization)";
-        resp["matches"] = match_lines;
-        resp["hint"] = "Use replace_all:true to replace all, or provide more context to make old_text unique";
-        resp["matched_with"] = "whitespace normalization";
-        return resp.dump();
-      }
-
-      // Map normalized positions back to original content by simulating
-      // normalization and tracking both positions simultaneously.
-      auto map_norm_to_orig = [&](size_t target_norm_pos) -> size_t {
-        size_t oi = 0, ni = 0;
-        while (oi < content.size() && ni < target_norm_pos) {
-          char c = content[oi];
-          if (c == '\r' && oi + 1 < content.size() && content[oi + 1] == '\n') {
-            oi += 2; ni += 1;           // CRLF → LF
-          } else if (c == '\r') {
-            oi += 1; ni += 1;           // bare CR → LF
-          } else if (c == ' ' || c == '\t') {
-            // Trailing whitespace check MUST come before tab→spaces expansion:
-            // peek ahead to see if this space/tab block is followed by newline
-            // or EOF, which means normalize_whitespace would strip it entirely.
-            size_t peek = oi;
-            while (peek < content.size() &&
-                   (content[peek] == ' ' || content[peek] == '\t')) {
-              peek++;
-            }
-            if (peek >= content.size() || content[peek] == '\n' ||
-                (content[peek] == '\r' && peek + 1 < content.size() && content[peek + 1] == '\n')) {
-              // Trailing whitespace — stripped in normalized form
-              oi = peek; // skip all trailing whitespace, no ni advance
-              if (peek < content.size() && content[peek] == '\r') { oi += 2; ni += 1; }
-              else if (peek < content.size()) { oi += 1; ni += 1; }
-            } else if (c == '\t' && meta.indent_style == "spaces") {
-              oi += 1; ni += meta.indent_width; // non-trailing tab → N spaces
-            } else {
-              oi += 1; ni += 1;
-            }
-          } else {
-            oi += 1; ni += 1;
-          }
-        }
-        return oi;
-      };
-
-      // Build replacement ranges in original content (mapped from normalized matches)
-      struct Range { size_t start; size_t end; };
-      std::vector<Range> ranges;
-      for (size_t np : norm_positions) {
-        ranges.push_back({map_norm_to_orig(np), map_norm_to_orig(np + norm_old.size())});
-      }
-
-      // Deduplicate overlapping ranges (can happen with whitespace stripping)
-      std::vector<Range> merged;
-      for (auto& r : ranges) {
-        if (!merged.empty() && r.start <= merged.back().end) {
-          merged.back().end = std::max(merged.back().end, r.end);
-        } else {
-          merged.push_back(r);
-        }
-      }
-
-      if (!replace_all) {
-        // Single replacement
-        auto& r = merged[0];
-        if (r.start == 0 && r.end == 0) {
-          // Mapping failed entirely — fall back to exact-match failure path
-          // (shouldn't normally happen, but don't corrupt the file)
-        } else {
-          std::string result = content.substr(0, r.start) + new_text + content.substr(r.end);
-          {
-            std::ofstream out(resolved, std::ios::binary | std::ios::trunc);
-            if (!out) return error_result("Cannot write file: " + path);
-            out.write(result.data(), result.size());
-          }
-
-          LOG_INFO("edit_file: " + resolved + " normalized match, 1 replacement");
-          json resp;
-          resp["ok"] = true;
-          resp["replacements"] = 1;
-          resp["matched_with"] = "whitespace normalization";
-          return resp.dump();
-        }
-      } else {
-        // replace_all: apply replacements right-to-left to preserve positions
-        std::string result = content;
-        for (int i = static_cast<int>(merged.size()) - 1; i >= 0; --i) {
-          auto& r = merged[i];
-          result.replace(r.start, r.end - r.start, new_text);
-        }
-
-        {
-          std::ofstream out(resolved, std::ios::binary | std::ios::trunc);
-          if (!out) return error_result("Cannot write file: " + path);
-          out.write(result.data(), result.size());
-        }
-
-        LOG_INFO("edit_file: " + resolved + " normalized match, " +
-                 std::to_string(merged.size()) + " replacements (replace_all)");
-        json resp;
-        resp["ok"] = true;
-        resp["replacements"] = static_cast<int>(merged.size());
-        resp["matched_with"] = "whitespace normalization";
+        resp["error"] = "edits overlap";
         return resp.dump();
       }
     }
   }
 
-  // ---- Tier 3: Diagnostic error (1.6) ----
-  {
-    json diagnosis = diagnostic_match(content, old_text, meta);
+  // ---- Apply: per-hit, global reverse byte-offset order ----
+  std::sort(hits.begin(), hits.end(),
+            [](const AppliedHit& a, const AppliedHit& b) {
+              if (a.start != b.start) return a.start > b.start;
+              return a.end > b.end;
+            });
 
-    json resp;
-    resp["ok"] = false;
-    resp["error"] = "old_text not found in file";
-    resp["diagnosis"] = diagnosis;
-    return resp.dump();
+  std::string result = content;
+  int replacements = 0;
+  for (const auto& h : hits) {
+    result.replace(h.start, h.end - h.start, pairs[h.pair].new_text);
+    replacements++;
   }
+
+  {
+    std::ofstream out(resolved, std::ios::binary | std::ios::trunc);
+    if (!out) return error_result("Cannot write file: " + path);
+    out.write(result.data(), result.size());
+  }
+
+  LOG_INFO("edit_file: " + resolved + " " + std::to_string(hits.size()) + " replacements (batch)");
+  json resp;
+  resp["ok"] = true;
+  resp["replacements"] = replacements;
+  if (any_normalized) resp["matched_with"] = "whitespace normalization";
+  return resp.dump();
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,6 +1107,457 @@ std::string list_dir(const std::string& path) {
   std::string result = ok_result(entries_json);
   LOG_INFO("list_dir: " + resolved + " (" + result + ")");
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// ripgrep-backed search tools (glob_file / grep_file)
+// ---------------------------------------------------------------------------
+
+// Search subprocess timeout (matches web_fetch SUBPROCESS_TIMEOUT_SEC)
+static const int SEARCH_TIMEOUT_SEC = 30;
+
+/// Locate the rg binary. Windows: DLL-relative + CWD-relative candidate paths
+/// (no PATH fallback — matching resolve_script_path pattern); POSIX: PATH probe.
+static std::string resolve_rg_path() {
+#ifdef _WIN32
+  char dll_path[MAX_PATH] = {0};
+  HMODULE hModule = nullptr;
+  static int dummy = 0;
+  GetModuleHandleExA(
+    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    (LPCSTR)&dummy, &hModule);
+  if (hModule) {
+    GetModuleFileNameA(hModule, dll_path, sizeof(dll_path));
+  }
+  std::string dir;
+  if (dll_path[0] != '\0') {
+    dir = dll_path;
+    size_t last_sep = dir.find_last_of("\\/");
+    if (last_sep != std::string::npos) dir = dir.substr(0, last_sep);
+  }
+  const char* suffixes[] = {
+    "/../tools/rg.exe", "/tools/rg.exe",
+    "/../share/aliasagent/tools/rg.exe", "/share/aliasagent/tools/rg.exe",
+  };
+  for (const auto* suffix : suffixes) {
+    std::string candidate = dir + suffix;
+    if (path_exists(candidate)) return candidate;
+  }
+  const char* cwd_suffixes[] = {"tools/rg.exe", "../tools/rg.exe"};
+  for (const auto* c : cwd_suffixes) {
+    if (path_exists(c)) {
+      // Return an ABSOLUTE path: the subprocess runner sets the child's cwd
+      // (lpCurrentDirectory), and CreateProcess resolves a relative argv[0]
+      // against that cwd — which would fail to find rg.
+      std::string abs = canonical(c);
+      if (!abs.empty()) return abs;
+      return c;
+    }
+  }
+  return "";  // not found — caller returns install guidance
+#else
+  const char* path_env = getenv("PATH");
+  if (path_env) {
+    std::string p = path_env;
+    size_t start = 0;
+    while (start <= p.size()) {
+      size_t end = p.find(':', start);
+      std::string d = (end == std::string::npos) ? p.substr(start) : p.substr(start, end - start);
+      std::string cand = d.empty() ? "rg" : d + "/rg";
+      if (access(cand.c_str(), X_OK) == 0) return cand;
+      if (end == std::string::npos) break;
+      start = end + 1;
+    }
+  }
+  return "";
+#endif
+}
+
+/// Validate a glob pattern: allowed character set (A-Za-z0-9*?.,_/-[]{}!), no
+/// absolute path, no `..` path segment (a `..` inside a filename like `a..b.txt`
+/// is legal — the check is per path segment, not substring).
+static bool is_valid_glob_pattern(const std::string& pattern, std::string& error) {
+  if (pattern.empty()) {
+    error = "pattern is required";
+    return false;
+  }
+  if (pattern[0] == '/' || pattern[0] == '\\') {
+    error = "absolute path not allowed";
+    return false;
+  }
+#ifdef _WIN32
+  if (pattern.size() >= 2 && pattern[1] == ':') {
+    error = "absolute path not allowed";
+    return false;
+  }
+#endif
+  static const char kAllowed[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789*?.,_/-[]{}!";
+  for (char c : pattern) {
+    if (strchr(kAllowed, c) == nullptr) {
+      error = std::string("invalid character in glob pattern: ") + c;
+      return false;
+    }
+  }
+  // Reject ".." only as an independent path segment (directory traversal).
+  std::string seg;
+  for (size_t i = 0; i <= pattern.size(); ++i) {
+    if (i == pattern.size() || pattern[i] == '/' || pattern[i] == '\\') {
+      if (seg == "..") {
+        error = "path traversal not allowed (..)";
+        return false;
+      }
+      seg.clear();
+    } else {
+      seg += pattern[i];
+    }
+  }
+  return true;
+}
+
+/// Convert an rg output path to a workspace-relative path (de-rooting).
+/// Handles absolute-under-root (strip prefix + separator), already-relative
+/// (use as-is, normalize backslashes), and absolute-outside-root (keep as-is,
+/// logged by caller). Path comparison is case-insensitive on Windows.
+static std::string strip_root_prefix(const std::string& path, const std::string& root) {
+  std::string p = path;
+  for (auto& c : p) if (c == '\\') c = '/';
+
+  bool is_abs = false;
+#ifdef _WIN32
+  is_abs = p.size() >= 2 && p[1] == ':';
+#else
+  is_abs = !p.empty() && p[0] == '/';
+#endif
+
+  if (is_abs && p.size() >= root.size()) {
+    bool prefix_match = false;
+#ifdef _WIN32
+    prefix_match = _strnicmp(p.c_str(), root.c_str(), root.size()) == 0;
+#else
+    prefix_match = p.compare(0, root.size(), root) == 0;
+#endif
+    if (prefix_match) {
+      if (p.size() == root.size()) return ".";
+      if (p[root.size()] == '/') {
+        return p.substr(root.size() + 1);
+      }
+      // Prefix matches but next char is not a separator (e.g. root2) — NOT
+      // under the root; fall through and keep the path as-is.
+    }
+  }
+  return p;
+}
+
+/// Find files within the workspace matching a glob pattern (ripgrep-backed).
+/// Request JSON: {"pattern":"...", "max_results":N}
+/// Returns JSON: {"ok":true,"paths":[...],"count":N,"truncated":true|false}
+std::string glob_file(const std::string& request_json) {
+  LOG_TRACE("tools::glob_file entry");
+
+  std::string pattern;
+  int max_results = 200;
+  try {
+    auto req = json::parse(request_json);
+    pattern = req.value("pattern", "");
+    if (req.contains("max_results") && req["max_results"].is_number()) {
+      max_results = req["max_results"].get<int>();
+    }
+  } catch (const json::parse_error& e) {
+    return error_result("Invalid request JSON: " + std::string(e.what()));
+  }
+
+  std::string verr;
+  if (!is_valid_glob_pattern(pattern, verr)) return error_result(verr);
+  if (max_results <= 0) return error_result("max_results must be >= 1");
+  if (g_workspace.empty()) return error_result("No workspace set");
+
+  std::string rg = resolve_rg_path();
+  if (rg.empty()) {
+    return error_result("rg not found — install ripgrep or place rg.exe in tools/");
+  }
+
+  // rg --files --no-require-git -g <pattern> <workspace_root>
+  std::vector<std::string> argv;
+  argv.push_back(rg);
+  argv.push_back("--files");
+  argv.push_back("--no-require-git");
+  argv.push_back("-g");
+  argv.push_back(pattern);
+  argv.push_back(g_workspace);
+
+  // Stream-parse the newline-delimited --files output and terminate rg early
+  // once max_results paths are collected (D4: "max_results 到达即终止"), so a
+  // huge tree does not buffer unboundedly or run to the 30s timeout when the
+  // first results were already available.
+  std::vector<std::string> paths;  // holds at most max_results entries
+  bool truncated = false;
+  std::string leftover;
+
+  subprocess::Options opts;
+  opts.timeout_seconds = SEARCH_TIMEOUT_SEC;
+  opts.cwd = g_workspace;
+  opts.on_stdout_chunk = [&](const std::string& chunk) -> bool {
+    leftover += chunk;
+    size_t nl;
+    while ((nl = leftover.find('\n')) != std::string::npos) {
+      std::string line = leftover.substr(0, nl);
+      leftover.erase(0, nl + 1);
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (line.empty()) continue;
+      if (paths.size() < static_cast<size_t>(max_results)) {
+        paths.push_back(strip_root_prefix(line, g_workspace));
+      } else {
+        truncated = true;
+        return true;  // terminate rg — max_results already collected
+      }
+    }
+    return false;
+  };
+
+  subprocess::Result res = subprocess::run(argv, opts);
+
+  if (!res.started) return error_result("Failed to start ripgrep");
+  if (res.timed_out) return error_result("glob_file timed out after 30 seconds");
+  // Exit code: 0 = files found, 1 = no match (normal empty result, success),
+  // 2 = error (ripgrepDoc section 4). Skip when the truncation handler
+  // terminated the process (killed processes have no meaningful exit code).
+  if (!res.stopped_early && res.exit_code == 2) {
+    std::string err = res.stderr_data.empty() ? "unknown ripgrep error" : res.stderr_data;
+    json resp;
+    resp["ok"] = false;
+    resp["error"] = "search failed: " + err;
+    return resp.dump();
+  }
+
+  size_t count = paths.size();
+
+  json resp;
+  resp["ok"] = true;
+  resp["paths"] = json::array();
+  for (size_t i = 0; i < count; ++i) resp["paths"].push_back(paths[i]);
+  resp["count"] = count;
+  if (truncated) resp["truncated"] = true;
+
+  LOG_INFO("glob_file: pattern=" + pattern + " matched=" + std::to_string(count) +
+           " truncated=" + (truncated ? "true" : "false"));
+  return resp.dump();
+}
+
+// ---------------------------------------------------------------------------
+// grep_file — ripgrep --json regex content search
+// ---------------------------------------------------------------------------
+
+/// Minimal base64 decoder (rg `--json` encodes non-UTF-8 path/text as `bytes`,
+/// which the doc marks UNVERIFIED; accept it leniently when `text` is absent).
+static std::string base64_decode(const std::string& in) {
+  static const char* tbl =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  int val[256];
+  for (int i = 0; i < 256; ++i) val[i] = -1;
+  for (int i = 0; i < 64; ++i) val[static_cast<unsigned char>(tbl[i])] = i;
+  std::string out;
+  int buffer = 0, bits = 0;
+  for (unsigned char c : in) {
+    if (c == '=' || c == '\n' || c == '\r') continue;
+    if (c > 255 || val[c] < 0) continue;
+    buffer = (buffer << 6) | val[c];
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out += static_cast<char>((buffer >> bits) & 0xFF);
+    }
+  }
+  return out;
+}
+
+/// Classify rg's exit-2 stderr: true when it is a regex parse error (which
+/// grep_file reports as "invalid regex"), false for other (soft) errors such as
+/// an unreadable file (reported as "search failed"). Exposed for testing.
+bool classify_grep_regex_error(const std::string& stderr_data) {
+  std::string lower = stderr_data;
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return lower.find("regex parse error") != std::string::npos ||
+         lower.find("regex parse") != std::string::npos;
+}
+
+/// Build a grep match entry `{path, line?, text?}` from an `--json` match
+/// message's `data` object, de-rooting the path. Degrades gracefully when
+/// fields are absent (path via `bytes` base64, missing line_number omitted).
+/// The field schema is verified in Docs/ripgrepDoc.md section 1.1. Exposed for
+/// testing the lenient-degradation paths.
+json build_match_entry(const json& data, const std::string& root) {
+  json entry;
+  if (data.is_object()) {
+    if (data.contains("path") && data["path"].is_object()) {
+      const auto& pathobj = data["path"];
+      if (pathobj.contains("text") && pathobj["text"].is_string()) {
+        entry["path"] = strip_root_prefix(pathobj["text"].get<std::string>(), root);
+      } else if (pathobj.contains("bytes") && pathobj["bytes"].is_string()) {
+        entry["path"] = strip_root_prefix(
+            base64_decode(pathobj["bytes"].get<std::string>()), root);
+      }
+    }
+    if (data.contains("line_number") && data["line_number"].is_number()) {
+      entry["line"] = data["line_number"].get<int>();
+    }
+    if (data.contains("lines") && data["lines"].is_object()) {
+      const auto& linesobj = data["lines"];
+      if (linesobj.contains("text") && linesobj["text"].is_string()) {
+        entry["text"] = linesobj["text"].get<std::string>();
+      } else if (linesobj.contains("bytes") && linesobj["bytes"].is_string()) {
+        entry["text"] = base64_decode(linesobj["bytes"].get<std::string>());
+      }
+    }
+  }
+  return entry;
+}
+
+/// Search file contents within the workspace using a regular expression
+/// (ripgrep-backed). Request JSON:
+///   {"pattern":"...", "glob":"...", "ignore_case":bool, "max_results":N}
+/// Returns JSON:
+///   {"ok":true,"matches":[{"path":"...","line":N,"text":"..."}],
+///    "count":N,"truncated":true|false}
+/// or {"ok":false,"error":"..."}
+std::string grep_file(const std::string& request_json) {
+  LOG_TRACE("tools::grep_file entry");
+
+  std::string pattern;
+  std::string glob;
+  bool ignore_case = false;
+  int max_results = 100;
+  try {
+    auto req = json::parse(request_json);
+    pattern = req.value("pattern", "");
+    glob = req.value("glob", "");
+    if (req.contains("ignore_case") && req["ignore_case"].is_boolean()) {
+      ignore_case = req["ignore_case"].get<bool>();
+    }
+    if (req.contains("max_results") && req["max_results"].is_number()) {
+      max_results = req["max_results"].get<int>();
+    }
+  } catch (const json::parse_error& e) {
+    return error_result("Invalid request JSON: " + std::string(e.what()));
+  }
+
+  if (pattern.empty()) return error_result("pattern is required");
+  if (max_results <= 0) return error_result("max_results must be >= 1");
+  if (!glob.empty()) {
+    std::string verr;
+    if (!is_valid_glob_pattern(glob, verr)) return error_result(verr);
+  }
+  if (g_workspace.empty()) return error_result("No workspace set");
+
+  std::string rg = resolve_rg_path();
+  if (rg.empty()) {
+    return error_result("rg not found — install ripgrep or place rg.exe in tools/");
+  }
+
+  // rg --json -n --no-require-git [--glob <glob>] [-i] [-m N] -- <pattern> <root>
+  std::vector<std::string> argv;
+  argv.push_back(rg);
+  argv.push_back("--json");
+  argv.push_back("-n");
+  argv.push_back("--no-require-git");
+  if (!glob.empty()) {
+    argv.push_back("--glob");
+    argv.push_back(glob);
+  }
+  if (ignore_case) argv.push_back("-i");
+  // -m is a per-file cap at a relaxed multiple of the global limit so a single
+  // file cannot monopolize all results (4x — MAX_COUNT_MULTIPLIER).
+  constexpr int MAX_COUNT_MULTIPLIER = 4;
+  argv.push_back("-m");
+  argv.push_back(std::to_string(static_cast<long long>(max_results) * MAX_COUNT_MULTIPLIER));
+  argv.push_back("--");  // isolate pattern so it is never parsed as a flag
+  argv.push_back(pattern);
+  argv.push_back(g_workspace);
+
+  // Stream-parse the --json message stream and decide truncation by message
+  // type (the stream always ends with a `summary` message — ripgrepDoc section
+  // 1). After collecting max_results `match` messages, the next message being
+  // a `match` → truncated; being a `summary` → total is exactly max_results
+  // (or fewer), no truncation.
+  json matches = json::array();
+  bool truncated = false;
+  bool decided = false;
+  std::string leftover;
+
+  subprocess::Options opts;
+  opts.timeout_seconds = SEARCH_TIMEOUT_SEC;
+  opts.cwd = g_workspace;
+  opts.on_stdout_chunk = [&](const std::string& chunk) -> bool {
+    leftover += chunk;
+    size_t nl;
+    while ((nl = leftover.find('\n')) != std::string::npos) {
+      std::string line = leftover.substr(0, nl);
+      leftover.erase(0, nl + 1);
+      if (line.empty()) continue;
+      if (decided) continue;  // already saw summary — skip any stragglers
+      json msg;
+      try {
+        msg = json::parse(line);
+      } catch (...) {
+        continue;  // lenient — skip unparseable lines
+      }
+      if (!msg.is_object() || !msg.contains("type")) continue;
+      std::string type = msg["type"].get<std::string>();
+      if (type == "match") {
+        if (matches.size() < static_cast<size_t>(max_results)) {
+          // Lenient extraction (schema verified in ripgrepDoc 1.1; degrade
+          // when fields are absent).
+          json data = (msg.contains("data") && msg["data"].is_object())
+              ? msg["data"]
+              : json::object();
+          matches.push_back(build_match_entry(data, g_workspace));
+        } else {
+          truncated = true;
+          decided = true;
+          return true;  // terminate rg — we have enough
+        }
+      } else if (type == "summary") {
+        // Total is within the limit. Do NOT return true here — stopping the
+        // process early would discard its real exit code, hiding soft errors
+        // (rg emits summary then exits 2 when some files were unreadable).
+        decided = true;
+      }
+    }
+    return false;
+  };
+
+  subprocess::Result res = subprocess::run(argv, opts);
+
+  if (!res.started) return error_result("Failed to start ripgrep");
+  if (res.timed_out) return error_result("grep_file timed out after 30 seconds");
+
+  // Map exit codes only when the process was NOT terminated early by the
+  // truncation handler (a killed process has no meaningful exit code). Exit 0
+  // (match) and 1 (no match, normal empty result) are success; exit 2 is an
+  // error (regex error or soft error such as an unreadable file — ripgrepDoc
+  // section 4) distinguished via stderr. The summary message does NOT suppress
+  // the exit-2 check: rg emits summary and still exits 2 on soft errors.
+  if (!res.stopped_early) {
+    if (res.exit_code == 2) {
+      bool regex_error = classify_grep_regex_error(res.stderr_data);
+      json resp;
+      resp["ok"] = false;
+      resp["error"] = regex_error
+          ? ("invalid regex: " + res.stderr_data)
+          : ("search failed: " + (res.stderr_data.empty() ? "unknown ripgrep error" : res.stderr_data));
+      return resp.dump();
+    }
+  }
+
+  json resp;
+  resp["ok"] = true;
+  resp["matches"] = matches;
+  resp["count"] = matches.size();
+  if (truncated) resp["truncated"] = true;
+  LOG_INFO("grep_file: pattern=" + pattern + " matches=" + std::to_string(matches.size()) +
+           " truncated=" + (truncated ? "true" : "false"));
+  return resp.dump();
 }
 
 } // namespace tools

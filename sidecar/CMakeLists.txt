@@ -45,6 +45,7 @@ set(SOURCES
   src/search_provider.cpp
   src/openai_transport.cpp
   src/web_fetch.cpp
+  src/subprocess.cpp
   src/zhipuai_search.cpp
   src/searxng_search.cpp
   src/kimi_search.cpp
@@ -88,11 +89,14 @@ add_executable(sidecar_tests
   src/search_provider.cpp
   src/openai_transport.cpp
   src/web_fetch.cpp
+  src/subprocess.cpp
   src/zhipuai_search.cpp
   src/searxng_search.cpp
   src/kimi_search.cpp
   test/sse_parser_test.cpp
   test/tool_execution_test.cpp
+  test/subprocess_test.cpp
+  test/search_tools_test.cpp
   test/http_client_test.cpp
   test/ffi_tracing_test.cpp
   test/search_provider_test.cpp
