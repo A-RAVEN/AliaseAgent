@@ -294,3 +294,25 @@ Set `ALIASAGENT_LOG_LEVEL=trace` to see search-related logs:
 2026-07-18 12:35:00.001 [INFO] web_fetch: url=https://example.com/article
 2026-07-18 12:35:02.000 [INFO] web_fetch: Content-Type=text/html; charset=utf-8 — stripping HTML tags
 ```
+
+## Running Live Tests
+
+窗口版 live 套件（`integration_test/live_file_tools_test.dart`）在**真实桌面窗口**（`-d windows`）运行完整应用，真实模型 + 真实 sidecar + 真实 ripgrep 端到端，**能看到真实 AI 在窗口里回答**——项目 live 测试规范形态（仿 `integration_test/real_api_test.dart`，design D1）。隔离由 `@Tags(['live'])` + `dart_test.yaml`（`tags.live.skip`）控制，该隔离对 `flutter test integration_test/... -d windows` **已实测生效**（task 12.1 探针确认）：
+
+- **默认 `flutter test` 排除 live**：live 测试显示为 skipped（带原因），不发真实网络请求。这是设计行为，不是失败。
+- **显式运行窗口版 live 套件（规范命令）**：
+  ```
+  flutter test --tags live --run-skipped integration_test/live_file_tools_test.dart -d windows
+  ```
+  `--tags live` 选择 live 测试，`--run-skipped` 解除 config 的 skip。只带 `--tags live`（缺 `--run-skipped`）不会运行被 skip 的测试。`-d windows` 在真实桌面窗口运行（应用会构建 ~3 分钟）。
+
+**前置条件：**
+1. `%USERPROFILE%\.aliasagent\config.json` 含 **api_key + base_url + model**（`providers.anthropic.api_key` / `providers.anthropic.base_url` / `agent_types.general.model`）。config 缺失/不可用 → 每用例 `markTestSkipped` 优雅跳过（不发请求）；API 调用失败（如 key 无效/配额）→ 首个用例捕获 `Error:` 回复后 `markTestSkipped`，后续用例跳过。base_url/model 无 fallback 默认值——项目端点为 DeepSeek Anthropic 兼容（`Docs/DeepSeekAPIDoc.md`），不要回退到 `api.anthropic.com` / `deepseek-chat`。
+2. `tools/rg.exe`（Windows）已就位——`glob_file` / `grep_file` 依赖。
+3. `thinking_effort` 影响指令遵循性（design finding 11）：`agent_types.general.thinking_effort` 缺失则 thinking disabled（`_callModel` 按 config 决定）。当前真实 config 为 `"max"`（adaptive 启用）。若缺失，复杂指令（Test 2 单次批量、Test 3 只改 countA）遵循性可能下降——套件仍如实记录实际工具调用与文件状态，不静默硬失败。
+
+**成本提示：** live 套件 4 个用例各驱动真实模型多轮工具调用（每用例 5 分钟 timeout，pumpUntilFound 每阶段 150s），运行耗真实 API token。按需运行。
+
+**套件内容（design D3）：** 窗口版 `integration_test/live_file_tools_test.dart`：Test 1 自然多工具（grep_file + edit_file 卡片均 done + 文件含 DONE）、Test 2 批量 edits 数组（断言 `ToolCallActivity.input['edits'].length>=2` + 行锚定文件断言）、Test 3 唯一匹配拒绝/自愈（countA/countB 区域 + comment-token 锚定断言，软记录是否出现过 error 卡片）、Test 4 glob_file 专项（卡片结果含 `src/a.dart` + `src/b.dart`）。每个用例 pump 完整应用后**重新 `setWorkspace`** 到独立 fixture temp（`AppShell.initState` 会把 workspace 重置到 homeDir，必须在 pump 后重设——design D2），模型只读写 fixture，绝不触碰真实用户文件。
+
+**headless 套件**（`test/integration/live_file_tools_test.dart`，flutter_tester 无窗口）：初版返工遗留，**形态不符合 live 规范**（无窗口、看不到 AI 回答）。已按用户确认**删除**（change add-file-tools-live-tests task 12.6）；其打磨的 fixture / 指令文本已继承到窗口版套件。

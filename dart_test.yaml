@@ -1,0 +1,6 @@
+# package:test / flutter test 配置
+# live 测试（需真实模型 API key + 网络）默认跳过，显式命令运行：
+#   flutter test --tags live --run-skipped integration_test/live_file_tools_test.dart -d windows
+tags:
+  live:
+    skip: "Live test requires a real model API key. Run with: flutter test --tags live --run-skipped integration_test/live_file_tools_test.dart -d windows"
