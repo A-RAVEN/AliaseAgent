@@ -1,3 +1,6 @@
+@Tags(['live'])
+library;
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -11,10 +14,12 @@ import 'package:alias_agent/main.dart';
 import 'package:alias_agent/services/config_service.dart';
 import 'package:alias_agent/services/database_service.dart';
 import 'package:alias_agent/services/sidecar_bridge.dart';
+import 'package:alias_agent/ui/chat_area.dart';
 import 'package:alias_agent/ui/message_bubble.dart';
 import 'package:alias_agent/ui/thinking_card.dart';
 import 'package:alias_agent/ui/tool_call_card.dart';
 import 'package:alias_agent/models/tool_call_activity.dart';
+import 'live_observability.dart';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -45,6 +50,34 @@ String? latestAssistantText(WidgetTester tester) {
   final widgets = tester.widgetList<MessageBubble>(completedAssistant);
   if (widgets.isEmpty) return null;
   return widgets.last.content;
+}
+
+/// Pump until the conversation resolves:
+///  (a) a completed assistant bubble appears (normal or Error reply), OR
+///  (b) the turn completes (streaming was observed true, then false) with no
+///      bubble — "silent completion" (empty reply OR internal exception), OR
+///  (c) [timeoutSec] elapses while streaming never stopped (genuine hang).
+/// Throws TimeoutException only for (c).
+Future<void> pumpUntilReplyOrTurnDone(WidgetTester tester,
+    {int timeoutSec = 150}) async {
+  final end = DateTime.now().add(Duration(seconds: timeoutSec));
+  var sawStreaming = false;
+  while (DateTime.now().isBefore(end)) {
+    await tester.pump(const Duration(seconds: 1));
+    final areas = tester.widgetList<ChatArea>(find.byType(ChatArea));
+    final stillStreaming = areas.isNotEmpty && areas.last.isStreaming;
+    if (stillStreaming) sawStreaming = true;
+    if (completedAssistant.evaluate().isNotEmpty) return;   // (a) normal / Error
+    if (sawStreaming && !stillStreaming) {
+      // (b) streaming stopped: grace period so a pending Error:/empty bubble
+      // renders (the error path _endStreaming runs before _storeError's bubble).
+      await tester.pump(const Duration(milliseconds: 500));
+      if (completedAssistant.evaluate().isNotEmpty) return; // (a) error bubble arrived
+      return;                                               // (b) silent completion
+    }
+    // !sawStreaming && !stillStreaming: still in the pre-stream DB preamble — poll on.
+  }
+  throw TimeoutException('Conversation still streaming after ${timeoutSec}s'); // (c)
 }
 
 // ---------------------------------------------------------------------------
@@ -107,17 +140,30 @@ void main() {
     await tester.tap(sendButton);
     await tester.pump();
 
-    // Wait for completed assistant reply (isStreaming == false)
+    // Wait for the turn to resolve: completed bubble, silent completion, or hang
     try {
-      await pumpUntilFound(tester, completedAssistant, timeoutSec: 150);
+      await pumpUntilReplyOrTurnDone(tester, timeoutSec: 150);
     } on TimeoutException {
-      fail('No completed assistant reply within 150s — possible pipe deadlock or FFI crash');
+      await dumpToolCards(tester, phase: '3.1 reply timeout');
+      fail('Conversation still streaming after 150s — possible pipe deadlock or FFI crash');
     }
+    if (completedAssistant.evaluate().isEmpty) {
+      // 静默完成：模型空回复或内部异常（测试视角不可区分）→ fail 诚实归因。
+      await dumpToolCards(tester, phase: '3.1 silent completion');
+      fail('Conversation completed without an assistant reply — model empty reply '
+          'or internal exception (see [OBS] dump and sidecar log)');
+    }
+
+    // No-tool-call case: confirm the chat list really holds no ToolCallCard
+    // before reporting "无工具调用" (if the model deviated and called a tool,
+    // dump the real cards instead of falsely reporting no tools).
+    await dumpNoTool(tester, '3.1 basic conversation');
 
     // Check for API error
     final text = latestAssistantText(tester);
     expect(text, isNotNull, reason: 'Assistant reply should exist');
     if (text!.startsWith('Error:')) {
+      await dumpToolCards(tester, phase: '3.1 API error reply');
       apiAvailable = false;
       markTestSkipped('API unavailable: $text');
       return;
@@ -169,6 +215,7 @@ void main() {
     try {
       await pumpUntilFound(tester, find.byType(ToolCallCard), timeoutSec: 150);
     } on TimeoutException {
+      await dumpToolCards(tester, phase: '3.2 wait ToolCallCard timeout');
       // AI might not have called web_fetch — check if there's an error reply
       final text = latestAssistantText(tester);
       if (text != null && text.startsWith('Error:')) {
@@ -185,6 +232,7 @@ void main() {
     try {
       await pumpUntilFound(tester, doneCard, timeoutSec: 60);
     } on TimeoutException {
+      await dumpToolCards(tester, phase: '3.2 wait done-card timeout');
       // Check for error status
       final errorCard = find.byWidgetPredicate(
         (w) => w is ToolCallCard && w.activity.status == ToolCallStatus.error,
@@ -195,13 +243,21 @@ void main() {
       fail('ToolCallCard did not reach Done within 60s');
     }
 
-    // Wait for completed assistant reply
+    // Wait for the turn to resolve: completed bubble, silent completion, or hang
     try {
-      await pumpUntilFound(tester, completedAssistant, timeoutSec: 150);
+      await pumpUntilReplyOrTurnDone(tester, timeoutSec: 150);
     } on TimeoutException {
-      fail('No completed assistant reply after web_fetch — possible pipe deadlock');
+      await dumpToolCards(tester, phase: '3.2 reply timeout');
+      fail('Conversation still streaming after 150s — possible pipe deadlock or FFI crash');
+    }
+    if (completedAssistant.evaluate().isEmpty) {
+      // 静默完成：模型空回复或内部异常 → fail 诚实归因。
+      await dumpToolCards(tester, phase: '3.2 silent completion');
+      fail('Conversation completed without an assistant reply after web_fetch — '
+          'model empty reply or internal exception (see [OBS] dump and sidecar log)');
     }
 
+    await dumpToolCards(tester, phase: '3.2 pre-assertion');
     final text = latestAssistantText(tester);
     expect(text, isNotNull);
     expect(text!.trim(), isNotEmpty, reason: 'Reply after web_fetch should be non-empty');
@@ -226,7 +282,7 @@ void main() {
     }
 
     final homeDir = ConfigService.homeDir;
-    final testFilePath = '${homeDir}${Platform.pathSeparator}_aliasagent_live_test.txt';
+    final testFilePath = '$homeDir${Platform.pathSeparator}_aliasagent_live_test.txt';
     final testFileRelPath = '_aliasagent_live_test.txt';
 
     // Create the test file outside of the widget tree using real SidecarBridge
@@ -250,7 +306,8 @@ void main() {
     final textField = find.byType(TextField);
     await tester.enterText(
       textField,
-      '请使用 edit_file 工具修改 $testFileRelPath，把 "line two" 改成 "LINE TWO MODIFIED"。改完告诉我结果。',
+      '请使用 edit_file 工具修改 $testFileRelPath，把 "line two" 改成 "LINE TWO MODIFIED"。'
+      '修改完成后，必须用中文自然语言回复我：修改是否成功，以及修改后的文件内容。',
     );
 
     final sendButton = find.byTooltip('Send');
@@ -261,6 +318,7 @@ void main() {
     try {
       await pumpUntilFound(tester, find.byType(ToolCallCard), timeoutSec: 150);
     } on TimeoutException {
+      await dumpToolCards(tester, phase: '3.3 wait ToolCallCard timeout');
       final text = latestAssistantText(tester);
       if (text != null && text.startsWith('Error:')) {
         markTestSkipped('API unavailable: $text');
@@ -278,6 +336,7 @@ void main() {
     try {
       await pumpUntilFound(tester, doneCard, timeoutSec: 60);
     } on TimeoutException {
+      await dumpToolCards(tester, phase: '3.3 wait done-card timeout');
       final errorCard = find.byWidgetPredicate(
         (w) => w is ToolCallCard && w.activity.status == ToolCallStatus.error,
       );
@@ -287,16 +346,28 @@ void main() {
       fail('ToolCallCard did not reach Done within 60s');
     }
 
-    // Wait for completed assistant reply
+    // Wait for the turn to resolve: completed bubble, silent completion, or hang
     try {
-      await pumpUntilFound(tester, completedAssistant, timeoutSec: 150);
+      await pumpUntilReplyOrTurnDone(tester, timeoutSec: 150);
     } on TimeoutException {
-      fail('No completed assistant reply after edit_file');
+      await dumpToolCards(tester, phase: '3.3 reply timeout');
+      // Cleanup (home-dir file is outside tearDown's tempDir scope)
+      try { File(testFilePath).deleteSync(); } catch (_) {}
+      fail('Conversation still streaming after 150s — possible pipe deadlock or FFI crash');
+    }
+    if (completedAssistant.evaluate().isEmpty) {
+      // 静默完成：模型空回复或内部异常 → fail 诚实归因（先清理测试文件）。
+      await dumpToolCards(tester, phase: '3.3 silent completion');
+      try { File(testFilePath).deleteSync(); } catch (_) {}
+      fail('Conversation completed without an assistant reply after edit_file — '
+          'model empty reply or internal exception (see [OBS] dump and sidecar log)');
     }
 
     // Pump extra to ensure all tool turns complete before verification
     await tester.pump(const Duration(seconds: 2));
 
+    await dumpToolCards(tester, phase: '3.3 pre-assertion');
+    dumpFile(testFilePath, label: '3.3 test file');
     final text = latestAssistantText(tester);
     expect(text, isNotNull);
     expect(text!.trim(), isNotEmpty, reason: 'Reply after edit_file should be non-empty');
@@ -370,6 +441,7 @@ void main() {
     try {
       await pumpUntilFound(tester, find.byType(ThinkingCard), timeoutSec: 150);
     } on TimeoutException {
+      await dumpToolCards(tester, phase: '3.4 wait ThinkingCard timeout');
       final text = latestAssistantText(tester);
       if (text != null && text.startsWith('Error:')) {
         markTestSkipped('API error: $text');
@@ -427,11 +499,18 @@ void main() {
           '(degraded path: final block + indicator, documented in 8.12)');
     }
 
-    // Wait for turn to complete
+    // Wait for the turn to resolve: completed bubble, silent completion, or hang
     try {
-      await pumpUntilFound(tester, completedAssistant, timeoutSec: 150);
+      await pumpUntilReplyOrTurnDone(tester, timeoutSec: 150);
     } on TimeoutException {
-      fail('No completed assistant reply after thinking');
+      await dumpToolCards(tester, phase: '3.4 reply timeout');
+      fail('Conversation still streaming after 150s — possible pipe deadlock or FFI crash');
+    }
+    if (completedAssistant.evaluate().isEmpty) {
+      // 静默完成：模型空回复或内部异常 → fail 诚实归因。
+      await dumpToolCards(tester, phase: '3.4 silent completion');
+      fail('Conversation completed without an assistant reply after thinking — '
+          'model empty reply or internal exception (see [OBS] dump and sidecar log)');
     }
 
     // NOTE: "card still present after turn" is intentionally NOT asserted on
@@ -443,6 +522,7 @@ void main() {
     // content + reply) above.
 
     // Verify assistant reply
+    await dumpNoTool(tester, '3.4 extended thinking');
     final text = latestAssistantText(tester);
     expect(text, isNotNull);
     expect(text!.trim(), isNotEmpty,

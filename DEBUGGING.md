@@ -315,4 +315,12 @@ Set `ALIASAGENT_LOG_LEVEL=trace` to see search-related logs:
 
 **套件内容（design D3）：** 窗口版 `integration_test/live_file_tools_test.dart`：Test 1 自然多工具（grep_file + edit_file 卡片均 done + 文件含 DONE）、Test 2 批量 edits 数组（断言 `ToolCallActivity.input['edits'].length>=2` + 行锚定文件断言）、Test 3 唯一匹配拒绝/自愈（countA/countB 区域 + comment-token 锚定断言，软记录是否出现过 error 卡片）、Test 4 glob_file 专项（卡片结果含 `src/a.dart` + `src/b.dart`）。每个用例 pump 完整应用后**重新 `setWorkspace`** 到独立 fixture temp（`AppShell.initState` 会把 workspace 重置到 homeDir，必须在 pump 后重设——design D2），模型只读写 fixture，绝不触碰真实用户文件。
 
+**输出内容说明（change add-live-test-observability，共享 helper `integration_test/live_observability.dart`）：** 每个窗口版 live 用例（`live_file_tools_test.dart` / `real_api_test.dart`）在**断言前**与**所有失败路径**（等待超时 / 错误状态检测）输出 `[OBS]` 前缀的可观测 dump，运行者应看到：
+
+- **工具调用 dump**（`dumpToolCards`）：`[OBS] <phase> — tool=<toolName> status=<status> id=<id>` + **完整 input**（缩进 JSON）+ **result 预览**（前 500 字符；结构化结果如 web_fetch 按 section 汇总）——经 UI `ToolCallCard` 读取（窗口版观察通道），滚动扫描聊天列表（ListView.builder 回收，按 `ToolCallActivity.id` 去重 + 拖拽上限 12 次）。
+- **文件状态 dump**（`dumpFile`）：`[OBS] <label> — file: <path>` + 文件**最终内容**——涉及 edit_file / write_file 的用例在断言前输出（如 `live_file_tools_test` Test 1/2/3 的 fixture 文件、`real_api_test` 3.3 的测试文件）。
+- **无工具调用**（`dumpNoTool`）：`[OBS] <phase> — 无工具调用（扫描确认聊天列表内无 ToolCallCard）`——无工具用例（`real_api_test` 3.1 基础对话 / 3.4 扩展思考）**先滚动扫描确认无卡片**再如实报告；若模型偏离实际发出工具调用则 dump 真实卡片，不谎报。
+- **失败路径同样有现场**：每个 `on TimeoutException` 分支在 `fail(...)` / `markTestSkipped(...)` **之前** dump；`_waitForTurnComplete` 裸超时（"对话永不完成"）4 个调用点包 `try/on TimeoutException`，rethrow 前 dump 工具卡片 + 涉及文件。
+- dump 为**纯 `debugPrint` 增量**：不参与断言、不改任何 `expect` / `fail` / `markTestSkipped` 行为、不弱化既有断言。
+
 **headless 套件**（`test/integration/live_file_tools_test.dart`，flutter_tester 无窗口）：初版返工遗留，**形态不符合 live 规范**（无窗口、看不到 AI 回答）。已按用户确认**删除**（change add-file-tools-live-tests task 12.6）；其打磨的 fixture / 指令文本已继承到窗口版套件。

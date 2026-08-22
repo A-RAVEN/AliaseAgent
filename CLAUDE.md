@@ -23,6 +23,11 @@ Flutter 桌面 AI 对话应用，通过 dart:ffi 调用 C++ Sidecar 动态库（
   2. 测试失败必须有**可归因的现场证据**（该轮实际行为 + 文件内容 dump），禁止"失败但日志无现场"；无法从输出解释归因的失败视为规范缺陷。
   3. 观察通道随测试形态不同（headless harness 直接持有工具调用记录；窗口版经 UI 卡片 `ToolCallCard.activity` 读取），但**无论哪种形态，测试内容都必须可观察**——拿不到测试内容即规范违规。
 - **apply 期间禁止无故停顿** — `/opsx:apply` 执行期间，连续执行所有任务直到全部完成或遇到阻断性阻塞。**禁止**在以下情况停顿：完成一批任务后汇报进度、询问用户"接下来做什么"、展示当前状态、等待用户确认。**唯一合法停顿条件**：遇到必须用户亲自决策的阻断性问题（如环境配置缺失、网络不通、API 密钥无效等导致后续任务无法继续）。停顿时不汇报进度，只说明阻塞点和需要用户做什么。全部任务完成后，用户看到的最后一条消息必须是诚实性审查报告，不得是闲聊、总结、或确认。
+- **用 `/opsx:propose` 生成完整 change，禁止手写零碎 artifacts** — 创建任何 OpenSpec change 必须通过 `/opsx:propose` 一次生成全套 artifacts（proposal.md + design.md + specs deltas + tasks.md），**禁止**手写单个 proposal.md 再零碎补其余。审查/设计/apply 都必须在**完整 change** 上做，不得对孤立的 proposal.md 反复审查。OpenSpec 流程由主循环驱动到底，不得用"下一步你定 / 要我继续吗 / 两件事你选一个"把决定权推回用户。**反思必须落地**：自省出的错误（偏离要求、流程违规等）必须写入 memory 或本条/相关规则后才算完成，否则等于没反思。
+- **openspec 下禁止存在只有 proposal 的活跃 change** — 定义与边界必须精确：
+  - **判定范围（垃圾只在这里查）**：`openspec/changes/<name>/` 的**顶层直接子目录且含 `.openspec.yaml` 标记**的活跃 change。判据用 `openspec status --change <name> --json`：`tasks` 为 `blocked`（missingDeps 缺 design/specs，即只有 proposal 或 artifact 集不全）→ 垃圾。
+  - **删除动作**：`rm -rf openspec/changes/<name>` 后用 `/opsx:propose <name>` 重来；不修补、不保留。
+  - **永不删（不在判定范围）**：`openspec/changes/archive/` 及其下全部内容——无论其中是否有只有 proposal.md 的目录（实存案例：`archive/2026-05-14-explore-agent-framework` 只有 proposal.md 且无 `.openspec.yaml`，是合法归档历史）。禁止用"目录里文件少"这类感性判据去删归档。未含 `.openspec.yaml` 的目录不是活跃 change，不适用本规则。
 - **开 Workflow 后不要等** — 启动 Workflow（或任何后台任务）后，**禁止**用 TaskOutput 阻塞等待或空转等待。Workflow 完成会自动通知（task-notification），收到通知后再处理结果。等待期间如果有可推进的工作就继续做，没有就结束当前回复，等通知。
 - **Git 提交需要明确授权** — 不得在用户没有明确说"提交/commit/交"的情况下执行 git commit/amend/reset/rebase。"任务做完了"不是提交授权。提交内容必须干净，不夹带调试文件或未确认的改动。
 - **审查必须验证外部真实性（完全参考本地文档）** — 所有审查（包括 Workflow 对抗验证）必须检查"外部真实性"：审查对象声称依赖的任何 API 格式、参数、字段、行为，必须能由**本地官方文档**（`Docs/DeepSeekAPIDoc.md`、`Docs/AnthropicAPIDoc.md` 等，由官方文档整理而成）验证。规则：

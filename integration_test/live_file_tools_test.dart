@@ -41,6 +41,7 @@ import 'package:alias_agent/services/sidecar_bridge.dart';
 import 'package:alias_agent/ui/chat_area.dart';
 import 'package:alias_agent/ui/message_bubble.dart';
 import 'package:alias_agent/ui/tool_call_card.dart';
+import 'live_observability.dart';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -286,6 +287,7 @@ void main() {
           toolCard('edit_file', status: ToolCallStatus.done),
         ], timeoutSec: 150);
       } on TimeoutException {
+        await dumpToolCards(tester, phase: 'Test 1 wait grep+edit done timeout');
         final text = latestAssistantText(tester);
         if (text != null && text.startsWith('Error:')) {
           apiAvailable = false;
@@ -296,9 +298,19 @@ void main() {
       }
       // Wait for the full conversation to complete so all tool turns have
       // applied before asserting file state.
-      await _waitForTurnComplete(tester);
+      try {
+        await _waitForTurnComplete(tester);
+      } on TimeoutException {
+        await dumpToolCards(tester, phase: 'Test 1 turn-complete timeout');
+        dumpFile('${src.path}/a.dart', label: 'Test 1 a.dart');
+        dumpFile('${src.path}/b.dart', label: 'Test 1 b.dart');
+        rethrow;
+      }
 
       // 6. Assert file final state.
+      await dumpToolCards(tester, phase: 'Test 1 pre-assertion');
+      dumpFile('${src.path}/a.dart', label: 'Test 1 a.dart');
+      dumpFile('${src.path}/b.dart', label: 'Test 1 b.dart');
       final aContent = File('${src.path}/a.dart').readAsStringSync();
       final bContent = File('${src.path}/b.dart').readAsStringSync();
       expect(aContent, contains('DONE'), reason: 'a.dart should end with DONE');
@@ -363,6 +375,8 @@ void main() {
       try {
         await pumpUntilFound(tester, batchEditCard(), timeoutSec: 150);
       } on TimeoutException {
+        await dumpToolCards(
+            tester, phase: 'Test 2 wait batch-edit-card timeout');
         final text = latestAssistantText(tester);
         if (text != null && text.startsWith('Error:')) {
           apiAvailable = false;
@@ -375,9 +389,19 @@ void main() {
       // SEPARATE later turn ("Handle src/notes.dart separately"), so the file
       // assertions must run only after the turn truly completes (else they
       // race ahead of the notes.dart edit — the run-1 Test 2 failure).
-      await _waitForTurnComplete(tester);
+      try {
+        await _waitForTurnComplete(tester);
+      } on TimeoutException {
+        await dumpToolCards(tester, phase: 'Test 2 turn-complete timeout');
+        dumpFile('${src.path}/tasks.dart', label: 'Test 2 tasks.dart');
+        dumpFile('${src.path}/notes.dart', label: 'Test 2 notes.dart');
+        rethrow;
+      }
 
       // Line-anchored assertions (design D4 — no global substring counts).
+      await dumpToolCards(tester, phase: 'Test 2 pre-assertion');
+      dumpFile('${src.path}/tasks.dart', label: 'Test 2 tasks.dart');
+      dumpFile('${src.path}/notes.dart', label: 'Test 2 notes.dart');
       final tasksLines = File('${src.path}/tasks.dart')
           .readAsStringSync()
           .split('\n');
@@ -457,6 +481,7 @@ void main() {
         await pumpUntilFound(
             tester, toolCard('edit_file'), timeoutSec: 150);
       } on TimeoutException {
+        await dumpToolCards(tester, phase: 'Test 3 wait edit_file-card timeout');
         final text = latestAssistantText(tester);
         if (text != null && text.startsWith('Error:')) {
           apiAvailable = false;
@@ -471,6 +496,7 @@ void main() {
             toolCard('edit_file', status: ToolCallStatus.done),
             timeoutSec: 150);
       } on TimeoutException {
+        await dumpToolCards(tester, phase: 'Test 3 wait edit_file-done timeout');
         // API may have died mid-turn after the first card appeared (the DONE
         // never arrives) — degrade to a graceful skip like every other wait
         // (wrap-up finding): an API-availability flake must not become a hard
@@ -485,7 +511,13 @@ void main() {
       }
       // Wait for the full conversation to complete so the region file-state
       // assertions below reflect the settled result (self-heal may span turns).
-      await _waitForTurnComplete(tester);
+      try {
+        await _waitForTurnComplete(tester);
+      } on TimeoutException {
+        await dumpToolCards(tester, phase: 'Test 3 turn-complete timeout');
+        dumpFile('${src.path}/app.dart', label: 'Test 3 app.dart');
+        rethrow;
+      }
 
       // Soft record (design D4): did the model hit a rejection (error card)?
       // Not a hard assertion — the model may take the unique old_text path.
@@ -493,6 +525,9 @@ void main() {
       // miscounted as zero.
       final errorCards = await _scanErrorCardsWithScroll(tester);
       debugPrint('[TEST 3] error-status tool cards observed: $errorCards');
+
+      await dumpToolCards(tester, phase: 'Test 3 pre-assertion');
+      dumpFile('${src.path}/app.dart', label: 'Test 3 app.dart');
 
       // Region + comment-token anchored assertions. Region split is DEFENSIVE
       // (length check — if the model rewrote the file and dropped the function
@@ -578,6 +613,7 @@ void main() {
             ),
             timeoutSec: 150);
       } on TimeoutException {
+        await dumpToolCards(tester, phase: 'Test 4 wait glob_file-done timeout');
         final text = latestAssistantText(tester);
         if (text != null && text.startsWith('Error:')) {
           apiAvailable = false;
@@ -590,7 +626,13 @@ void main() {
       // Wait for the conversation to complete too: the instruction asks for
       // read_file after the glob, so the model's later turns must finish before
       // teardown (else the DB-closed mid-flight race from run-1 Test 2 recurs).
-      await _waitForTurnComplete(tester);
+      try {
+        await _waitForTurnComplete(tester);
+      } on TimeoutException {
+        await dumpToolCards(tester, phase: 'Test 4 turn-complete timeout');
+        rethrow;
+      }
+      await dumpToolCards(tester, phase: 'Test 4 pre-assertion');
       debugPrint('[TEST 4] OK — glob_file returned src/a.dart + src/b.dart '
           '(workspace-relative)');
     },
