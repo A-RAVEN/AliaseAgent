@@ -22,9 +22,31 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:alias_agent/main.dart';
 import 'package:alias_agent/models/tool_call_activity.dart';
 import 'package:alias_agent/ui/chat_area.dart';
 import 'package:alias_agent/ui/tool_call_card.dart';
+import '../test/integration/helpers/screenshot_utils.dart';
+
+/// Read the app's MOST RECENT final assistant reply from STATE (not the widget
+/// tree). The live test pumps the full MyApp, so exactly one ChatScreen is
+/// mounted; `tester.state<ChatScreenState>(find.byType(ChatScreen))` resolves to
+/// the live `ChatScreenState`, whose `finalAssistantReply` getter reflects the
+/// stored `isFinalReply`-marked message — independent of ListView.builder
+/// build/recycle/timing (change fix-live-test-reply-detection D1/D2). This is
+/// the replacement for the one-shot widget scan (completedAssistant /
+/// latestAssistantText) that false-failed 3.3 when the reply bubble was
+/// momentarily unbuilt.
+///
+/// Returns null when ChatScreen is not yet mounted (config-load phase) or when
+/// no final reply has been stored this turn (empty-final / internal exception).
+/// The caller distinguishes those per design D4 (getter null => silent-
+/// completion / pre-stream; "Error:" prefix => skip; otherwise => pass).
+String? readFinalAssistantReply(WidgetTester tester) {
+  final screen = find.byType(ChatScreen);
+  if (screen.evaluate().isEmpty) return null;
+  return tester.state<ChatScreenState>(screen).finalAssistantReply;
+}
 
 /// Unique lock on the chat message list. AppShell renders
 /// Row(SessionSidebar, ChatArea) and BOTH hold a ListView.builder, so
@@ -157,5 +179,90 @@ Future<void> dumpNoTool(WidgetTester tester, String phase) async {
     debugPrint('[OBS] $phase — 无工具调用（扫描确认聊天列表内无 ToolCallCard）');
   } else {
     await dumpToolCards(tester, phase: phase);
+  }
+}
+
+/// Minimum on-disk PNG size for a shot to count as sane — rejects gross
+/// corruption / zero-length writes. This is the change's own spec-mandated
+/// "字节数/尺寸阈值" sanity check (design D3 #2). It is deliberately a small byte
+/// floor, NOT a fine-grained blank detector: a `captureWidgetAsPng` capture
+/// either renders the real app (multi-color, far above this) or throws on a
+/// failed/painted boundary → caught → delete-on-fail, so a solid blank isn't
+/// producible here. Adding a pixel-variance decoder to hunt the (non-producible)
+/// solid-blank was judged over-engineering (round-3) and, worse, a ≤5-shade
+/// quantizer would delete a genuinely low-entropy but structured fail-state
+/// frame that 5.1 must preserve. Any truly unreadable frame is still reported
+/// honestly by the native-vision acceptance loop as "截图无效" (design D4), not
+/// counted as pass — so this is a best-effort pre-filter, not the acceptance
+/// gate. Kept comfortably below any real scene (27-53 KB measured) and any
+/// sparse-but-real fail frame, so it never rejects a legitimate capture.
+const int _kMinShotBytes = 2048;
+
+/// 5.2 stale cleanup: remove every PNG in test/live_visual/ so a stale capture
+/// from a prior run — or from a case skipped BEFORE registering capture, where
+/// delete-on-fail never ran — is never misread as this run's result. Called
+/// from the suite's `setUpAll` (runs once before any test body). Best-effort.
+void clearLiveVisualDir() {
+  final dir = Directory('test/live_visual');
+  if (!dir.existsSync()) return;
+  for (final e in dir.listSync()) {
+    if (e is File && e.path.toLowerCase().endsWith('.png')) {
+      try {
+        e.deleteSync();
+      } catch (_) {
+        // best-effort — a locked file is fine; the capture path re-validates
+      }
+    }
+  }
+}
+
+/// Capture the live window render to test/live_visual/[name].png for
+/// native-vision acceptance (change add-live-test-visual-acceptance). The
+/// caller must wrap MyApp in a RepaintBoundary(key: key) and call this from the
+/// test body's `finally` (bug-fix 5.1) — a case-tail call is skipped by every
+/// earlier fail()/expect/markTestSkipped/Timeout throw, so fail states would
+/// never be screenshotted; and calling it from a teardown (addTearDown) is WRONG
+/// because the tree is reset (runApp(_postTestMessage) in _runTestBody) before
+/// teardowns fire, so the boundary is gone and capture fails on the pass path.
+/// try/finally runs inside the body, before the reset, and covers all of
+/// pass/fail/skip/timeout.
+///
+/// [tester] is used to flush one frame first: fail paths have no
+/// render-stabilizing pump, and `RepaintBoundary.toImage` asserts on a
+/// not-yet-painted (debugNeedsPaint) boundary.
+///
+/// Non-fatal: a capture failure deletes the target file (bug-fix 5.2) and
+/// returns WITHOUT throwing, so a screenshot problem never fails the test it
+/// observes.
+Future<void> captureLiveShot(
+  WidgetTester tester,
+  GlobalKey key,
+  String name,
+) async {
+  final path = 'test/live_visual/$name.png';
+  final file = File(path);
+  try {
+    // 5.1: flush one frame so toImage doesn't hit the debugNeedsPaint assert on
+    // fail paths (which have no render-stabilizing pump). A single pump() is
+    // deterministic — pumpAndSettle would hang on the infinite _StreamingDots.
+    await tester.pump();
+    await captureWidgetAsPng(key, path);
+
+    // 5.2 sanity: reject gross corruption / zero-length writes (byte floor).
+    // This is the spec's "字节数/尺寸阈值" check; a genuinely unreadable frame is
+    // still reported honestly as "截图无效" by the acceptance loop, not here.
+    final bytes = await file.readAsBytes();
+    if (bytes.length < _kMinShotBytes) {
+      throw StateError('screenshot degenerate: ${bytes.length} bytes '
+          '< $_kMinShotBytes (corrupt/zero-length write)');
+    }
+    debugPrint('[SHOT] captured $path (${bytes.length} bytes)');
+  } catch (e) {
+    // 5.2 delete-on-fail: a failed capture must NOT leave a prior run's PNG at
+    // the same fixed path (which the loop reader would misread as this run).
+    try {
+      if (file.existsSync()) file.deleteSync();
+    } catch (_) {}
+    debugPrint('[SHOT] screenshot failed (non-fatal): $e');
   }
 }

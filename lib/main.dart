@@ -145,10 +145,10 @@ class ChatScreen extends StatefulWidget {
   });
 
   @override
-  State<ChatScreen> createState() => _ChatScreenState();
+  State<ChatScreen> createState() => ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class ChatScreenState extends State<ChatScreen> {
   late final SessionRepository _sessionRepo;
   late final MessageRepository _msgRepo;
   late final ISidecar _sidecar;
@@ -156,6 +156,24 @@ class _ChatScreenState extends State<ChatScreen> {
   List<Session> _sessions = [];
   String? _currentId;
   List<ChatItem> _chatItems = [];
+
+  /// The MOST RECENT final assistant reply of the current turn, read from state
+  /// (not the widget tree) by the live test. Returns null when no final reply
+  /// has been stored yet — i.e. the turn is still in an intermediate tool round
+  /// (isFinalReply==false), or the model produced an empty final text / an
+  /// internal exception ended the turn. Scans from the END so that across a
+  /// multi-turn session an earlier turn's final reply is not misreported as the
+  /// current one.
+  String? get finalAssistantReply {
+    for (final item in _chatItems.reversed) {
+      if (item is ChatMessageItem &&
+          item.isFinalReply &&
+          item.message.content.trim().isNotEmpty) {
+        return item.message.content;
+      }
+    }
+    return null;
+  }
 
   // Streaming state
   bool _isStreaming = false;
@@ -917,7 +935,7 @@ class _ChatScreenState extends State<ChatScreen> {
           await _sessionRepo.touch(sessionId);
           if (_currentId == sessionId && mounted) {
             setState(() {
-              _chatItems.add(ChatMessageItem(assistantMsg));
+              _chatItems.add(ChatMessageItem(assistantMsg, isFinalReply: true));
             });
           }
         }
@@ -1455,7 +1473,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (mounted) {
       setState(() {
         if (_currentId == sessionId) {
-          _chatItems.add(ChatMessageItem(errorMsg));
+          _chatItems.add(ChatMessageItem(errorMsg, isFinalReply: true));
         }
       });
     }

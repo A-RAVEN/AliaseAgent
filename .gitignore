@@ -57,6 +57,9 @@ Screenshot*.png
 # Smoke test output
 test/smoke/output/
 
+# Live-test visual acceptance screenshots
+test/live_visual/
+
 # SearXNG local search engine (deployed by scripts/setup_searxng.bat)
 tools/searxng/
 sidecar.dll

@@ -7,7 +7,15 @@ sealed class ChatItem {
 
 class ChatMessageItem extends ChatItem {
   final Message message;
-  const ChatMessageItem(this.message);
+
+  /// Whether this assistant message is the FINAL reply of its turn (the turn
+  /// concluded with no further tool calls). Distinguished from an intermediate
+  /// tool-round text bubble, which is the same type (role=assistant, non-empty
+  /// content). Not persisted — an observability/identifier flag the live test
+  /// reads via `ChatScreenState.finalAssistantReply`.
+  final bool isFinalReply;
+
+  const ChatMessageItem(this.message, {this.isFinalReply = false});
 }
 
 class ChatToolCallItem extends ChatItem {

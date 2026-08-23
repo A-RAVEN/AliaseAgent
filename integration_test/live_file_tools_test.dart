@@ -15,7 +15,7 @@ library;
 //     Missing any → the per-test markTestSkipped gate skips gracefully.
 //
 // Fixture ordering (design D2, review findings 9/16): `pumpWidget(MyApp)` runs
-// _ChatScreenState.initState which resets the sidecar workspace to
+// ChatScreenState.initState which resets the sidecar workspace to
 // ConfigService.homeDir — so the test MUST re-setWorkspace(wsPath) AFTER pump
 // before sending the instruction. The model only reads/writes the fixture
 // workspace; the user's real files are never touched.
@@ -39,7 +39,6 @@ import 'package:alias_agent/services/config_service.dart';
 import 'package:alias_agent/services/database_service.dart';
 import 'package:alias_agent/services/sidecar_bridge.dart';
 import 'package:alias_agent/ui/chat_area.dart';
-import 'package:alias_agent/ui/message_bubble.dart';
 import 'package:alias_agent/ui/tool_call_card.dart';
 import 'live_observability.dart';
 
@@ -155,18 +154,6 @@ Future<int> _scanErrorCardsWithScroll(WidgetTester tester,
   return best;
 }
 
-/// Finder for a COMPLETED (non-streaming) assistant MessageBubble.
-Finder get completedAssistant => find.byWidgetPredicate(
-      (w) => w is MessageBubble && w.role == 'assistant' && !w.isStreaming,
-    );
-
-/// Extract text from the latest completed assistant MessageBubble.
-String? latestAssistantText(WidgetTester tester) {
-  final widgets = tester.widgetList<MessageBubble>(completedAssistant);
-  if (widgets.isEmpty) return null;
-  return widgets.last.content;
-}
-
 /// Leading keyword after the last comment marker, normalized to upper-case:
 ///   'return 1; // DONE: fix' -> 'DONE'
 ///   '// TODO: implement'     -> 'TODO'
@@ -194,6 +181,11 @@ void main() {
 
   late Directory tempDir;
   bool apiAvailable = true;
+
+  // 5.2: clear any prior run's test/live_visual/*.png before the suite, so a
+  // stale capture (or one from a case skipped before registering capture) is
+  // never misread as this run's result.
+  setUpAll(clearLiveVisualDir);
 
   final configResult = ConfigService.load();
   // Strict gate matching spec Req-1(c) and the (deleted) headless suite's task
@@ -256,9 +248,15 @@ void main() {
           '// TODO: also fix the retry\nvoid other() {}\n');
 
       // 2. Pump the full app; initState resets workspace to homeDir.
-      await tester.pumpWidget(const MyApp());
+      final captureKey = GlobalKey();
+      await tester.pumpWidget(
+          RepaintBoundary(key: captureKey, child: const MyApp()));
       await tester.pump(const Duration(seconds: 2));
 
+      // 5.1: ride the body in try/finally (NOT addTearDown — a teardown shot
+      // fires after the tree reset and would break the pass path). Capture runs
+      // in finally.
+      try {
       // 3. Redirect the workspace to the fixture AFTER pump (design D2).
       //    Null return = success; non-null would mean the model could touch the
       //    user's homeDir — a serious safety hazard (design Risks).
@@ -288,7 +286,7 @@ void main() {
         ], timeoutSec: 150);
       } on TimeoutException {
         await dumpToolCards(tester, phase: 'Test 1 wait grep+edit done timeout');
-        final text = latestAssistantText(tester);
+        final text = readFinalAssistantReply(tester);
         if (text != null && text.startsWith('Error:')) {
           apiAvailable = false;
           markTestSkipped('API unavailable: $text');
@@ -317,6 +315,10 @@ void main() {
       expect(bContent, contains('DONE'), reason: 'b.dart should end with DONE');
       debugPrint('[TEST 1] OK — grep_file + edit_file reached done; '
           'a.dart/b.dart now contain DONE');
+
+      } finally {
+        await captureLiveShot(tester, captureKey, 'livefile_t1');
+      }
     },
     timeout: const Timeout(Duration(seconds: 300)),
   );
@@ -352,8 +354,14 @@ void main() {
       File('${src.path}/notes.dart').writeAsStringSync(
           '// TODO: review the doc\nvoid note() {}\n');
 
-      await tester.pumpWidget(const MyApp());
+      final captureKey = GlobalKey();
+      await tester.pumpWidget(
+          RepaintBoundary(key: captureKey, child: const MyApp()));
       await tester.pump(const Duration(seconds: 2));
+      // 5.1: ride the body in try/finally (NOT addTearDown — a teardown shot
+      // fires after the tree reset and would break the pass path). Capture runs
+      // in finally.
+      try {
       expect(SidecarBridge.instance.setWorkspace(ws.path), isNull,
           reason: 'setWorkspace(fixture) must succeed — never fall back to homeDir');
 
@@ -377,7 +385,7 @@ void main() {
       } on TimeoutException {
         await dumpToolCards(
             tester, phase: 'Test 2 wait batch-edit-card timeout');
-        final text = latestAssistantText(tester);
+        final text = readFinalAssistantReply(tester);
         if (text != null && text.startsWith('Error:')) {
           apiAvailable = false;
           markTestSkipped('API unavailable: $text');
@@ -418,6 +426,10 @@ void main() {
           reason: 'notes.dart must contain no TODO comment line');
       debugPrint('[TEST 2] OK — batch edits array observed (edits.length >= 2) '
           'and both files line-anchored DONE');
+
+      } finally {
+        await captureLiveShot(tester, captureKey, 'livefile_t2');
+      }
     },
     timeout: const Timeout(Duration(seconds: 300)),
   );
@@ -454,8 +466,14 @@ void main() {
           '  return 1; // TODO: implement\n'
           '}\n');
 
-      await tester.pumpWidget(const MyApp());
+      final captureKey = GlobalKey();
+      await tester.pumpWidget(
+          RepaintBoundary(key: captureKey, child: const MyApp()));
       await tester.pump(const Duration(seconds: 2));
+      // 5.1: ride the body in try/finally (NOT addTearDown — a teardown shot
+      // fires after the tree reset and would break the pass path). Capture runs
+      // in finally.
+      try {
       expect(SidecarBridge.instance.setWorkspace(ws.path), isNull,
           reason: 'setWorkspace(fixture) must succeed — never fall back to homeDir');
 
@@ -482,7 +500,7 @@ void main() {
             tester, toolCard('edit_file'), timeoutSec: 150);
       } on TimeoutException {
         await dumpToolCards(tester, phase: 'Test 3 wait edit_file-card timeout');
-        final text = latestAssistantText(tester);
+        final text = readFinalAssistantReply(tester);
         if (text != null && text.startsWith('Error:')) {
           apiAvailable = false;
           markTestSkipped('API unavailable: $text');
@@ -501,7 +519,7 @@ void main() {
         // never arrives) — degrade to a graceful skip like every other wait
         // (wrap-up finding): an API-availability flake must not become a hard
         // suite failure.
-        final text = latestAssistantText(tester);
+        final text = readFinalAssistantReply(tester);
         if (text != null && text.startsWith('Error:')) {
           apiAvailable = false;
           markTestSkipped('API unavailable: $text');
@@ -553,6 +571,10 @@ void main() {
           reason: 'countB must not be changed (no replace_all blast)');
       debugPrint('[TEST 3] OK — countA DONE, countB preserved (region + '
           'comment-token anchored)');
+
+      } finally {
+        await captureLiveShot(tester, captureKey, 'livefile_t3');
+      }
     },
     timeout: const Timeout(Duration(seconds: 300)),
   );
@@ -581,8 +603,14 @@ void main() {
       File('${src.path}/data.json').writeAsStringSync('{"x": 1}\n');
       File('${ws.path}/README.md').writeAsStringSync('# Project\n');
 
-      await tester.pumpWidget(const MyApp());
+      final captureKey = GlobalKey();
+      await tester.pumpWidget(
+          RepaintBoundary(key: captureKey, child: const MyApp()));
       await tester.pump(const Duration(seconds: 2));
+      // 5.1: ride the body in try/finally (NOT addTearDown — a teardown shot
+      // fires after the tree reset and would break the pass path). Capture runs
+      // in finally.
+      try {
       expect(SidecarBridge.instance.setWorkspace(ws.path), isNull,
           reason: 'setWorkspace(fixture) must succeed — never fall back to homeDir');
 
@@ -614,7 +642,7 @@ void main() {
             timeoutSec: 150);
       } on TimeoutException {
         await dumpToolCards(tester, phase: 'Test 4 wait glob_file-done timeout');
-        final text = latestAssistantText(tester);
+        final text = readFinalAssistantReply(tester);
         if (text != null && text.startsWith('Error:')) {
           apiAvailable = false;
           markTestSkipped('API unavailable: $text');
@@ -635,6 +663,10 @@ void main() {
       await dumpToolCards(tester, phase: 'Test 4 pre-assertion');
       debugPrint('[TEST 4] OK — glob_file returned src/a.dart + src/b.dart '
           '(workspace-relative)');
+
+      } finally {
+        await captureLiveShot(tester, captureKey, 'livefile_t4');
+      }
     },
     timeout: const Timeout(Duration(seconds: 300)),
   );

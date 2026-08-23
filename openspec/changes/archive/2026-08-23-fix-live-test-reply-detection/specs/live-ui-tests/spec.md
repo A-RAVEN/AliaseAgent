@@ -1,4 +1,4 @@
-## ADDED Requirements
+## MODIFIED Requirements
 
 ### Requirement: Basic conversation via UI
 The system SHALL support an integration test that types a message into the chat TextField, taps Send, and verifies a COMPLETED (non-empty, non-"Error:") assistant reply is reliably detected.
@@ -61,44 +61,3 @@ External failures (API/network) SHALL cause the test to be skipped, not failed. 
 #### Scenario: Live test skip does not block other tests
 - **WHEN** all live UI test scenarios are skipped due to API unavailability
 - **THEN** unit tests, widget tests, real sidecar tests, and smoke tests SHALL still run independently
-
-### Requirement: Test data isolation
-Live UI tests SHALL use a temporary database via `DatabaseService.openAt(tempDir)`. The temporary database SHALL be closed and deleted in tearDown.
-
-#### Scenario: Test sessions do not pollute user data
-- **WHEN** a live UI test creates sessions and messages
-- **THEN** they SHALL be stored in a temporary database; the user's real aliasagent.db SHALL remain unchanged
-
-#### Scenario: Cleanup after test
-- **WHEN** the test completes (pass, fail, or skip)
-- **THEN** tearDown SHALL close the database connection via DatabaseService.close() and delete the temporary directory
-
-### Requirement: AppShell-based test setup
-Live UI tests SHALL pump the full AppShell widget (not bare ChatScreen with injected sidecar), so that _initSearchAndTools() executes and registers all tool definitions including web_fetch.
-
-#### Scenario: Config exists
-- **WHEN** ~/.aliasagent/config.json exists with valid API key and search providers
-- **THEN** AppShell SHALL initialize normally, tools SHALL be registered, and the test SHALL proceed
-
-#### Scenario: Config missing
-- **WHEN** ~/.aliasagent/config.json does not exist
-- **THEN** the test SHALL be skipped (SetupDialog would block the test)
-
-### Requirement: Live test output observability
-窗口版 live 测试（真实模型驱动）SHALL 在**断言前及所有失败路径（等待超时 / 错误状态检测）**输出该轮**实际工具调用**（toolName / 完整 input / status / result）与涉及文件的**最终状态**（如有工具调用/文件修改；无工具调用的用例如实报告"无工具调用"），使失败可归因；不输出测试内容即规范违规。
-
-#### Scenario: Tool calls are dumped before assertions
-- **WHEN** a live test reaches its assertion phase with tool calls having occurred this turn
-- **THEN** the test SHALL print each `ToolCallCard`'s `toolName`, `status`, complete `input`, and a result preview BEFORE the file-state assertions run
-
-#### Scenario: Failure paths dump before fail/skip
-- **WHEN** a live test fails (wait timeout / error-status detection) before or during its assertions
-- **THEN** the test SHALL print the tool-call and file-state evidence BEFORE calling `fail(...)` or `markTestSkipped(...)`, so the failure is attributable
-
-#### Scenario: File state is dumped for file-modifying tests
-- **WHEN** a live test involves `write_file` / `edit_file` and reaches its assertions
-- **THEN** the test SHALL dump the affected files' final content, attributable per-file
-
-#### Scenario: No-tool-call tests report explicitly
-- **WHEN** a live test case makes no tool calls (e.g. basic conversation / extended thinking)
-- **THEN** the test SHALL first verify no `ToolCallCard` exists (not merely assume it), then print "无工具调用" instead of an empty dump

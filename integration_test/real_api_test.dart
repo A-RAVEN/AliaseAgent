@@ -15,7 +15,6 @@ import 'package:alias_agent/services/config_service.dart';
 import 'package:alias_agent/services/database_service.dart';
 import 'package:alias_agent/services/sidecar_bridge.dart';
 import 'package:alias_agent/ui/chat_area.dart';
-import 'package:alias_agent/ui/message_bubble.dart';
 import 'package:alias_agent/ui/thinking_card.dart';
 import 'package:alias_agent/ui/tool_call_card.dart';
 import 'package:alias_agent/models/tool_call_activity.dart';
@@ -40,24 +39,22 @@ Future<void> pumpUntilFound(
   throw TimeoutException('Widget not found within ${timeoutSec}s');
 }
 
-/// Finder for a COMPLETED (non-streaming) assistant MessageBubble.
-Finder get completedAssistant => find.byWidgetPredicate(
-      (w) => w is MessageBubble && w.role == 'assistant' && !w.isStreaming,
-    );
-
-/// Extract text from the latest completed assistant MessageBubble.
-String? latestAssistantText(WidgetTester tester) {
-  final widgets = tester.widgetList<MessageBubble>(completedAssistant);
-  if (widgets.isEmpty) return null;
-  return widgets.last.content;
-}
-
 /// Pump until the conversation resolves:
-///  (a) a completed assistant bubble appears (normal or Error reply), OR
+///  (a) the app has STORED a final assistant reply (read from state — normal or
+///      "Error:" reply), OR
 ///  (b) the turn completes (streaming was observed true, then false) with no
-///      bubble — "silent completion" (empty reply OR internal exception), OR
+///      final reply stored — "silent completion" (empty reply OR internal
+///      exception), OR
 ///  (c) [timeoutSec] elapses while streaming never stopped (genuine hang).
 /// Throws TimeoutException only for (c).
+///
+/// The reply is detected by reading STATE (readFinalAssistantReply), NOT the
+/// widget tree, so a reply the app stored (main.dart insert) but whose bubble
+/// was momentarily unbuilt (ListView lazy-build/recycle) is still detected
+/// (fix-live-test-reply-detection D1/D2 — the 3.3 false-fail fix). On the error
+/// path _endStreaming sets isStreaming=false BEFORE _storeError inserts the
+/// Error reply, so a bounded grace period waits for that pending insert before
+/// concluding silent-completion (design D4).
 Future<void> pumpUntilReplyOrTurnDone(WidgetTester tester,
     {int timeoutSec = 150}) async {
   final end = DateTime.now().add(Duration(seconds: timeoutSec));
@@ -67,13 +64,13 @@ Future<void> pumpUntilReplyOrTurnDone(WidgetTester tester,
     final areas = tester.widgetList<ChatArea>(find.byType(ChatArea));
     final stillStreaming = areas.isNotEmpty && areas.last.isStreaming;
     if (stillStreaming) sawStreaming = true;
-    if (completedAssistant.evaluate().isNotEmpty) return;   // (a) normal / Error
+    if (readFinalAssistantReply(tester) != null) return;   // (a) final reply stored
     if (sawStreaming && !stillStreaming) {
-      // (b) streaming stopped: grace period so a pending Error:/empty bubble
-      // renders (the error path _endStreaming runs before _storeError's bubble).
+      // (b) streaming stopped: grace period so a pending _storeError insert
+      // (which runs AFTER _endStreaming) lands and finalAssistantReply is set.
       await tester.pump(const Duration(milliseconds: 500));
-      if (completedAssistant.evaluate().isNotEmpty) return; // (a) error bubble arrived
-      return;                                               // (b) silent completion
+      if (readFinalAssistantReply(tester) != null) return; // (a) error reply stored
+      return;                                              // (b) silent completion
     }
     // !sawStreaming && !stillStreaming: still in the pre-stream DB preamble — poll on.
   }
@@ -91,6 +88,11 @@ void main() {
 
   late Directory tempDir;
   bool apiAvailable = true;
+
+  // 5.2: clear any prior run's test/live_visual/*.png before the suite, so a
+  // stale capture (or one from a case skipped before registering capture) is
+  // never misread as this run's result.
+  setUpAll(clearLiveVisualDir);
 
   // Check config before all tests
   final configResult = ConfigService.load();
@@ -125,10 +127,20 @@ void main() {
       return;
     }
 
+    // Spike: captureKey for RepaintBoundary.toImage() — wrap MyApp so the full
+    // real window render (sidebar + chat) is captured at the end of the case.
+    final captureKey = GlobalKey();
+
     // Pump full AppShell (lets _initSearchAndTools run naturally)
-    await tester.pumpWidget(const MyApp());
+    await tester.pumpWidget(
+        RepaintBoundary(key: captureKey, child: const MyApp()));
     await tester.pump(const Duration(seconds: 2)); // let AppShell init
 
+    // 5.1: ride the body in try/finally (NOT addTearDown) so the capture runs
+    // while the widget tree is still mounted — a teardown-registered shot fires
+    // AFTER _runTestBody resets the tree (runApp(_postTestMessage)), which would
+    // break the pass path. try/finally covers pass/fail/skip/timeout.
+    try {
     // Type message
     final textField = find.byType(TextField);
     expect(textField, findsOneWidget, reason: 'Chat input TextField should exist');
@@ -147,7 +159,7 @@ void main() {
       await dumpToolCards(tester, phase: '3.1 reply timeout');
       fail('Conversation still streaming after 150s — possible pipe deadlock or FFI crash');
     }
-    if (completedAssistant.evaluate().isEmpty) {
+    if (readFinalAssistantReply(tester) == null) {
       // 静默完成：模型空回复或内部异常（测试视角不可区分）→ fail 诚实归因。
       await dumpToolCards(tester, phase: '3.1 silent completion');
       fail('Conversation completed without an assistant reply — model empty reply '
@@ -160,7 +172,7 @@ void main() {
     await dumpNoTool(tester, '3.1 basic conversation');
 
     // Check for API error
-    final text = latestAssistantText(tester);
+    final text = readFinalAssistantReply(tester);
     expect(text, isNotNull, reason: 'Assistant reply should exist');
     if (text!.startsWith('Error:')) {
       await dumpToolCards(tester, phase: '3.1 API error reply');
@@ -175,6 +187,11 @@ void main() {
 
     // Let the reply render visually before teardown
     await tester.pump(const Duration(seconds: 1));
+    } finally {
+      // Capture on EVERY exit from the try (pass/fail/skip/timeout), while the
+      // tree is still mounted (before _runTestBody's reset unmounts it on pass).
+      await captureLiveShot(tester, captureKey, '3.1_basic');
+    }
   }, timeout: const Timeout(Duration(seconds: 300)));
 
   // =========================================================================
@@ -196,10 +213,17 @@ void main() {
       return;
     }
 
+    // captureKey for RepaintBoundary.toImage() — wrap MyApp for full-window shot.
+    final captureKey = GlobalKey();
+
     // Pump full AppShell
-    await tester.pumpWidget(const MyApp());
+    await tester.pumpWidget(
+        RepaintBoundary(key: captureKey, child: const MyApp()));
     await tester.pump(const Duration(seconds: 2));
 
+    // 5.1: ride the body in try/finally (NOT addTearDown — a teardown shot fires
+    // after the tree reset and would break the pass path). Capture runs in finally.
+    try {
     // Type message with explicit tool instruction
     final textField = find.byType(TextField);
     await tester.enterText(
@@ -217,7 +241,7 @@ void main() {
     } on TimeoutException {
       await dumpToolCards(tester, phase: '3.2 wait ToolCallCard timeout');
       // AI might not have called web_fetch — check if there's an error reply
-      final text = latestAssistantText(tester);
+      final text = readFinalAssistantReply(tester);
       if (text != null && text.startsWith('Error:')) {
         markTestSkipped('API unavailable: $text');
         return;
@@ -250,7 +274,7 @@ void main() {
       await dumpToolCards(tester, phase: '3.2 reply timeout');
       fail('Conversation still streaming after 150s — possible pipe deadlock or FFI crash');
     }
-    if (completedAssistant.evaluate().isEmpty) {
+    if (readFinalAssistantReply(tester) == null) {
       // 静默完成：模型空回复或内部异常 → fail 诚实归因。
       await dumpToolCards(tester, phase: '3.2 silent completion');
       fail('Conversation completed without an assistant reply after web_fetch — '
@@ -258,13 +282,16 @@ void main() {
     }
 
     await dumpToolCards(tester, phase: '3.2 pre-assertion');
-    final text = latestAssistantText(tester);
+    final text = readFinalAssistantReply(tester);
     expect(text, isNotNull);
     expect(text!.trim(), isNotEmpty, reason: 'Reply after web_fetch should be non-empty');
     debugPrint('[TEST] Assistant replied after web_fetch: ${text.length > 200 ? '${text.substring(0, 200)}...' : text}');
 
     // Let the reply render visually before teardown
     await tester.pump(const Duration(seconds: 1));
+    } finally {
+      await captureLiveShot(tester, captureKey, '3.2_web_fetch');
+    }
   }, timeout: const Timeout(Duration(seconds: 300)));
 
   // =========================================================================
@@ -298,10 +325,17 @@ void main() {
     }
     debugPrint('[TEST] Created test file at $testFilePath');
 
+    // captureKey for RepaintBoundary.toImage() — wrap MyApp for full-window shot.
+    final captureKey = GlobalKey();
+
     // Pump full AppShell
-    await tester.pumpWidget(const MyApp());
+    await tester.pumpWidget(
+        RepaintBoundary(key: captureKey, child: const MyApp()));
     await tester.pump(const Duration(seconds: 2));
 
+    // 5.1: ride the body in try/finally (NOT addTearDown — a teardown shot fires
+    // after the tree reset and would break the pass path). Capture runs in finally.
+    try {
     // Tell AI to edit the file
     final textField = find.byType(TextField);
     await tester.enterText(
@@ -319,7 +353,7 @@ void main() {
       await pumpUntilFound(tester, find.byType(ToolCallCard), timeoutSec: 150);
     } on TimeoutException {
       await dumpToolCards(tester, phase: '3.3 wait ToolCallCard timeout');
-      final text = latestAssistantText(tester);
+      final text = readFinalAssistantReply(tester);
       if (text != null && text.startsWith('Error:')) {
         markTestSkipped('API unavailable: $text');
         // Cleanup
@@ -355,7 +389,7 @@ void main() {
       try { File(testFilePath).deleteSync(); } catch (_) {}
       fail('Conversation still streaming after 150s — possible pipe deadlock or FFI crash');
     }
-    if (completedAssistant.evaluate().isEmpty) {
+    if (readFinalAssistantReply(tester) == null) {
       // 静默完成：模型空回复或内部异常 → fail 诚实归因（先清理测试文件）。
       await dumpToolCards(tester, phase: '3.3 silent completion');
       try { File(testFilePath).deleteSync(); } catch (_) {}
@@ -368,7 +402,7 @@ void main() {
 
     await dumpToolCards(tester, phase: '3.3 pre-assertion');
     dumpFile(testFilePath, label: '3.3 test file');
-    final text = latestAssistantText(tester);
+    final text = readFinalAssistantReply(tester);
     expect(text, isNotNull);
     expect(text!.trim(), isNotEmpty, reason: 'Reply after edit_file should be non-empty');
     debugPrint('[TEST] Assistant replied after edit_file: ${text.length > 200 ? '${text.substring(0, 200)}...' : text}');
@@ -389,6 +423,9 @@ void main() {
     try { File(testFilePath).deleteSync(); } catch (_) {}
 
     await tester.pump(const Duration(seconds: 1));
+    } finally {
+      await captureLiveShot(tester, captureKey, '3.3_edit_file');
+    }
   }, timeout: const Timeout(Duration(seconds: 300)));
 
   // =========================================================================
@@ -422,10 +459,17 @@ void main() {
       return;
     }
 
+    // captureKey for RepaintBoundary.toImage() — wrap MyApp for full-window shot.
+    final captureKey = GlobalKey();
+
     // Pump full AppShell
-    await tester.pumpWidget(const MyApp());
+    await tester.pumpWidget(
+        RepaintBoundary(key: captureKey, child: const MyApp()));
     await tester.pump(const Duration(seconds: 2));
 
+    // 5.1: ride the body in try/finally (NOT addTearDown — a teardown shot fires
+    // after the tree reset and would break the pass path). Capture runs in finally.
+    try {
     // Send message requiring reasoning
     final textField = find.byType(TextField);
     await tester.enterText(
@@ -442,7 +486,7 @@ void main() {
       await pumpUntilFound(tester, find.byType(ThinkingCard), timeoutSec: 150);
     } on TimeoutException {
       await dumpToolCards(tester, phase: '3.4 wait ThinkingCard timeout');
-      final text = latestAssistantText(tester);
+      final text = readFinalAssistantReply(tester);
       if (text != null && text.startsWith('Error:')) {
         markTestSkipped('API error: $text');
         return;
@@ -506,7 +550,7 @@ void main() {
       await dumpToolCards(tester, phase: '3.4 reply timeout');
       fail('Conversation still streaming after 150s — possible pipe deadlock or FFI crash');
     }
-    if (completedAssistant.evaluate().isEmpty) {
+    if (readFinalAssistantReply(tester) == null) {
       // 静默完成：模型空回复或内部异常 → fail 诚实归因。
       await dumpToolCards(tester, phase: '3.4 silent completion');
       fail('Conversation completed without an assistant reply after thinking — '
@@ -523,12 +567,15 @@ void main() {
 
     // Verify assistant reply
     await dumpNoTool(tester, '3.4 extended thinking');
-    final text = latestAssistantText(tester);
+    final text = readFinalAssistantReply(tester);
     expect(text, isNotNull);
     expect(text!.trim(), isNotEmpty,
         reason: 'Reply after thinking should be non-empty');
     debugPrint('[TEST] Reply after thinking: ${text.length > 200 ? '${text.substring(0, 200)}...' : text}');
 
     await tester.pump(const Duration(seconds: 1));
+    } finally {
+      await captureLiveShot(tester, captureKey, '3.4_thinking');
+    }
   }, timeout: const Timeout(Duration(seconds: 300)));
 }
