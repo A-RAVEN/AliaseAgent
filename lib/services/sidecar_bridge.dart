@@ -12,7 +12,7 @@ import 'package:ffi/ffi.dart';
 typedef OnChunkNative = Void Function(Pointer<Utf8> text);
 typedef OnToolCallNative = Void Function(Pointer<Utf8> json);
 typedef OnThinkingNative = Void Function(Pointer<Utf8> thinkingJson);
-typedef OnDoneNative = Void Function(Int32 code, Pointer<Utf8> err, Pointer<Utf8> stopReason);
+typedef OnDoneNative = Void Function(Int32 code, Pointer<Utf8> err, Pointer<Utf8> stopReason, Int32 inputTokens, Int32 outputTokens);
 
 typedef SendMessageNative = Int32 Function(
   Pointer<Utf8> apiKey,
@@ -48,7 +48,7 @@ typedef SendMessageDart = int Function(
   Pointer<NativeFunction<OnDoneNative>> onDone,
 );
 
-typedef OnDoneDart = void Function(int code, Pointer<Utf8> err, Pointer<Utf8> stopReason);
+typedef OnDoneDart = void Function(int code, Pointer<Utf8> err, Pointer<Utf8> stopReason, int inputTokens, int outputTokens);
 
 typedef SetWorkspaceDart = Pointer<Utf8> Function(Pointer<Utf8> path);
 typedef ReadFileDart = Pointer<Utf8> Function(Pointer<Utf8> path);
@@ -70,7 +70,8 @@ typedef CancelRequestDart = void Function();
 typedef OnChunkCallback = void Function(String text);
 typedef OnToolCallCallback = void Function(String json);
 typedef OnThinkingCallback = void Function(String thinkingJson);
-typedef OnDoneCallback = void Function(int code, String? error, String? stopReason);
+typedef OnDoneCallback = void Function(int code, String? error, String? stopReason,
+    int? inputTokens, int? outputTokens);
 
 // ---------------------------------------------------------------------------
 // ISidecar — abstract interface for sidecar communication
@@ -253,7 +254,8 @@ class SidecarBridge implements ISidecar {
     late final NativeCallable<OnThinkingNative> onThinkingCallable;
     late final NativeCallable<OnDoneNative> onDoneCallable;
 
-    void finish(int code, String error, String stopReason,
+    void finish(int code, String error, String stopReason, int inputTokens,
+        int outputTokens,
         {bool closeCallables = true}) {
       if (finished) return; // idempotent: ignore duplicate done (F5)
       finished = true;
@@ -275,7 +277,8 @@ class SidecarBridge implements ISidecar {
       completer.complete();
       onDone(code,
           error.isEmpty ? null : (timedOut && code != 0 ? 'Request timed out after 120s' : error),
-          stopReason.isEmpty ? null : stopReason);
+          stopReason.isEmpty ? null : stopReason,
+          inputTokens, outputTokens);
     }
 
     onChunkCallable = NativeCallable<OnChunkNative>.listener(
@@ -294,8 +297,10 @@ class SidecarBridge implements ISidecar {
       },
     );
     onDoneCallable = NativeCallable<OnDoneNative>.listener(
-      (int code, Pointer<Utf8> errPtr, Pointer<Utf8> stopReasonPtr) {
-        finish(code, errPtr.toDartString(), stopReasonPtr.toDartString());
+      (int code, Pointer<Utf8> errPtr, Pointer<Utf8> stopReasonPtr,
+          int inputTokens, int outputTokens) {
+        finish(code, errPtr.toDartString(), stopReasonPtr.toDartString(),
+            inputTokens, outputTokens);
       },
     );
 
@@ -347,7 +352,7 @@ class SidecarBridge implements ISidecar {
           print('[SidecarBridge] FALLBACK: no done 30s after cancel — '
               'releasing gate without closing callables (leaked, 10.3)');
           finish(-1, 'Request timed out after 120s (no done after cancel)', '',
-              closeCallables: false);
+              0, 0, closeCallables: false);
         }
       });
       completer.future.whenComplete(fallback.cancel);
@@ -445,7 +450,7 @@ class SidecarBridge implements ISidecar {
         // and stalling the gate until the 150s fallback. Pass a non-null
         // (deliberately leaked) empty string instead.
         final stopPtr = ''.toNativeUtf8();
-        onDoneDart(-1, errPtr, stopPtr);
+        onDoneDart(-1, errPtr, stopPtr, 0, 0);
       } catch (_) {
         // Nothing more we can do — the 120s+30s timeout path still releases
         // the gate as a last resort.

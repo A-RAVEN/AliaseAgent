@@ -317,7 +317,7 @@ void main() {
             thinkingBlocks.add(jsonDecode(json));
           } catch (_) {}
         },
-        onDone: (_, __, ___) {},
+        onDone: (_, __, ___, ____, _____) {},
       );
 
       expect(thinkingBlocks.length, 1);

@@ -12,14 +12,15 @@ void main() {
   group('SetupDialog', () {
     // ── 4.1 Renders TextField + "Start" button ─────────────────────
 
-    testWidgets('renders API key TextField and Start button', (tester) async {
+    testWidgets('renders API key + max context tokens fields and Start button', (tester) async {
       await tester.pumpWidget(_wrapDialog(
         SetupDialog(onComplete: () {}),
       ));
 
-      // TextField for API key
-      expect(find.byType(TextField), findsOneWidget);
+      // Two TextFields: API key + max context tokens
+      expect(find.byType(TextField), findsNWidgets(2));
       expect(find.text('API Key'), findsOneWidget); // labelText
+      expect(find.text('Max Context Tokens'), findsOneWidget); // labelText
 
       // "Start" button (NOT "Save")
       expect(find.text('Start'), findsOneWidget);
@@ -61,8 +62,9 @@ void main() {
         ),
       ));
 
-      // Enter a valid key
-      await tester.enterText(find.byType(TextField), 'sk-ant-test-key');
+      // Enter a valid key + a valid max context token count
+      await tester.enterText(find.byType(TextField).at(0), 'sk-ant-test-key');
+      await tester.enterText(find.byType(TextField).at(1), '200000');
       await tester.pump();
 
       // Tap "Start"
@@ -75,6 +77,34 @@ void main() {
       // saveConfig should have been called with a valid config
       expect(savedConfig, isNotNull);
       expect(savedConfig!.providers['anthropic']!.apiKey, 'sk-ant-test-key');
+      expect(
+        savedConfig!.agentTypes['general']!.maxContextTokens,
+        200000,
+        reason: 'max context tokens must be required and captured on setup',
+      );
+    });
+
+    // ── 4.3b Max context tokens is required → validation error ─────
+
+    testWidgets('missing max context tokens shows validation error', (tester) async {
+      bool completed = false;
+
+      await tester.pumpWidget(_wrapDialog(
+        SetupDialog(onComplete: () => completed = true),
+      ));
+
+      // Enter only the API key — max context tokens left empty
+      await tester.enterText(find.byType(TextField).at(0), 'sk-ant-test-key');
+      await tester.pump();
+
+      await tester.tap(find.text('Start'));
+      await tester.pump();
+
+      expect(completed, isFalse);
+      expect(
+        find.text('Please enter a valid max context token count (a positive integer)'),
+        findsOneWidget,
+      );
     });
 
     // ── 4.4 barrierDismissible=false ───────────────────────────────

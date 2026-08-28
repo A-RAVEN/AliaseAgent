@@ -32,8 +32,9 @@ AliasAgent(Flutter 桌面 AI 对话应用,经 dart:ffi 调 C++ Sidecar,走 DeepS
 - 顶层 `system` 留作真指令;摘要 = role:user 文本 + 正文标记(`## 更早上下文(压缩xN,非用户发言)`)。DeepSeek `name` 字段(DeepSeekAPIDoc.md:221)是 **chat/completions** 消息字段,`/v1/messages` 未验证——故**首选正文文本标记**,不依赖 `name:'history'`。
 - 备选:摘要进 system(污染真指令)、发明 role("history" 非合法 role)。
 
-**D3 触发预算 = 必填配置 `maxContextTokens` + 实测 usage**(非查精确窗口、非隐藏默认)。
-- 接口拿不到精确窗口(无 `/models` 元数据);DeepSeek `/v1/messages`(Anthropic 格式)usage 字段为 `input_tokens`/`output_tokens`(AnthropicAPIDoc.md:354/:372),**但 [UNVERIFIED] 待从 DeepSeek 官方 Anthropic 兼容文档核实**;侧车应**防御性解析 usage 块**(读端点实际返回的 token-count 字段);`prompt_tokens`(:661)是 chat/completions 字段,不适用于 `/v1/messages`。
+**D3 触发预算 = 必填配置 `maxContextTokens` + 本地估算器**；实测 usage 作遥测/校准，不驱动触发（对齐 spec "Context budget trigger"：确定性 local estimator 投影）。
+- 接口拿不到精确窗口(无 `/models` 元数据);**触发**用确定性本地估算器 `ContextEstimator`(逐消息 proxy token 求和)——spec 明定 "deterministic local estimator (sum of per-message proxy tokens)"，代码 `CompactionEngine.buildTree(history, maxContextTokens)` 正是如此。
+- **实测 usage**：DeepSeek `/v1/messages`(Anthropic 格式)usage 字段为 `input_tokens`/`output_tokens`（AnthropicAPIDoc.md:354/:372；**2026-08-26 live 验证已确认**，非 [UNVERIFIED]）。侧车防御性解析；`prompt_tokens`(:661)是 chat/completions 字段,不适用于 `/v1/messages`。实测 usage 写入 `Message.token_count`(task 1.3)作为**遥测记录 + 破平衡点回归(task 5.2)依据**，但**不回读驱动触发**（spec 要求 local estimator 触发；回读触发属返工 ⑤ (b) 的新增功能，默认不做）。
 - 必填(同 apiKey);`stop_reason: length` 不作触发(:328 语义含糊)。
 
 **D4 确定性:决策/执行分离 `buildTree(history, config, proxy_usage)` 纯函数 + `FakeSummarizer` seam**。
@@ -56,11 +57,12 @@ AliasAgent(Flutter 桌面 AI 对话应用,经 dart:ffi 调 C++ Sidecar,走 DeepS
 
 **D8 后台折卷 idle-gated + 可抢占(request-id 定向)+ 断点续 + 事务原子落库**。
 - 单槽(模型路径);折卷与用户请求轮换共享、用户优先;`summary_nodes` 表事务写 + `tree_version` 递增(dirty-seq 标记失效,lazy 重折);materialize == buildTree。
+- **`materialize` 必须 UPSERT(不是裸 INSERT)**:同一事务内先删同 `(session_id, covered_min_seq, covered_max_seq)` 的旧行再插。否则同 span 因 staleness 重算时会叠重复行 → ①违反 D9「covered 稠密非重叠」②`findCovering` 无 ORDER BY 取 `rows.first`(=旧 stale 行)→ stale reuse。此即 2026-08-28 设计一致性审计抓到的真实缺陷(见附录 A)。
 - 注意:串行化的**只是模型路径**,web_search/web_fetch 在独立 worker isolate(不可与用户模型请求并发但工具/网络路径未被门控)。
 
 **D9 存储:seq 全序 + `summary_nodes` 树 + 派生索引**。
 - `messages` 加 `seq INTEGER`(autoincrement)+ `(session_id, seq)` 索引;树边界用 `(session_id, start_seq, end_seq)`,不用 UUID。
-- `summary_nodes`:(session_id, level, start_seq, end_seq, node_type, parent_id, summary_json, token_cost, summary_prompt_version, model, covered_min_seq, covered_max_seq);`summary_json`(role blocks)非单段 text;covered_min/max 稠密非重叠 + `leaf_owner` 平面索引;parent_id 仅导航;memo 化摘要(content hash + prompt version + model)。
+- `summary_nodes`:(session_id, level, start_seq, end_seq, node_type, parent_id, summary_json, token_cost, summary_prompt_version, model, covered_min_seq, covered_max_seq);`summary_json`(role blocks)非单段 text;covered_min/max **稠密非重叠**(由 `materialize` 的 UPSERT 保证——同 span 先删旧行再插,见 D8);+ `leaf_owner` 平面索引;parent_id 仅导航;**parent 导航逻辑属 Phase-3 level-2 成树后行为,当前 DEFERRED**(列已铺、行为未落地);memo 化摘要(content hash + prompt version + model)。
 - 原始 `messages` 表逐字保留;树节点按需展开路径由 harness 注入(非 agent 工具)。
 
 **D10 便宜层优先 + 折卷预算**。
@@ -89,3 +91,64 @@ AliasAgent(Flutter 桌面 AI 对话应用,经 dart:ffi 调 C++ Sidecar,走 DeepS
 - 语义边界 A 的 memo 键 / 是否复用同一摘要调用(实现层,我把关;见参考文档 §8 D1/D2/D3 已降级为实现细节)。
 - DeepSeek `/v1/messages`(Anthropic 兼容)的 usage 精确字段名(Anthropic 格式 `input_tokens`/`output_tokens`)待核实;`prompt_tokens` 是 chat/completions 字段。精确窗口数(可选优化,不做前置;用户授权时从官方核实)。
 - 摘要是否要"意图叙述"还是纯结构化记录(tool_input/outcome/refetch_hint 是数据,可纯机械;叙述部分可选)。
+
+---
+
+## 附录 A — 对抗审查证据记录（Round 1/2/3; 仅证据链，不作任务解析）
+
+> 本附录记录各轮对抗 Workflow 的发现证据、refute/NOT-a-bug 判定，用于回溯。**不作为可执行任务** — 可执行任务在 `tasks.md` Section 0（返工）与 Section 1-8（原始任务 + 诚实审查）。所有 Workflow 均为 N≥3 REFUTING skeptics per finding、perspective-diverse、majority-kill、STRICTLY OFFLINE（只读本地文件，外部真实性对照 `Docs/*.md`）。
+
+### R1（55 agents）— 已修复问题（其修复已在 tasks.md 1.1-1.7 保留 `[x]`）
+
+- R1-1 summary profile 须发 `thinking.type=disabled`（DeepSeek 缺省 enabled，absence≠disable）。已修 model_gateway.cpp。**注意**: 该修复只加在 summary 分支(549)，交互 else(552) 未加 — 见返工 ①。
+- R1-2 `dispatch_done` `stop_reason.c_str()` 悬垂于临时字符串("") — UB。已修（走 stable pending_strings）。
+- R1-3 compaction 投影不得发连续 role:user（DeepSeek 未记载 same-role merge）。已修（所有摘要并入一个 role:user 前缀）。
+- R1-4 安全段边界不得落入带 tool_calls 的 assistant。已修 `_alignToSafeBoundary`。**注意**: 仅修 far/near 缝(103)，内部 `_budgetSegments` chunk 未对齐 — 见返工 ④。
+- R1-5 摘要失败不得静默替换上下文为 "(empty summary)"。已修（ModelSummaryProvider 在 done(-1) 抛错，_callModel 回退全量 verbatim）。
+- R1-6 加 v3→v4 迁移测试。已加 schema_migration_test.dart。
+
+### R2（34 agents）— Round-2 发现
+
+- **R2-1 thinking 禁用机制（EXTERNAL-TRUTH，2026-08-26 live 探测解决）**: `thinking.type="disabled"` 在 `/v1/messages` 实测有效（无 reasoning block）；`reasoning.effort="none"` 实测无效（仍有 block）。当前 summary 分支(549)正确。→ 返工 ⑧（改注释）+ Docs 已修。同探针确认 usage 字段为 `input_tokens`/`output_tokens`（tasks 1.1/5.4 的 `[UNVERIFIED]` 已解除）。
+- **R2-2 task 3.1 dirty-seq 水位线/按受影响 span lazy 重算缺失**（stateless 整树重算 + 整表 bump）→ 返工 ⑥。
+- **R2-3 task 2.9 guard 生产失效**（`_guard=GuardAnchors()` 空实现，零生产 seed，inject 恒'') → 返工 ⑦。
+- **R2-4 内部 `_budgetSegments` chunk 边界未安全对齐** → 返工 ④。
+- **R2-5 "original messages preserved" 测试名不符实**（只查 sqlite_master 表名）→ 返工 ②。
+- **R2-6 under-budget 投影测试无 `[OBS]` dump** → 返工 ③。
+- **R2-7 summary_node_repository 两测试无 `[OBS]` dump** → 返工 ③。
+- **R2-8 schema_migration_test 无 `[OBS]` dump** → 返工 ③。
+- **R2-9 决策点**（R2-1/R2-2 需决策）— 经 live 探测 + D8 解读后，R2-1 无需新决策（当前行为正确，只改注释）；R2-2 设计方向已定（D8），无用户决策。**不再需要 R2-9 的 a/b 决策。**
+- **R2-11 code-change approval gate**（用户策略: 任何代码改动作先落 task + 批准）— 全部返工项均列在 tasks.md Section 0。
+
+### R3（34 agents）— Round-3 artifact-vs-code-baseline audit 发现
+
+- **R3-1 交互「thinking disabled」路径实际没关 thinking**（HIGH，前两轮漏掉）→ 返工 ①。根因 R1-1 只修 summary 分支。
+- **R3-2 buildTree 签名 `(history, config, proxy_usage)` vs 代码 `(history, maxContextTokens)` 不符；design D3「实测 usage 驱动触发」未兑现** → 返工 ⑤。**已定 (a) 纯文档修正**（spec.md:6 明定 "deterministic local estimator" 触发，代码对 spec 忠实，是 design/tasks 描述过度声称；无真实二选一）→ design.md D3 + tasks 2.1 已改，无代码改动。
+- **R3-3 task 2.8 声称「前后 token」但无测试输出前后对比** → 返工 ③。
+- **R3-4 (=R2-4 再确认)** 内部 chunk 边界 → 返工 ④。
+- **R3-5 (=R2-1 注释)** `model_gateway.cpp:528`「ONLY output_config.effort」错 → 返工 ⑧。
+- **R3-6 (=R2-1 引用)** `model_gateway.cpp:546` 引「line 228」错（228 是 §3.1 空行，非 §2.5）→ 返工 ⑧。
+
+### Verified NOT-a-bug（majory-refuted; 后续轮次勿再报告）
+
+- near-zone oversized tool_result body elision 未实现 → 对应 task 5.3（Phase 4，`[ ]`），属正常待办。
+- 层级 level-2「总结之总结」+ 语义边界未实现 → 对应 task 4.1/4.3（Phase 3，`[ ]`），属正常待办。
+- D10 成本纪律（prompt-caching、折卷预算、破平衡点）未实现 → task 5.1/5.2/5.3（Phase 4，`[ ]`），属正常待办。
+- C1「overstates D8」→ refuted：D8(design.md:58) 确写「dirty-seq 标记失效」；D4 与 D8 均坚持 `materialize==buildTree`（幂等缓存），增量+同输出是设计自身解法，非新矛盾。
+
+### 设计一致性审计（Round A，2026-08-28；21 agents，7 claims × 3 skeptics，offline）
+
+> 目的：独立核对「当前摘要生成/管理实现是否对齐 design D1-D10 + specs」。结论：**没有任何一条被多数判定为真实偏离**（isDeviation 全 False）。判定：MATCHES / DEFERRED=待办`[ ]`（非假完成）/ DEVIATED=真实偏离。
+
+- **D1/2/4（摘要形态/投影[摘要][近段原文][当前]/决策执行分离 buildTree 纯函数 + FakeSummarizer seam）= MATCHES 3/3**。
+  - 摘要 = `role:user` 文本 + 标记 `## 更早上下文(压缩xN,非用户发言)`（summary_provider.dart:35 逐字一致）；无 name:'history' 依赖、不塞 system。
+  - 决策/执行分离：`buildTree(history, maxContextTokens)` 纯函数（注释明示不调模型），`_summaryProvider.summarize()` 只填已定死叶子内容。
+  - 注：design D4 曾写 `buildTree(history, config, proxy_usage)` 与代码不符——返工 ⑤(a) 已裁定为**文档纠偏**（spec 明定 local estimator 触发），代码本来就对，非偏离。
+- **D3（触发预算 = maxContextTokens + 本地确定性估算器）= MATCHES 3/3**。实测 usage 只写 `token_count` 作遥测/校准，不回读驱动触发（对齐 spec）。
+- **D7（摘要 profile = 复用 model_gateway、关 thinking、max_tokens 1024）= MATCHES 3/3**。
+- **D5/D10（语义边界 A、成本/便宜层）= DEFERRED 3/3**（对应 4.3 / 5.x 待办，非假完成）。
+- **D6（原子单元 + 安全边界）= 2 MATCHES / 1 DEVIATED（未达多数，不以偏离计）**。原子性+边界规则满足 spec「绝不拆工具轮 / 绝不落 tool_calls 行」（工具轮因 tool_result 合成而**按构造原子**）；但 D6 原文「带 tool_calls 的叶子**永原样展开**(node_type)」的更强说法**未实现**——远区 tool_calls 叶会被折进摘要，属 Phase 3 node_type/level-2 机制（DEFERRED，对应 4.2/4.3）。
+- **D8（事务落库 + 复用 + dirty-seq）+ D9（存储）= 各 1 个怀疑者独立抓到同一真实缺陷** → **追加返工任务 R0-H-BUG（materialize UPSERT）**：
+  - `materialize` 只 `txn.insert`、从不删同 covered span 的旧行。同 span 因 staleness 重算 → 叠重复行 → 违反 D9「covered 稠密非重叠」+ `findCovering` 无 ORDER BY 取 `rows.first` = 旧 stale 行 → **stale reuse**（正是 dirty-seq/⑥ 使其更常可达）。
+  - **修法（已写入 D8/D9）**：materialize 在**同一事务内先删同 `(session_id, covered_min_seq, covered_max_seq)` 旧行再插**（upsert），保稠密非重叠 + 取到最新。
+- **D9 parent_id 导航 = DEFERRED**（列已铺、行为未落地，属 Phase-3 level-2 成树后）。

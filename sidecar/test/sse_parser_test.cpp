@@ -26,6 +26,9 @@ struct SseResult {
     int done_code = -99;
     std::string done_err;
     std::string done_stop_reason;
+    // Measured usage carried into on_done (defensive parse; default 0).
+    int done_input_tokens = 0;
+    int done_output_tokens = 0;
 };
 
 static SseResult* s_r = nullptr;
@@ -50,12 +53,15 @@ static void s_on_thinking(const char* t) {
         s_r->thinkings.push_back(t);
     }
 }
-static void s_on_done(int c, const char* e, const char* r_ptr) {
+static void s_on_done(int c, const char* e, const char* r_ptr,
+                      int input_tokens, int output_tokens) {
     if (s_r) {
         s_r->done_count++;
         s_r->done_code = c;
         s_r->done_err = e ? e : "";
         s_r->done_stop_reason = r_ptr ? r_ptr : "";
+        s_r->done_input_tokens = input_tokens;
+        s_r->done_output_tokens = output_tokens;
     }
 }
 
@@ -543,4 +549,35 @@ TEST_CASE("SSE: message_stop plus [DONE] fires exactly one done", "[sse_parser][
     REQUIRE(r.done_count == 1);
     REQUIRE(r.done_code == 0);
     REQUIRE(r.done_stop_reason == "end_turn");
+}
+
+// ============================================================================
+// Usage telemetry (Phase 0) — input/output tokens parsed from message_start /
+// message_delta and carried into on_done. Field dialect [UNVERIFIED]: the
+// sidecar reads whichever token-count field the endpoint returns.
+// ============================================================================
+TEST_CASE("SSE: usage parsed from message_start/message_delta", "[sse_parser][usage]") {
+    MockServer server;
+    server.set_response_body(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n"
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":15}}\n\n"
+        "data: {\"type\":\"message_stop\"}\n\n");
+    server.start("", 200);
+    server.wait_ready();
+
+    ModelGateway gw;
+    gw.set_timeout(5);
+    SseResult r;
+    s_r = &r;
+    gw.execute("sk-test", server.base_url().c_str(), "m", "",
+               R"([{"role":"user","content":"hi"}])", "", "", "",
+               s_on_chunk, s_on_tool_call, s_on_thinking, s_on_done);
+    s_r = nullptr;
+
+    REQUIRE(r.done_code == 0);
+    REQUIRE(r.done_input_tokens == 25);   // from message_start usage
+    REQUIRE(r.done_output_tokens == 15);  // from message_delta usage
 }

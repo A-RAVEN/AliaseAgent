@@ -72,6 +72,7 @@ class FakeMessageRepository implements MessageRepository {
     String? toolCallsJson,
     String? thinkingJson,
     int? tokenCount,
+    int? outputTokenCount,
   }) async {
     final msg = Message(
       id: 'msg-${messages.length}',
@@ -81,6 +82,7 @@ class FakeMessageRepository implements MessageRepository {
       toolCallsJson: toolCallsJson,
       thinkingJson: thinkingJson,
       tokenCount: tokenCount,
+      outputTokenCount: outputTokenCount,
       createdAt: DateTime.now().millisecondsSinceEpoch,
     );
     messages.add(msg);
@@ -98,6 +100,7 @@ class FakeMessageRepository implements MessageRepository {
     if (idx >= 0) {
       messages[idx] = Message(
         id: messages[idx].id,
+        seq: messages[idx].seq,
         sessionId: messages[idx].sessionId,
         role: messages[idx].role,
         content: messages[idx].content,

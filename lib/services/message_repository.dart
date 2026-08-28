@@ -13,6 +13,7 @@ class MessageRepository {
     String? toolCallsJson,
     String? thinkingJson,
     int? tokenCount,
+    int? outputTokenCount,
   }) async {
     final db = await DatabaseService.database;
     final msg = Message(
@@ -23,10 +24,28 @@ class MessageRepository {
       toolCallsJson: toolCallsJson,
       thinkingJson: thinkingJson,
       tokenCount: tokenCount,
+      outputTokenCount: outputTokenCount,
       createdAt: DateTime.now().millisecondsSinceEpoch,
     );
-    await db.insert('messages', msg.toRow());
-    return msg;
+    // seq is the message's stable ordering key. Assign it from the SQLite
+    // rowid (monotonic per insert, unique even under same-millisecond inserts)
+    // so compaction tree spans are stable. Two-step: insert (seq NULL) then
+    // set seq = rowid.
+    final rowId = await db.insert('messages', msg.toRow());
+    await db.update('messages', {'seq': rowId}, where: 'id = ?', whereArgs: [msg.id]);
+    final inserted = Message(
+      id: msg.id,
+      seq: rowId,
+      sessionId: sessionId,
+      role: role,
+      content: content,
+      toolCallsJson: toolCallsJson,
+      thinkingJson: thinkingJson,
+      tokenCount: tokenCount,
+      outputTokenCount: outputTokenCount,
+      createdAt: msg.createdAt,
+    );
+    return inserted;
   }
 
   Future<void> updateToolCalls(String id, String toolCallsJson) async {
@@ -45,7 +64,9 @@ class MessageRepository {
       'messages',
       where: 'session_id = ?',
       whereArgs: [sessionId],
-      orderBy: 'created_at ASC',
+      // seq is the deterministic tiebreaker when created_at collides
+      // (same-millisecond tool-loop inserts).
+      orderBy: 'created_at ASC, seq ASC',
     );
     return rows.map(Message.fromRow).toList();
   }

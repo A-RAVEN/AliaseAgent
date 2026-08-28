@@ -20,7 +20,7 @@ static bool s_done = false;
 static void on_chunk_cb(const char*) { s_chunk_count++; }
 static void on_tool_cb(const char*) { s_tool_count++; }
 static void on_thinking_cb(const char*) { s_thinking_count++; }
-static void on_done_cb(int, const char*, const char*) { s_done = true; }
+static void on_done_cb(int, const char*, const char*, int, int) { s_done = true; }
 
 static void reset_callbacks() {
     s_chunk_count = 0;

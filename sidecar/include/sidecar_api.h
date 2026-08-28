@@ -19,7 +19,13 @@ extern "C" {
 typedef void (*OnChunkCallback)(const char* text);
 typedef void (*OnToolCallCallback)(const char* json);
 typedef void (*OnThinkingCallback)(const char* thinking_json);
-typedef void (*OnDoneCallback)(int code, const char* err, const char* stop_reason);
+/// The on_done callback now also carries the measured usage (input/output
+/// token counts) so Dart can persist them to the message's token_count column.
+/// The field dialect follows the Anthropic-format /v1/messages endpoint; the
+/// exact DeepSeek naming is [UNVERIFIED], so the sidecar parses defensively and
+/// passes 0 for any value the endpoint did not report.
+typedef void (*OnDoneCallback)(int code, const char* err, const char* stop_reason,
+                               int input_tokens, int output_tokens);
 
 /// Ping: verify FFI bridge is working
 SIDECAR_API const char* ping(void);

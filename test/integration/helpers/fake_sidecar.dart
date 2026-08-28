@@ -48,12 +48,15 @@ class FakeSidecar implements ISidecar {
     _events.add(_FakeEvent(type: 'thinking', json: json));
   }
 
-  void queueDone({int code = 0, String? error, String? stopReason}) {
+  void queueDone({int code = 0, String? error, String? stopReason,
+      int inputTokens = 0, int outputTokens = 0}) {
     _events.add(_FakeEvent(
       type: 'done',
       code: code,
       error: error,
       stopReason: stopReason,
+      inputTokens: inputTokens,
+      outputTokens: outputTokens,
     ));
   }
 
@@ -75,6 +78,14 @@ class FakeSidecar implements ISidecar {
 
   /// Records cancelRequest() invocations (for tests asserting the cancel path).
   int cancelCount = 0;
+
+  /// The last request's JSON + profile (for asserting the compaction projection
+  /// and the summary profile mode are actually sent).
+  String? lastMessagesJson;
+  String? lastSystemPrompt;
+  String? lastThinkingMode;
+  String? lastBaseUrl;
+  String? lastModel;
 
   /// Suspends the NEXT sendMessage's event delivery until [releaseGate] is
   /// called — lets tests interleave a mid-stream session switch (11.4).
@@ -119,6 +130,13 @@ class FakeSidecar implements ISidecar {
     OnThinkingCallback? onThinking,
     required OnDoneCallback onDone,
   }) async {
+    // Record the request for assertion (compaction projection / summary profile).
+    lastMessagesJson = messagesJson;
+    lastSystemPrompt = systemPrompt;
+    lastThinkingMode = thinkingMode;
+    lastBaseUrl = baseUrl;
+    lastModel = model;
+
     // Gate (11.4): suspend event delivery until the test releases it.
     // Per-send semantics (17.1): each sendMessage pops ITS OWN gate — the
     // oldest pending send waits on the oldest gate, so releaseGate() releases
@@ -142,14 +160,15 @@ class FakeSidecar implements ISidecar {
         case 'thinking':
           onThinking?.call(event.json!);
         case 'done':
-          onDone(event.code, event.error, event.stopReason);
+          onDone(event.code, event.error, event.stopReason,
+              event.inputTokens, event.outputTokens);
           _events.removeRange(0, consumed);
           return;
       }
     }
     // If no done event queued, consume everything and fire a default done
     _events.clear();
-    onDone(0, null, 'end_turn');
+    onDone(0, null, 'end_turn', 0, 0);
   }
 
   @override
@@ -199,6 +218,8 @@ class _FakeEvent {
   final int code;
   final String? error;
   final String? stopReason;
+  final int inputTokens;
+  final int outputTokens;
 
   const _FakeEvent({
     required this.type,
@@ -207,5 +228,7 @@ class _FakeEvent {
     this.code = 0,
     this.error,
     this.stopReason,
+    this.inputTokens = 0,
+    this.outputTokens = 0,
   });
 }

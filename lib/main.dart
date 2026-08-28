@@ -3,17 +3,24 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
+import 'models/agent_type_config.dart';
 import 'models/app_config.dart';
 import 'models/chat_item.dart';
 import 'models/message.dart';
 import 'models/session.dart';
 import 'models/tool_call_activity.dart';
 import 'services/agent_type_registry.dart';
+import 'services/compaction/compaction_plan.dart';
+import 'services/compaction/guard_anchors.dart';
+import 'services/compaction/model_summary_provider.dart';
+import 'services/compaction/summary_provider.dart';
 import 'services/config_service.dart';
+import 'services/database_service.dart';
 import 'services/message_repository.dart';
 import 'services/provider_resolver.dart';
 import 'services/session_repository.dart';
 import 'services/sidecar_bridge.dart';
+import 'services/summary_node_repository.dart';
 import 'ui/chat_area.dart';
 import 'ui/session_sidebar.dart';
 import 'ui/setup_dialog.dart';
@@ -71,6 +78,16 @@ class _AppShellState extends State<AppShell> {
         setState(() {
           _config = result.config;
           _populateRegistry(result.config!);
+        });
+        // R1-7: maxContextTokens is a REQUIRED per-agent config (like apiKey).
+        // If the loaded config's active agent lacks a valid maxContextTokens,
+        // surface the setup prompt again rather than silently disabling compaction
+        // (which the user would otherwise not know about). One-time config.
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          final mct = registry.lookup('general')?.maxContextTokens;
+          if (mct == null || mct <= 0) {
+            _showSetup();
+          }
         });
       case ConfigStatus.notFound:
         WidgetsBinding.instance.addPostFrameCallback((_) => _showSetup());
@@ -135,6 +152,8 @@ class ChatScreen extends StatefulWidget {
   final SessionRepository? sessionRepo;
   final MessageRepository? msgRepo;
   final ISidecar? sidecar;
+  final SummaryProvider? summaryProvider;
+  final GuardAnchors? guard;
 
   const ChatScreen({
     super.key,
@@ -142,6 +161,8 @@ class ChatScreen extends StatefulWidget {
     this.sessionRepo,
     this.msgRepo,
     this.sidecar,
+    this.summaryProvider,
+    this.guard,
   });
 
   @override
@@ -152,6 +173,9 @@ class ChatScreenState extends State<ChatScreen> {
   late final SessionRepository _sessionRepo;
   late final MessageRepository _msgRepo;
   late final ISidecar _sidecar;
+  late final SummaryProvider _summaryProvider;
+  late final GuardAnchors _guard;
+  late final SummaryNodeRepository _summaryNodeRepo;
 
   List<Session> _sessions = [];
   String? _currentId;
@@ -193,8 +217,30 @@ class ChatScreenState extends State<ChatScreen> {
     if (widget.sidecar == null && widget.sessionRepo == null) {
       _sidecar.setWorkspace(ConfigService.homeDir);
     }
+    // Seed the guard producer from the ACTIVE agent type's explicit standing
+    // requirements (R2-3). Previously _guard was created empty and never seeded,
+    // so inject() returned '' on every turn — the non-compressible anchor never
+    // fired. Registry is populated (via _populateRegistry) before this initState.
+    _guard = widget.guard ?? _seedGuardFromConfig();
+    _summaryProvider = widget.summaryProvider ??
+        (resolver != null
+            ? ModelSummaryProvider(sidecar: _sidecar, resolver: resolver!)
+            : FakeSummaryProvider());
+    _summaryNodeRepo = SummaryNodeRepository();
     _initSearchAndTools();
     _loadSessions();
+  }
+
+  /// Build a GuardAnchors seeded from the active agent type's standing
+  /// requirements. Shared mutable global `registry` is read at init time; the
+  /// anchor set stays as caller/config produces it (deterministic, not LLM).
+  GuardAnchors _seedGuardFromConfig() {
+    final g = GuardAnchors();
+    final agent = registry.lookup('general');
+    if (agent != null && agent.standingRequirements.isNotEmpty) {
+      g.setStandingRequirements(agent.standingRequirements);
+    }
+    return g;
   }
 
   /// Initialize search infrastructure and build tool definitions (tasks 8.2, 8.3, 8.6)
@@ -685,8 +731,38 @@ class ChatScreenState extends State<ChatScreen> {
         ? '[]'
         : jsonEncode(_toolDefs.values.toList());
 
-    // Build API conversation from persisted messages, reconstructing tool_use blocks
-    final apiMessages = _buildApiMessages(messages);
+    // Build API conversation. When the conversation exceeds maxContextTokens,
+    // compact it: fold the far span into a role:user summary and replay only the
+    // near-verbatim span (projection [摘要][近段原文][当前]). The guard anchors
+    // (non-compressible invariants) are injected into the system prompt.
+    final maxContextTokens = agentType.maxContextTokens ?? 0;
+    final List<Map<String, dynamic>> apiMessages;
+    if (maxContextTokens > 0) {
+      final plan = CompactionEngine.buildTree(
+          history: messages, maxContextTokens: maxContextTokens);
+      if (plan.shouldCompact) {
+        List<SummaryResult> summaries;
+        try {
+          summaries = await _resolveSummaries(sessionId, plan, agentType);
+        } catch (e) {
+          // Summarization failed — never silently replace the folded context with
+          // a placeholder. Fall back to sending the conversation verbatim.
+          debugPrint('[AliasAgent] compaction summary failed, sending verbatim: $e');
+          summaries = const [];
+        }
+        if (summaries.isEmpty) {
+          apiMessages = _buildApiMessages(messages);
+        } else {
+          apiMessages = _buildCompactionProjection(
+              summaries, plan, _buildApiMessages(plan.verbatim));
+        }
+      } else {
+        apiMessages = _buildApiMessages(messages);
+      }
+    } else {
+      // maxContextTokens not configured — keep the current full-send behavior.
+      apiMessages = _buildApiMessages(messages);
+    }
 
     // Track all tool calls across turns for final assistant message
     final allTurnToolCalls = <Map<String, dynamic>>[];
@@ -706,6 +782,11 @@ class ChatScreenState extends State<ChatScreen> {
       final turnThinkingBlocks = <Map<String, dynamic>>[];
       int doneCode = 0;
       String? doneError;
+      // Measured usage from the provider (Anthropic-format /v1/messages
+      // input_tokens/output_tokens, defensively parsed). Persisted to the
+      // assistant message's token_count (the budget trigger/calibration signal).
+      int lastInputTokens = 0;
+      int lastOutputTokens = 0;
 
       // Determine thinking mode/effort from agent config
       const validEfforts = {'low', 'medium', 'high', 'xhigh', 'max'};
@@ -721,7 +802,7 @@ class ChatScreenState extends State<ChatScreen> {
         apiKey: provider.apiKey,
         baseUrl: baseUrl,
         model: agentType.model,
-        systemPrompt: '${agentType.systemPrompt}\nCurrent date: ${DateTime.now().toIso8601String().substring(0, 10)}. For precise time-sensitive queries, use the get_current_time tool.',
+        systemPrompt: '${agentType.systemPrompt}\n${_guard.inject()}\nCurrent date: ${DateTime.now().toIso8601String().substring(0, 10)}. For precise time-sensitive queries, use the get_current_time tool.',
         messagesJson: messagesJson,
         toolsJson: toolsJson,
         thinkingMode: thinkingMode,
@@ -853,9 +934,11 @@ class ChatScreenState extends State<ChatScreen> {
             debugPrint('[AliasAgent] onThinking parse error: $e\nraw: $json');
           }
         },
-        onDone: (code, error, stopReason) {
+        onDone: (code, error, stopReason, int? inputTokens, int? outputTokens) {
           doneCode = code;
           doneError = error;
+          lastInputTokens = inputTokens ?? 0;
+          lastOutputTokens = outputTokens ?? 0;
         },
       );
 
@@ -931,6 +1014,8 @@ class ChatScreenState extends State<ChatScreen> {
             content: turnText,
             toolCallsJson: toolCallsJson,
             thinkingJson: thinkingJsonStr,
+            tokenCount: lastInputTokens,
+            outputTokenCount: lastOutputTokens,
           );
           await _sessionRepo.touch(sessionId);
           if (_currentId == sessionId && mounted) {
@@ -957,6 +1042,8 @@ class ChatScreenState extends State<ChatScreen> {
         content: turnText,
         toolCallsJson: turnJson,
         thinkingJson: thinkingJsonStr,
+        tokenCount: lastInputTokens,
+        outputTokenCount: lastOutputTokens,
       );
       await _sessionRepo.touch(sessionId);
       if (_currentId == sessionId && mounted && turnText.isNotEmpty) {
@@ -1037,10 +1124,29 @@ class ChatScreenState extends State<ChatScreen> {
         }
       }
 
-      // Update intermediate message with enriched tool call data
+      // Update intermediate message with enriched tool call data. This is the
+      // sole leaf-level content mutation, so it invalidates the compaction tree
+      // (bump tree_version) — any cached summary over a span that includes this
+      // message must be recomputed (buildTree recomputes lazily next turn).
       if (_currentId == sessionId) {
         await _msgRepo.updateToolCalls(
             intermediateMsg.id, jsonEncode(turnToolCalls));
+        // Record the leaf-level content mutation as a dirty-since-seq watermark
+        // (D8 lazy recompute). Instead of a full-table tree_version bump on every
+        // leaf change (R2-2), lower dirty_since_seq so _resolveSummaries
+        // re-summarizes only spans that reach the dirty region. Gated on a real
+        // DB being open: hermetic widget tests never open one, and this must not
+        // lazily create the user DB as a side effect.
+        if (DatabaseService.isOpen) {
+          try {
+            final dirtySeq = intermediateMsg.seq;
+            if (dirtySeq != null) {
+              await _summaryNodeRepo.markDirty(sessionId, dirtySeq);
+            }
+          } catch (e) {
+            debugPrint('[AliasAgent] mark dirty watermark failed: $e');
+          }
+        }
       }
 
       apiMessages.add({
@@ -1070,6 +1176,150 @@ class ChatScreenState extends State<ChatScreen> {
     if (!th.containsKey('index')) return th;
     final cleaned = Map<String, dynamic>.from(th)..remove('index');
     return cleaned;
+  }
+
+  /// Resolve summaries for every summary segment of a fold plan: reuse a
+  /// previously-persisted summary node covering that segment (so the send path
+  /// does NOT re-invoke the LLM), else generate via [_summaryProvider] and
+  /// best-effort persist it to summary_nodes (background-folding reuse). The
+  /// persistence write is transactional re: tree_version.
+  Future<List<SummaryResult>> _resolveSummaries(
+      String sessionId, CompactionPlan plan, AgentTypeConfig agentType) async {
+    final results = <SummaryResult>[];
+    final dbOpen = DatabaseService.isOpen;
+    // Dirty-since-seq watermark (D8 lazy recompute): a cached summary may be
+    // reused only if its covered span is strictly below the watermark (clean —
+    // no leaf content changed in it). Spans reaching the dirty region are stale
+    // and must be re-summarized, never blindly reused (R2-2).
+    var dirtySince = 0;
+    if (dbOpen) {
+      try {
+        dirtySince = await _summaryNodeRepo.dirtySinceSeq(sessionId);
+      } catch (e) {
+        debugPrint('[AliasAgent] dirty watermark read failed: $e');
+      }
+    }
+    var persistFailed = false;
+    for (final seg in plan.segments) {
+      if (!seg.summary || seg.messages.isEmpty) continue;
+      final minSeq = seg.messages.first.seq;
+      final maxSeq = seg.messages.last.seq;
+      if (dbOpen && minSeq != null && maxSeq != null) {
+        try {
+          final node = await _summaryNodeRepo.findCovering(sessionId, minSeq, maxSeq);
+          if (node != null && node.summaryJson != null &&
+              (dirtySince == 0 || node.coveredMaxSeq < dirtySince)) {
+            final text = _summaryTextFromJson(node.summaryJson!);
+            if (text.isNotEmpty) {
+              results.add(SummaryResult(text: text, tokens: node.tokenCost ?? 0));
+              continue;
+            }
+          }
+        } catch (e) {
+          debugPrint('[AliasAgent] summary reuse read failed: $e');
+        }
+      }
+      final summary =
+          await _summaryProvider.summarize(folded: seg.messages, config: agentType);
+      // Hermetic tests (no DB open) never persist the derived index — the originals
+      // stay in memory and there is no tree to invalidate.
+      if (dbOpen && minSeq != null && maxSeq != null) {
+        debugPrint('[AliasAgent] folding ${seg.messages.length} messages '
+            '(seq $minSeq..$maxSeq) into a level-1 summary');
+        try {
+          await _summaryNodeRepo.materialize(
+            sessionId: sessionId,
+            level: 1,
+            startSeq: minSeq,
+            endSeq: maxSeq,
+            nodeType: 'summary',
+            summaryJson: jsonEncode({
+              'role': 'user',
+              'content': [
+                {'type': 'text', 'text': summary.text},
+              ],
+            }),
+            tokenCost: summary.tokens,
+            summaryPromptVersion: 1,
+            model: agentType.model,
+            coveredMinSeq: minSeq,
+            coveredMaxSeq: maxSeq,
+          );
+        } catch (e) {
+          persistFailed = true;
+          debugPrint('[AliasAgent] persist summary failed: $e');
+        }
+      }
+      results.add(summary);
+    }
+    // Consume the dirty watermark ONLY if every stale span was re-summarized AND
+    // persisted in this pass. If any materialize write failed, the stale cached
+    // node is still on disk; clearing the watermark would make the next refold
+    // reuse it (dirtySince==0 short-circuits the reuse gate), hiding real
+    // staleness. So on a write failure we keep the watermark (recomputed next turn).
+    if (dbOpen && !persistFailed) {
+      try {
+        await _summaryNodeRepo.clearDirty(sessionId);
+      } catch (e) {
+        debugPrint('[AliasAgent] clear dirty watermark failed: $e');
+      }
+    }
+    return results;
+  }
+
+  /// Extract the summary text from a stored summary_json block document.
+  static String _summaryTextFromJson(String summaryJson) {
+    try {
+      final doc = jsonDecode(summaryJson) as Map<String, dynamic>;
+      final content = doc['content'] as List<dynamic>;
+      for (final block in content) {
+        final m = block as Map<String, dynamic>;
+        if (m['type'] == 'text') return (m['text'] as String?) ?? '';
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  /// Build the compacted projection: leading role:user summary-prefix messages
+  /// (one per level-1 segment, oldest → newest) followed by the near-verbatim
+  /// span replayed via [_buildApiMessages]. If the verbatim span starts on a user
+  /// turn, the LAST summary's marker+text is merged into that leading user
+  /// message to keep valid role alternation (user,user would violate the schema).
+  List<Map<String, dynamic>> _buildCompactionProjection(
+      List<SummaryResult> summaries, CompactionPlan plan,
+      List<Map<String, dynamic>> verbatim) {
+    final summarySegs =
+        plan.segments.where((s) => s.summary && s.messages.isNotEmpty).toList();
+    // Concatenate ALL summary segments into a SINGLE role:user prefix message
+    // (one text block per segment, each with its own marker). This guarantees the
+    // projection never emits consecutive role:user messages — DeepSeek does NOT
+    // document same-role merging, so user,user would be fragile — keeping
+    // role alternation valid.
+    final summaryBlocks = <Map<String, dynamic>>[];
+    for (var i = 0; i < summaries.length; i++) {
+      final count = i < summarySegs.length ? summarySegs[i].messages.length : summaries.length;
+      summaryBlocks.add({
+        'type': 'text',
+        'text': buildSummaryContent(result: summaries[i], foldedCount: count),
+      });
+    }
+    final out = <Map<String, dynamic>>[];
+    if (summaryBlocks.isNotEmpty) {
+      if (verbatim.isNotEmpty && verbatim.first['role'] == 'user') {
+        // Merge the summary blocks into the leading user message (preserves the
+        // current user's text; avoids a leading user,user when the safe boundary
+        // lands on a real user text).
+        final content = (verbatim.first['content'] as List<Map<String, dynamic>>);
+        content.insertAll(0, summaryBlocks);
+        out.addAll(verbatim);
+      } else {
+        out.add({'role': 'user', 'content': summaryBlocks});
+        out.addAll(verbatim);
+      }
+    } else {
+      out.addAll(verbatim);
+    }
+    return out;
   }
 
   /// Build API conversation messages from persisted Message objects,

@@ -19,11 +19,11 @@ static bool s_done_called = false;
 static int s_done_code = 0;
 static std::string s_done_err;
 
-static void s_done_nop(int, const char*, const char*) {
+static void s_done_nop(int, const char*, const char*, int, int) {
     // no-op callback
 }
 
-static void s_done_capture(int c, const char* e, const char*) {
+static void s_done_capture(int c, const char* e, const char*, int, int) {
     s_done_called = true;
     s_done_code = c;
     s_done_err = e ? e : "";
@@ -348,9 +348,40 @@ TEST_CASE("HTTP: thinking disabled when mode is not adaptive", "[http_client][th
     server.join();
 
     auto body = json::parse(server.last_body());
-    REQUIRE(!body.contains("thinking"));
+    // "disabled" mode MUST explicitly send thinking.type="disabled" (DeepSeek
+    // /v1/messages defaults thinking to enabled, so absence is NOT a disable).
+    REQUIRE(body.contains("thinking"));
+    REQUIRE(body["thinking"]["type"] == "disabled");
     REQUIRE(!body.contains("output_config"));
     REQUIRE(body["max_tokens"] == 4096);
+}
+
+// Summary-profile request (compaction): thinking disabled + max_tokens capped at
+// 1024 (overrides the 4096 non-adaptive default). Spec: "Summary profile caps
+// max_tokens — max_tokens is 512-1024, overriding the 4096 non-adaptive default."
+TEST_CASE("HTTP: summary profile caps max_tokens", "[http_client][thinking]") {
+    MockServer server;
+    server.start(fixture("text_delta.txt"));
+    server.wait_ready();
+
+    ModelGateway gw;
+    gw.set_timeout(5);
+
+    gw.execute(
+        "sk-key", server.base_url().c_str(), "claude-sonnet-4-6",
+        "", VALID_MSG, "",
+        "summary", "",
+        nullptr, nullptr, nullptr, s_done_nop
+    );
+    server.join();
+
+    auto body = json::parse(server.last_body());
+    // Thinking must be EXPLICITLY disabled (DeepSeek defaults to enabled) ->
+    // thinking.type == "disabled", not merely absent.
+    REQUIRE(body.contains("thinking"));
+    REQUIRE(body["thinking"]["type"] == "disabled");
+    REQUIRE(!body.contains("output_config"));
+    REQUIRE(body["max_tokens"] == 1024);         // within the 512-1024 window
 }
 
 TEST_CASE("HTTP: thinking disabled with empty mode string", "[http_client][thinking]") {
@@ -370,7 +401,8 @@ TEST_CASE("HTTP: thinking disabled with empty mode string", "[http_client][think
     server.join();
 
     auto body = json::parse(server.last_body());
-    REQUIRE(!body.contains("thinking"));
+    REQUIRE(body.contains("thinking"));
+    REQUIRE(body["thinking"]["type"] == "disabled");
     REQUIRE(body["max_tokens"] == 4096);
 }
 
@@ -409,7 +441,8 @@ TEST_CASE("HTTP: max_tokens 16000 when thinking enabled, 4096 when disabled", "[
         server.join();
         auto body = json::parse(server.last_body());
         REQUIRE(body["max_tokens"] == 4096);
-        REQUIRE(!body.contains("thinking"));
+        REQUIRE(body.contains("thinking"));
+        REQUIRE(body["thinking"]["type"] == "disabled");
     }
 }
 

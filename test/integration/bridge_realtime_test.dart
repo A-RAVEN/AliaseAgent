@@ -111,7 +111,7 @@ void main() {
         onChunk: (_) {},
         onToolCall: (_) {},
         onThinking: (json) => deltas.add(json),
-        onDone: (code, err, stop) {
+        onDone: (code, err, stop, _, __) {
           if (!done.isCompleted) done.complete();
         },
       );
@@ -147,7 +147,7 @@ void main() {
         thinkingEffort: '',
         onChunk: (_) {},
         onToolCall: (_) {},
-        onDone: (code, err, stop) {
+        onDone: (code, err, stop, _, __) {
           doneCount++;
           doneCode = code;
         },
@@ -188,7 +188,7 @@ void main() {
         onChunk: (_) {},
         onToolCall: (_) {},
         onThinking: (_) {},
-        onDone: (code, err, stop) {
+        onDone: (code, err, stop, _, __) {
           doneCode = code;
           doneErr = err;
           if (!done.isCompleted) done.complete();
@@ -234,7 +234,7 @@ void main() {
         thinkingEffort: '',
         onChunk: (_) {},
         onToolCall: (_) {},
-        onDone: (code, err, stop) => order.add('A'),
+        onDone: (code, err, stop, _, __) => order.add('A'),
       );
       await Future.delayed(const Duration(milliseconds: 200));
       final reqB = bridge.sendMessage(
@@ -248,7 +248,7 @@ void main() {
         thinkingEffort: '',
         onChunk: (_) {},
         onToolCall: (_) {},
-        onDone: (code, err, stop) => order.add('B'),
+        onDone: (code, err, stop, _, __) => order.add('B'),
       );
 
       await reqA.timeout(const Duration(seconds: 10));

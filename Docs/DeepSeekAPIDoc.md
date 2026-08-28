@@ -1,6 +1,7 @@
 # DeepSeek API 参考文档
 
 > **抓取时间**: 2026-05-24（2026-08-02 更新：补充 Thinking Mode 指南，来源 WebFetch 官方页面）
+> **2026-08-26 实测修正**: 本地 live 探测 `POST https://api.deepseek.com/anthropic/v1/messages` 证实 `thinking.type=disabled` 在 Anthropic `/v1/messages` 端点禁用思考有效；`reasoning.effort=none` 在该端点不生效（属 OpenAI/chat-completions 字段）。详见 §2.5 标注。
 > **来源**: [DeepSeek API 官方文档](https://api-docs.deepseek.com/zh-cn/)
 
 ---
@@ -161,25 +162,28 @@ DeepSeek 提供 Anthropic API 格式支持，base_url 为 `https://api.deepseek.
 ### 2.5 Thinking Mode 指南（Anthropic 格式，2026-08-02 抓取）
 
 来源: https://api-docs.deepseek.com/guides/thinking_mode/
+（2026-08-26 实测修正）本地 live 探测 `POST https://api.deepseek.com/anthropic/v1/messages`（model `deepseek-v4-pro`，同一消息、3 种字段配置）证实：**禁用开关在 Anthropic `/v1/messages` 端点上用 `{"thinking":{"type":"disabled"}}`，实测关闭思考（响应无 thinking block）；`reasoning.effort=none` 在该端点不关闭思考（仍返回 reasoning block）**。原文档 L167-171 把 `reasoning.effort=none` 标为 Anthropic 格式开关，实际仅适用于 OpenAI/chat-completions 路径。
 
 #### 控制参数（Anthropic 格式）
 
-**Thinking 开关**（`none` 禁用思考模式）：
+**Thinking 开关**（对 `/v1/messages` 端点实测有效的禁用）：
 
 ```json
-{"reasoning": {"effort": "none/low/high/max"}}
+{"thinking": {"type": "enabled/disabled"}}
 ```
 
-**思考强度**：
+**思考强度**（对 `/v1/messages` 端点）：
 
 ```json
 {"output_config": {"effort": "low/high/max"}}
 ```
 
+> `reasoning.effort`（`none/low/high/max`）与 `reasoning_effort`、`temperature`、`top_p`、`frequency_penalty` 等属于 OpenAI/chat-completions 路径参数，在 `/v1/messages` 端点上**不生效**（实测 `reasoning.effort="none"` 未关闭思考）。思考强度在 `/v1/messages` 端点上控制字段是 `output_config.effort`（`low/high/max`，见上）。
+
 #### 默认行为
 
-- **Thinking 默认启用**，默认 effort 为 `high`
-- Thinking 模式下不支持 `temperature`、`top_p`、`presence_penalty`、`frequency_penalty`——设置不会报错但**不生效**
+- **Thinking 默认启用**，默认 effort 为 `high`（故不发送 `thinking` 字段时默认开启思考——实测场景 C 响应含 thinking block，TEXT LEN≈95）
+- 禁用思考时须显式发送 `{"thinking":{"type":"disabled"}}`（否则/缺省都为开启状态）
 
 #### Effort 映射表（请求值 → 实际映射值）
 
@@ -200,9 +204,10 @@ DeepSeek 提供 Anthropic API 格式支持，base_url 为 `https://api.deepseek.
 
 #### OpenAI 格式等价参数
 
-- 开关: `{"thinking": {"type": "enabled/disabled"}}`
+- 开关: `{"thinking": {"type": "enabled/disabled"}}`（OpenAI 路径亦用此字段名）
 - 强度: `{"reasoning_effort": "low/high/max"}`
 - OpenAI SDK 中 `thinking` 参数必须放在 `extra_body` 中传递，如 `extra_body={"thinking": {"type": "enabled"}}`
+- 注意：`thinking.type` 在 **Anthropic `/v1/messages`（实测有效）** 和 **OpenAI/chat-completions（文档记载）** 两处均为有效字段；但 `reasoning.effort` / `reasoning_effort` 仅 OpenAI 路径有效，`/v1/messages` 上的强度控制字段是 `output_config.effort`。项目实际走 `https://api.deepseek.com/anthropic`（Anthropic 路径），故禁用用 `{"thinking":{"type":"disabled"}}`。
 
 > **注意**：DeepSeek 官方文档（anthropic_api 指南 + thinking_mode 指南）均未记载 `thinking.type="adaptive"`、`display`、`summarized` 字段。本项目实现发送 `{"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"..."}}`（Anthropic 原生 adaptive 格式）——live 实测被端点接受并返回完整 thinking 流（thinking_delta 增量），但该格式无 DeepSeek 官方文档依据，仅 `output_config.effort` 有文档确认。
 

@@ -17,12 +17,14 @@ class SetupDialog extends StatefulWidget {
 
 class _SetupDialogState extends State<SetupDialog> {
   final _keyController = TextEditingController();
+  final _contextTokensController = TextEditingController();
   String? _error;
   bool _saving = false;
 
   @override
   void dispose() {
     _keyController.dispose();
+    _contextTokensController.dispose();
     super.dispose();
   }
 
@@ -33,9 +35,16 @@ class _SetupDialogState extends State<SetupDialog> {
       return;
     }
 
+    final tokensText = _contextTokensController.text.trim();
+    final maxContextTokens = int.tryParse(tokensText);
+    if (tokensText.isEmpty || maxContextTokens == null || maxContextTokens <= 0) {
+      setState(() => _error = 'Please enter a valid max context token count (a positive integer)');
+      return;
+    }
+
     setState(() => _saving = true);
 
-    final config = _buildDefaultConfig(key);
+    final config = _buildDefaultConfig(key, maxContextTokens);
     if (widget.saveConfig != null) {
       widget.saveConfig!(config);
     } else {
@@ -45,7 +54,7 @@ class _SetupDialogState extends State<SetupDialog> {
     widget.onComplete();
   }
 
-  AppConfig _buildDefaultConfig(String apiKey) {
+  AppConfig _buildDefaultConfig(String apiKey, int maxContextTokens) {
     return AppConfig(
       version: 1,
       providers: {
@@ -61,6 +70,7 @@ class _SetupDialogState extends State<SetupDialog> {
           model: 'claude-sonnet-4-6',
           systemPrompt: 'You are a helpful assistant.',
           tools: ['read_file', 'list_dir'],
+          maxContextTokens: maxContextTokens,
         ),
       },
     );
@@ -85,6 +95,18 @@ class _SetupDialogState extends State<SetupDialog> {
               hintText: 'sk-ant-...',
               border: const OutlineInputBorder(),
               errorText: _error,
+            ),
+            enabled: !_saving,
+          ),
+          const SizedBox(height: 16),
+          TextField(
+            controller: _contextTokensController,
+            keyboardType: const TextInputType.numberWithOptions(decimal: false),
+            decoration: InputDecoration(
+              labelText: 'Max Context Tokens',
+              hintText: 'e.g. 200000',
+              helperText: 'Compaction threshold (one-time setting)',
+              border: const OutlineInputBorder(),
             ),
             enabled: !_saving,
           ),

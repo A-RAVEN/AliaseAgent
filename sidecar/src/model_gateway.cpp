@@ -109,6 +109,11 @@ struct ModelGateway::Impl {
   std::map<int, PendingThinking> pending_thinking;
   // stop_reason from message_delta, carried into DONE events
   std::string last_stop_reason;
+  // Measured usage carried into DONE events (field dialect [UNVERIFIED]:
+  // Anthropic-format /v1/messages uses input_tokens/output_tokens; the sidecar
+  // parses whichever token-count field the endpoint returns, defaulting to 0).
+  int last_input_tokens = 0;
+  int last_output_tokens = 0;
 
   int request_id = 0;
   static std::atomic<int> next_request_id;
@@ -277,6 +282,25 @@ static size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdat
           }
           else if (type == "message_start") {
             LOG_TRACE("SSE: message_start");
+            // Usage may ride on message_start (input_tokens). Defensive parse —
+            // read whichever token-count field the endpoint returns ([UNVERIFIED]).
+            // The start event normally carries only input_tokens; output_tokens
+            // typically arrives on message_delta.
+            if (ev.contains("message") && ev["message"].is_object() &&
+                ev["message"].contains("usage") &&
+                ev["message"]["usage"].is_object()) {
+              auto& usage = ev["message"]["usage"];
+              if (usage.contains("input_tokens")) {
+                impl->last_input_tokens = usage.value("input_tokens", 0);
+              } else if (usage.contains("prompt_tokens")) {
+                impl->last_input_tokens = usage.value("prompt_tokens", 0);
+              }
+              if (usage.contains("output_tokens")) {
+                impl->last_output_tokens = usage.value("output_tokens", 0);
+              } else if (usage.contains("completion_tokens")) {
+                impl->last_output_tokens = usage.value("completion_tokens", 0);
+              }
+            }
           }
           else if (type == "content_block_stop") {
             int idx = ev.value("index", -1);
@@ -324,6 +348,20 @@ static size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdat
             if (ev.contains("delta") && ev["delta"].contains("stop_reason")) {
               impl->last_stop_reason = ev["delta"]["stop_reason"];
             }
+            // Usage rides on message_delta (output_tokens). Defensive parse.
+            if (ev.contains("usage") && ev["usage"].is_object()) {
+              auto& usage = ev["usage"];
+              if (usage.contains("output_tokens")) {
+                impl->last_output_tokens = usage.value("output_tokens", 0);
+              } else if (usage.contains("completion_tokens")) {
+                impl->last_output_tokens = usage.value("completion_tokens", 0);
+              }
+              if (usage.contains("input_tokens")) {
+                impl->last_input_tokens = usage.value("input_tokens", 0);
+              } else if (usage.contains("prompt_tokens")) {
+                impl->last_input_tokens = usage.value("prompt_tokens", 0);
+              }
+            }
             LOG_TRACE("SSE: message_delta stop_reason=" + impl->last_stop_reason);
           }
           else if (type == "ping") {
@@ -364,12 +402,22 @@ static bool http_status_ok(ModelGateway::Impl* impl) {
 static void dispatch_done(ModelGateway::Impl* impl, int code, const std::string& err,
                           const std::string& stop_reason) {
   impl->ffi_ring.push(FfiEventType::DONE, 0);
-  LOG_TRACE("FFI: on_done(code=" + std::to_string(code) + ")");
+  LOG_TRACE("FFI: on_done(code=" + std::to_string(code) +
+            " input=" + std::to_string(impl->last_input_tokens) +
+            " output=" + std::to_string(impl->last_output_tokens) + ")");
   if (!impl->on_done) return;
+  // stop_reason may bind to a TEMPORARY std::string (error/cancel paths pass the
+  // literal ""), so .c_str() dangles as soon as this statement ends — while the
+  // Dart NativeCallable.listener reads it asynchronously on the isolate event
+  // loop. Route it through the stable pending_strings pool (like err) so the
+  // pointer remains valid until the Dart isolate copies it.
+  const char* stop = stable_str(impl, std::string(stop_reason));
   if (err.empty()) {
-    impl->on_done(code, "", stop_reason.c_str());
+    impl->on_done(code, "", stop,
+                  impl->last_input_tokens, impl->last_output_tokens);
   } else {
-    impl->on_done(code, stable_str(impl, std::string(err)), stop_reason.c_str());
+    impl->on_done(code, stable_str(impl, std::string(err)), stop,
+                  impl->last_input_tokens, impl->last_output_tokens);
   }
 }
 
@@ -431,7 +479,7 @@ int ModelGateway::execute(
 
   if (!impl_->curl) {
     LOG_ERR("CURL handle not initialized");
-    if (on_done) on_done(-1, "Internal error: CURL not initialized", "");
+    if (on_done) on_done(-1, "Internal error: CURL not initialized", "", 0, 0);
     return -1;
   }
 
@@ -453,6 +501,8 @@ int ModelGateway::execute(
   impl_->raw_body.clear();
   impl_->done_dispatched = false;
   impl_->last_stop_reason.clear();
+  impl_->last_input_tokens = 0;
+  impl_->last_output_tokens = 0;
   impl_->pending_thinking.clear();
   impl_->pending_tool_uses.clear();
   impl_->partial_jsons.clear();
@@ -471,13 +521,22 @@ int ModelGateway::execute(
   body["model"] = model;
   body["stream"] = true;
 
-  // Thinking format (unified for DeepSeek + Anthropic):
-  // Per DeepSeek official docs (api-docs.deepseek.com/guides/anthropic_api/):
-  //   thinking      | Supported (`budget_tokens` is ignored)
-  //   output_config | Only `effort` is supported
-  // So the ONLY effective thinking control is output_config.effort.
-  // Anthropic's adaptive thinking (platform.claude.com/docs/en/build-with-claude/extended-thinking)
-  // uses the same shape: thinking.type="adaptive" + output_config.effort.
+  // Thinking on/off + intensity (unified for DeepSeek /v1/messages, Anthropic format).
+  // Docs/DeepSeekAPIDoc.md §2.5 "Thinking Mode（Anthropic 格式）":
+  //   thinking.type        | ON/OFF switch: "enabled" | "disabled" — per §2.5 documented
+  //                          switch. Our code also sends "adaptive" for the interactive
+  //                          path (project/live-verified usage; §2.5 does NOT document
+  //                          adaptive — see doc L212 note). Live-verified 2026-08-26:
+  //                          thinking.type="disabled" turns thinking OFF; the endpoint
+  //                          DEFAULTS thinking to enabled (default effort high), so
+  //                          ABSENCE is NOT a disable — we must explicitly send it (see
+  //                          summary + else branches).
+  //   output_config.effort | intensity ONLY (low/high/max), NOT the on/off switch.
+  //   reasoning.effort / reasoning_effort | chat/completions only; NO effect on
+  //                          /v1/messages (live-verified) — do not use for on/off here.
+  // Summary-profile request (compaction): thinking.type="disabled" + a small
+  // max_tokens window (1024) — summarization only, never the interactive 16K path.
+  const bool summary_mode = (thinking_mode && std::string(thinking_mode) == "summary");
   const bool thinking_enabled = (thinking_mode && std::string(thinking_mode) == "adaptive");
   if (thinking_enabled) {
     body["thinking"]["type"] = "adaptive";
@@ -487,7 +546,22 @@ int ModelGateway::execute(
     }
     body["max_tokens"] = 16000;
     LOG_INFO("Thinking: adaptive, effort=" + std::string(thinking_effort ? thinking_effort : "default"));
+  } else if (summary_mode) {
+    // Summary profile: thinking.type="disabled" + capped output. Overrides the
+    // 4096 default. DeepSeek's /v1/messages endpoint DEFAULTS thinking to enabled
+    // (Docs/DeepSeekAPIDoc.md §2.5 "默认行为": Thinking 默认启用, 默认 effort high — this
+    // is the §2.5 prose, NOT a field-table line; §3.1 line ~228 is chat/completions),
+    // so absence is NOT a disable — without thinking.type="disabled" the summary
+    // burns its 1024-token budget on reasoning.
+    body["thinking"]["type"] = "disabled";
+    body["max_tokens"] = 1024;
+    LOG_INFO("Summary profile: thinking disabled, max_tokens=1024");
   } else {
+    // Interactive "disabled" path (agent has no / invalid thinkingEffort).
+    // DeepSeek's Anthropic-format endpoint DEFAULTS thinking to enabled, so
+    // absence is NOT a disable — we must explicitly send thinking.type="disabled"
+    // or the model silently reasons. (R3-1: R1-1 only patched the summary branch.)
+    body["thinking"]["type"] = "disabled";
     body["max_tokens"] = 4096;
     LOG_INFO("Thinking: disabled");
   }
@@ -500,7 +574,7 @@ int ModelGateway::execute(
     body["messages"] = json::parse(messages_json);
   } catch (const json::parse_error& e) {
     LOG_ERR("Failed to parse messages_json: " + std::string(e.what()));
-    if (on_done) on_done(-1, "Invalid messages JSON", "");
+    if (on_done) on_done(-1, "Invalid messages JSON", "", 0, 0);
     return -1;
   }
 
@@ -509,7 +583,7 @@ int ModelGateway::execute(
       body["tools"] = json::parse(tools_json);
     } catch (const json::parse_error& e) {
       LOG_ERR("Failed to parse tools_json: " + std::string(e.what()));
-      if (on_done) on_done(-1, "Invalid tools JSON", "");
+      if (on_done) on_done(-1, "Invalid tools JSON", "", 0, 0);
       return -1;
     }
   }
