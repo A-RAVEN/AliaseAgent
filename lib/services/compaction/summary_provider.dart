@@ -29,13 +29,29 @@ abstract class SummaryProvider {
     required List<Message> folded,
     required AgentTypeConfig config,
   });
+
+  /// Produce a 2-pass "summary of summaries": summarize the already-produced
+  /// [text] (the joined level-1 summary texts) into a coarser level-2 summary.
+  Future<SummaryResult> summarizeText({
+    required String text,
+    required AgentTypeConfig config,
+  });
 }
 
-/// Marker prepended to a summary message so it is clearly non-user speech.
+/// Marker prepended to a level-1 summary message so it is clearly non-user
+/// speech.
 const String kSummaryMarker = '## 更早上下文(压缩xN,非用户发言)';
 
+/// Marker prepended to a level-2 "summary of summaries" message.
+const String kLevel2SummaryMarker = '## 更早上下文(压缩xN,层级2,非用户发言)';
+
 /// Build the role:user plain-text summary message content from a provider
-/// result + the number of folded messages.
-String buildSummaryContent({required SummaryResult result, required int foldedCount}) {
-  return '$kSummaryMarker\n\n${result.text}';
+/// result + the number of folded messages. [level] (1 or 2) selects the marker.
+String buildSummaryContent({
+  required SummaryResult result,
+  required int foldedCount,
+  int level = 1,
+}) {
+  final marker = level >= 2 ? kLevel2SummaryMarker : kSummaryMarker;
+  return '$marker\n\n${result.text}';
 }

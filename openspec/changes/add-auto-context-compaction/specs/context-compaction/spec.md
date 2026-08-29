@@ -18,7 +18,7 @@ The system SHALL keep the API request's total context within a configurable budg
 - **THEN** the app surfaces a setup prompt (like a missing apiKey); this is a one-time configuration, not per-turn management
 
 ### Requirement: Recency-gradient hierarchical compaction
-The system SHALL compress the conversation as a hierarchy: recent turns kept verbatim, medium-distance turns replaced by per-segment summaries, and farthest turns by summaries of summaries. The recency gradient SHALL be a deterministic function of history + config.
+The system SHALL compress the conversation as a hierarchy: recent turns kept verbatim, medium-distance turns replaced by per-segment summaries, and farthest turns by summaries of summaries. The recency gradient SHALL be a deterministic function of history + config, where the set of already-closed segments (delimited boundaries) is a fixed input that is never re-derived or re-shaped (progressive closure — see Segment closure and summary immutability).
 
 #### Scenario: Recent verbatim
 - **WHEN** the conversation exceeds the budget
@@ -72,12 +72,20 @@ The compressed summary SHALL be a plain role:user text message, clearly marked a
 - **WHEN** a fold produces a summary
 - **THEN** it contains no fabricated tool_use, tool_result, or thinking blocks
 
-### Requirement: Original conversation retained on disk
-The system SHALL keep the full original conversation in SQLite; the compaction tree SHALL be a derived index, and no original message SHALL be deleted or overwritten by compaction.
+### Requirement: Original conversation retained on disk (immutable)
+The system SHALL keep the full original conversation in SQLite, and SHALL persist BOTH the level-1 per-segment summaries AND the level-2 "summary of summaries" as immutable derived data in `summary_nodes` (keyed by level). The compaction tree SHALL be a derived index; no original message and no persisted summary SHALL be deleted or overwritten by compaction. Omitting a segment from the API PROJECTION (not sending it to the model) is a projection decision ONLY and SHALL NEVER delete the underlying data: originals and summaries remain persisted and re-expandable.
 
 #### Scenario: Originals preserved
 - **WHEN** compaction folds a segment
 - **THEN** the original messages remain in the messages table, unchanged
+
+#### Scenario: Summaries persisted (level-1 and level-2)
+- **WHEN** a segment is folded to a level-1 summary, or level-1 summaries are rolled up to a level-2 summary
+- **THEN** the summary is stored in summary_nodes with its level, unchanged, and is never deleted by later compaction
+
+#### Scenario: Omitting from projection never deletes data
+- **WHEN** the coarsest (level-2) summary alone still exceeds the budget and the oldest content is omitted from the request projection
+- **THEN** that content is simply not sent to the model; the original messages and all summaries remain persisted on disk and can be re-expanded on demand
 
 #### Scenario: Re-expand path
 - **WHEN** a summary is not detailed enough
@@ -98,6 +106,21 @@ The system SHALL fold segments in the background, idle-gated and preemptible: fo
 - **WHEN** a fold completes
 - **THEN** the summary node is written to summary_nodes and tree_version is bumped in a single transaction
 
+### Requirement: Segment closure and summary immutability
+The system SHALL treat a conversation segment delimited by two cut markers as a fixed, immutable unit of history. A closed segment's summary SHALL be computed once, persisted, and reused on every subsequent turn — never re-summarized. Segment closure SHALL be progressive: as the conversation grows, the system closes new segments only from the not-yet-closed tail; previously-closed segments are never re-opened or re-shaped, even if the budget would otherwise prefer a different partition.
+
+#### Scenario: Closed segment is frozen
+- **WHEN** a segment is delimited by two cut markers
+- **THEN** its content and its summary never change and are reused verbatim from the persisted node on all later turns
+
+#### Scenario: Progressive closure at the tail
+- **WHEN** new messages are appended to a growing conversation
+- **THEN** the system folds only the not-yet-closed tail into new closed segments; existing closed segments and their summaries remain untouched
+
+#### Scenario: Summary persisted once and reused
+- **WHEN** a segment is first closed
+- **THEN** its summary is materialized to summary_nodes exactly once and is reused (not regenerated) on every later turn
+
 ### Requirement: Near-zone oversized tool_result body elision
 For a recently-kept (verbatim) tool round whose tool_result content is extremely large, the system SHALL be permitted to elide the oversized BODY to a truncation marker plus a refetch record (path/byte/line range) while preserving the tool_use block, the tool_result placement, and the tool round structure. This is a documented near-zone exception to full-body replay; it never folds or splits the round, nor does it break tool_use/tool_result pairing.
 
@@ -110,10 +133,10 @@ For a recently-kept (verbatim) tool round whose tool_result content is extremely
 - **THEN** no tool_use/tool_result pair is folded or split, and the message remains valid alternation
 
 ### Requirement: Deterministic fold plan
-The system SHALL deterministically determine WHICH segments are eligible to fold, the budget, and the cover topology, as a pure function of history + config + proxy token sizes. LLM output SHALL only fill the content of already-chosen leaves; it SHALL NOT change which segments fold or the cover topology. (The singular LLM-assisted exception — selecting the seam within a chosen fold — is constrained to memoization, see Semantic boundary selection.)
+The system SHALL deterministically determine WHICH segments are eligible to fold, the budget, and the cover topology, as a pure function of history + config + proxy token sizes + the set of the already-closed segments (the persisted closed segmentation). Determinism means the same (history, config, closed-segmentation) yields the same fold plan; closed segments are fixed inputs, never re-derived or re-shaped (progressive closure). LLM output SHALL only fill the content of already-chosen leaves; it SHALL NOT change which segments fold or the cover topology. (The singular LLM-assisted exception — selecting the seam within a chosen fold — is constrained to memoization, see Semantic boundary selection.)
 
 #### Scenario: Deterministic which-segments-fold
-- **WHEN** the same history and config are provided twice
+- **WHEN** the same history, config, and closed-segmentation are provided twice
 - **THEN** both produce the same fold plan (same eligible segments, budget, cover topology)
 
 #### Scenario: LLM only fills chosen leaves

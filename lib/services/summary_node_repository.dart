@@ -49,14 +49,19 @@ class SummaryNodeRepository {
     SummaryNode? inserted;
     await db.transaction((txn) async {
       // UPSERT: a covered span must have EXACTLY ONE current row (D9 dense
-      // non-overlap). Delete any prior row covering the same (covered_min_seq,
-      // covered_max_seq) before inserting, so re-materialization (dirty-seq
-      // recompute) never accumulates duplicate spans and findCovering returns the
-      // freshest, not the oldest. (R0-H-BUG — minimal defensive contract.)
+      // non-overlap). Delete any prior row covering the same
+      // (level, covered_min_seq, covered_max_seq) before inserting, so
+      // re-materialization (dirty-seq recompute) never accumulates duplicate
+      // spans and findCovering returns the freshest, not the oldest. (R0-H-BUG —
+      // load-bearing: this delete-before-insert IS the operative guarantee of
+      // covered dense non-overlap, since the table has NO UNIQUE constraint on
+      // covered_min/max_seq. It is a documented real-bug fix, not a defensive
+      // nicety.) `level` is included so a level-2 node never deletes a level-1
+      // node that shares the same covered span (see task 4.1 level-key note).
       await txn.delete(
         'summary_nodes',
-        where: 'session_id = ? AND covered_min_seq = ? AND covered_max_seq = ?',
-        whereArgs: [sessionId, coveredMinSeq, coveredMaxSeq],
+        where: 'session_id = ? AND level = ? AND covered_min_seq = ? AND covered_max_seq = ?',
+        whereArgs: [sessionId, level, coveredMinSeq, coveredMaxSeq],
       );
       final row = <String, dynamic>{
         'session_id': sessionId,
@@ -108,13 +113,22 @@ class SummaryNodeRepository {
   }
 
   /// Find a summary node covering exactly the [startSeq, endSeq] span (leaf
-  /// coverage), if one exists.
-  Future<SummaryNode?> findCovering(String sessionId, int startSeq, int endSeq) async {
+  /// coverage), if one exists. Pass [level] to disambiguate when a level-2 node
+  /// shares a (covered_min, covered_max) span with a subsumed level-1 node
+  /// (task 4.1 level-key note).
+  Future<SummaryNode?> findCovering(
+      String sessionId, int startSeq, int endSeq, {int? level}) async {
     final db = await DatabaseService.database;
     final rows = await db.query(
       'summary_nodes',
-      where: 'session_id = ? AND covered_min_seq = ? AND covered_max_seq = ?',
-      whereArgs: [sessionId, startSeq, endSeq],
+      where: 'session_id = ? AND covered_min_seq = ? AND covered_max_seq = ?'
+          '${level != null ? ' AND level = ?' : ''}',
+      whereArgs: [
+        sessionId, startSeq, endSeq,
+        if (level != null) level,
+      ],
+      orderBy: 'level DESC', // coarsest (highest level) wins if level not specified
+      limit: 1,
     );
     return rows.isEmpty ? null : SummaryNode.fromRow(rows.first);
   }

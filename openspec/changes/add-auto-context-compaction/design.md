@@ -25,6 +25,9 @@ AliasAgent(Flutter 桌面 AI 对话应用,经 dart:ffi 调 C++ Sidecar,走 DeepS
 ## Decisions
 
 **D1 压缩形态 = 层级化摘要树 + recency 梯度**(非单一滚动摘要 / 非滑窗截断)。
+- **三层梯度(近详→远略)**:`[L2 大摘要(最旧)][L1 小摘要(中段)][原文(最新)]`——最新保留原文,中段逐段压成 L1 小摘要,最旧的多段 L1 再卷成一条 L2 "总结之总结"。**只做两级**(L1 + L2),**不引入 level-3**。
+- **coarsen-only(只并不拆)**:摘要只越并越大、绝不拆细、绝不把已摘要的重新放回原文。若连 L2 都超预算,则"省略最旧"(**投影不发给模型**),**绝不删数据**(见 D9)。
+- **边界归属(确定性骨架 + 唯一 LLM 缝)**:L1 段边界 = AI 挑话题缝(见 D5,方案A,唯一影响树形的 LLM 点,memo 化);**L1→L2 组边界 = 算术**(确定性,2026-08-29 用户决定"先尝试算术")——L2 按哪些 L1 分组完全由确定性算术规则决定,不调用 LLM。即"折哪些、几段、哪层、预算"纯函数,"L1 缝"留给 AI,"L2 组缝"是算术。
 - 理由:对数成本、粒度梯度(近详远略)、远端"总结之总结"保留决策链;外部 remnic LCM / hierarchical-context-ai-agent 验证。
 - 备选:单一滚动总结(简单但 O(N) 重写、粒度差)、滑窗截断(破坏完整性/丢失再执行钥匙)。
 
@@ -37,11 +40,14 @@ AliasAgent(Flutter 桌面 AI 对话应用,经 dart:ffi 调 C++ Sidecar,走 DeepS
 - **实测 usage**：DeepSeek `/v1/messages`(Anthropic 格式)usage 字段为 `input_tokens`/`output_tokens`（AnthropicAPIDoc.md:354/:372；**2026-08-26 live 验证已确认**，非 [UNVERIFIED]）。侧车防御性解析；`prompt_tokens`(:661)是 chat/completions 字段,不适用于 `/v1/messages`。实测 usage 写入 `Message.token_count`(task 1.3)作为**遥测记录 + 破平衡点回归(task 5.2)依据**，但**不回读驱动触发**（spec 要求 local estimator 触发；回读触发属返工 ⑤ (b) 的新增功能，默认不做）。
 - 必填(同 apiKey);`stop_reason: length` 不作触发(:328 语义含糊)。
 
-**D4 确定性:决策/执行分离 `buildTree(history, config, proxy_usage)` 纯函数 + `FakeSummarizer` seam**。
+**D4 确定性:决策/执行分离 `buildTree` 纯函数 + `FakeSummarizer` seam**。
 - **"哪些段该折 + 预算 + cover 拓扑"是纯函数**(确定性);LLM 只填"已定死叶子"的内容,不改变这些。**唯一的 LLM 影响树形点 = 边界缝(见 D5),被 memo 化约束为可复现**。测试断言树形/预算/耦合/边界,不断言措辞;后台物化 = 幂等缓存,materialize == buildTree。
+- **输入集含"已闭段"(见 D8 渐进封口)**:`buildTree(history, maxContextTokens, closedSegments)` 以已持久化的闭段边界作为**输入之一**(非内部可变状态),故仍为纯函数;确定性 = 同 (history, config, closedSegmentation) 产生同 fold plan,已闭段永不重塑。
 
 **D5 语义边界选 A(LLM 在安全候选点挑话题缝),memo 化保可复现**。
 - 结构安全切点可能拆开话题簇;A 把边界选择嵌入同一次摘要调用(边际成本小),memo 化(内容哈希 keyed)让重建/测试可复现。**它是"纯函数折叠计划"的唯一例外(只影响缝,不改'折哪些段'),且被 memo 化**。
+- **两道切分标记圈定一个"已闭段"**:AI 在安全候选点落下前后两道标记,标记之间的历史即闭段 — 其内容与摘要在闭段后固定(见 D8 闭段冻结)。
+- **❗实现偏差警告(仅边界缝;后续设计禁止引用错误实现)**:当前 Phase-1/2 代码(`_budgetSegments`,见任务 2.1/2.2/2.8)的**确定性骨架(折哪些段、几段、预算、cover)正确**(见 D4 纯函数);**仅"边界缝"这一处**用算术(方案C式:每~8条一刀+安全对齐),而**本决策选定 A**。故**该缝为唯一设计偏差/未满足点**,应由 4.3(方案A)修复;**骨架本身正确**。后续 Phase-3/4 实现与设计必须严格按方案 A(AI 在话题缝挑边界+memo 化)修缝,不得引用/基于此算术缝;spec "Semantic boundary selection (topic seams)" 是正确要求。
 - 备选:C(结构切+recency 兜底,简单但保留接缝丢细节)。
 
 **D-guard 不变量守卫(用户目标/验收标准/不变量永不塌缩)**。
@@ -55,15 +61,16 @@ AliasAgent(Flutter 桌面 AI 对话应用,经 dart:ffi 调 C++ Sidecar,走 DeepS
 **D7 压缩调用复用 `model_gateway`,用"摘要 profile"(关 thinking、`max_tokens` 512-1024、可选更便宜模型)**。
 - 同一 `/v1/messages` 端点,末端 user 消息追加 summarize 指令(参照 Claude Code `querySource:'compact'`)。
 
-**D8 后台折卷 idle-gated + 可抢占(request-id 定向)+ 断点续 + 事务原子落库**。
-- 单槽(模型路径);折卷与用户请求轮换共享、用户优先;`summary_nodes` 表事务写 + `tree_version` 递增(dirty-seq 标记失效,lazy 重折);materialize == buildTree。
-- **`materialize` 必须 UPSERT(不是裸 INSERT)**:同一事务内先删同 `(session_id, covered_min_seq, covered_max_seq)` 的旧行再插。否则同 span 因 staleness 重算时会叠重复行 → ①违反 D9「covered 稠密非重叠」②`findCovering` 无 ORDER BY 取 `rows.first`(=旧 stale 行)→ stale reuse。此即 2026-08-28 设计一致性审计抓到的真实缺陷(见附录 A)。
+**D8 后台折卷 idle-gated + 可抢占(request-id 定向)+ 断点续 + 事务原子落库 + 闭段冻结(渐进封口)**。
+- 单槽(模型路径);折卷与用户请求轮换共享、用户优先;`summary_nodes` 表事务写 + `tree_version` 递增;materialize == buildTree(后台路径=纯函数)。
+- **闭段冻结(progressive closure)**:某段被两道切分标记圈定后,其消息内容与摘要即固定为永久历史 — 摘要落库**一次**,此后逐轮从持久化节点**复用,绝不重新摘要**;dirty-seq 惰性重算**只作用于未封口的尾部**,已闭段不参与(其内容因工具轮已完结而不再被 `updateToolCalls` 触及)。`buildTree` 因此是**渐进封口**的纯函数:读入已持久化的闭段边界作为输入,只对未闭尾部决定"再封几段",绝不重塑已闭段。**注:当前 reuse-gate(复用闸门)尚无显式"已闭段强制命中缓存"逻辑——这是 tasks ⑨ 要实现的落点此处为设计目标,非现状。**
+- **`materialize` 必须 UPSERT(不是裸 INSERT)**:同一事务内先删同 `(session_id, covered_min_seq, covered_max_seq)` 的旧行再插。否则同 span 因 staleness 重算时会叠重复行 → ①违反 D9「covered 稠密非重叠」②`findCovering` 无 ORDER BY 取 `rows.first`(=旧 stale 行)→ stale reuse。此即 2026-08-28 设计一致性审计抓到的真实缺陷(见附录 A)。**渐进封口只关闭了"已闭段重复写"的常见触发路径;UPSERT 仍是 load-bearing(承载性)的——任何发生在未闭尾部/预算变化/dirty 尾部的重算都可能对同 span 再次 materialize,必须"先删旧行再插"才能维持 D9 稠密非重叠 + `findCovering` 取最新。不得弱化为"纯防御/可能不触发"。**
 - 注意:串行化的**只是模型路径**,web_search/web_fetch 在独立 worker isolate(不可与用户模型请求并发但工具/网络路径未被门控)。
 
 **D9 存储:seq 全序 + `summary_nodes` 树 + 派生索引**。
 - `messages` 加 `seq INTEGER`(autoincrement)+ `(session_id, seq)` 索引;树边界用 `(session_id, start_seq, end_seq)`,不用 UUID。
-- `summary_nodes`:(session_id, level, start_seq, end_seq, node_type, parent_id, summary_json, token_cost, summary_prompt_version, model, covered_min_seq, covered_max_seq);`summary_json`(role blocks)非单段 text;covered_min/max **稠密非重叠**(由 `materialize` 的 UPSERT 保证——同 span 先删旧行再插,见 D8);+ `leaf_owner` 平面索引;parent_id 仅导航;**parent 导航逻辑属 Phase-3 level-2 成树后行为,当前 DEFERRED**(列已铺、行为未落地);memo 化摘要(content hash + prompt version + model)。
-- 原始 `messages` 表逐字保留;树节点按需展开路径由 harness 注入(非 agent 工具)。
+- `summary_nodes`:(session_id, level, start_seq, end_seq, node_type, parent_id, summary_json, token_cost, summary_prompt_version, model, covered_min_seq, covered_max_seq);`summary_json`(role blocks)非单段 text;covered_min/max **稠密非重叠**(由 `materialize` 的 UPSERT 保证——**load-bearing**,任何重算都必须"先删旧行再插",见 D8);+ `leaf_owner` 平面索引;parent_id 仅导航;**parent 导航逻辑属 Phase-3 level-2 成树后行为,当前 DEFERRED**(列已铺、行为未落地);memo 化摘要(content hash + prompt version + model)。**闭段的 `covered_min/max_seq` 即其两道切分标记,持久化后驱动后续复用的"冻结"判定。**
+- 原始 `messages` 表逐字保留;树节点按需展开路径由 harness 注入(非 agent 工具)。**三层皆不可变持久化**:原文(消息表)+ L1 小摘要 + L2 大摘要都作为稳定数据落盘,永不删除;"**省略最旧**"仅是**投影决定**(这次不发给模型),**绝不等于删除数据**——被省略的内容仍在磁盘,将来可由 harness/agent 的 **re-expand 机制**(本轮不实现,仅占位)从磁盘重新展开。**禁止把"省略/丢弃"实现为删库/删行。**
 
 **D10 便宜层优先 + 折卷预算**。
 - 先用 DeepSeek prompt-caching(user_id,:241)+ **对远端采用"已存在的更粗摘要层"**(不是直接裁剪、不丢决策/再执行钥匙)作为便宜层;近端超大 `tool_result` **正文**(非工具对)允许轮内裁剪为"截断标记 + 再取记录"(保住 tool_use 块与工具对,不折叠该轮);LLM 树仅长会话升级。每会话折卷次数/token 上限 + 破平衡点回归(折卷 input ≪ 每请求省下 input)。

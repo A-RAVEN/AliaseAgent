@@ -738,8 +738,9 @@ class ChatScreenState extends State<ChatScreen> {
     final maxContextTokens = agentType.maxContextTokens ?? 0;
     final List<Map<String, dynamic>> apiMessages;
     if (maxContextTokens > 0) {
+      final closed = await _loadClosedSegments(sessionId);
       final plan = CompactionEngine.buildTree(
-          history: messages, maxContextTokens: maxContextTokens);
+          history: messages, maxContextTokens: maxContextTokens, closed: closed);
       if (plan.shouldCompact) {
         List<SummaryResult> summaries;
         try {
@@ -1183,6 +1184,90 @@ class ChatScreenState extends State<ChatScreen> {
   /// does NOT re-invoke the LLM), else generate via [_summaryProvider] and
   /// best-effort persist it to summary_nodes (background-folding reuse). The
   /// persistence write is transactional re: tree_version.
+  /// Read the session's CLOSED (frozen) summary segments from summary_nodes so
+  /// buildTree can do progressive closure — only fold the unclosed tail, never
+  /// re-open or re-shape a closed segment (⑨). Returns a non-overlapping set
+  /// sorted by span (D9 dense non-overlap), cheapest-first priority on coarser
+  /// nodes is refined by Phase-4 frontier logic; here we just avoid overlap.
+  Future<List<ClosedSummary>> _loadClosedSegments(String sessionId) async {
+    if (!DatabaseService.isOpen) return const [];
+    try {
+      final nodes = await _summaryNodeRepo.queryBySession(sessionId);
+      final sorted = nodes
+          .where((n) =>
+              n.level >= 1 &&
+              n.summaryJson != null &&
+              n.coveredMinSeq > 0)
+          .toList()
+        ..sort((a, b) => a.coveredMaxSeq - b.coveredMaxSeq);
+      final picked = <ClosedSummary>[];
+      var lastMax = 0;
+      for (final n in sorted) {
+        if (n.coveredMinSeq > lastMax) {
+          picked.add(ClosedSummary(
+            level: n.level,
+            coveredMinSeq: n.coveredMinSeq,
+            coveredMaxSeq: n.coveredMaxSeq,
+            tokenCost: n.tokenCost ?? 0,
+          ));
+          lastMax = n.coveredMaxSeq;
+        }
+      }
+      return picked;
+    } catch (e) {
+      debugPrint('[AliasAgent] closed segments load failed: $e');
+      return const [];
+    }
+  }
+
+  /// Fetch or produce the level-1 summary TEXT for a sub-span [msgs] (used by the
+  /// 2-pass level-2 "summary of summaries"): reuse the persisted level-1 node if
+  /// present & not stale, else summarize the span and best-effort persist level-1.
+  Future<String> _l1SummaryText(String sessionId, bool dbOpen, int dirtySince,
+      List<Message> msgs, AgentTypeConfig agentType) async {
+    if (msgs.isEmpty) return '';
+    final minSeq = msgs.first.seq;
+    final maxSeq = msgs.last.seq;
+    if (dbOpen && minSeq != null && maxSeq != null) {
+      try {
+        final node = await _summaryNodeRepo.findCovering(sessionId, minSeq, maxSeq, level: 1);
+        if (node != null && node.summaryJson != null &&
+            (dirtySince == 0 || node.coveredMaxSeq < dirtySince)) {
+          final t = _summaryTextFromJson(node.summaryJson!);
+          if (t.isNotEmpty) return t;
+        }
+      } catch (e) {
+        debugPrint('[AliasAgent] L1 sub-span reuse failed: $e');
+      }
+    }
+    final s = await _summaryProvider.summarize(folded: msgs, config: agentType);
+    if (dbOpen && minSeq != null && maxSeq != null) {
+      try {
+        await _summaryNodeRepo.materialize(
+          sessionId: sessionId,
+          level: 1,
+          startSeq: minSeq,
+          endSeq: maxSeq,
+          nodeType: 'summary',
+          summaryJson: jsonEncode({
+            'role': 'user',
+            'content': [
+              {'type': 'text', 'text': s.text},
+            ],
+          }),
+          tokenCost: s.tokens,
+          summaryPromptVersion: 1,
+          model: agentType.model,
+          coveredMinSeq: minSeq,
+          coveredMaxSeq: maxSeq,
+        );
+      } catch (e) {
+        debugPrint('[AliasAgent] L1 sub-span persist failed: $e');
+      }
+    }
+    return s.text;
+  }
+
   Future<List<SummaryResult>> _resolveSummaries(
       String sessionId, CompactionPlan plan, AgentTypeConfig agentType) async {
     final results = <SummaryResult>[];
@@ -1204,9 +1289,43 @@ class ChatScreenState extends State<ChatScreen> {
       if (!seg.summary || seg.messages.isEmpty) continue;
       final minSeq = seg.messages.first.seq;
       final maxSeq = seg.messages.last.seq;
+
+      // A CLOSED (frozen) segment must ALWAYS cache-hit its persisted summary —
+      // never re-summarized, regardless of the dirty watermark (spec "Segment
+      // closure and summary immutability" / D8 progressive closure). Its content
+      // is fixed history, so it can never be stale.
+      if (seg.reuse != null) {
+        // A CLOSED segment is immutable: its summary is computed once, persisted,
+        // and NEVER re-summarized. If its cache is missing (defensive — it should
+        // exist, since _loadClosedSegments read it from the same DB), do NOT
+        // regenerate it (that would break the immutable-history guarantee); throw
+        // so the caller falls back to sending the conversation verbatim.
+        if (!dbOpen) {
+          throw StateError('closed segment ${seg.reuse!.coveredMinSeq}..'
+              '${seg.reuse!.coveredMaxSeq} cache lookup requires an open DB');
+        }
+        final node = await _summaryNodeRepo.findCovering(sessionId,
+            seg.reuse!.coveredMinSeq, seg.reuse!.coveredMaxSeq,
+            level: seg.reuse!.level);
+        if (node == null || node.summaryJson == null) {
+          throw StateError('closed segment ${seg.reuse!.coveredMinSeq}..'
+              '${seg.reuse!.coveredMaxSeq} has no persisted summary — cannot re-summarize an immutable segment');
+        }
+        final text = _summaryTextFromJson(node.summaryJson!);
+        if (text.isEmpty) {
+          throw StateError('closed segment ${seg.reuse!.coveredMinSeq}..'
+              '${seg.reuse!.coveredMaxSeq} persisted summary is empty');
+        }
+        results.add(SummaryResult(text: text, tokens: node.tokenCost ?? 0));
+        continue;
+      }
       if (dbOpen && minSeq != null && maxSeq != null) {
+        // Open (not-yet-closed) segment: reuse its cached summary only if it is
+        // not stale (covered span strictly below the dirty watermark). Query at
+        // the segment's level (1 or 2) so an open level-2 node can be reused.
         try {
-          final node = await _summaryNodeRepo.findCovering(sessionId, minSeq, maxSeq);
+          final node = await _summaryNodeRepo.findCovering(sessionId, minSeq, maxSeq,
+              level: seg.level);
           if (node != null && node.summaryJson != null &&
               (dirtySince == 0 || node.coveredMaxSeq < dirtySince)) {
             final text = _summaryTextFromJson(node.summaryJson!);
@@ -1219,17 +1338,44 @@ class ChatScreenState extends State<ChatScreen> {
           debugPrint('[AliasAgent] summary reuse read failed: $e');
         }
       }
-      final summary =
-          await _summaryProvider.summarize(folded: seg.messages, config: agentType);
+
+      // 2-pass "summary of summaries" (level-2): produce/fetch each level-1
+      // sub-summary's text, join them, then re-summarize into a coarser level-2.
+      // When l2SubSpans is null (omit/truncated case) fall back to a single
+      // coarser pass over the segment.
+      final SummaryResult summary;
+      if (seg.level == 2 &&
+          seg.l2SubSpans != null &&
+          seg.l2SubSpans!.isNotEmpty) {
+        final l1Texts = <String>[];
+        for (final span in seg.l2SubSpans!) {
+          final lo = span[0];
+          final hi = span[1];
+          final l1Msgs = seg.messages
+              .where((m) {
+                final s = m.seq ?? 0;
+                return s >= lo && s <= hi;
+              })
+              .toList();
+          if (l1Msgs.isEmpty) continue;
+          l1Texts.add(
+              await _l1SummaryText(sessionId, dbOpen, dirtySince, l1Msgs, agentType));
+        }
+        summary = await _summaryProvider.summarizeText(
+            text: l1Texts.join('\n\n'), config: agentType);
+      } else {
+        summary =
+            await _summaryProvider.summarize(folded: seg.messages, config: agentType);
+      }
       // Hermetic tests (no DB open) never persist the derived index — the originals
       // stay in memory and there is no tree to invalidate.
       if (dbOpen && minSeq != null && maxSeq != null) {
         debugPrint('[AliasAgent] folding ${seg.messages.length} messages '
-            '(seq $minSeq..$maxSeq) into a level-1 summary');
+            '(seq $minSeq..$maxSeq) into a level-${seg.level} summary');
         try {
           await _summaryNodeRepo.materialize(
             sessionId: sessionId,
-            level: 1,
+            level: seg.level,
             startSeq: minSeq,
             endSeq: maxSeq,
             nodeType: 'summary',
@@ -1300,7 +1446,8 @@ class ChatScreenState extends State<ChatScreen> {
       final count = i < summarySegs.length ? summarySegs[i].messages.length : summaries.length;
       summaryBlocks.add({
         'type': 'text',
-        'text': buildSummaryContent(result: summaries[i], foldedCount: count),
+        'text': buildSummaryContent(
+            result: summaries[i], foldedCount: count, level: summarySegs[i].level),
       });
     }
     final out = <Map<String, dynamic>>[];

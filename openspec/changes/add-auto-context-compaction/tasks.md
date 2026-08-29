@@ -2,7 +2,7 @@
 
 > **执行顺序阅读指南**: 本文件是**唯一任务载体**，openspec 会从此文件解析 `- [ ]`/`- [x]` 作为任务并按序执行。**完整审查证据（R1/R2/R3 被发现记录、refute/NOT-a-bug 判定）见 `design.md` 附录 A**，不作为任务解析。若要执行返工，先做 Section 0，再做 Section 1-6 未完成项。
 
-## 0. 返工主清单 — 按推荐执行顺序 (Round 2/3 对抗审查发现的修复)
+## 0. 返工主清单 — 按推荐执行顺序 (Round 2/3 对抗审查 + 设计对齐 ⑨；均须先于后续 Phase 执行)
 
 > 每项: 文件 / 问题 / 怎么修 / 对应设计条款 / 是否需要审批。推荐顺序 ①→②→③→④→⑧→⑤→⑦→⑥（前 5 项小而安全，后 2 项大子系统）。发现的完整证据见 design.md 附录 A。
 
@@ -49,6 +49,17 @@
   - 问题: ①(528-532)「ONLY effective thinking control is output_config.effort」错——实测 `thinking.type` 才是 on/off(disabled/adaptive)，`output_config.effort` 是强度。被修正文档+代码自身(536/549 用 thinking.type)推翻。②(546)引「§2.5 / field table line 228」错——228 是 §3.1 chat/completions 空行，§2.5 无 thinking field table；「缺省 enabled」证据在 §2.5 prose(~185-186)。
   - 修法: 改写两注释块为「thinking.type=enabled/disabled/adaptive 是 on/off; output_config.effort 是强度; 正确引 §2.5」。
   - 设计: D7。**审批: 代码注释改动需审批。**（行为本身正确，仅注释错）
+- [x] **⑨ REWORK — 闭段冻结/渐进封口（design D8 对齐）**
+  - 起因: 用户在 `/opsx:explore` 中明确——"一旦对话片段被 AI 两道切分标记圈定，即成固定历史，摘要固定不变、可长期落盘复用"。对照现有实现发现 Phase 1/2 已实现的 `buildTree` 是"无状态全量重算"（每轮拿全部历史从头算分段），已闭段边界会随新消息移动、摘要可能被重新生成，与"闭段=固定历史、摘要不可变"不一致。**本项是后续 4.1-4.4 的前置依赖，必须先于 Phase 3 完成。**
+  - 文件: `lib/services/compaction/compaction_plan.dart`, `lib/main.dart`, `lib/services/summary_node_repository.dart`
+  - 问题: 现 `buildTree(history, maxContextTokens)`（compaction_plan.dart:69-125）是无状态全量重算——每轮从全部历史重新决定"哪些段折、边界在哪"；已闭段（已持久化在 `summary_nodes` 的 covered span）不参与输入，边界会随之漂移，`_resolveSummaries`（main.dart:1203-1254）按 span `findCovering` 复用时常因 span 不匹配而**重新摘要**，违背"闭段=固定历史、摘要落盘一次永久复用"。
+  - 修法: ①`buildTree` 增入 `closedSegments`（已持久化闭段的 covered span）作为**输入**，保持纯函数；只对**未闭尾部**决定"再封几段、边界在何处"，**绝不重塑已闭段**。②`_resolveSummaries` 对**已闭段**强制命中其缓存摘要（无论 dirty-seq 水位线如何），绝不重摘要；dirty-seq 只影响未闭尾部。③本次新增的 4.3 AI 挑缝（memo）作用于未闭尾部与闭段两侧边界。
+  - 设计: D8（渐进封口）/ D9 / 新 spec "Segment closure and summary immutability"。**审批: 产品逻辑重构需审批（用户已在探索中明确此设计意图，视为已授权方向，但具体改法仍需落地审查）。**
+- [x] **⑩ FIX stage-review confirmed (2 confirmed + 1 principled)** — 对抗验证 stage-review 抓出的真缺陷
+  - 文件: `lib/services/compaction/compaction_plan.dart` (buildTree closed 段), `lib/main.dart` (_resolveSummaries)
+  - 问题: ①closed 段构造没传 `level: c.level` → closed 的 level-2 被错贴 L1 标记 / cache-miss 时以 level 1 落库降级（med, 3x confirm）;②open 尾部 level-2 段复用闸门写死 `level: 1` → 永不命中已持久化 L2 节点、每轮 2-pass 重摘要（low, 2x confirm）;③closed 段 cache-miss fall-through 到 fresh summarize → 违背"闭段绝不重摘要"（refuted 但原则性，一并修）。
+  - 修法: ①`CompactionSegment(..., level: c.level)`;②`_resolveSummaries` open 复用按 `seg.level` 查询 `findCovering`;③closed 段 cache-miss 改为 `throw StateError`（caller 回退全量 verbatim，符合 R1-5 兜底；绝不再摘要不可变闭段）。
+  - 设计: D8/D9 + spec "Segment closure and summary immutability" + "Original conversation retained on disk"。**状态: 已修复 + 17 测试全绿 + analyze 无新警告。**
 
 ## 1. Phase 0 — 遥测地基(token usage + 全序 + 配置)
 
@@ -62,14 +73,17 @@
 
 ## 2. Phase 1 — 单层平铺 MVP(近段原文 + 一个根总结)
 
-- [x] 2.1 实现 `buildTree(history, maxContextTokens)` 纯函数:分段 + 段边界规则 + 预算/cover + 近段原文 + 一个根总结;可注入 `FakeSummarizer`(决策/执行分离)（注: 原始措辞写作 `(history, config, proxy_usage)`，与实现不符——已修正为实际签名 `(history, maxContextTokens)`，对齐 spec "deterministic local estimator" 触发。见返工 ⑤(a)。）
-- [x] 2.2 原子单元:折叠单元 = 带 tool_calls 的 assistant 消息 + 紧随其后的合成 user(tool_result);段边界只落"真实用户文本 / 无 tool_use 的 assistant 终答",绝不落带 tool_calls 的行（注: 但 `_budgetSegments` 内部 chunk 边界未执行此规则 — 见返工 ④）
+- [x] 2.1 ❗边界缝实现偏差 — 实现 `buildTree(history, maxContextTokens)` 纯函数:分段 + 段边界规则 + 预算/cover + 近段原文 + 一个根总结;可注入 `FakeSummarizer`(决策/执行分离)（注: 原始措辞写作 `(history, config, proxy_usage)`，与实现不符——已修正为实际签名 `(history, maxContextTokens)`，对齐 spec "deterministic local estimator" 触发。见返工 ⑤(a)。）
+  - **❗偏差说明**: 本任务的**确定性骨架(折哪些段、几段、预算、cover)正确**(设计 D4 纯函数);**仅"边界缝"这一处**用 **算术**(`_budgetSegments`: 每~8条一刀 + 安全对齐, 属**设计方案C式**),而**设计选定方案 A —— AI 在话题缝上挑边界(4.3)**。故**只有该缝为设计偏差/未满足点**,应由 4.3 修复;骨架本身正确,后续实现不得把"算术缝"当正确参照(见 4.3)。
+- [x] 2.2 ❗边界缝实现偏差(部分) — 原子单元:折叠单元 = 带 tool_calls 的 assistant 消息 + 紧随其后的合成 user(tool_result);段边界只落"真实用户文本 / 无 tool_use 的 assistant 终答",绝不落带 tool_calls 的行（注: 但 `_budgetSegments` 内部 chunk 边界未执行此规则 — 见返工 ④）
+  - **❗偏差说明**: 本任务的**原子单元/安全边界保证本身正确**(设计对齐);仅"边界缝"由算术分段(`_budgetSegments` ~8条一刀)决定,而设计选定方案 A(AI 挑话题缝,4.3)。故**仅该缝为偏差**;安全保证保留,缝选取须在 4.3 按方案 A 修正。后续设计不得把"算术缝"当作正确参照。
 - [x] 2.3 摘要输出为 role:user 纯文本 + 明显标记(`## 更早上下文(压缩xN,非用户发言)`);不合成 thinking/tool_use/tool_result 块(DeepSeek /v1/messages 客户端侧标记,不依赖 chat/completions 的 `name` 字段)
 - [x] 2.4 摘要请求 profile:复用 model_gateway,关 thinking、`max_tokens` 512-1024,末条 user 追加 summarize 指令;不用交互式 16K 路径
 - [x] 2.5 组装投影:`_buildApiMessages` 改为读压缩树投影 `[system][摘要][近段原文][当前]`;节点按需展开(harness 注入,非 agent 工具)
 - [ ] 2.6 后台折卷(idle-gated):槽空 + `_chain` 空 + 用户空闲才跑;request-id 定向 cancel;存断点"fold pending on segment N",下次空闲续折,绝不 delay 用户发送
 - [x] 2.7 `summary_nodes` 落库(单事务)+ bump `tree_version`;折卷和用户请求轮换共享单槽
-- [x] 2.8 测试:工具对完整性属性测试(折叠后仍合法交替、可喂回 `_buildApiMessages` 不拆对);树形/预算/确定性(FakeSummarizer);headless 集成(dump 折叠视图 + 前后 token)（注: 「前后 token」无测试实际输出 — 见返工 ③ R3-3）
+- [x] 2.8 ❗边界缝实现偏差(测试) — 测试:工具对完整性属性测试(折叠后仍合法交替、可喂回 `_buildApiMessages` 不拆对);树形/预算/确定性(FakeSummarizer);headless 集成(dump 折叠视图 + 前后 token)（注: 「前后 token」无测试实际输出 — 见返工 ③ R3-3）
+  - **❗偏差说明**: 本任务的**工具对完整性/交替合法断言正确**;其**树形/预算/确定性测试断言的是算术分段(`_budgetSegments`)这一"缝偏差"的形态**——骨架断言(预算/确定性/cover)仍成立,但**边界缝相关断言须随 4.3(方案 A)重新对齐**。工具对完整性断言保留;缝相关断言标记为待随 4.3 修正。
 - [x] 2.9 guard/anchor:实现不可压缩锚点——用户目标/验收标准/"don't touch X" 不变量 pin 为永不塌缩,每轮重注入,集合有界/去重/可失效;来源为显式 standing-requirements(非 LLM 从 prose 抽取)（注: 生产环境无生产者 seed, inject 恒空 — 见返工 ⑦）
 
 ## 3. Phase 2 — 失效/重算 + 两级梯度
@@ -81,8 +95,10 @@
 
 ## 4. Phase 3 — 全树 + canonical-cover 前锋 + 语义边界
 
-- [ ] 4.1 层级用文本标记编码(非角色/块);"总结之总结"(level-2)卷起
-- [ ] 4.2 ascend-on-the-left canonical-cover 前锋;预算驱动 `coarsen-only`(缩 N_verbatim / 换粗父);cover 稠密 + 完整 + 梯度单调
+- [x] 4.1 层级用文本标记编码(非角色/块);"总结之总结"(level-2)卷起
+  - **实现注(设计一致性复核 R-reverify #1)**: `materialize`/`findCovering` 的 UPSERT 删除键与查询键当前为 `(session_id, covered_min_seq, covered_max_seq)`（**无 level**）。一旦建 level-2，level-2 节点的 covered span 可能与被它卷起的 level-1 节点共享相同 `(covered_min,max)`（单子上卷 / coarsen-left 情形），会导致 materialize 跨层删错行、`findCovering` 取到任意层行。**本任务须把 `level` 加入删除/查询键**（并给 findCovering 加 ORDER BY / 或按 level 过滤），维持 D9「covered 稠密非重叠」在跨层下仍成立。
+- [x] 4.2 canonical-cover 前锋(预算驱动 `coarsen-only`):`[L2 大摘要(最旧)][L1 小摘要(中段)][原文(最新)]` 三层梯度,coarsen-only(只并不拆、只两级);cover 稠密 + 完整 + 梯度单调(近详→远略);连 L2 都超预算则"省略最旧"——**只从投影省略(不发给模型),绝不删原文/摘要**(见 spec "Original conversation retained on disk" + design D9)
+  - **实现注(2026-08-29 用户确认)**: ①只并/只造粗层,永不拆细;②保留"多条 L1 + 一条 L2"的中间层(不是整段卷成单条 L2);③"省略最旧"只在投影层生效(本次不发给模型),底层原文 + L1 + L2 全落盘不变;④将来 re-expand 机制本轮不做、仅占位;⑤**边界归属**:L1 段边界 = AI 挑话题缝(4.3, 方案A, 唯一 LLM 点);**L1→L2 组边界 = 算术**(确定性,用户 2026-08-29 决定"先尝试算术")——即 L2 分组按确定性算术规则(固定组大小/预算驱动 coarsen-only),**不调用 LLM**;L1 段内部边界仍由 AI 切缝。
 - [ ] 4.3 语义边界 A:LLM 在安全候选切点挑话题缝(嵌入同一摘要调用)+ memo 化(content hash keyed)保重建/测试可复现
 - [ ] 4.4 测试:cover 稠密且完整;梯度单调(近详→远略);总预算 ≤ `maxContextTokens`;LADDER 可断言;确定性(同 history+config → 同树形);memo(重建用缓存不重调 LLM)
 

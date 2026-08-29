@@ -96,6 +96,57 @@ class ModelSummaryProvider implements SummaryProvider {
     );
   }
 
+  @override
+  Future<SummaryResult> summarizeText({
+    required String text,
+    required AgentTypeConfig config,
+  }) async {
+    final provider = _resolver.resolve(config.provider);
+    if (provider == null) {
+      return SummaryResult(
+          text: '(could not summarize: provider "${config.provider}" not found)',
+          tokens: 20);
+    }
+
+    // 2-pass "summary of summaries": the input is the joined level-1 summary
+    // texts. Send it as a single user message + the summarize instruction on the
+    // summary profile (thinking disabled, max_tokens 1024).
+    final summaryMessages = <Map<String, dynamic>>[
+      {'role': 'user', 'content': '$text\n\n$kSummarizeInstruction'},
+    ];
+
+    var out = StringBuffer();
+    int doneCode = 0;
+    String doneErr = '';
+    await _sidecar.sendMessage(
+      apiKey: provider.apiKey,
+      baseUrl: provider.baseUrl,
+      model: config.model,
+      systemPrompt:
+          'You are a conversation summarizer for AliasAgent. Produce a faithful, '
+          'dense plain-text summary of the provided summaries.',
+      messagesJson: jsonEncode(summaryMessages),
+      toolsJson: '[]',
+      thinkingMode: 'summary',
+      thinkingEffort: '',
+      onChunk: (t) => out.write(t),
+      onToolCall: (_) {},
+      onDone: (code, err, stop, inTok, outTok) {
+        doneCode = code;
+        doneErr = err ?? '';
+      },
+    );
+    if (doneCode != 0) {
+      throw StateError(
+          'level-2 summarization failed (code=$doneCode): ${doneErr.isEmpty ? 'unknown' : doneErr}');
+    }
+    final content = out.toString().trim();
+    return SummaryResult(
+      text: content.isEmpty ? '(empty summary)' : content,
+      tokens: ContextEstimator.estimateTokens(content),
+    );
+  }
+
   /// Render a message's content for the summarizer (plain text transcript).
   static String _messageText(Message m) {
     final buf = StringBuffer();
@@ -142,6 +193,14 @@ class FakeSummaryProvider implements SummaryProvider {
     required AgentTypeConfig config,
   }) async {
     lastFolded = List.of(folded);
+    return SummaryResult(text: text, tokens: ContextEstimator.estimateTokens(text));
+  }
+
+  @override
+  Future<SummaryResult> summarizeText({
+    required String text,
+    required AgentTypeConfig config,
+  }) async {
     return SummaryResult(text: text, tokens: ContextEstimator.estimateTokens(text));
   }
 }

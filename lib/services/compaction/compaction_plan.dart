@@ -11,8 +11,37 @@ import '../context_estimator.dart';
 /// tool_use/tool_result pair.
 class CompactionSegment {
   final List<Message> messages; // oldest → newest within the segment
-  final bool summary; // true → folded to a level-1 summary; false → verbatim
-  const CompactionSegment({required this.messages, required this.summary});
+  final bool summary; // true → folded to a summary; false → verbatim
+  final int level; // 1 = level-1 segment summary, 2 = level-2 summary-of-summaries, 0 = verbatim
+  final ClosedSummary? reuse; // non-null → this (closed) segment reuses a cached summary
+  final List<List<int>>? l2SubSpans; // level-2 only: each [startSeq, endSeq] of a
+                                     // level-1 sub-span, for 2-pass "summary of summaries".
+  const CompactionSegment({
+    required this.messages,
+    required this.summary,
+    this.level = 1,
+    this.reuse,
+    this.l2SubSpans,
+  });
+
+  bool get isClosed => reuse != null;
+}
+
+/// A conversation segment already delimited by two cut markers — FIXED history
+/// (progressive closure). Its content and summary never change: the reuse-gate
+/// MUST always cache-hit it and never re-summarize it. Persisted in
+/// `summary_nodes`, keyed by its covered (start_seq, end_seq) span.
+class ClosedSummary {
+  final int level; // 1 = level-1 summary, 2 = level-2 summary (for cache lookup)
+  final int coveredMinSeq;
+  final int coveredMaxSeq;
+  final int tokenCost; // proxy cost of the cached summary token (budget accounting)
+  const ClosedSummary({
+    required this.level,
+    required this.coveredMinSeq,
+    required this.coveredMaxSeq,
+    required this.tokenCost,
+  });
 }
 
 /// The deterministic fold plan (decision/execution separation).
@@ -66,14 +95,69 @@ class CompactionEngine {
   static const int _segmentSize = 8;
 
   /// Build the fold plan for a conversation.
+  ///
+  /// Progressive closure (D8): the passed-in [closed] segments are FROZEN fixed
+  /// history — their summaries are reused verbatim, never re-folded or re-shaped.
+  /// Only the unclosed TAIL (messages newer than the newest closed segment) is a
+  /// candidate for new folding. So this is a pure function of
+  /// (history, budget, closed-segmentation): deterministic given those inputs.
   static CompactionPlan buildTree({
     required List<Message> history,
     required int maxContextTokens,
+    List<ClosedSummary> closed = const [],
   }) {
-    final totalProxy = ContextEstimator.estimateConversation(history);
-    if (totalProxy <= maxContextTokens) {
+    final closedFloor = closed.isEmpty
+        ? -1
+        : closed.map((c) => c.coveredMaxSeq).reduce((a, b) => a > b ? a : b);
+    final frozenCost = closed.fold(0, (m, c) => m + c.tokenCost);
+
+    var tailStart = 0;
+    while (tailStart < history.length &&
+        (history[tailStart].seq ?? 0) <= closedFloor) {
+      tailStart++;
+    }
+    final tail = history.sublist(tailStart);
+    final tailBudget = (maxContextTokens - frozenCost) < 0 ? 0 : maxContextTokens - frozenCost;
+
+    final closedSegments = <CompactionSegment>[
+      for (final c in closed)
+        CompactionSegment(
+          messages: _spanMessages(history, c.coveredMinSeq, c.coveredMaxSeq),
+          summary: true,
+          level: c.level, // preserve the closed segment's level (L1 or L2)
+          reuse: c,
+        ),
+    ];
+    final tailPlan = _foldTail(tail, tailBudget);
+    return CompactionPlan(
+      segments: [
+        ...closedSegments,
+        ...tailPlan.segments,
+      ],
+      projectedTokens: frozenCost + tailPlan.projectedTokens,
+      shouldCompact: closedSegments.isNotEmpty || tailPlan.shouldCompact,
+    );
+  }
+
+  /// Messages of [history] whose seq lies in [minSeq..maxSeq] (oldest → newest).
+  static List<Message> _spanMessages(List<Message> history, int minSeq, int maxSeq) {
+    return history.where((m) {
+      final s = m.seq ?? 0;
+      return s >= minSeq && s <= maxSeq;
+    }).toList();
+  }
+
+  /// Fold plan for the not-yet-closed tail: far span folded into level-1 (or
+  /// level-2 via [CompactionEngine] callers) summaries, near span kept verbatim.
+  static CompactionPlan _foldTail(List<Message> messages, int budget) {
+    if (messages.isEmpty) {
+      return const CompactionPlan(
+          segments: [], projectedTokens: 0, shouldCompact: false);
+    }
+    final totalProxy = ContextEstimator.estimateConversation(messages);
+    if (totalProxy <= budget) {
       return CompactionPlan(
-        segments: [CompactionSegment(messages: List.of(history), summary: false)],
+        segments: [CompactionSegment(messages: List.of(messages), summary: false)],
         projectedTokens: totalProxy,
         shouldCompact: false,
       );
@@ -83,12 +167,12 @@ class CompactionEngine {
     // [0..foldEnd) are summarizable; [foldEnd..] are verbatim. Grow verbatim
     // greedily from the newest message while the (budget-coarsened) summary cost
     // of the far span still fits the budget.
-    var foldEnd = history.length;
+    var foldEnd = messages.length;
     var verbatimCost = 0;
-    for (var i = history.length - 1; i >= 0; i--) {
-      final mCost = ContextEstimator.estimateMessage(history[i]);
-      final summaryCost = _coarsenedSummaryCost(history.sublist(0, i), maxContextTokens);
-      if (verbatimCost + mCost + summaryCost <= maxContextTokens) {
+    for (var i = messages.length - 1; i >= 0; i--) {
+      final mCost = ContextEstimator.estimateMessage(messages[i]);
+      final summaryCost = _coarsenedSummaryCost(messages.sublist(0, i), budget);
+      if (verbatimCost + mCost + summaryCost <= budget) {
         verbatimCost += mCost;
         foldEnd = i;
       } else {
@@ -107,14 +191,23 @@ class CompactionEngine {
     // because the tool_result is synthesized from the same assistant message by
     // _buildApiMessages. Interior far-span chunk starts ARE snapped safe inside
     // _budgetSegments.
-    foldEnd = _alignToSafeBoundary(history, foldEnd);
+    foldEnd = _alignToSafeBoundary(messages, foldEnd);
 
-    final far = history.sublist(0, foldEnd);
-    final near = history.sublist(foldEnd);
-    final segments = <CompactionSegment>[
-      ..._budgetSegments(far, maxContextTokens), // each far chunk -> a summary segment
+    final far = messages.sublist(0, foldEnd);
+    final near = messages.sublist(foldEnd);
+    final farBudget = budget - verbatimCost;
+
+    // Gradient (4.2, canonical-cover front): far span = [L2 最旧][L1 中段].
+    // The L1 segmentation is the deterministic skeleton (_budgetSegments, see
+    // task 4.3 for the AI-seam refinement); L2 grouping is arithmetic + coarsen-
+    // only. Then append the near-verbatim span.
+    final l1s = _budgetSegments(far, budget);
+    final gradient = _buildGradient(l1s, farBudget);
+    var segments = <CompactionSegment>[
+      ...gradient,
       if (near.isNotEmpty) CompactionSegment(messages: near, summary: false),
     ];
+
     final projected = _summariesCost(segments.where((s) => s.summary).toList()) +
         CompactionEngine._verbatimCost(near);
     return CompactionPlan(
@@ -122,6 +215,64 @@ class CompactionEngine {
       projectedTokens: projected,
       shouldCompact: segments.any((s) => s.summary),
     );
+  }
+
+  /// Coarsen-only gradient over the level-1 summary segments of a far span:
+  /// keep the NEWEST level-1s as level-1 (medium tier), roll the OLDEST level-1s
+  /// into ONE level-2 "summary of summaries" (deep tier). Merges more oldest
+  /// L1s into the level-2 as the budget tightens (coarsen-only — never splits).
+  /// If a lone level-2 over the whole far still exceeds [farBudget], OMIT the
+  /// OLDEST content from the projection (data is NOT deleted — see spec
+  /// "Original conversation retained on disk"). Returns [L2][L1...] (newest last).
+  static List<CompactionSegment> _buildGradient(
+      List<CompactionSegment> l1s, int farBudget) {
+    if (l1s.isEmpty) return [];
+    // If the level-1 segmentation already fits (incl. a single L1), keep it —
+    // the L1 tier is the medium/preferred granularity.
+    if (_summariesCost(l1s) <= farBudget) return l1s;
+
+    // Coarsen-only: merge the OLDEST L1(s) into a growing level-2 group until
+    // [l2 + remaining L1s] fits. Record the merged L1 sub-spans so the level-2
+    // can be generated as a 2-pass "summary of summaries".
+    var l2Msgs = <Message>[];
+    final merged = <CompactionSegment>[];
+    var rest = List<CompactionSegment>.of(l1s);
+    while (rest.isNotEmpty) {
+      l2Msgs = [...l2Msgs, ...rest.first.messages];
+      merged.add(rest.first);
+      rest = rest.sublist(1);
+      final l2Cost = CompactionEngine._summaryCostWithK(l2Msgs, 1);
+      if (l2Cost + _summariesCost(rest) <= farBudget) {
+        return [
+          CompactionSegment(messages: l2Msgs, summary: true, level: 2,
+              l2SubSpans: merged.map(_spanOf).toList()),
+          ...rest,
+        ];
+      }
+    }
+
+    // A lone level-2 over the whole far is the coarsest; if it still exceeds the
+    // budget, OMIT the OLDEST content (projection only — data kept on disk).
+    if (CompactionEngine._summaryCostWithK(l2Msgs, 1) <= farBudget) {
+      return [
+        CompactionSegment(messages: l2Msgs, summary: true, level: 2,
+            l2SubSpans: merged.map(_spanOf).toList()),
+      ];
+    }
+    // Truncated (omit) case: sub-spans are lost, so the level-2 resolves as a
+    // single coarser (1-pass) summary — a null l2SubSpans means 1-pass.
+    var kept = List<Message>.of(l2Msgs);
+    while (kept.isNotEmpty && CompactionEngine._summaryCostWithK(kept, 1) > farBudget) {
+      kept.removeAt(0);
+    }
+    if (kept.isEmpty) return [];
+    return [CompactionSegment(messages: kept, summary: true, level: 2)];
+  }
+
+  /// [startSeq, endSeq] span of a segment's messages (for L2 sub-span recording).
+  static List<int> _spanOf(CompactionSegment s) {
+    if (s.messages.isEmpty) return [0, 0];
+    return [(s.messages.first.seq ?? 0), (s.messages.last.seq ?? 0)];
   }
 
   /// The coarsened summary cost of a far span — the cheapest way to fold it.
