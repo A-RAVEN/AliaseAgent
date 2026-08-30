@@ -41,9 +41,9 @@ SIDECAR_API const char* ping(void) {
   return "pong";
 }
 
-SIDECAR_API void cancel_request(void) {
+SIDECAR_API void cancel_request(int request_id) {
   ensure_log();
-  g_gateway.cancel();
+  g_gateway.cancel(request_id);
 }
 
 SIDECAR_API int send_message(
@@ -58,7 +58,8 @@ SIDECAR_API int send_message(
   OnChunkCallback on_chunk,
   OnToolCallCallback on_tool_call,
   OnThinkingCallback on_thinking,
-  OnDoneCallback on_done
+  OnDoneCallback on_done,
+  int request_id
 ) {
   ensure_log();
   ensure_debug_infra();
@@ -77,7 +78,8 @@ SIDECAR_API int send_message(
     tools_json ? tools_json : "",
     thinking_mode ? thinking_mode : "",
     thinking_effort ? thinking_effort : "",
-    on_chunk, on_tool_call, on_thinking, on_done
+    on_chunk, on_tool_call, on_thinking, on_done,
+    request_id
   );
 }
 

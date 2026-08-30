@@ -25,8 +25,8 @@ AliasAgent(Flutter 桌面 AI 对话应用,经 dart:ffi 调 C++ Sidecar,走 DeepS
 ## Decisions
 
 **D1 压缩形态 = 层级化摘要树 + recency 梯度**(非单一滚动摘要 / 非滑窗截断)。
-- **三层梯度(近详→远略)**:`[L2 大摘要(最旧)][L1 小摘要(中段)][原文(最新)]`——最新保留原文,中段逐段压成 L1 小摘要,最旧的多段 L1 再卷成一条 L2 "总结之总结"。**只做两级**(L1 + L2),**不引入 level-3**。
-- **coarsen-only(只并不拆)**:摘要只越并越大、绝不拆细、绝不把已摘要的重新放回原文。若连 L2 都超预算,则"省略最旧"(**投影不发给模型**),**绝不删数据**(见 D9)。
+- **三层梯度(近详→远略)**:`[L2 大摘要(最旧)][L1 小摘要(中段)][原文(最新)]`——最新保留原文,中段逐段压成 L1 小摘要,最旧的多段 L1 再卷成一条 L2 "总结之总结"。**只做两级**(L1 + L2),**不引入 level-3**。L2 的**输入是 L1 摘要文本**(2-pass 总结之总结),不是原始消息。
+- **coarsen-only(只并不拆)**:摘要只越并越大、绝不拆细、绝不把已摘要的重新放回原文。若连 L2 都超预算,则"省略最旧"(**投影不发给模型**),**绝不删数据**(见 D9)。**每层摘要的实际 token 数运行时实测**(真实 usage `output_tokens`),"是否超预算/该不该 coarsen/省略"由实测值后置判定——**不预设压缩比**。
 - **边界归属(确定性骨架 + 唯一 LLM 缝)**:L1 段边界 = AI 挑话题缝(见 D5,方案A,唯一影响树形的 LLM 点,memo 化);**L1→L2 组边界 = 算术**(确定性,2026-08-29 用户决定"先尝试算术")——L2 按哪些 L1 分组完全由确定性算术规则决定,不调用 LLM。即"折哪些、几段、哪层、预算"纯函数,"L1 缝"留给 AI,"L2 组缝"是算术。
 - 理由:对数成本、粒度梯度(近详远略)、远端"总结之总结"保留决策链;外部 remnic LCM / hierarchical-context-ai-agent 验证。
 - 备选:单一滚动总结(简单但 O(N) 重写、粒度差)、滑窗截断(破坏完整性/丢失再执行钥匙)。
@@ -35,19 +35,25 @@ AliasAgent(Flutter 桌面 AI 对话应用,经 dart:ffi 调 C++ Sidecar,走 DeepS
 - 顶层 `system` 留作真指令;摘要 = role:user 文本 + 正文标记(`## 更早上下文(压缩xN,非用户发言)`)。DeepSeek `name` 字段(DeepSeekAPIDoc.md:221)是 **chat/completions** 消息字段,`/v1/messages` 未验证——故**首选正文文本标记**,不依赖 `name:'history'`。
 - 备选:摘要进 system(污染真指令)、发明 role("history" 非合法 role)。
 
-**D3 触发预算 = 必填配置 `maxContextTokens` + 本地估算器**；实测 usage 作遥测/校准，不驱动触发（对齐 spec "Context budget trigger"：确定性 local estimator 投影）。
-- 接口拿不到精确窗口(无 `/models` 元数据);**触发**用确定性本地估算器 `ContextEstimator`(逐消息 proxy token 求和)——spec 明定 "deterministic local estimator (sum of per-message proxy tokens)"，代码 `CompactionEngine.buildTree(history, maxContextTokens)` 正是如此。
-- **实测 usage**：DeepSeek `/v1/messages`(Anthropic 格式)usage 字段为 `input_tokens`/`output_tokens`（AnthropicAPIDoc.md:354/:372；**2026-08-26 live 验证已确认**，非 [UNVERIFIED]）。侧车防御性解析；`prompt_tokens`(:661)是 chat/completions 字段,不适用于 `/v1/messages`。实测 usage 写入 `Message.token_count`(task 1.3)作为**遥测记录 + 破平衡点回归(task 5.2)依据**，但**不回读驱动触发**（spec 要求 local estimator 触发；回读触发属返工 ⑤ (b) 的新增功能，默认不做）。
+**D3 触发预算 = 必填配置 `maxContextTokens` + 原始尺寸本地估算器；摘要尺寸 = 运行时实测(真实 usage)，不做压缩比假设**（对齐 spec "Context budget trigger"，2026-08-29 重构）。
+- 接口拿不到精确窗口(无 `/models` 元数据);**触发**用确定性本地估算器 `ContextEstimator`(逐消息 proxy token 求和)算**原始会话尺寸**——spec 明定 "deterministic local estimator (sum of per-message proxy tokens)"。**这只算原始消息 token，不涉及"摘要会压多少"**。
+- **统一规则(2026-08-29 用户定稿):批量 + 每层实测判 token 变少,零压缩比**。从**最旧**开始,累加(原文片段→L1;L1 片段→L2)原始 token,**合计 > 阈值 `T = maxContextTokens ~/ 2` 就把这一批压一次**成上一级摘要;**判据 = 压出的实测 token < 这一批的 token**(有效压缩;否则**拆半再压**,确定性、必终止——拆到单条/单工具轮仍不省,则该原子批**省略**——只不进投影、数据留盘,见 D9)。**最新始终保留原文(verbatim)**:只对较旧内容批量化/摘要/省略,**绝不动最新**——若仍超预算,只继续**省略最旧的较旧内容**(只不进投影,数据不删,见 D9),**最新永远 verbatim**。逐层向新推进,到 `Σ(L2)+Σ(L1)+最新原文 ≤ maxContextTokens` 停;若**最新一段单独**就 > 预算(单条 > 上下文窗口),属病态、无法靠压缩解决,记为**已知上限**(尽力而为)。**注(实现边界)**: 名义"最新 verbatim"段是**有界近期块**,上限 `T = maxContextTokens ~/ 2`(对应 spec "which newest content stays verbatim"的**有界近期块**语义,而非"全部最新一直压到预算");一条单独 > T(即便 ≤ 预算)的最新消息会被划入远端折叠。此为对 D3 措辞的精化,**与 spec 一致**(spec 只要求"折哪些/如何折由纯函数定","最新 verbatim"是选定的有界近期块)。`buildTree` 只定批量边界(原始 token 可加、确定性),**摘要尺寸运行时实测**(真实 `output_tokens`),不预判、无 `/4`/`/16`。
+- **❗实现取舍(2026-08-29 对抗审查确认)**: 设计原措辞"拆到单条/工具轮仍不省则该原子批**原样保留**"→ **实现为"省略(投影不发送,数据留盘)"**,而非按原文发送。原因: 把原子批按原文插入远端会导致投影 `[摘要前缀][verbatim 尾]` 与 role 交替失去一致(远端内容混进 near);省略同样满足"绝不发送不小于原批的摘要" + 数据不删(D9),且不违反任何 spec SHALL(spec.md:6 的 omit 是预算驱动的合法动作)。**已知保真代价**: 极小的原子消息(如远端一个短用户输入)若其摘要(含结构开销)≥自身 raw,会被静默从投影丢弃,而"原样保留"可近似 raw 成本保回。**若需严格原样保留,须在投影层重构(verbatim 就地交错)——本轮不做**,如实记录。
+- **实测 usage**：DeepSeek `/v1/messages`(Anthropic 格式)usage 字段为 `input_tokens`/`output_tokens`(AnthropicAPIDoc.md:354/:372；**2026-08-26 live 验证已确认**)。侧车防御性解析；`prompt_tokens`(:661)是 chat/completions 字段,不适用。真实 usage 写入 `Message.token_count`(task 1.3)作遥测 + 破平衡点回归(task 5.2)依据,并**驱动折叠后的尺寸判定**(回读,不是只当遥测)。
 - 必填(同 apiKey);`stop_reason: length` 不作触发(:328 语义含糊)。
 
-**D4 确定性:决策/执行分离 `buildTree` 纯函数 + `FakeSummarizer` seam**。
-- **"哪些段该折 + 预算 + cover 拓扑"是纯函数**(确定性);LLM 只填"已定死叶子"的内容,不改变这些。**唯一的 LLM 影响树形点 = 边界缝(见 D5),被 memo 化约束为可复现**。测试断言树形/预算/耦合/边界,不断言措辞;后台物化 = 幂等缓存,materialize == buildTree。
-- **输入集含"已闭段"(见 D8 渐进封口)**:`buildTree(history, maxContextTokens, closedSegments)` 以已持久化的闭段边界作为**输入之一**(非内部可变状态),故仍为纯函数;确定性 = 同 (history, config, closedSegmentation) 产生同 fold plan,已闭段永不重塑。
+**D4 确定性与成本:统一"批量 + 每层实测判 token 变少",零压缩比假设,批量边界纯函数**。
+- **批量边界是纯函数**(确定):从最旧开始累加原始 token,合计 > 阈值 `T = maxContextTokens ~/ 2` 就划为一个 L1 批;累加 L1 token 合计 > T 划为一个 L2 批。原始 token 可加、确定性,故边界确定。AI 缝(4.3)在其上挑话题边界(唯一 LLM 树形点,memo 化)。
+- **每层摘要尺寸运行时实测**(真实 `/v1/messages` `output_tokens`):每压一批**量一次**,判"压出的 token < 这一批的 token"(有效压缩;否则**拆半再压**,确定性必终止;拆到单条/单工具轮仍不省则该原子批**省略**——只不进投影、数据留盘 D9;见 D3 实现取舍注)。budget/coarsen/omit 由此实测值后置判定。**零压缩比假设**(无 `/4`/`/16`)。
+- **每层有效性判定的实现细节**: "拆半再压"在 **L1(原文→L1)** 由 `_resolveOpenLevel1` 递归执行;在 **L2(L1 摘要→L2)** 无效压缩(实测 L2 token ≥ 被替换的 L1 摘要 token 之和)则**不采纳该 L2、改 omit 最旧的 open L1**(数据留盘 D9),而非拆半再压——实现比"每层同样拆半"更省调用且同样保证"绝不采纳不小于其替换内容的摘要"。此为设计措辞与实现的行为差异,**如实记录**,非缺陷。
+- **最新始终保留原文**(verbatim):只对较旧内容批量化/摘要/省略,**绝不动最新**;仍超预算只继续**省略最旧的较旧内容**(数据不删),**最新永远 verbatim**。`buildTree` 只保证批量边界确定性 + 保留原文;不保证"压完必小于预算"——靠实测 + 调整达成。最新单段单独超预算 = 病态已知上限。
+- **输入集含"已闭段"(见 D8 渐进封口)**:`buildTree(history, maxContextTokens, closedSegments)` 以闭段为输入之一,故边界纯函数;已闭段永不重塑,冻结复用已存实测 `token_cost`。
 
 **D5 语义边界选 A(LLM 在安全候选点挑话题缝),memo 化保可复现**。
 - 结构安全切点可能拆开话题簇;A 把边界选择嵌入同一次摘要调用(边际成本小),memo 化(内容哈希 keyed)让重建/测试可复现。**它是"纯函数折叠计划"的唯一例外(只影响缝,不改'折哪些段'),且被 memo 化**。
+- **实现机制(2026-08-29 调和批量 + AI 缝)**: 批量边界由"累加原始 token > 阈值 T"确定(算术、纯函数);`SeamSelector`(服务)在其上**选最近的安全话题缝**——异步 `ensure(batchRegion)`:当某批累积到 T 附近时,向模型请求该批内"最接近 T 的若干安全候选索引中,哪个是话题边界",按内容哈希缓存;失败/解析失败回退算术边界。**绝不让缝拆分工具轮**(缝必须落在真实用户文本/无工具 assistant 终答上)、**绝不改批量结构**(只微调分界位置以不拆话题簇)。生产在 `_callModel` 先按批量边界预取 memo,再以 memo 背板 seam 微调分界;密封测试注入 `FakeSeamSelector` 或留 null(走算术边界,不额外消费 FakeSidecar 事件)。这是"纯函数折叠计划"的唯一 LLM 树形点,且被 memo 化。
 - **两道切分标记圈定一个"已闭段"**:AI 在安全候选点落下前后两道标记,标记之间的历史即闭段 — 其内容与摘要在闭段后固定(见 D8 闭段冻结)。
-- **❗实现偏差警告(仅边界缝;后续设计禁止引用错误实现)**:当前 Phase-1/2 代码(`_budgetSegments`,见任务 2.1/2.2/2.8)的**确定性骨架(折哪些段、几段、预算、cover)正确**(见 D4 纯函数);**仅"边界缝"这一处**用算术(方案C式:每~8条一刀+安全对齐),而**本决策选定 A**。故**该缝为唯一设计偏差/未满足点**,应由 4.3(方案A)修复;**骨架本身正确**。后续 Phase-3/4 实现与设计必须严格按方案 A(AI 在话题缝挑边界+memo 化)修缝,不得引用/基于此算术缝;spec "Semantic boundary selection (topic seams)" 是正确要求。
+- **❗实现偏差警告(历史;已被 ⑪ 取代)**:(原说法)Phase-1/2 代码(`_budgetSegments`)的**确定性骨架正确、仅边界缝用算术**——该说法里的"**骨架正确**"**只对**"安全边界/工具轮原子性/不重不漏 cover"成立;其"折哪些段、几段、预算"的批量划分规则基于 `/4` 成本 + 每~8条,已被 ⑪(`buildTree` 改"原始 token > T 批量")**作废**。边界缝由 AI 挑话题缝(4.3, 方案A, memo 化)这一方向保留,但**AI 缝只"微调原始 token 批量边界到最近安全话题缝",不得 wholesale 替换批量结构**(⑪ 会相应改 `_segmentsFromSeams`)。spec "Semantic boundary selection (topic seams)" 是关于"缝"的正确要求。
 - 备选:C(结构切+recency 兜底,简单但保留接缝丢细节)。
 
 **D-guard 不变量守卫(用户目标/验收标准/不变量永不塌缩)**。
@@ -63,6 +69,7 @@ AliasAgent(Flutter 桌面 AI 对话应用,经 dart:ffi 调 C++ Sidecar,走 DeepS
 
 **D8 后台折卷 idle-gated + 可抢占(request-id 定向)+ 断点续 + 事务原子落库 + 闭段冻结(渐进封口)**。
 - 单槽(模型路径);折卷与用户请求轮换共享、用户优先;`summary_nodes` 表事务写 + `tree_version` 递增;materialize == buildTree(后台路径=纯函数)。
+- **抢占 = request-id 定向 cancel(2026-08-30 实施,满足 spec "never delays")**: 初版单槽全局 `cancel_flag`(execute() 每新请求重置)无法完全定向;现改为**真正的 per-request-id cancel**——Dart bridge 每个 `sendMessage` 分配唯一 `requestId`(enqueue 前)并传入 C++ `send_message`;C++ `execute(..., request_id)` 用 `std::atomic<int> cancel_request_id`(**execute 不重置**)+ `cancel(int request_id)` 设它;execute 起始查 `cancel_request_id==rid` → 立即 abort(close **enqueue→start** 窗口),`xferinfo_cb` 亦查它(in-flight);用户请求取不同 id,**不受影响**。Dart 侧另: fold 每个模型调用点(seam/`_resolveOpenLevel1`/`_l1SummaryText`/Phase A,B)均有 isAborted gate + `_sendMessage` 抢占对 pending timer 也生效 + 导航 bump `_foldGen` 并取消待定时器。C++ 测试(http_client/sse_parser + `[reqid]` targeted-cancel 新增 2 测)离线经 local mock server 全绿。
 - **闭段冻结(progressive closure)**:某段被两道切分标记圈定后,其消息内容与摘要即固定为永久历史 — 摘要落库**一次**,此后逐轮从持久化节点**复用,绝不重新摘要**;dirty-seq 惰性重算**只作用于未封口的尾部**,已闭段不参与(其内容因工具轮已完结而不再被 `updateToolCalls` 触及)。`buildTree` 因此是**渐进封口**的纯函数:读入已持久化的闭段边界作为输入,只对未闭尾部决定"再封几段",绝不重塑已闭段。**注:当前 reuse-gate(复用闸门)尚无显式"已闭段强制命中缓存"逻辑——这是 tasks ⑨ 要实现的落点此处为设计目标,非现状。**
 - **`materialize` 必须 UPSERT(不是裸 INSERT)**:同一事务内先删同 `(session_id, covered_min_seq, covered_max_seq)` 的旧行再插。否则同 span 因 staleness 重算时会叠重复行 → ①违反 D9「covered 稠密非重叠」②`findCovering` 无 ORDER BY 取 `rows.first`(=旧 stale 行)→ stale reuse。此即 2026-08-28 设计一致性审计抓到的真实缺陷(见附录 A)。**渐进封口只关闭了"已闭段重复写"的常见触发路径;UPSERT 仍是 load-bearing(承载性)的——任何发生在未闭尾部/预算变化/dirty 尾部的重算都可能对同 span 再次 materialize,必须"先删旧行再插"才能维持 D9 稠密非重叠 + `findCovering` 取最新。不得弱化为"纯防御/可能不触发"。**
 - 注意:串行化的**只是模型路径**,web_search/web_fetch 在独立 worker isolate(不可与用户模型请求并发但工具/网络路径未被门控)。

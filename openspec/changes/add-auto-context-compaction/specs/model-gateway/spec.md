@@ -38,3 +38,18 @@ The C++ Sidecar SHALL conditionally include adaptive thinking configuration in t
 #### Scenario: display summarized always set
 - **WHEN** adaptive thinking is enabled
 - **THEN** `"display":"summarized"` is always included to ensure visible thinking content on Opus 4.7+ models
+
+### Requirement: Request-id targeted cancellation (was: cancel-before-start is a no-op)
+`cancel_request()` takes a request id, and `send_message` takes a caller-supplied `request_id` (the Dart bridge assigns a unique monotonically-increasing id per request before enqueueing). **Modified from the base contract** (which had a no-arg `cancel_request()` and a no-op "cancel before request start"): the sidecar SHALL keep a `cancel_request_id` state that `execute()` does NOT reset at request start; when `cancel_request(id)` is called, a request whose id matches SHALL be aborted whether it is already in-flight (observed via the XFERINFO callback) OR only enqueued/not-yet-started (checked at execute() start, before any network I/O), and SHALL deliver `on_done(-1, "cancelled")` in both cases. The `cancel_request_id` SHALL be cleared once that specific request resolves, so later requests that reuse the id are not spuriously cancelled. Other (non-matching-id) requests are unaffected.
+
+#### Scenario: In-flight request-id cancel
+- **WHEN** `cancel_request(id)` is called while the request with that id is streaming
+- **THEN** the transfer aborts (`CURLE_ABORTED_BY_CALLBACK`), `cancelled` is set (NOT mislabeled a connection error), and `on_done(-1, "cancelled")` is delivered
+
+#### Scenario: Enqueued-not-started request-id cancel
+- **WHEN** `cancel_request(id)` is called while the request with that id is queued but not yet running
+- **THEN** `execute()` aborts at its start check (before network I/O) and delivers `on_done(-1, "cancelled")`
+
+#### Scenario: Latch cleared after the target resolves
+- **WHEN** the request identified by `cancel_request_id` completes (cancelled or otherwise)
+- **THEN** `cancel_request_id` is cleared so a later request reusing that id is not spuriously cancelled

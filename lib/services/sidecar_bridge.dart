@@ -27,10 +27,11 @@ typedef SendMessageNative = Int32 Function(
   Pointer<NativeFunction<OnToolCallNative>> onToolCall,
   Pointer<NativeFunction<OnThinkingNative>> onThinking,
   Pointer<NativeFunction<OnDoneNative>> onDone,
+  Int32 requestId,
 );
 
 typedef SetWorkspaceNative = Pointer<Utf8> Function(Pointer<Utf8> path);
-typedef CancelRequestNative = Void Function();
+typedef CancelRequestNative = Void Function(Int32 requestId);
 
 // Dart-facing types
 typedef SendMessageDart = int Function(
@@ -46,6 +47,7 @@ typedef SendMessageDart = int Function(
   Pointer<NativeFunction<OnToolCallNative>> onToolCall,
   Pointer<NativeFunction<OnThinkingNative>> onThinking,
   Pointer<NativeFunction<OnDoneNative>> onDone,
+  int requestId,
 );
 
 typedef OnDoneDart = void Function(int code, Pointer<Utf8> err, Pointer<Utf8> stopReason, int inputTokens, int outputTokens);
@@ -61,7 +63,7 @@ typedef WriteFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef EditFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef GlobFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef GrepFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
-typedef CancelRequestDart = void Function();
+typedef CancelRequestDart = void Function(int requestId);
 
 // ---------------------------------------------------------------------------
 // Dart-facing callback types
@@ -144,6 +146,21 @@ class SidecarBridge implements ISidecar {
   // pending_strings cleanup barrier (D3) depends on.
   Future<void>? _chain;
 
+  // Request-id targeted cancel (design D8). Every sendMessage is assigned a
+  // unique monotonically increasing id BEFORE it is enqueued, and that id is
+  // passed to the C++ `send_message` so cancel_request(id) can abort the SPECIFIC
+  // request (even one only enqueued / not yet running — a global flag cannot,
+  // because execute() resets it). `_lastRequestId` is the most recently enqueued
+  // request: at a user-send preempt it is the background fold's current request,
+  // so cancelRequest() targets exactly that and never the user's own request.
+  int _nextRequestId = 1;
+  int? _lastRequestId;
+  // Count of requests enqueued but not yet resolved. cancelRequest() only cancels
+  // when >0 — so it never targets an ALREADY-COMPLETED request id, which would
+  // otherwise leave a stale cancel_request_id latched in the C++ gateway (poison
+  // on a later hot-restart id reuse). See model_gateway cancel_request_id.
+  int _pendingRequests = 0;
+
   SidecarBridge._() {
     _lib = _openLibrary();
     _setWorkspaceFn =
@@ -195,6 +212,11 @@ class SidecarBridge implements ISidecar {
     OnThinkingCallback? onThinking,
     required OnDoneCallback onDone,
   }) {
+    // Assign a unique id BEFORE enqueueing so cancel_request(id) can target this
+    // request even while it is queued / not yet running (design D8).
+    final requestId = _nextRequestId++;
+    _lastRequestId = requestId;
+    _pendingRequests++;
     return _enqueue(() => _sendMessageInner(
           apiKey: apiKey,
           baseUrl: baseUrl,
@@ -204,6 +226,7 @@ class SidecarBridge implements ISidecar {
           toolsJson: toolsJson,
           thinkingMode: thinkingMode,
           thinkingEffort: thinkingEffort,
+          requestId: requestId,
           onChunk: onChunk,
           onToolCall: onToolCall,
           onThinking: onThinking,
@@ -221,7 +244,16 @@ class SidecarBridge implements ISidecar {
 
   @override
   void cancelRequest() {
-    _cancelRequestFn();
+    // Request-id targeted cancel (design D8): cancel the most recently enqueued
+    // request. At a user-send preempt this is the background fold's current
+    // request, so it aborts that — never the user's own request (assigned a
+    // different id after the preempt). No-op when NO request is pending: if we
+    // cancelled a stale/completed id it would latch cancel_request_id in C++
+    // (uncleared -> a later hot-restart id reuse spuriously cancels). Only a LIVE
+    // (enqueued/running) request has a meaningful id to cancel.
+    if (_pendingRequests <= 0) return;
+    final id = _lastRequestId;
+    if (id != null && id != 0) _cancelRequestFn(id);
   }
 
   Future<void> _sendMessageInner({
@@ -233,6 +265,7 @@ class SidecarBridge implements ISidecar {
     required String toolsJson,
     required String thinkingMode,
     required String thinkingEffort,
+    required int requestId,
     required OnChunkCallback onChunk,
     required OnToolCallCallback onToolCall,
     OnThinkingCallback? onThinking,
@@ -259,6 +292,10 @@ class SidecarBridge implements ISidecar {
         {bool closeCallables = true}) {
       if (finished) return; // idempotent: ignore duplicate done (F5)
       finished = true;
+      // This request is now complete — decrement BEFORE onDone fires, so a caller
+      // (e.g. _endStreaming) that invokes cancelRequest() from the onDone callback
+      // sees no pending request and does NOT latch a stale/completed id in C++.
+      _pendingRequests--;
       // Close callables only after a real done (success or cancellation):
       // by the time this callback is processed, the curl thread has already
       // terminated (done is its last action before join), so no callback can
@@ -314,6 +351,7 @@ class SidecarBridge implements ISidecar {
       'toolsJson': toolsJson,
       'thinkingMode': thinkingMode,
       'thinkingEffort': thinkingEffort,
+      'requestId': requestId,
       'onChunkAddr': onChunkCallable.nativeFunction.address,
       'onToolCallAddr': onToolCallCallable.nativeFunction.address,
       'onThinkingAddr': onThinkingCallable.nativeFunction.address,
@@ -328,8 +366,8 @@ class SidecarBridge implements ISidecar {
       if (finished) return;
       timedOut = true;
       // ignore: avoid_print
-      print('[SidecarBridge] request timed out after 120s — cancelling');
-      _cancelRequestFn();
+      print('[SidecarBridge] request #$requestId timed out after 120s — cancelling');
+      _cancelRequestFn(requestId);
       // Fallback in case the cancel path never delivers a done (defensive).
       // closeCallables: false (9.3) — the curl thread may still be alive if
       // cancellation failed to terminate it; closing would be UB. We complete
@@ -373,6 +411,7 @@ class SidecarBridge implements ISidecar {
     final toolsJson = args['toolsJson'] as String;
     final thinkingMode = args['thinkingMode'] as String;
     final thinkingEffort = args['thinkingEffort'] as String;
+    final requestId = args['requestId'] as int;
     final onChunkAddr = args['onChunkAddr'] as int;
     final onToolCallAddr = args['onToolCallAddr'] as int;
     final onThinkingAddr = args['onThinkingAddr'] as int;
@@ -419,6 +458,7 @@ class SidecarBridge implements ISidecar {
           onToolCallPtr,
           onThinkingPtr,
           onDonePtr,
+          requestId,
         );
       } finally {
         malloc.free(apiKeyPtr);

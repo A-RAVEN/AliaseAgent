@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -13,6 +14,7 @@ import 'services/agent_type_registry.dart';
 import 'services/compaction/compaction_plan.dart';
 import 'services/compaction/guard_anchors.dart';
 import 'services/compaction/model_summary_provider.dart';
+import 'services/compaction/seam_selector.dart';
 import 'services/compaction/summary_provider.dart';
 import 'services/config_service.dart';
 import 'services/database_service.dart';
@@ -27,6 +29,17 @@ import 'ui/setup_dialog.dart';
 
 final registry = AgentTypeRegistry();
 ProviderResolver? resolver;
+
+/// Thrown by [_resolveSummaries] when a background fold is aborted (preempted by
+/// a user send). Distinct from a real summarization failure: the inline send path
+/// never passes `isAborted`, so it never raises this; the background fold catches
+/// it as "resume next idle". Its `message` must not be confused with a model error.
+class _BackgroundFoldCancelled implements Exception {
+  final String reason;
+  const _BackgroundFoldCancelled(this.reason);
+  @override
+  String toString() => reason;
+}
 
 void main() {
   sqfliteFfiInit();
@@ -153,7 +166,13 @@ class ChatScreen extends StatefulWidget {
   final MessageRepository? msgRepo;
   final ISidecar? sidecar;
   final SummaryProvider? summaryProvider;
+  final SeamSelector? seamSelector;
   final GuardAnchors? guard;
+  /// Idle-gated background folding (2.6). Defaults to production behavior
+  /// (enabled when no summary provider is injected). Hermetic widget tests inject
+  /// a fake summary provider, so it defaults OFF there; a test may override this
+  /// to true to exercise the fold with a fake provider against a real in-memory DB.
+  final bool? backgroundFoldEnabled;
 
   const ChatScreen({
     super.key,
@@ -162,7 +181,9 @@ class ChatScreen extends StatefulWidget {
     this.msgRepo,
     this.sidecar,
     this.summaryProvider,
+    this.seamSelector,
     this.guard,
+    this.backgroundFoldEnabled,
   });
 
   @override
@@ -174,8 +195,27 @@ class ChatScreenState extends State<ChatScreen> {
   late final MessageRepository _msgRepo;
   late final ISidecar _sidecar;
   late final SummaryProvider _summaryProvider;
+  late final SeamSelector? _seamSelector;
   late final GuardAnchors _guard;
   late final SummaryNodeRepository _summaryNodeRepo;
+  /// 2.6 background folding: enabled iff no summary provider is injected
+  /// (production), unless the test overrides [ChatScreen.backgroundFoldEnabled].
+  late final bool _backgroundFoldEnabled;
+
+  // 2.6 idle-gated background folding state. A fold runs only when the model slot
+  // is free (not streaming), the user is idle (debounce window elapsed), and no
+  // fold is already in flight. `_foldGen` is a generation token: a user send
+  // increments it to invalidate a running fold, whose in-flight summarize then
+  // throws (ModelSummaryProvider throws on done != 0) and aborts — so the fold is
+  // preempted and does not delay the user's request (BEST-EFFORT, see design D8
+  // known-limit: the single-slot global cancel leaves a bounded race where an
+  // already-enqueued fold call can run ahead of the user). The durable resume
+  // point is the persisted summary_nodes (progressive closure folds only the
+  // not-yet-closed tail next idle); the top closed seq is logged, not stored as a
+  // control value.
+  bool _foldInFlight = false;
+  int _foldGen = 0;
+  Timer? _foldIdleTimer;
 
   List<Session> _sessions = [];
   String? _currentId;
@@ -226,9 +266,32 @@ class ChatScreenState extends State<ChatScreen> {
         (resolver != null
             ? ModelSummaryProvider(sidecar: _sidecar, resolver: resolver!)
             : FakeSummaryProvider());
+    // Seam selector (4.3, design D5 option A): AI picks the L1 topic seam. Wired
+    // only on the production path (no injected summaryProvider == a real model
+    // gateway). Hermetic tests inject a FakeSeamSelector or leave it null (the
+    // arithmetic-safe skeleton then applies, so no extra LLM call is consumed
+    // from a FakeSidecar event queue).
+    _seamSelector = widget.seamSelector ??
+        (widget.summaryProvider == null && resolver != null
+            ? ModelSeamSelector(sidecar: _sidecar, resolver: resolver!)
+            : null);
     _summaryNodeRepo = SummaryNodeRepository();
+    // 2.6: production enables background folding (real summary provider); a
+    // hermetic test injects a fake provider and must opt in explicitly.
+    _backgroundFoldEnabled =
+        widget.backgroundFoldEnabled ?? (widget.summaryProvider == null);
     _initSearchAndTools();
     _loadSessions();
+  }
+
+  @override
+  void dispose() {
+    // 2.6: cancel any pending idle-fold debounce timer before teardown, so a
+    // foreground fold scheduled in the 2s window is not left pending (which would
+    // trip widget-test "Timer still pending" and, on real dispose, hold the State).
+    _foldIdleTimer?.cancel();
+    _foldIdleTimer = null;
+    super.dispose();
   }
 
   /// Build a GuardAnchors seeded from the active agent type's standing
@@ -606,6 +669,14 @@ class ChatScreenState extends State<ChatScreen> {
   int _switchEpoch = -1;
 
   void _selectSession(Session s) {
+    // 2.6: navigating away invalidates any running/scheduled background fold for
+    // the previous session. Bump gen to abort a RUNNING fold (its isAborted closure
+    // sees a stale myGen); cancel a PENDING idle timer so a SCHEDULED fold is not
+    // started for the session the user just left (a scheduled fold captures myGen
+    // AFTER any bump, so gen alone would not stop it).
+    _foldGen++;
+    _foldIdleTimer?.cancel();
+    _foldIdleTimer = null;
     if (_isStreaming) _switchEpoch = _requestEpoch;
     _endStreaming();
     setState(() {
@@ -616,6 +687,13 @@ class ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _newChat() async {
+    // 2.6: a new chat invalidates any running/scheduled background fold (bump gen
+    // for a running fold; cancel the pending timer for a scheduled one) BEFORE the
+    // await — the 2s idle timer could otherwise fire during the create gap and start
+    // a fold for the session being left.
+    _foldGen++;
+    _foldIdleTimer?.cancel();
+    _foldIdleTimer = null;
     final s = await _sessionRepo.create();
     if (!mounted) return;
     if (_isStreaming) _switchEpoch = _requestEpoch;
@@ -628,9 +706,17 @@ class ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _deleteSession(Session s) async {
+    final wasCurrent = _currentId == s.id;
+    if (wasCurrent) {
+      // 2.6: deleting the current session invalidates any running/scheduled fold
+      // BEFORE the await — the idle timer could otherwise fire during the delete
+      // gap and start a fold for the session being abandoned.
+      _foldGen++;
+      _foldIdleTimer?.cancel();
+      _foldIdleTimer = null;
+    }
     await _sessionRepo.delete(s.id);
     if (!mounted) return;
-    final wasCurrent = _currentId == s.id;
     if (wasCurrent) {
       if (_isStreaming) _switchEpoch = _requestEpoch;
       _endStreaming();
@@ -647,6 +733,20 @@ class ChatScreenState extends State<ChatScreen> {
 
   Future<void> _sendMessage(String text) async {
     if (_isStreaming) return;
+    // 2.6 —— preempt ANY scheduled or in-flight background fold before issuing the
+    // user's request. A PENDING idle timer means a fold is SCHEDULED (not yet
+    // started, `_foldInFlight` still false); an in-flight fold is RUNNING. Both
+    // must be suppressed here, otherwise the timer can fire inside this send's
+    // setup gap (before `_isStreaming` is set) and start a fold that is never
+    // preempted, enqueueing a model call ahead of the user's request (D8 user
+    // priority / "never delay"). Bump the generation (invalidate the isAborted
+    // closure), cancel the slot if a fold is mid-model-call, and clear the timer.
+    if (_foldInFlight || _foldIdleTimer != null) {
+      _foldGen++;
+      _sidecar.cancelRequest();
+      _foldIdleTimer?.cancel();
+      _foldIdleTimer = null;
+    }
     if (_currentId == null) {
       // Auto-create a session if none exists
       await _newChat();
@@ -739,23 +839,45 @@ class ChatScreenState extends State<ChatScreen> {
     final List<Map<String, dynamic>> apiMessages;
     if (maxContextTokens > 0) {
       final closed = await _loadClosedSegments(sessionId);
+      // 4.3 design D5 option A: when a seam selector is available, prefetch/memoize
+      // the LLM L1 topic seams for the current fold BEFORE building the plan, then
+      // pass a memo-backed L1SeamChooser. A seam failure degrades gracefully to the
+      // arithmetic-safe skeleton (never splits a tool round, never blocks the turn).
+      final seamChooser =
+          await _prepareSeamChooser(messages, closed, agentType, maxContextTokens);
       final plan = CompactionEngine.buildTree(
-          history: messages, maxContextTokens: maxContextTokens, closed: closed);
+          history: messages,
+          maxContextTokens: maxContextTokens,
+          closed: closed,
+          seamChooser: seamChooser);
       if (plan.shouldCompact) {
-        List<SummaryResult> summaries;
+        ({List<CompactionSegment> segments, List<SummaryResult> summaries}) resolved =
+            (segments: const [], summaries: const []);
         try {
-          summaries = await _resolveSummaries(sessionId, plan, agentType);
+          resolved = await _resolveSummaries(
+              sessionId, plan, agentType, maxContextTokens);
         } catch (e) {
           // Summarization failed — never silently replace the folded context with
           // a placeholder. Fall back to sending the conversation verbatim.
           debugPrint('[AliasAgent] compaction summary failed, sending verbatim: $e');
-          summaries = const [];
+          resolved = (segments: const [], summaries: const []);
         }
-        if (summaries.isEmpty) {
+        if (resolved.segments.isEmpty) {
+          // Empty-far pathological case: compaction split-omitted the ENTIRE far
+          // span (no compressible batch) and there was no verbatim tail, so the
+          // projection is empty — we fall back to the full conversation (which is
+          // over budget, since we entered the fold path). Surface it rather than
+          // silently resend over budget.
+          debugPrint('[AliasAgent] compaction produced no projection (far fully '
+              'omit-worthy, no verbatim tail) — resending the full over-budget '
+              'conversation (known pathological limit)');
           apiMessages = _buildApiMessages(messages);
         } else {
-          apiMessages = _buildCompactionProjection(
-              summaries, plan, _buildApiMessages(plan.verbatim));
+          // segments carries the (measure→adjusted) summary segments + the verbatim
+          // tail; summaries may be empty after an omit-most-of-the-far, in which
+          // case _buildCompactionProjection sends only the verbatim tail (the older
+          // omitted content stays on disk, D9).
+          apiMessages = _buildCompactionProjection(resolved.summaries, resolved.segments);
         }
       } else {
         apiMessages = _buildApiMessages(messages);
@@ -1025,7 +1147,12 @@ class ChatScreenState extends State<ChatScreen> {
             });
           }
         }
-        if (_currentId == sessionId && !wasSwitchCancelled) _endStreaming();
+        if (_currentId == sessionId && !wasSwitchCancelled) {
+          _endStreaming();
+          // 2.6: turn completed — schedule an idle-gated background fold so the
+          // far span is pre-folded for the next turn (does not delay this turn's end).
+          _maybeScheduleBackgroundFold(sessionId);
+        }
         return;
       }
 
@@ -1161,7 +1288,10 @@ class ChatScreenState extends State<ChatScreen> {
       turnThinkingBlocks.clear();
       if (turn >= 50) {
         debugPrint('[AliasAgent] Max tool turns (50) exceeded — aborting');
-        if (_currentId == sessionId && !wasSwitchCancelled) _endStreaming();
+        if (_currentId == sessionId && !wasSwitchCancelled) {
+          _endStreaming();
+          _maybeScheduleBackgroundFold(sessionId);
+        }
         await _sessionRepo.touch(sessionId);
         return;
       }
@@ -1189,6 +1319,116 @@ class ChatScreenState extends State<ChatScreen> {
   /// re-open or re-shape a closed segment (⑨). Returns a non-overlapping set
   /// sorted by span (D9 dense non-overlap), cheapest-first priority on coarser
   /// nodes is refined by Phase-4 frontier logic; here we just avoid overlap.
+  /// Prefetch/memoize the LLM L1 topic seams (4.3, D5 option A) for a fold and
+  /// return a memo-backed chooser. Shared by the inline send path and the
+  /// background fold so both produce the SAME segment topology: a closed segment
+  /// materialized by the background fold is then cache-hit by the inline path.
+  /// A seam failure degrades to the arithmetic-safe skeleton (never splits a
+  /// tool round, never blocks the turn).
+  Future<L1SeamChooser?> _prepareSeamChooser(List<Message> history,
+      List<ClosedSummary> closed, AgentTypeConfig agentType,
+      int maxContextTokens, {bool Function()? isAborted}) async {
+    if (_seamSelector == null) return null;
+    final seamInputs = CompactionEngine.resolveFoldSeamInputs(
+        history: history, maxContextTokens: maxContextTokens, closed: closed);
+    if (seamInputs == null) return null;
+    final seamSel = _seamSelector;
+    // 2.6 abort gate: the seam ensure makes its own model call (SeamSelector.ensure
+    // -> a real sendMessage on the single-slot _chain). A preempted background fold
+    // must NOT enqueue it ahead of the user's request. Inline send path passes null.
+    if (isAborted?.call() ?? false) {
+      throw const _BackgroundFoldCancelled('background fold aborted before seam selection');
+    }
+    try {
+      await seamSel.ensure(
+          far: seamInputs.far, k: seamInputs.k, config: agentType);
+      return (far, k) => seamSel.memoizedSeams(far: far, k: k) ?? const [];
+    } catch (e) {
+      debugPrint('[AliasAgent] seam selection failed, using arithmetic skeleton: $e');
+      return null;
+    }
+  }
+
+  /// Schedule a background fold for the idle gap after a completed user turn
+  /// (2.6). Idle-gated + preemptible: it runs only when the model slot is free
+  /// (not streaming, no fold in flight), the DB is open, `maxContextTokens` is
+  /// set, and the user stays idle past a short debounce window. Hermetic widget
+  /// tests (which inject a fake summary provider) leave it disabled by default.
+  void _maybeScheduleBackgroundFold(String sessionId) {
+    if (!_backgroundFoldEnabled) return;
+    if (_isStreaming || _foldInFlight) return;
+    if ((registry.lookup('general')?.maxContextTokens ?? 0) <= 0) return;
+    _foldIdleTimer?.cancel();
+    _foldIdleTimer = Timer(const Duration(seconds: 2), () {
+      _foldIdleTimer = null;
+      if (mounted && !_isStreaming && !_foldInFlight) {
+        _runBackgroundFold(sessionId);
+      }
+    });
+  }
+
+  /// Run a background fold for `sessionId`: build a fold plan from the persisted
+  /// history and fold+materialize the far span via [_resolveSummaries] (which
+  /// writes closed summary nodes transactionally + bumps tree_version). Reuses
+  /// the SAME pure fold path as the user's inline send, so a materialized closed
+  /// segment is then cache-hit by the inline `_resolveSummaries` — the user's
+  /// token-time is NOT consumed by re-summarization. Preemptible: a user send
+  /// increments `_foldGen` (=`myGen` mismatch → `isAborted`) and cancels the
+  /// in-flight model request (request-id targeted cancel); the fold aborts and
+  /// does not delay the user (design D8 per-request-id cancel).
+  Future<void> _runBackgroundFold(String sessionId) async {
+    if (_foldInFlight) return;
+    final agentType = registry.lookup('general');
+    if (agentType == null) return;
+    final maxContextTokens = agentType.maxContextTokens ?? 0;
+    if (maxContextTokens <= 0) return;
+
+    _foldInFlight = true;
+    final myGen = _foldGen;
+    try {
+      // Durable resume point (D8 progressive closure): the already-persisted
+      // closed segments are an INPUT, so only the not-yet-closed tail is folded.
+      // NOTE: we do NOT gate on DatabaseService.isOpen here. In production the DB
+      // is always open, so materialize persists; in hermetic tests (fake repos,
+      // no DB) the fold still runs and computes summaries but skips persist
+      // (the materialize calls inside _resolveSummaries are `if (dbOpen)`).
+      final messages = await _msgRepo.queryBySession(sessionId);
+      if (messages.isEmpty) return;
+      final closed = await _loadClosedSegments(sessionId);
+      // Durable resume point (D8 progressive closure) = the persisted `closed`
+      // segments passed into buildTree; the top closed seq is only logged for
+      // observability (there is no separate in-memory checkpoint control value).
+      final topClosedMax = closed.isEmpty
+          ? 0
+          : closed.map((c) => c.coveredMaxSeq).reduce((a, b) => a > b ? a : b);
+      final seamChooser = await _prepareSeamChooser(messages, closed, agentType,
+          maxContextTokens, isAborted: () => _foldGen != myGen);
+      final plan = CompactionEngine.buildTree(
+          history: messages,
+          maxContextTokens: maxContextTokens,
+          closed: closed,
+          seamChooser: seamChooser);
+      if (!plan.shouldCompact) {
+        debugPrint('[AliasAgent] background fold: conversation within budget, '
+            'nothing to fold (top closed seq=$topClosedMax) -> no-op');
+        return;
+      }
+      final resolved = await _resolveSummaries(
+          sessionId, plan, agentType, maxContextTokens,
+          isAborted: () => _foldGen != myGen);
+      debugPrint('[AliasAgent] background fold: folded '
+          '${resolved.summaries.length} summary segment(s) for session $sessionId, '
+          'top closed seq=$topClosedMax');
+    } catch (e) {
+      // A preempted fold's in-flight summarize throws (ModelSummaryProvider throws
+      // on done != 0, which includes cancel). Treat as "aborted, resume next idle"
+      // — the already-materialized closed nodes are durable; never a hard failure.
+      debugPrint('[AliasAgent] background fold aborted for session $sessionId: $e');
+    } finally {
+      _foldInFlight = false;
+    }
+  }
+
   Future<List<ClosedSummary>> _loadClosedSegments(String sessionId) async {
     if (!DatabaseService.isOpen) return const [];
     try {
@@ -1224,7 +1464,8 @@ class ChatScreenState extends State<ChatScreen> {
   /// 2-pass level-2 "summary of summaries"): reuse the persisted level-1 node if
   /// present & not stale, else summarize the span and best-effort persist level-1.
   Future<String> _l1SummaryText(String sessionId, bool dbOpen, int dirtySince,
-      List<Message> msgs, AgentTypeConfig agentType) async {
+      List<Message> msgs, AgentTypeConfig agentType,
+      {bool Function()? isAborted}) async {
     if (msgs.isEmpty) return '';
     final minSeq = msgs.first.seq;
     final maxSeq = msgs.last.seq;
@@ -1239,6 +1480,14 @@ class ChatScreenState extends State<ChatScreen> {
       } catch (e) {
         debugPrint('[AliasAgent] L1 sub-span reuse failed: $e');
       }
+    }
+    // 2.6 abort gate: this helper makes its own model call INSIDE the fold, and a
+    // preempted fold must NOT enqueue a further summarize onto the single-slot
+    // _chain ahead of the user's request. Check the generation before issuing it
+    // (the in-flight request is cancelled by the preempt's cancelRequest; the next
+    // one is prevented here). Inline callers pass isAborted:null -> no-op.
+    if (isAborted?.call() ?? false) {
+      throw const _BackgroundFoldCancelled('background fold aborted during L1 sub-span');
     }
     final s = await _summaryProvider.summarize(folded: msgs, config: agentType);
     if (dbOpen && minSeq != null && maxSeq != null) {
@@ -1268,9 +1517,49 @@ class ChatScreenState extends State<ChatScreen> {
     return s.text;
   }
 
-  Future<List<SummaryResult>> _resolveSummaries(
-      String sessionId, CompactionPlan plan, AgentTypeConfig agentType) async {
-    final results = <SummaryResult>[];
+  /// Summarize an OPEN level-1 batch with SPLIT-IF-INVALID (design D3/D4).
+  ///
+  /// A compression is valid ONLY if the produced summary's MEASURED token count
+  /// (real `output_tokens`, ⑪.1) is LESS than the batch it replaced. If invalid,
+  /// split the batch in half and recurse (deterministic — always terminates: the
+  /// batch halves). If a single (atomic) batch still cannot compress, RETURN an
+  /// empty list — the atomic batch is OMITTED from the projection (DATA KEPT on
+  /// disk, D9), never sent as a summary larger than the content it replaced.
+  Future<List<({CompactionSegment seg, String text, int tokens, bool isClosed})>>
+      _resolveOpenLevel1(List<Message> msgs, AgentTypeConfig agentType,
+          {bool Function()? isAborted}) async {
+    // 2.6 abort gate (split-if-invalid recursion makes its own model calls): a
+    // preempted background fold must stop at the next model call rather than
+    // enqueueing an un-cancelled summarize onto the single-slot _chain ahead of the
+    // user's request. Checked at each recursion entry. Inline callers pass null.
+    if (isAborted?.call() ?? false) {
+      throw const _BackgroundFoldCancelled('background fold aborted during open-batch resolve');
+    }
+    if (msgs.isEmpty) return const [];
+    final raw = CompactionEngine.rawTokens(msgs);
+    final summary = await _summaryProvider.summarize(folded: msgs, config: agentType);
+    if (summary.tokens < raw) {
+      return [
+        (seg: CompactionSegment(messages: msgs, summary: true, level: 1),
+            text: summary.text, tokens: summary.tokens, isClosed: false),
+      ];
+    }
+    // Invalid (summary ≥ batch raw): split the batch in half and recurse.
+    if (msgs.length > 1) {
+      final mid = msgs.length ~/ 2;
+      return [
+        ...await _resolveOpenLevel1(msgs.sublist(0, mid), agentType, isAborted: isAborted),
+        ...await _resolveOpenLevel1(msgs.sublist(mid), agentType, isAborted: isAborted),
+      ];
+    }
+    // Atomic batch that cannot compress — omit (never send a bloated summary).
+    return const [];
+  }
+
+  Future<({List<CompactionSegment> segments, List<SummaryResult> summaries})>
+      _resolveSummaries(String sessionId, CompactionPlan plan,
+          AgentTypeConfig agentType, int budget,
+          {bool Function()? isAborted}) async {
     final dbOpen = DatabaseService.isOpen;
     // Dirty-since-seq watermark (D8 lazy recompute): a cached summary may be
     // reused only if its covered span is strictly below the watermark (clean —
@@ -1285,7 +1574,14 @@ class ChatScreenState extends State<ChatScreen> {
       }
     }
     var persistFailed = false;
+
+    // Phase A — resolve each summary segment to text + MEASURED tokens (⑪.1 real
+    // output_tokens), keeping its identity for the measure→adjust loop (⑪.3).
+    final entries = <({CompactionSegment seg, String text, int tokens, bool isClosed})>[];
     for (final seg in plan.segments) {
+      if (isAborted?.call() ?? false) {
+        throw const _BackgroundFoldCancelled('background fold aborted between segments');
+      }
       if (!seg.summary || seg.messages.isEmpty) continue;
       final minSeq = seg.messages.first.seq;
       final maxSeq = seg.messages.last.seq;
@@ -1295,11 +1591,6 @@ class ChatScreenState extends State<ChatScreen> {
       // closure and summary immutability" / D8 progressive closure). Its content
       // is fixed history, so it can never be stale.
       if (seg.reuse != null) {
-        // A CLOSED segment is immutable: its summary is computed once, persisted,
-        // and NEVER re-summarized. If its cache is missing (defensive — it should
-        // exist, since _loadClosedSegments read it from the same DB), do NOT
-        // regenerate it (that would break the immutable-history guarantee); throw
-        // so the caller falls back to sending the conversation verbatim.
         if (!dbOpen) {
           throw StateError('closed segment ${seg.reuse!.coveredMinSeq}..'
               '${seg.reuse!.coveredMaxSeq} cache lookup requires an open DB');
@@ -1316,7 +1607,7 @@ class ChatScreenState extends State<ChatScreen> {
           throw StateError('closed segment ${seg.reuse!.coveredMinSeq}..'
               '${seg.reuse!.coveredMaxSeq} persisted summary is empty');
         }
-        results.add(SummaryResult(text: text, tokens: node.tokenCost ?? 0));
+        entries.add((seg: seg, text: text, tokens: node.tokenCost ?? 0, isClosed: true));
         continue;
       }
       if (dbOpen && minSeq != null && maxSeq != null) {
@@ -1330,7 +1621,7 @@ class ChatScreenState extends State<ChatScreen> {
               (dirtySince == 0 || node.coveredMaxSeq < dirtySince)) {
             final text = _summaryTextFromJson(node.summaryJson!);
             if (text.isNotEmpty) {
-              results.add(SummaryResult(text: text, tokens: node.tokenCost ?? 0));
+              entries.add((seg: seg, text: text, tokens: node.tokenCost ?? 0, isClosed: false));
               continue;
             }
           }
@@ -1339,11 +1630,9 @@ class ChatScreenState extends State<ChatScreen> {
         }
       }
 
-      // 2-pass "summary of summaries" (level-2): produce/fetch each level-1
-      // sub-summary's text, join them, then re-summarize into a coarser level-2.
-      // When l2SubSpans is null (omit/truncated case) fall back to a single
-      // coarser pass over the segment.
-      final SummaryResult summary;
+      // 2-pass "summary of summaries" (level-2) — nominal buildTree no longer
+      // yields an open level-2, but a closed level-2 is handled above; keep this
+      // path for safety (l2SubSpans = null → single coarser pass).
       if (seg.level == 2 &&
           seg.l2SubSpans != null &&
           seg.l2SubSpans!.isNotEmpty) {
@@ -1359,45 +1648,213 @@ class ChatScreenState extends State<ChatScreen> {
               .toList();
           if (l1Msgs.isEmpty) continue;
           l1Texts.add(
-              await _l1SummaryText(sessionId, dbOpen, dirtySince, l1Msgs, agentType));
+              await _l1SummaryText(sessionId, dbOpen, dirtySince, l1Msgs, agentType,
+                  isAborted: isAborted));
         }
-        summary = await _summaryProvider.summarizeText(
+        final summary = await _summaryProvider.summarizeText(
             text: l1Texts.join('\n\n'), config: agentType);
-      } else {
-        summary =
-            await _summaryProvider.summarize(folded: seg.messages, config: agentType);
-      }
-      // Hermetic tests (no DB open) never persist the derived index — the originals
-      // stay in memory and there is no tree to invalidate.
-      if (dbOpen && minSeq != null && maxSeq != null) {
-        debugPrint('[AliasAgent] folding ${seg.messages.length} messages '
-            '(seq $minSeq..$maxSeq) into a level-${seg.level} summary');
-        try {
-          await _summaryNodeRepo.materialize(
-            sessionId: sessionId,
-            level: seg.level,
-            startSeq: minSeq,
-            endSeq: maxSeq,
-            nodeType: 'summary',
-            summaryJson: jsonEncode({
-              'role': 'user',
-              'content': [
-                {'type': 'text', 'text': summary.text},
-              ],
-            }),
-            tokenCost: summary.tokens,
-            summaryPromptVersion: 1,
-            model: agentType.model,
-            coveredMinSeq: minSeq,
-            coveredMaxSeq: maxSeq,
-          );
-        } catch (e) {
-          persistFailed = true;
-          debugPrint('[AliasAgent] persist summary failed: $e');
+        if (dbOpen && minSeq != null && maxSeq != null) {
+          debugPrint('[AliasAgent] folding ${seg.messages.length} messages '
+              '(seq $minSeq..$maxSeq) into a level-${seg.level} summary');
+          try {
+            await _summaryNodeRepo.materialize(
+              sessionId: sessionId,
+              level: seg.level,
+              startSeq: minSeq,
+              endSeq: maxSeq,
+              nodeType: 'summary',
+              summaryJson: jsonEncode({
+                'role': 'user',
+                'content': [
+                  {'type': 'text', 'text': summary.text},
+                ],
+              }),
+              tokenCost: summary.tokens,
+              summaryPromptVersion: 1,
+              model: agentType.model,
+              coveredMinSeq: minSeq,
+              coveredMaxSeq: maxSeq,
+            );
+          } catch (e) {
+            persistFailed = true;
+            debugPrint('[AliasAgent] persist summary failed: $e');
+          }
         }
+        entries.add((seg: seg, text: summary.text, tokens: summary.tokens, isClosed: false));
+        continue;
       }
-      results.add(summary);
+
+      // OPEN level-1 batch: resolve with split-if-invalid (D3/D4). A summary is
+      // valid ONLY if its MEASURED token count is less than the batch it replaced
+      // (else split in half + recurse); an atomic batch that still cannot compress
+      // is OMITTED from the projection (data kept on disk, D9) — never send a
+      // bloat- > batch summary.
+      final leafEntries = await _resolveOpenLevel1(seg.messages, agentType,
+          isAborted: isAborted);
+      for (final leaf in leafEntries) {
+        // Hermetic tests (no DB open) never persist the derived index.
+        if (dbOpen && leaf.seg.messages.isNotEmpty &&
+            leaf.seg.messages.first.seq != null &&
+            leaf.seg.messages.last.seq != null) {
+          final lo = leaf.seg.messages.first.seq!;
+          final hi = leaf.seg.messages.last.seq!;
+          debugPrint('[AliasAgent] folding ${leaf.seg.messages.length} messages '
+              '(seq $lo..$hi) into a level-${leaf.seg.level} summary');
+          try {
+            await _summaryNodeRepo.materialize(
+              sessionId: sessionId,
+              level: leaf.seg.level,
+              startSeq: lo,
+              endSeq: hi,
+              nodeType: 'summary',
+              summaryJson: jsonEncode({
+                'role': 'user',
+                'content': [
+                  {'type': 'text', 'text': leaf.text},
+                ],
+              }),
+              tokenCost: leaf.tokens,
+              summaryPromptVersion: 1,
+              model: agentType.model,
+              coveredMinSeq: lo,
+              coveredMaxSeq: hi,
+            );
+          } catch (e) {
+            persistFailed = true;
+            debugPrint('[AliasAgent] persist summary failed: $e');
+          }
+        }
+        entries.add(leaf);
+      }
     }
+
+    // Phase B — fold→measure→adjust (⑪.3). Closed segments are FROZEN; only the
+    // OPEN (tail) L1 batches are adjustable. Over budget → coarsen the OLDEST
+    // open L1s into a level-2 "summary of summaries" (measured token > T) and
+    // re-measure; when no coarsening would merge ≥2 → OMIT the oldest open.
+    final closedEntries = entries.where((e) => e.isClosed).toList();
+    var open = entries.where((e) => !e.isClosed).toList();
+    final verbatimRaw = CompactionEngine.rawTokens(plan.verbatim);
+    final closedSum = closedEntries.fold(0, (m, e) => m + e.tokens);
+    var openSum = open.fold(0, (m, e) => m + e.tokens);
+    final T = budget ~/ 2;
+    var total = closedSum + openSum + verbatimRaw;
+    while (total > budget && open.isNotEmpty) {
+      if (isAborted?.call() ?? false) {
+        throw const _BackgroundFoldCancelled('background fold aborted during coarsen');
+      }
+      // Never re-coarsen an existing level-2 into a new level-2: that would make
+      // the new L2 a "summary of a summary + more L1s" (violates design D1 "只做两
+      // 级 / L2 的输入是 L1 摘要文本") and persist overlapping level-2 rows. An
+      // already-coarse L2 is handled by omission only.
+      if (open[0].seg.level >= 2) {
+        open.removeAt(0);
+        openSum = open.fold(0, (m, e) => m + e.tokens);
+        total = closedSum + openSum + verbatimRaw;
+        continue;
+      }
+      // Prefer coarsening the OLDEST consecutive open L1s whose cumulative
+      // measured tokens exceed T into ONE level-2 "summary of summaries".
+      final l1Tokens = <int>[];
+      var consecutiveL1 = 0;
+      for (final e in open) {
+        if (e.seg.level >= 2) break;
+        l1Tokens.add(e.tokens);
+        consecutiveL1++;
+      }
+      final groupCount = CompactionEngine.l2GroupCount(l1Tokens, T);
+      if (consecutiveL1 >= 2 && groupCount >= 2) {
+        final group = open.sublist(0, groupCount);
+        final groupSum = group.fold(0, (m, e) => m + e.tokens);
+        final l2 = await _summaryProvider.summarizeText(
+            text: group.map((e) => e.text).join('\n\n'), config: agentType);
+        if (l2.tokens >= groupSum) {
+          // INVALID coarsen: the level-2 is NOT smaller than the L1 summaries it
+          // would replace — the same "valid only if measured < replaced" criterion
+          // split-if-invalid enforces for L1. A bloated L2 would INFLATE total, so
+          // reject it and DRAIN (omit) the group's entries one-at-a-time, re-measuring
+          // total, WITHOUT re-coarsening the same futile group — this avoids O(n)
+          // fresh summarizeText calls while preserving the still-valid L1s (each omit
+          // is projection-only; data kept on disk, D9).
+          var drain = groupCount;
+          while (drain > 0 && open.isNotEmpty && total > budget) {
+            open.removeAt(0);
+            drain--;
+            openSum = open.fold(0, (m, e) => m + e.tokens);
+            total = closedSum + openSum + verbatimRaw;
+          }
+        } else {
+          final mergedMsgs = group.expand((e) => e.seg.messages).toList();
+          final l2seg = CompactionSegment(
+              messages: mergedMsgs,
+              summary: true,
+              level: 2,
+              l2SubSpans:
+                  group.map((e) => CompactionEngine.segmentSpan(e.seg)).toList());
+          final l2Entry =
+              (seg: l2seg, text: l2.text, tokens: l2.tokens, isClosed: false);
+          if (dbOpen && mergedMsgs.isNotEmpty &&
+              mergedMsgs.first.seq != null && mergedMsgs.last.seq != null) {
+            final lo = mergedMsgs.first.seq!;
+            final hi = mergedMsgs.last.seq!;
+            try {
+              await _summaryNodeRepo.materialize(
+                sessionId: sessionId,
+                level: 2,
+                startSeq: lo,
+                endSeq: hi,
+                nodeType: 'summary',
+                summaryJson: jsonEncode({
+                  'role': 'user',
+                  'content': [
+                    {'type': 'text', 'text': l2.text},
+                  ],
+                }),
+                tokenCost: l2.tokens,
+                summaryPromptVersion: 1,
+                model: agentType.model,
+                coveredMinSeq: lo,
+                coveredMaxSeq: hi,
+              );
+            } catch (e) {
+              persistFailed = true;
+              debugPrint('[AliasAgent] persist level-2 summary failed: $e');
+            }
+          }
+          open = [l2Entry, ...open.sublist(groupCount)];
+          openSum = open.fold(0, (m, e) => m + e.tokens);
+        }
+      } else {
+        // Fully coarsened (no merge of ≥2 L1s) — OMIT the OLDEST open content from
+        // the projection (data kept on disk, D9).
+        open.removeAt(0);
+        openSum = open.fold(0, (m, e) => m + e.tokens);
+      }
+      total = closedSum + openSum + verbatimRaw;
+    }
+    // Residual-over-budget detection (⑪ review finding): the loop exits on
+    // `open.isEmpty`, NOT on `total <= budget`. If open is fully coarsened+omitted
+    // and closedSum + verbatimRaw alone still exceeds budget (frozen closed
+    // summaries + newest verbatim are both excluded from omission — D8 "闭段冻结"
+    // and D3/D4 "最新始终 verbatim"), the projection is sent over budget. This is
+    // the acknowledged pathological "known limit"; surface it rather than hide it.
+    if (total > budget) {
+      debugPrint('[AliasAgent] compaction projection still over budget by '
+          '${total - budget} tokens (closed+verbatim alone exceed maxContextTokens; '
+          'sending best-effort projection — a pathological known limit)');
+    }
+
+    final finalSegments = <CompactionSegment>[
+      ...closedEntries.map((e) => e.seg),
+      ...open.map((e) => e.seg),
+      if (plan.verbatim.isNotEmpty)
+        CompactionSegment(messages: plan.verbatim, summary: false),
+    ];
+    final finalSummaries = <SummaryResult>[
+      ...closedEntries.map((e) => SummaryResult(text: e.text, tokens: e.tokens)),
+      ...open.map((e) => SummaryResult(text: e.text, tokens: e.tokens)),
+    ];
+
     // Consume the dirty watermark ONLY if every stale span was re-summarized AND
     // persisted in this pass. If any materialize write failed, the stale cached
     // node is still on disk; clearing the watermark would make the next refold
@@ -1410,7 +1867,7 @@ class ChatScreenState extends State<ChatScreen> {
         debugPrint('[AliasAgent] clear dirty watermark failed: $e');
       }
     }
-    return results;
+    return (segments: finalSegments, summaries: finalSummaries);
   }
 
   /// Extract the summary text from a stored summary_json block document.
@@ -1427,15 +1884,20 @@ class ChatScreenState extends State<ChatScreen> {
   }
 
   /// Build the compacted projection: leading role:user summary-prefix messages
-  /// (one per level-1 segment, oldest → newest) followed by the near-verbatim
+  /// (one per summary segment, oldest → newest) followed by the near-verbatim
   /// span replayed via [_buildApiMessages]. If the verbatim span starts on a user
   /// turn, the LAST summary's marker+text is merged into that leading user
   /// message to keep valid role alternation (user,user would violate the schema).
+  ///
+  /// [segments] is the FINAL (measure→adjusted) segment list (⑪.3); summaries are
+  /// aligned one-to-one with the summary segments, in order.
   List<Map<String, dynamic>> _buildCompactionProjection(
-      List<SummaryResult> summaries, CompactionPlan plan,
-      List<Map<String, dynamic>> verbatim) {
+      List<SummaryResult> summaries, List<CompactionSegment> segments) {
     final summarySegs =
-        plan.segments.where((s) => s.summary && s.messages.isNotEmpty).toList();
+        segments.where((s) => s.summary && s.messages.isNotEmpty).toList();
+    final verbatimMsg =
+        segments.where((s) => !s.summary).expand((s) => s.messages).toList();
+    final verbatim = _buildApiMessages(verbatimMsg);
     // Concatenate ALL summary segments into a SINGLE role:user prefix message
     // (one text block per segment, each with its own marker). This guarantees the
     // projection never emits consecutive role:user messages — DeepSeek does NOT

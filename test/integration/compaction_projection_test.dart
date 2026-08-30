@@ -42,7 +42,7 @@ Widget _buildApp({
   required FakeSessionRepository sessionRepo,
   required FakeMessageRepository msgRepo,
   required FakeSidecar sidecar,
-  required FakeSummaryProvider summaryProvider,
+  required SummaryProvider summaryProvider,
 }) {
   return MaterialApp(
     home: Scaffold(
@@ -68,6 +68,38 @@ List<Message> _longConversation(int n) {
         createdAt: i,
       ),
   ];
+}
+
+/// Fake with controllable summary sizes so the measure→adjust loop (⑪.3) can be
+/// forced off the "fits-budget" path: `l1Tokens` is what every level-1 summary
+/// reports, `l2Tokens` what the level-2 "summary of summaries" reports.
+class _SizedFakeSummaryProvider implements SummaryProvider {
+  final int l1Tokens;
+  final int l2Tokens;
+  int summarizeCalls = 0;
+  int summarizeTextCalls = 0;
+  _SizedFakeSummaryProvider({required this.l1Tokens, required this.l2Tokens});
+
+  @override
+  Future<SummaryResult> summarize({
+    required List<Message> folded,
+    required AgentTypeConfig config,
+  }) async {
+    summarizeCalls++;
+    return SummaryResult(
+        text: 'L1 summary (${folded.length} msgs)', tokens: l1Tokens);
+  }
+
+  @override
+  Future<SummaryResult> summarizeText({
+    required String text,
+    required AgentTypeConfig config,
+  }) async {
+    summarizeTextCalls++;
+    // l2Tokens lets the test simulate a compressing (small) or non-compressing
+    // (large) level-2 roll-up.
+    return SummaryResult(text: 'L2 rolled up', tokens: l2Tokens);
+  }
 }
 
 void main() {
@@ -248,6 +280,149 @@ void main() {
           reason: 'no folding should happen under budget');
       expect(sidecar.lastMessagesJson, isNot(contains('## 更早上下文')),
           reason: 'under budget the conversation must be sent verbatim');
+    });
+
+    testWidgets('⑪.3 coarsen: over-budget L1 summaries are rolled into a level-2', (tester) async {
+      // l1Tokens=75×6 L1 batches (+verbatim) exceed budget 200 → the measure-adjust
+      // loop coarsens the OLDEST L1s into a level-2; l2Tokens=20 (compressing)
+      // makes the roll-up smaller so it eventually fits. This exercises ⑪.3.
+      _setupAgentRegistry(maxContextTokens: 200);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final sessions = testSessions(1);
+      final sessionRepo = FakeSessionRepository(sessions);
+      final msgRepo = FakeMessageRepository(_longConversation(24));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final summaryProvider = _SizedFakeSummaryProvider(l1Tokens: 75, l2Tokens: 20);
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: summaryProvider,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      // [OBS] show the coarsen actually ran and the projection the model received.
+      final projected = sidecar.lastMessagesJson ?? '';
+      // ignore: avoid_print
+      print('  [OBS] coarsen: summarizeCalls=${summaryProvider.summarizeCalls} '
+          'summarizeTextCalls=${summaryProvider.summarizeTextCalls} '
+          'projectedChars=${projected.length} '
+          'hasL2=${projected.contains('L2 rolled up')}');
+      expect(summaryProvider.summarizeTextCalls, greaterThanOrEqualTo(1),
+          reason: 'over-budget L1 summaries must be coarsened into a level-2 (⑪.3)');
+      // The final projection carries the coarsened level-2 summary + the current
+      // user message, and stays under control (some far content folded).
+      expect(projected, contains('## 更早上下文'),
+          reason: 'a coarsened projection must still lead with the summary marker');
+      expect(projected, contains('continue'),
+          reason: 'the current user message must survive coarsening');
+    });
+
+    testWidgets('⑪.3 reject-bloated-L2: a non-compressing level-2 is rejected, valid L1s kept', (tester) async {
+      // l1Tokens=20 (< every batch's raw → each L1 is a VALID compression, so
+      // split-if-invalid never fires) but l2Tokens=150 (>= the L1s it would roll
+      // up → the L2 is INVALID, "measured < replaced" fails). ⑪.3 must NOT accept
+      // a bloated L2; it rejects the coarsen and omits the oldest L1 instead, so
+      // the projection keeps the (valid) L1 summaries and drops one, never sending
+      // a summary larger than the content it replaced.
+      _setupAgentRegistry(maxContextTokens: 200);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final sessions = testSessions(1);
+      final sessionRepo = FakeSessionRepository(sessions);
+      final msgRepo = FakeMessageRepository(_longConversation(24));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final summaryProvider = _SizedFakeSummaryProvider(l1Tokens: 20, l2Tokens: 150);
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: summaryProvider,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      final projected = sidecar.lastMessagesJson ?? '';
+      // ignore: avoid_print
+      print('  [OBS] reject-bloated-L2: summarizeCalls=${summaryProvider.summarizeCalls} '
+          'summarizeTextCalls=${summaryProvider.summarizeTextCalls} '
+          'projectedChars=${projected.length} '
+          'hasMarker=${projected.contains('## 更早上下文')} '
+          'hasL2=${projected.contains('L2 rolled up')} '
+          'hasContinue=${projected.contains('continue')}');
+      // The coarsen was ATTEMPTED (summarizeText called) but the invalid (>= the
+      // L1s it replaces) L2 was REJECTED — not sent as a bloated summary.
+      expect(summaryProvider.summarizeTextCalls, greaterThanOrEqualTo(1),
+          reason: 'coarsening must be attempted before the invalid L2 is rejected');
+      expect(projected, isNot(contains('L2 rolled up')),
+          reason: 'a level-2 that is not smaller than the L1s it replaces must be rejected, never sent');
+      expect(projected, contains('## 更早上下文'),
+          reason: 'the valid L1 summaries are still kept (rejected L2 does not drop them)');
+      expect(projected, contains('continue'),
+          reason: 'the current user message must survive');
+    });
+
+    testWidgets('⑪.3 split-if-invalid: an un-compressible batch is split down to atomics and omitted', (tester) async {
+      // l1Tokens=150 (>= every batch's raw) so a batch's summary is NEVER smaller
+      // than the batch it replaced — invalid. _resolveOpenLevel1 splits it in half,
+      // recurses, and omits each atomic batch (data kept, D9) rather than send a
+      // bloated summary. The projection must therefore be verbatim-only (no marker)
+      // and summarize must have been called MORE than once per batch (split ran).
+      _setupAgentRegistry(maxContextTokens: 200);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final sessions = testSessions(1);
+      final sessionRepo = FakeSessionRepository(sessions);
+      final msgRepo = FakeMessageRepository(_longConversation(24));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final summaryProvider = _SizedFakeSummaryProvider(l1Tokens: 150, l2Tokens: 150);
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: summaryProvider,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      final projected = sidecar.lastMessagesJson ?? '';
+      // ignore: avoid_print
+      print('  [OBS] split: summarizeCalls=${summaryProvider.summarizeCalls} '
+          'summarizeTextCalls=${summaryProvider.summarizeTextCalls} '
+          'projectedChars=${projected.length} '
+          'hasMarker=${projected.contains('## 更早上下文')} '
+          'hasContinue=${projected.contains('continue')}');
+      // More summarize calls than line-batches → the split recursion ran, and each
+      // atomic un-compressible batch was omitted (no bloated summary was sent).
+      expect(summaryProvider.summarizeCalls, greaterThan(6),
+          reason: 'an un-compressible batch must be split down several times before omission');
+      expect(projected, isNot(contains('## 更早上下文')),
+          reason: 'un-compressible far content is omitted (never sent as a bloated summary)');
+      expect(projected, contains('continue'),
+          reason: 'the current user message must survive the split-omit');
     });
   });
 }

@@ -16,3 +16,14 @@ The system SHALL invoke the `on_done` callback from C++ to Dart when the API res
 #### Scenario: token_count written from usage
 - **WHEN** Dart receives usage for a message
 - **THEN** the token_count column for that message row is written
+
+### Requirement: Request-id targeted cancel (assign a per-request id)
+The Dart bridge SHALL assign a unique monotonically-increasing `request_id` to every `sendMessage` **before** it is enqueued on the serialization gate, and pass it to the C++ `send_message`; it SHALL also pass the id into the worker isolate. `cancelRequest()` SHALL invoke the C++ `cancel_request(id)` with the id of the request it wants to cancel — the most recently enqueued/active request, which at a background-fold preempt is the fold's request (the user's own request is enqueued AFTER with a different id). This makes cancellation request-id targeted (a queued-but-not-starting fold request is aborted, the user request is unaffected), satisfying the "background folding never delays the user" contract.
+
+#### Scenario: Bridge assigns unique ids
+- **WHEN** `sendMessage` is called
+- **THEN** a fresh monotonically-increasing `request_id` is assigned before enqueueing and passed to the C++ `send_message`
+
+#### Scenario: cancelRequest targets the fold's request id
+- **WHEN** `cancelRequest()` is invoked while a background fold request is the most recently enqueued/active request
+- **THEN** `cancel_request(foldRequestId)` is called (NOT a no-arg cancel), so the fold request aborts and the user request (different id) is unaffected

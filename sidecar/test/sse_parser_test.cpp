@@ -539,6 +539,75 @@ TEST_CASE("SSE: cancel aborts in-flight request", "[sse_parser][cancel]") {
 }
 
 // ============================================================================
+// Request-id targeted cancel (D8, 2.6-返工) — cancel_request(id) aborts the
+// SPECIFIC request, and must deliver on_done(-1,"cancelled") (not "Connection
+// error") for both the in-flight case and the enqueued-not-started case. The
+// user's request (different id) must NOT be affected.
+// ============================================================================
+TEST_CASE("SSE: request-id targeted cancel aborts an IN-FLIGHT request with done 'cancelled'",
+          "[sse_parser][cancel][reqid]") {
+    MockServer server;
+    // Slow long stream so the cancel lands mid-transfer.
+    server.set_response_body(
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n"
+        "data: {\"type\":\"message_stop\"}\n\n");
+    server.set_streaming_chunks(200, 50);
+    server.start("", 200);
+    server.wait_ready();
+
+    ModelGateway gw;
+    gw.set_timeout(30);
+    SseResult r;
+    s_r = &r;
+    std::atomic<bool> execute_returned{false};
+    const int rid = 42;
+    std::thread exec([&] {
+        gw.execute("sk-test", server.base_url().c_str(), "m", "",
+                   R"([{"role":"user","content":"hi"}])", "", "", "",
+                   s_on_chunk, s_on_tool_call, s_on_thinking, s_on_done, rid);
+        execute_returned.store(true);
+    });
+
+    // Let the stream start, then cancel the SPECIFIC id.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    gw.cancel(rid);
+
+    for (int i = 0; i < 200 && !execute_returned.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(execute_returned.load());
+    exec.join();
+    server.join();
+    s_r = nullptr;
+
+    REQUIRE(r.done_count >= 1);
+    REQUIRE(r.done_code == -1);
+    REQUIRE(r.done_err == "cancelled"); // NOT "Connection error"
+}
+
+TEST_CASE("SSE: request-id targeted cancel aborts a queued-not-started request (start-check)",
+          "[sse_parser][cancel][reqid]") {
+    // The start-check aborts BEFORE the curl thread connects, so NO mock server is
+    // needed (and a join() on an unconnected server would block on accept()).
+    ModelGateway gw;
+    gw.set_timeout(30);
+    SseResult r;
+    s_r = &r;
+    const int rid = 99;
+    gw.cancel(rid); // cancel BEFORE starting — execute() must abort at start-check
+
+    int rv = gw.execute("sk-test", "http://127.0.0.1:1", "m", "",
+                        R"([{"role":"user","content":"hi"}])", "", "", "",
+                        s_on_chunk, s_on_tool_call, s_on_thinking, s_on_done, rid);
+    s_r = nullptr;
+
+    REQUIRE(rv == -1); // aborted before starting
+    REQUIRE(r.done_count >= 1);
+    REQUIRE(r.done_code == -1);
+    REQUIRE(r.done_err == "cancelled");
+}
+
+// ============================================================================
 // Single-done guard (8.3) - [DONE] after message_stop fires exactly one done
 // ============================================================================
 TEST_CASE("SSE: message_stop plus [DONE] fires exactly one done", "[sse_parser][done-idempotent]") {

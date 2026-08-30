@@ -76,8 +76,14 @@ struct ModelGateway::Impl {
   // from more than one thread at any given time").
   std::mutex request_mutex;
 
-  // ---- Cancellation (D7) --------------------------------------------------
+  // ---- Cancellation (D7 / D8) ----------------------------------------------
+  // cancel_flag: generic "abort whatever is currently running" (observed by the
+  // curl thread's XFERINFO callback; reset by every execute()).
+  // cancel_request_id: request-id TARGETED cancel — set by cancel_request(id);
+  // NOT reset by execute(), so a cancel that lands in the enqueue→start window
+  // still aborts the SPECIFIC request (closes the global-flag reset race).
   std::atomic<bool> cancel_flag{false};
+  std::atomic<int> cancel_request_id{0};
 
   // ---- Callback string lifetime (D3) --------------------------------------
   // Incremental event texts are stored in a deque of strings; the curl thread
@@ -448,8 +454,12 @@ static int xferinfo_cb(void* userdata,
                        curl_off_t ultotal, curl_off_t ulnow) {
   (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
   auto* impl = static_cast<ModelGateway::Impl*>(userdata);
-  // Non-zero return aborts the transfer with CURLE_ABORTED_BY_CALLBACK
-  return impl->cancel_flag.load(std::memory_order_relaxed) ? 1 : 0;
+  // Non-zero return aborts the transfer with CURLE_ABORTED_BY_CALLBACK. Also honor
+  // the request-id targeted cancel (D8) for the in-flight case.
+  bool generic_cancel = impl->cancel_flag.load(std::memory_order_relaxed);
+  bool targeted_cancel = impl->request_id != 0 &&
+      impl->cancel_request_id.load(std::memory_order_relaxed) == impl->request_id;
+  return (generic_cancel || targeted_cancel) ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -468,7 +478,8 @@ int ModelGateway::execute(
   OnChunkCallback on_chunk,
   OnToolCallCallback on_tool_call,
   OnThinkingCallback on_thinking,
-  OnDoneCallback on_done
+  OnDoneCallback on_done,
+  int request_id
 ) {
   // ---- Request serialization: at most one active request ------------------
   // Held across spawn + join. A second concurrent send_message (e.g. from a
@@ -483,7 +494,10 @@ int ModelGateway::execute(
     return -1;
   }
 
-  int rid = impl_->next_request_id++;
+  // request-id targeted cancel (D8): the caller supplies the id (Dart bridge
+  // assigns it at enqueue) so a cancel_request(id) can target THIS request even
+  // before it starts. id==0 auto-assigns a monotonic id (C++ tests).
+  int rid = (request_id != 0) ? request_id : impl_->next_request_id++;
   impl_->request_id = rid;
 
   // ---- Reset per-request state (single writer before the curl thread) -----
@@ -510,6 +524,20 @@ int ModelGateway::execute(
   impl_->on_tool_call = on_tool_call;
   impl_->on_thinking = on_thinking;
   impl_->on_done = on_done;
+
+  // Request-id targeted cancel (D8): if a cancel_request(rid) landed while THIS
+  // request was enqueued-but-not-yet-running, abort immediately without touching
+  // the network. The global cancel_flag was reset at :499 and cannot catch this
+  // window; the persistent cancel_request_id can.
+  if (rid != 0 && impl_->cancel_request_id.load(std::memory_order_relaxed) == rid) {
+    LOG_INFO("Request #" + std::to_string(rid) + " cancelled before start (targeted)");
+    impl_->done_dispatched = true;
+    dispatch_done(impl_, -1, "cancelled", "");
+    // Clear the latch so a later request that reuses this id (hot-restart) is not
+    // spuriously cancelled; this path returns before the end-of-execute clear.
+    impl_->cancel_request_id.store(0, std::memory_order_relaxed);
+    return -1;
+  }
 
   g_ffi_ring = &impl_->ffi_ring;  // register for crash handler visibility
 
@@ -649,7 +677,15 @@ int ModelGateway::execute(
 
     res = curl_easy_perform(impl_->curl);
 
-    if (res == CURLE_ABORTED_BY_CALLBACK && impl_->cancel_flag.load(std::memory_order_relaxed)) {
+    // Request-id targeted cancellation (D8): the transfer can abort via the
+    // targeted (cancel_request_id == request_id) path too — xferinfo_cb returns 1
+    // for it WITHOUT setting the generic cancel_flag. So the post-perform
+    // classification must recognize BOTH, otherwise an in-flight targeted cancel
+    // is mislabeled "Connection error" instead of on_done(-1,"cancelled").
+    bool abort_cancelled = impl_->cancel_flag.load(std::memory_order_relaxed) ||
+        (impl_->request_id != 0 &&
+         impl_->cancel_request_id.load(std::memory_order_relaxed) == impl_->request_id);
+    if (res == CURLE_ABORTED_BY_CALLBACK && abort_cancelled) {
       // 14.7 (F5): the abort may arrive AFTER the stream's done was already
       // dispatched in real-time (success path — _endStreaming's cancelRequest
       // aborts the curl thread still finishing the connection close). That is
@@ -732,6 +768,14 @@ int ModelGateway::execute(
   if (!cancelled) {
     LOG_INFO("=== Request #" + std::to_string(rid) + " complete ===");
   }
+  // Request-id targeted cancel (D8): once THIS request (the one cancel_request_id
+  // identifies) resolves, clear the latch so a later request that happens to reuse
+  // the same id (e.g. after a hot-restart resets the Dart id counter to 1 while the
+  // DLL's g_gateway persists) is not spuriously cancelled. Non-target requests leave
+  // it alone (they are not the one being cancelled); cancel_flag is untouched.
+  if (rid != 0 && impl_->cancel_request_id.load(std::memory_order_relaxed) == rid) {
+    impl_->cancel_request_id.store(0, std::memory_order_relaxed);
+  }
   return rid;
 }
 
@@ -741,6 +785,18 @@ int ModelGateway::execute(
 
 void ModelGateway::cancel() {
   impl_->cancel_flag.store(true, std::memory_order_relaxed);
+}
+
+// Request-id targeted cancel (D8): sets a persistent cancel_request_id that
+// execute() checks at start AND xferinfo_cb checks mid-transfer, so the SPECIFIC
+// request aborts even in the enqueue→start window (which the single global flag,
+// reset by the next execute(), cannot catch).
+void ModelGateway::cancel(int request_id) {
+  if (request_id != 0) {
+    impl_->cancel_request_id.store(request_id, std::memory_order_relaxed);
+  } else {
+    impl_->cancel_flag.store(true, std::memory_order_relaxed);
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -64,6 +64,10 @@ class ModelSummaryProvider implements SummaryProvider {
     var text = StringBuffer();
     int doneCode = 0;
     String doneErr = '';
+    // Real measured usage from the summary call (Anthropic-format /v1/messages
+    // input_tokens/output_tokens). The summary's SIZE is the provider's actual
+    // output_tokens — NOT an estimate (no compression-ratio assumption, D3/D4).
+    int outTokens = 0;
     await _sidecar.sendMessage(
       apiKey: apiKey,
       baseUrl: baseUrl,
@@ -80,6 +84,7 @@ class ModelSummaryProvider implements SummaryProvider {
       onDone: (code, err, stop, inTok, outTok) {
         doneCode = code;
         doneErr = err ?? '';
+        outTokens = outTok ?? 0;
       },
     );
 
@@ -92,7 +97,9 @@ class ModelSummaryProvider implements SummaryProvider {
     final content = text.toString().trim();
     return SummaryResult(
       text: content.isEmpty ? '(empty summary)' : content,
-      tokens: ContextEstimator.estimateTokens(content),
+      // Real measured size; if the provider didn't report usage (0), fall back to
+      // a deterministic tokenizer estimate so the budget check still has a size.
+      tokens: outTokens > 0 ? outTokens : ContextEstimator.estimateTokens(content),
     );
   }
 
@@ -118,6 +125,7 @@ class ModelSummaryProvider implements SummaryProvider {
     var out = StringBuffer();
     int doneCode = 0;
     String doneErr = '';
+    int outTokens = 0;
     await _sidecar.sendMessage(
       apiKey: provider.apiKey,
       baseUrl: provider.baseUrl,
@@ -134,6 +142,7 @@ class ModelSummaryProvider implements SummaryProvider {
       onDone: (code, err, stop, inTok, outTok) {
         doneCode = code;
         doneErr = err ?? '';
+        outTokens = outTok ?? 0;
       },
     );
     if (doneCode != 0) {
@@ -143,7 +152,8 @@ class ModelSummaryProvider implements SummaryProvider {
     final content = out.toString().trim();
     return SummaryResult(
       text: content.isEmpty ? '(empty summary)' : content,
-      tokens: ContextEstimator.estimateTokens(content),
+      // Real measured size (no compression-ratio estimate).
+      tokens: outTokens > 0 ? outTokens : ContextEstimator.estimateTokens(content),
     );
   }
 
@@ -185,6 +195,12 @@ class FakeSummaryProvider implements SummaryProvider {
   /// Records the folded span passed in (for assertions).
   List<Message>? lastFolded;
 
+  /// Records the joined level-1 texts passed into the 2-pass summarizeText.
+  String? lastSummarizeText;
+
+  /// Count of summarizeText (2-pass) calls made.
+  int summarizeTextCalls = 0;
+
   FakeSummaryProvider({this.text = '前文摘要:用户要求读取文件并完成分析。'});
 
   @override
@@ -201,6 +217,8 @@ class FakeSummaryProvider implements SummaryProvider {
     required String text,
     required AgentTypeConfig config,
   }) async {
+    summarizeTextCalls++;
+    lastSummarizeText = text;
     return SummaryResult(text: text, tokens: ContextEstimator.estimateTokens(text));
   }
 }

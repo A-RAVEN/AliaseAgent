@@ -30,13 +30,17 @@ typedef void (*OnDoneCallback)(int code, const char* err, const char* stop_reaso
 /// Ping: verify FFI bridge is working
 SIDECAR_API const char* ping(void);
 
-/// Cancel the in-flight send_message request (if any). Thread-safe, returns
-/// immediately; no-op when no request is active. The curl thread aborts the
-/// transfer and delivers on_done(-1, "cancelled") before the request returns.
-SIDECAR_API void cancel_request(void);
+/// Cancel the send_message request whose id is `request_id` (request-id targeted,
+/// design D8). Thread-safe, returns immediately; no-op when no request with that id
+/// is active/queued. The curl thread aborts the transfer and delivers
+/// on_done(-1, "cancelled") before the request returns. Unlike a global cancel,
+/// this also aborts a request that is only enqueued (not yet started).
+SIDECAR_API void cancel_request(int request_id);
 
-/// Send a message to the model, stream response via callbacks
-/// Returns a request_id (integer)
+/// Send a message to the model, stream response via callbacks.
+/// `request_id` is caller-supplied (Dart bridge assigns a unique id per request)
+/// so cancel_request(id) can target a specific request; it does NOT use 0.
+/// Returns the request_id (== request_id) on success, -1 on error.
 SIDECAR_API int send_message(
   const char* api_key,
   const char* base_url,
@@ -49,7 +53,8 @@ SIDECAR_API int send_message(
   OnChunkCallback on_chunk,
   OnToolCallCallback on_tool_call,
   OnThinkingCallback on_thinking,
-  OnDoneCallback on_done
+  OnDoneCallback on_done,
+  int request_id
 );
 
 /// Set the workspace root for read_file / list_dir tools.
