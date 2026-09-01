@@ -6,14 +6,14 @@ AliasAgent(Flutter 桌面 AI 对话应用,经 dart:ffi 调 C++ Sidecar,走 DeepS
 
 设计依据:本 change 全部技术决策固化于 `Docs/context-compression-reference.md`(含 6 视角对抗评审 + 6-claim N≥3 对抗验证 + 外部实现证据,含 Claude Code 参照 §5.4)。方案方向经对抗验证:6 条核心 claim 中 C2 SURVIVED、其余 5 条被 KILLED 后的**真缺陷均已修正**回写(见参考文档 §8)。
 
-约束:CLAUDE.md 规定测试可观测性、不修改验收标准、无 user-in-the-loop 任务、对抗式 Workflow 诚实循环;DeepSeek 端点,严禁借 Anthropic 行为;usage 字段名随端点——Anthropic-format `/v1/messages` 用 `input_tokens`/`output_tokens`([UNVERIFIED],AnthropicAPIDoc.md:354/:372),`prompt_tokens`/`completion_tokens`(DeepSeekAPIDoc.md:661)是 chat/completions 字段,不适用于 `/v1/messages`。
+约束:CLAUDE.md 规定测试可观测性、不修改验收标准、无 user-in-the-loop 任务、对抗式 Workflow 诚实循环;DeepSeek 端点,严禁借 Anthropic 行为;usage 字段名随端点——Anthropic-format `/v1/messages` 用 `input_tokens`/`output_tokens`(2026-08-26 live 验证已确认,AnthropicAPIDoc.md:354/:372),`prompt_tokens`/`completion_tokens`(DeepSeekAPIDoc.md:661)是 chat/completions 字段,不适用于 `/v1/messages`。
 
 ## Goals / Non-Goals
 
 **Goals:**
 - 持续、自动地把发给模型的上下文维持在安全范围,无需手动 `/compact` 指令。
 - 层级化压缩:近端原文、中端段总结、远端总结之总结;原始对话**无损留盘**(树是派生索引)。
-- 通过接口**实测 usage**(Anthropic-format `/v1/messages` 的 `input_tokens`/`output_tokens`,[UNVERIFIED])驱动触发;上限为 per-agent-type 必填配置 `maxContextTokens`。
+- 通过接口**实测 usage**(Anthropic-format `/v1/messages` 的 `input_tokens`/`output_tokens`,2026-08-26 live 验证已确认)作**遥测/校准**并**驱动折叠后的尺寸判定**;上限为 per-agent-type 必填配置 `maxContextTokens`。**触发布局**由确定性本地估算器定(见 D3,非实测 usage 驱动——实测 usage 只写 `token_count` 作遥测 + 回读作尺寸判定)。
 - 决策/执行分离保证**可测确定性**。
 
 **Non-Goals:**
@@ -27,7 +27,7 @@ AliasAgent(Flutter 桌面 AI 对话应用,经 dart:ffi 调 C++ Sidecar,走 DeepS
 **D1 压缩形态 = 层级化摘要树 + recency 梯度**(非单一滚动摘要 / 非滑窗截断)。
 - **三层梯度(近详→远略)**:`[L2 大摘要(最旧)][L1 小摘要(中段)][原文(最新)]`——最新保留原文,中段逐段压成 L1 小摘要,最旧的多段 L1 再卷成一条 L2 "总结之总结"。**只做两级**(L1 + L2),**不引入 level-3**。L2 的**输入是 L1 摘要文本**(2-pass 总结之总结),不是原始消息。
 - **coarsen-only(只并不拆)**:摘要只越并越大、绝不拆细、绝不把已摘要的重新放回原文。若连 L2 都超预算,则"省略最旧"(**投影不发给模型**),**绝不删数据**(见 D9)。**每层摘要的实际 token 数运行时实测**(真实 usage `output_tokens`),"是否超预算/该不该 coarsen/省略"由实测值后置判定——**不预设压缩比**。
-- **边界归属(确定性骨架 + 唯一 LLM 缝)**:L1 段边界 = AI 挑话题缝(见 D5,方案A,唯一影响树形的 LLM 点,memo 化);**L1→L2 组边界 = 算术**(确定性,2026-08-29 用户决定"先尝试算术")——L2 按哪些 L1 分组完全由确定性算术规则决定,不调用 LLM。即"折哪些、几段、哪层、预算"纯函数,"L1 缝"留给 AI,"L2 组缝"是算术。
+- **边界归属(确定性批量 + 唯一 LLM 微调缝)**:L1 批边界 = **算术**"从最旧累计原始 token > 阈值 T 划为一批"(确定性,各批≈T、可压,用户约定"**累计>阈值→整批一次压**");AI 挑话题缝(见 D5,方案A,唯一影响树形的 LLM 点,memo 化)**只在该批边界上微调到最近安全话题缝,且必须保证每个 L1 批仍≈T 大小——绝不可把某批切成会压不动的极小段**(2026-08-29 用户约定;违者回退算术骨架);**L1→L2 组边界 = 算术**(确定性,2026-08-29 用户决定"先尝试算术")——L2 按哪些 L1 分组完全由确定性算术规则决定,不调用 LLM。即"折哪些、几段、哪层、预算"纯函数,AI 缝仅微调、不改批构成。
 - 理由:对数成本、粒度梯度(近详远略)、远端"总结之总结"保留决策链;外部 remnic LCM / hierarchical-context-ai-agent 验证。
 - 备选:单一滚动总结(简单但 O(N) 重写、粒度差)、滑窗截断(破坏完整性/丢失再执行钥匙)。
 
@@ -51,7 +51,7 @@ AliasAgent(Flutter 桌面 AI 对话应用,经 dart:ffi 调 C++ Sidecar,走 DeepS
 
 **D5 语义边界选 A(LLM 在安全候选点挑话题缝),memo 化保可复现**。
 - 结构安全切点可能拆开话题簇;A 把边界选择嵌入同一次摘要调用(边际成本小),memo 化(内容哈希 keyed)让重建/测试可复现。**它是"纯函数折叠计划"的唯一例外(只影响缝,不改'折哪些段'),且被 memo 化**。
-- **实现机制(2026-08-29 调和批量 + AI 缝)**: 批量边界由"累加原始 token > 阈值 T"确定(算术、纯函数);`SeamSelector`(服务)在其上**选最近的安全话题缝**——异步 `ensure(batchRegion)`:当某批累积到 T 附近时,向模型请求该批内"最接近 T 的若干安全候选索引中,哪个是话题边界",按内容哈希缓存;失败/解析失败回退算术边界。**绝不让缝拆分工具轮**(缝必须落在真实用户文本/无工具 assistant 终答上)、**绝不改批量结构**(只微调分界位置以不拆话题簇)。生产在 `_callModel` 先按批量边界预取 memo,再以 memo 背板 seam 微调分界;密封测试注入 `FakeSeamSelector` 或留 null(走算术边界,不额外消费 FakeSidecar 事件)。这是"纯函数折叠计划"的唯一 LLM 树形点,且被 memo 化。
+- **实现机制(2026-08-29 调和批量 + AI 缝)**: 批量边界由"累加原始 token > 阈值 T"确定(算术、纯函数);`SeamSelector`(服务)在其上**选最近的安全话题缝**——异步 `ensure(batchRegion)`:当某批累积到 T 附近时,向模型请求该批内"最接近 T 的若干安全候选索引中,哪个是话题边界",按内容哈希缓存;失败/解析失败回退算术边界。**绝不让缝拆分工具轮**(缝必须落在真实用户文本/无工具 assistant 终答上)、**绝不改批量结构**(只微调分界位置以不拆话题簇)。**尺寸守卫(2026-09-01 补,防执行偏离)**: 微调后任一批 raw < `max(1, T~/2, 1025)`(1025 = summary profile 上限 `max_tokens=1024`+1,即"必然压不动"的边界;把 `T~/2` 与压缩上限取 max,是因为真实压缩边界是 1024 而非 T~/2——`T~/2` 可能 < 1024,见 R-A2-5c)→ 该缝必须被**拒**、**回退整段确定性算术骨架**(配置-话题并入首批一起压,而不是"原样发送"——"原样发送"会把最旧原文插进投影破坏 `[摘要][verbatim 尾]` 结构,见 D3 实现取舍)——保证批 raw > 1024(摘要 ≤1024 必 < raw)≈ 可压,**绝不让极小批被 split-if-invalid 整段 bloat-omit**(否则再执行钥匙/绝对路径丢失)。守卫只对"批 ≥ ~T 且 >1024"的大规模折叠有意义;小预算/小对话的批必 <1025,seam 一律回退算术(正确——小对话无需话题微调)。生产在 `_callModel` 先按批量边界预取 memo,再以 memo 背板 seam 微调分界;密封测试注入 `FakeSeamSelector` 或留 null(走算术边界,不额外消费 FakeSidecar 事件)。这是"纯函数折叠计划"的唯一 LLM 树形点,且被 memo 化。
 - **两道切分标记圈定一个"已闭段"**:AI 在安全候选点落下前后两道标记,标记之间的历史即闭段 — 其内容与摘要在闭段后固定(见 D8 闭段冻结)。
 - **❗实现偏差警告(历史;已被 ⑪ 取代)**:(原说法)Phase-1/2 代码(`_budgetSegments`)的**确定性骨架正确、仅边界缝用算术**——该说法里的"**骨架正确**"**只对**"安全边界/工具轮原子性/不重不漏 cover"成立;其"折哪些段、几段、预算"的批量划分规则基于 `/4` 成本 + 每~8条,已被 ⑪(`buildTree` 改"原始 token > T 批量")**作废**。边界缝由 AI 挑话题缝(4.3, 方案A, memo 化)这一方向保留,但**AI 缝只"微调原始 token 批量边界到最近安全话题缝",不得 wholesale 替换批量结构**(⑪ 会相应改 `_segmentsFromSeams`)。spec "Semantic boundary selection (topic seams)" 是关于"缝"的正确要求。
 - 备选:C(结构切+recency 兜底,简单但保留接缝丢细节)。
@@ -85,6 +85,7 @@ AliasAgent(Flutter 桌面 AI 对话应用,经 dart:ffi 调 C++ Sidecar,走 DeepS
 ## Risks / Trade-offs
 
 - [压缩本质有损] → 摘要保留决策/结论 + 再执行钥匙(tool_input 原文/绝对路径)+ 原文留盘可 re-expand;live 连续性测试 + 对抗审查兜底。
+  - **A-2 窗口 live 定位(与 P1 行为连续性互补, corrected)**: 窗口真模型 live(`integration_test/` + `-d windows`)是 change 自规划的 **P1 行为连续性**形态——设 cap 远低于真实窗口跑 N 轮,断言不超限 + **助手能引用早期上下文/决策**(观察通道 = 实际工具调用 + 文件终态);摘要"措辞质量"好坏不单测(`Docs/context-compression-reference.md:165`),靠 live 行为 + 对抗审查兜底。A-2 在**此基础上额外**经**自身临时 DB 的 `summary_nodes`** 读回**真实摘要文本**并断言其保留再执行钥匙:调用 `SummaryNodeRepository.queryBySession`(summary_node_repository.dart:104)+ **测试侧自行解析 `node.summaryJson` 的 `content[].text`**(不能用不同 library 的私有 `ChatScreenState._summaryTextFromJson`);折叠经 **`AppShell(configLoader: () => ConfigResult.ok(小 maxContextTokens))`**(main.dart:70-71)注入触发,不用读真实 `/Users/.../config.json` 的 `const MyApp()`。**不否定行为连续性、不拆两路、不下放 offline Fake**;此为**字面 key 存在性**(强于 design 保留合同,合规有损 summarizer 会 false-fail)的补充信号,需跨 benchmark 标定。
 - [tool_use/tool_result 拆分导致 API 400] → 原子单元 + 边界规则 + node_type 门控 + 工具对完整属性测试。
 - [单槽折卷卡用户 / 抢占误杀用户请求] → request-id 定向 cancel + `_chain` 空时入队 + 断点续;折卷绝不进入用户关键路径。
 - [非确定摘要破坏测试确定性] → 决策/执行分离 + FakeSummarizer + memo 化;断言树形不断言措辞。
@@ -103,7 +104,7 @@ AliasAgent(Flutter 桌面 AI 对话应用,经 dart:ffi 调 C++ Sidecar,走 DeepS
 ## Open Questions
 
 - 语义边界 A 的 memo 键 / 是否复用同一摘要调用(实现层,我把关;见参考文档 §8 D1/D2/D3 已降级为实现细节)。
-- DeepSeek `/v1/messages`(Anthropic 兼容)的 usage 精确字段名(Anthropic 格式 `input_tokens`/`output_tokens`)待核实;`prompt_tokens` 是 chat/completions 字段。精确窗口数(可选优化,不做前置;用户授权时从官方核实)。
+- DeepSeek `/v1/messages`(Anthropic 兼容)的 usage 精确字段名(Anthropic 格式 `input_tokens`/`output_tokens`)——已确认(2026-08-26 live 探测,见 D3);`prompt_tokens` 是 chat/completions 字段。精确窗口数(可选优化,不做前置;用户授权时从官方核实)。
 - 摘要是否要"意图叙述"还是纯结构化记录(tool_input/outcome/refetch_hint 是数据,可纯机械;叙述部分可选)。
 
 ---

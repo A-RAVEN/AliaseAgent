@@ -838,49 +838,61 @@ class ChatScreenState extends State<ChatScreen> {
     final maxContextTokens = agentType.maxContextTokens ?? 0;
     final List<Map<String, dynamic>> apiMessages;
     if (maxContextTokens > 0) {
-      final closed = await _loadClosedSegments(sessionId);
-      // 4.3 design D5 option A: when a seam selector is available, prefetch/memoize
-      // the LLM L1 topic seams for the current fold BEFORE building the plan, then
-      // pass a memo-backed L1SeamChooser. A seam failure degrades gracefully to the
-      // arithmetic-safe skeleton (never splits a tool round, never blocks the turn).
-      final seamChooser =
-          await _prepareSeamChooser(messages, closed, agentType, maxContextTokens);
-      final plan = CompactionEngine.buildTree(
-          history: messages,
-          maxContextTokens: maxContextTokens,
-          closed: closed,
-          seamChooser: seamChooser);
-      if (plan.shouldCompact) {
-        ({List<CompactionSegment> segments, List<SummaryResult> summaries}) resolved =
-            (segments: const [], summaries: const []);
-        try {
-          resolved = await _resolveSummaries(
-              sessionId, plan, agentType, maxContextTokens);
-        } catch (e) {
-          // Summarization failed — never silently replace the folded context with
-          // a placeholder. Fall back to sending the conversation verbatim.
-          debugPrint('[AliasAgent] compaction summary failed, sending verbatim: $e');
-          resolved = (segments: const [], summaries: const []);
-        }
-        if (resolved.segments.isEmpty) {
-          // Empty-far pathological case: compaction split-omitted the ENTIRE far
-          // span (no compressible batch) and there was no verbatim tail, so the
-          // projection is empty — we fall back to the full conversation (which is
-          // over budget, since we entered the fold path). Surface it rather than
-          // silently resend over budget.
-          debugPrint('[AliasAgent] compaction produced no projection (far fully '
-              'omit-worthy, no verbatim tail) — resending the full over-budget '
-              'conversation (known pathological limit)');
-          apiMessages = _buildApiMessages(messages);
-        } else {
-          // segments carries the (measure→adjusted) summary segments + the verbatim
-          // tail; summaries may be empty after an omit-most-of-the-far, in which
-          // case _buildCompactionProjection sends only the verbatim tail (the older
-          // omitted content stays on disk, D9).
-          apiMessages = _buildCompactionProjection(resolved.summaries, resolved.segments);
-        }
-      } else {
+      // D10 cost discipline: a session that exhausted its fold budget skips ALL
+      // on-demand compaction — INCLUDING the seam-chooser LLM call, which would
+      // otherwise fire before the budget check and remain unbounded — and sends
+      // verbatim (best-effort over-budget known limit), so it cannot pay unbounded
+      // fold-related LLM cost per turn. The seam call is a real /v1/messages call
+      // (seam_selector.dart) and is NOT counted in the fold-budget token proxy.
+      if (await _foldBudgetExceeded(sessionId)) {
+        debugPrint('[AliasAgent] fold budget exceeded for session $sessionId — '
+            'skipping on-demand fold, sending verbatim (best-effort)');
         apiMessages = _buildApiMessages(messages);
+      } else {
+        final closed = await _loadClosedSegments(sessionId);
+        // 4.3 design D5 option A: when a seam selector is available, prefetch/memoize
+        // the LLM L1 topic seams for the current fold BEFORE building the plan, then
+        // pass a memo-backed L1SeamChooser. A seam failure degrades gracefully to the
+        // arithmetic-safe skeleton (never splits a tool round, never blocks the turn).
+        final seamChooser =
+            await _prepareSeamChooser(messages, closed, agentType, maxContextTokens);
+        final plan = CompactionEngine.buildTree(
+            history: messages,
+            maxContextTokens: maxContextTokens,
+            closed: closed,
+            seamChooser: seamChooser);
+        if (plan.shouldCompact) {
+          ({List<CompactionSegment> segments, List<SummaryResult> summaries}) resolved =
+              (segments: const [], summaries: const []);
+          try {
+            resolved = await _resolveSummaries(
+                sessionId, plan, agentType, maxContextTokens);
+          } catch (e) {
+            // Summarization failed — never silently replace the folded context with
+            // a placeholder. Fall back to sending the conversation verbatim.
+            debugPrint('[AliasAgent] compaction summary failed, sending verbatim: $e');
+            resolved = (segments: const [], summaries: const []);
+          }
+          if (resolved.segments.isEmpty) {
+            // Empty-far pathological case: compaction split-omitted the ENTIRE far
+            // span (no compressible batch) and there was no verbatim tail, so the
+            // projection is empty — we fall back to the full conversation (which is
+            // over budget, since we entered the fold path). Surface it rather than
+            // silently resend over budget.
+            debugPrint('[AliasAgent] compaction produced no projection (far fully '
+                'omit-worthy, no verbatim tail) — resending the full over-budget '
+                'conversation (known pathological limit)');
+            apiMessages = _buildApiMessages(messages);
+          } else {
+            // segments carries the (measure→adjusted) summary segments + the verbatim
+            // tail; summaries may be empty after an omit-most-of-the-far, in which
+            // case _buildCompactionProjection sends only the verbatim tail (the older
+            // omitted content stays on disk, D9).
+            apiMessages = _buildCompactionProjection(resolved.summaries, resolved.segments);
+          }
+        } else {
+          apiMessages = _buildApiMessages(messages);
+        }
       }
     } else {
       // maxContextTokens not configured — keep the current full-send behavior.
@@ -1254,8 +1266,9 @@ class ChatScreenState extends State<ChatScreen> {
 
       // Update intermediate message with enriched tool call data. This is the
       // sole leaf-level content mutation, so it invalidates the compaction tree
-      // (bump tree_version) — any cached summary over a span that includes this
-      // message must be recomputed (buildTree recomputes lazily next turn).
+      // via the dirty-since-seq watermark (markDirty below) — no full-table
+      // tree_version bump (R2-2). Any cached summary over a span that includes
+      // this message must be recomputed (buildTree recomputes lazily next turn).
       if (_currentId == sessionId) {
         await _msgRepo.updateToolCalls(
             intermediateMsg.id, jsonEncode(turnToolCalls));
@@ -1395,6 +1408,10 @@ class ChatScreenState extends State<ChatScreen> {
       final messages = await _msgRepo.queryBySession(sessionId);
       if (messages.isEmpty) return;
       final closed = await _loadClosedSegments(sessionId);
+      // D10 cost discipline: a session that has exhausted its fold budget stops
+      // auto-folding (best-effort) so a runaway session cannot spend unbounded
+      // summarization cost. Logged as a debug/replay view (not user-facing).
+      if (await _foldBudgetExceeded(sessionId)) return;
       // Durable resume point (D8 progressive closure) = the persisted `closed`
       // segments passed into buildTree; the top closed seq is only logged for
       // observability (there is no separate in-memory checkpoint control value).
@@ -1429,17 +1446,81 @@ class ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  /// Per-session fold budget caps (D10 cost discipline, "折卷次数/token 上限").
+  /// These bound how much a single session is allowed to spend on folding — a
+  /// cost guard, visible only via logs (a debug/replay view), NOT a user-facing
+  /// "manage compression" control. A normal session folds a handful of times
+  /// over its life; the caps are set generously so they only trip on runaway
+  /// folding, then the session reverts to best-effort (sends verbatim / at the
+  /// known over-budget limit) rather than paying unbounded summarization cost.
+  static const int kMaxFoldsPerSession = 30;
+  static const int kMaxFoldTokensPerSession = 500000;
+
+  /// Public cap getter so tests can reference the fold-budget limit.
+  static int get maxFoldsPerSession => kMaxFoldsPerSession;
+  static int get maxFoldTokensPerSession => kMaxFoldTokensPerSession;
+
+  /// Pure fold-budget cap check (D10): a session exceeds its budget when it has
+  /// folded more than [kMaxFoldsPerSession] times OR spent more than
+  /// [kMaxFoldTokensPerSession] tokens. Exposed for deterministic unit tests;
+  /// the widget path computes [foldCount]/[foldTokens] from the persisted nodes
+  /// and calls this.
+  static bool isFoldBudgetExceeded({required int foldCount, required int foldTokens}) =>
+      foldCount > kMaxFoldsPerSession || foldTokens > kMaxFoldTokensPerSession;
+
+  /// True when [sessionId] has exhausted its fold budget. Uses the persisted
+  /// [SummaryNodeRepository.queryBySession] accounting (count of nodes + sum of
+  /// their measured output `token_cost` as a monotonic proxy for fold cost —
+  /// fold INPUT cost is not stored per-session, so the summary output size is
+  /// the available bounded proxy). Hermetic tests (no DB) return false.
+  Future<bool> _foldBudgetExceeded(String sessionId) async {
+    if (!DatabaseService.isOpen) return false;
+    try {
+      final nodes = await _summaryNodeRepo.queryBySession(sessionId);
+      var foldCount = 0;
+      var foldTokens = 0;
+      for (final n in nodes) {
+        if (n.level >= 1 && n.tokenCost != null && n.tokenCost! > 0) {
+          foldCount++;
+          foldTokens += n.tokenCost!;
+        }
+      }
+      if (isFoldBudgetExceeded(foldCount: foldCount, foldTokens: foldTokens)) {
+        debugPrint('[AliasAgent] fold budget exceeded for session $sessionId: '
+            '$foldCount folds / $foldTokens fold-tokens (cap '
+            '$kMaxFoldsPerSession / $kMaxFoldTokensPerSession) — skipping auto-fold');
+        return true;
+      }
+    } catch (e) {
+      debugPrint('[AliasAgent] fold budget query failed: $e');
+    }
+    return false;
+  }
+
   Future<List<ClosedSummary>> _loadClosedSegments(String sessionId) async {
     if (!DatabaseService.isOpen) return const [];
     try {
       final nodes = await _summaryNodeRepo.queryBySession(sessionId);
+      // Prefer the COARSEST covering node for each span (R8-d). A coarsened
+      // level-2 "summary of summaries" covers the same span as the level-1s it
+      // rolled up; sorting by (coveredMinSeq ASC, coveredMaxSeq DESC, level DESC)
+      // puts the covering coarser node FIRST, so the greedy non-overlap advance
+      // below adopts it and subsumes the L1s — instead of skipping the L2 in favor
+      // of the larger frozen L1s (which discarded the coarsening + inflated the
+      // fold budget). Still yields D9 dense non-overlap.
       final sorted = nodes
           .where((n) =>
               n.level >= 1 &&
               n.summaryJson != null &&
               n.coveredMinSeq > 0)
           .toList()
-        ..sort((a, b) => a.coveredMaxSeq - b.coveredMaxSeq);
+        ..sort((a, b) {
+          final c = a.coveredMinSeq - b.coveredMinSeq;
+          if (c != 0) return c;
+          final d = b.coveredMaxSeq - a.coveredMaxSeq;
+          if (d != 0) return d;
+          return b.level - a.level;
+        });
       final picked = <ClosedSummary>[];
       var lastMax = 0;
       for (final n in sorted) {
@@ -1527,7 +1608,7 @@ class ChatScreenState extends State<ChatScreen> {
   /// disk, D9), never sent as a summary larger than the content it replaced.
   Future<List<({CompactionSegment seg, String text, int tokens, bool isClosed})>>
       _resolveOpenLevel1(List<Message> msgs, AgentTypeConfig agentType,
-          {bool Function()? isAborted}) async {
+          {bool Function()? isAborted, void Function(int minSeq, int maxSeq)? onOmit}) async {
     // 2.6 abort gate (split-if-invalid recursion makes its own model calls): a
     // preempted background fold must stop at the next model call rather than
     // enqueueing an un-cancelled summarize onto the single-slot _chain ahead of the
@@ -1548,11 +1629,20 @@ class ChatScreenState extends State<ChatScreen> {
     if (msgs.length > 1) {
       final mid = msgs.length ~/ 2;
       return [
-        ...await _resolveOpenLevel1(msgs.sublist(0, mid), agentType, isAborted: isAborted),
-        ...await _resolveOpenLevel1(msgs.sublist(mid), agentType, isAborted: isAborted),
+        ...await _resolveOpenLevel1(msgs.sublist(0, mid), agentType,
+            isAborted: isAborted, onOmit: onOmit),
+        ...await _resolveOpenLevel1(msgs.sublist(mid), agentType,
+            isAborted: isAborted, onOmit: onOmit),
       ];
     }
     // Atomic batch that cannot compress — omit (never send a bloated summary).
+    // DATA KEPT on disk (D9). But a stale span omitted here is NEITHER re-summarized
+    // NOR re-persisted, so the caller must NOT consume the dirty watermark (R8-c) —
+    // surface the omission so clearDirty is skipped (else next round reuses a stale
+    // cached summary, R2-2 reuse-gate failure).
+    if (onOmit != null && msgs.isNotEmpty) {
+      onOmit(msgs.first.seq ?? 0, msgs.last.seq ?? 0);
+    }
     return const [];
   }
 
@@ -1690,7 +1780,14 @@ class ChatScreenState extends State<ChatScreen> {
       // is OMITTED from the projection (data kept on disk, D9) — never send a
       // bloat- > batch summary.
       final leafEntries = await _resolveOpenLevel1(seg.messages, agentType,
-          isAborted: isAborted);
+          isAborted: isAborted,
+          // R8-c: if a STALE (dirty-reaching) span is omitted (un-compressible → not
+          // re-summarized/persisted), do NOT consume the dirty watermark — else the
+          // next fold reuses a stale cached summary. Mark persistFailed so the
+          // clearDirty gate (below) is skipped.
+          onOmit: (minSeq, maxSeq) {
+            if (dirtySince > 0 && maxSeq >= dirtySince) persistFailed = true;
+          });
       for (final leaf in leafEntries) {
         // Hermetic tests (no DB open) never persist the derived index.
         if (dbOpen && leaf.seg.messages.isNotEmpty &&
@@ -1990,10 +2087,21 @@ class ChatScreenState extends State<ChatScreen> {
           final toolResults = <Map<String, dynamic>>[];
           for (final tc in toolCalls) {
             final tcMap = tc as Map<String, dynamic>;
+            final rawBody = (tcMap['result'] ?? tcMap['resultPreview'] ?? '').toString();
+            final tcInput = (tcMap['input'] as Map<String, dynamic>?) ?? const {};
+            final toolName = (tcMap['toolName'] ?? tcMap['name'] ?? '').toString();
+            final refetchPath = (tcInput['path'] as String?) ?? '';
             toolResults.add({
               'type': 'tool_result',
               'tool_use_id': tcMap['id'] ?? '',
-              'content': tcMap['result'] ?? tcMap['resultPreview'] ?? '',
+              // Near-zone oversized tool_result body elision (spec "Near-zone
+              // oversized tool_result body elision"): a verbatim tool_result whose
+              // body is extremely large is elided to a truncation marker + refetch
+              // record (path/bytes), preserving the tool_use block, the tool_result
+              // placement, and the round structure. Never folds/splits the round;
+              // full body stays on disk and is recoverable via the tool+path.
+              'content': _elideOversizedToolResult(
+                name: toolName, path: refetchPath, body: rawBody),
             });
           }
           apiMessages.add({
@@ -2006,6 +2114,33 @@ class ChatScreenState extends State<ChatScreen> {
       }
     }
     return apiMessages;
+  }
+
+  /// Body size threshold above which a verbatim tool_result is treated as
+  /// "extremely large" and elided (near-zone). A normal tool_result is a few
+  /// thousand chars; beyond ~8K chars the model gains little from the full body
+  /// and the body dominates the request, so it is elided to a head/tail preview +
+  /// marker + refetch record (D10 "近端超大 tool_result 正文…截断标记+再取记录").
+  static const int kToolResultElisionThreshold = 8000;
+
+  /// Elide an oversized tool_result BODY (near-zone elision). Keeps a head/tail
+  /// preview (~the threshold total) + a truncation marker recording the original
+  /// byte length + the refetch path, so the round stays a valid tool_use/
+  /// tool_result pair and the full body is recoverable via the tool + path
+  /// (never deleted, D9). Under the threshold the body is passed through intact.
+  static String _elideOversizedToolResult({
+    required String name,
+    required String path,
+    required String body,
+  }) {
+    if (body.length <= kToolResultElisionThreshold) return body;
+    final half = kToolResultElisionThreshold ~/ 2;
+    final head = body.substring(0, half);
+    final tail = body.substring(body.length - half);
+    final refetch = path.isNotEmpty ? '; refetch via $name "$path"' : '';
+    return '$head\n...[truncated middle of ${body.length - 2 * half} chars]...\n$tail'
+        '\n[tool_result body elided: ${body.length} chars > threshold '
+        '$kToolResultElisionThreshold$refetch]';
   }
 
   /// Execute a tool call. Returns a JSON-like result map.

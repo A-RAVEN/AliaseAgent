@@ -549,6 +549,20 @@ int ModelGateway::execute(
   body["model"] = model;
   body["stream"] = true;
 
+  // Cheap layer (D10): DeepSeek prompt caching — set a STABLE app-level user_id so
+  // the endpoint's KVCache is scoped to this app and consecutive requests with the
+  // same prefix hit the cache. On the Anthropic-compatible /v1/messages endpoint
+  // this field is NESTED under `metadata`, NOT top-level — Docs/DeepSeekAPIDoc.md
+  // §2.2 (/v1/messages Simple Fields, line ~101): "`metadata` | 仅 `user_id` 支持，
+  // 其他忽略", and §7 note 10 (line ~701): "`metadata.user_id`: 仅 `user_id` 被支持，
+  // 可用于 KVCache 缓存隔离和调度隔离". A top-level `user_id` is the chat/completions
+  // (§3.1) form and §2.2 marks unknown /v1/messages fields as Ignored, so it would
+  // be a silent no-op. char set [a-zA-Z0-9\-_], max 512. A stable app identifier
+  // (not a per-session id) is the first cut — it avoids threading session_id through
+  // the summary profile, which has no session context; per-session isolation is a
+  // later refinement.
+  body["metadata"]["user_id"] = "aliasagent";
+
   // Thinking on/off + intensity (unified for DeepSeek /v1/messages, Anthropic format).
   // Docs/DeepSeekAPIDoc.md §2.5 "Thinking Mode（Anthropic 格式）":
   //   thinking.type        | ON/OFF switch: "enabled" | "disabled" — per §2.5 documented

@@ -12,12 +12,14 @@ import 'summary_provider.dart';
 /// chain, tool inputs (re-execution keys / absolute paths), and outcomes; no
 /// fabricated thinking/tool_use blocks (the model only writes text).
 const String kSummarizeInstruction =
-    'Summarize the above conversation for a future model turn. Preserve: (1) the '
-    'user\'s goals and constraints, (2) each decision and its reasoning, (3) every '
-    'tool call\'s name + input (including absolute file paths — these are '
-    're-execution keys), (4) each tool result\'s outcome, (5) workspaces/files created or '
-    'modified, and (6) any explicit "do not touch X" invariants. Output plain text — '
-    'no thinking blocks, no tool_use blocks, no tool_result blocks. Be dense but complete.';
+    '请把上面的对话总结成一段供未来模型轮次使用的摘要。必须保留：'
+    '(1) 用户的总体目标与约束；(2) 每个决定及其推理；(3) 每次工具调用的名称与输入'
+    '（包括绝对文件路径——这些是再执行钥匙）；(4) 每个工具结果的成功/失败结论；'
+    '(5) 创建或修改过的工作区/文件；(6) 任何「不要动 X」类的硬性不变量。'
+    '务必一字不差地保留每一个绝对路径/再执行钥匙——无论它出现在工具调用的 input 里，'
+    '还是对话正文里，都要原样写下，绝不改写、概括或丢弃路径。'
+    '请用与对话正文相同的语言输出摘要（对话主要是中文就用中文，主要是英文就用英文）。'
+    '只输出纯文本：不要 thinking 块、不要 tool_use 块、不要 tool_result 块。精简但完整。';
 
 /// The production [SummaryProvider]: routes a summarization request through the
 /// model gateway on the summary profile (thinking disabled, max_tokens 1024 —
@@ -39,9 +41,11 @@ class ModelSummaryProvider implements SummaryProvider {
   }) async {
     final provider = _resolver.resolve(config.provider);
     if (provider == null) {
-      // No provider → cannot summarize; return a deterministic placeholding
-      // summary so the pipeline still runs (callers can detect the low info).
-      return SummaryResult(text: '(could not summarize: provider "${config.provider}" not found)', tokens: 20);
+      // R1-5: never silently replace the folded context with a placeholder. A
+      // missing provider is a hard error → the caller's _callModel provider guard
+      // (main.dart) short-circuits before the fold, but belt-and-suspenders: throw
+      // so it falls back to sending the conversation verbatim, never a placeholder.
+      throw StateError('provider "${config.provider}" not found — cannot summarize');
     }
 
     final apiKey = provider.apiKey;
@@ -73,8 +77,8 @@ class ModelSummaryProvider implements SummaryProvider {
       baseUrl: baseUrl,
       model: config.model,
       systemPrompt:
-          'You are a conversation summarizer for AliasAgent. Produce a faithful, '
-          'dense plain-text summary of the earlier conversation.',
+          '你是 AliasAgent 的对话摘要器。请忠实、精简地用纯文本总结此前的对话。'
+          '请用与对话正文相同的语言输出摘要。',
       messagesJson: jsonEncode(summaryMessages),
       toolsJson: '[]',
       thinkingMode: 'summary', // summary profile: thinking disabled, max_tokens 1024
@@ -95,8 +99,16 @@ class ModelSummaryProvider implements SummaryProvider {
       throw StateError('Summarization failed (code=$doneCode): ${doneErr.isEmpty ? 'unknown' : doneErr}');
     }
     final content = text.toString().trim();
+    if (content.isEmpty) {
+      // R1-5: a SUCCESSFUL (code==0) but EMPTY summary must NOT silently become the
+      // "(empty summary)" placeholder — that would replace the folded context with
+      // garbage. Throw so the caller's _callModel catch falls back to sending the
+      // conversation verbatim (never a silent placeholder). This closes the
+      // done==0 + empty-content gap in the R1-5 fix, which only handled done!=0.
+      throw StateError('Summarization returned empty content (code=0, no text)');
+    }
     return SummaryResult(
-      text: content.isEmpty ? '(empty summary)' : content,
+      text: content,
       // Real measured size; if the provider didn't report usage (0), fall back to
       // a deterministic tokenizer estimate so the budget check still has a size.
       tokens: outTokens > 0 ? outTokens : ContextEstimator.estimateTokens(content),
@@ -110,9 +122,8 @@ class ModelSummaryProvider implements SummaryProvider {
   }) async {
     final provider = _resolver.resolve(config.provider);
     if (provider == null) {
-      return SummaryResult(
-          text: '(could not summarize: provider "${config.provider}" not found)',
-          tokens: 20);
+      // R1-5: never a silent placeholder (see summarize).
+      throw StateError('provider "${config.provider}" not found — cannot summarize');
     }
 
     // 2-pass "summary of summaries": the input is the joined level-1 summary
@@ -131,8 +142,8 @@ class ModelSummaryProvider implements SummaryProvider {
       baseUrl: provider.baseUrl,
       model: config.model,
       systemPrompt:
-          'You are a conversation summarizer for AliasAgent. Produce a faithful, '
-          'dense plain-text summary of the provided summaries.',
+          '你是 AliasAgent 的对话摘要器。请忠实、精简地用纯文本总结提供的这些摘要。'
+          '请用与对话正文相同的语言输出摘要。',
       messagesJson: jsonEncode(summaryMessages),
       toolsJson: '[]',
       thinkingMode: 'summary',
@@ -150,8 +161,12 @@ class ModelSummaryProvider implements SummaryProvider {
           'level-2 summarization failed (code=$doneCode): ${doneErr.isEmpty ? 'unknown' : doneErr}');
     }
     final content = out.toString().trim();
+    if (content.isEmpty) {
+      // R1-5: never a silent "(empty summary)" placeholder (see summarize).
+      throw StateError('level-2 summarization returned empty content (code=0, no text)');
+    }
     return SummaryResult(
-      text: content.isEmpty ? '(empty summary)' : content,
+      text: content,
       // Real measured size (no compression-ratio estimate).
       tokens: outTokens > 0 ? outTokens : ContextEstimator.estimateTokens(content),
     );

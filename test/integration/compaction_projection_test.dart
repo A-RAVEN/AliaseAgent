@@ -424,5 +424,73 @@ void main() {
       expect(projected, contains('continue'),
           reason: 'the current user message must survive the split-omit');
     });
+
+    testWidgets('R1-5: a FAILED summarization falls back to the full verbatim conversation',
+        (tester) async {
+      // R1-5: a failed summary must NEVER silently replace the folded context with a
+      // placeholder ("(empty summary)" / a provider-not-found text). The throwing
+      // provider simulates done!=0 / empty-content; _callModel must catch it and send
+      // the FULL conversation verbatim (no summary marker, no placeholder).
+      _setupAgentRegistry(maxContextTokens: 200);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final sessions = testSessions(1);
+      final sessionRepo = FakeSessionRepository(sessions);
+      final msgRepo = FakeMessageRepository(_longConversation(24));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final summaryProvider = _ThrowingSummaryProvider();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: summaryProvider,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      final projected = sidecar.lastMessagesJson ?? '';
+      // [OBS] dump the actual projection before asserting (observability).
+      // ignore: avoid_print
+      print('  [OBS] R1-5 fallback: hasMarker=${projected.contains('## 更早上下文')} '
+          'hasPlaceholder=${projected.contains('(empty summary)') || projected.contains('could not summarize')} '
+          'hasFullConversation=${projected.contains('continue')} '
+          'projectedChars=${projected.length}');
+      expect(projected, isNot(contains('## 更早上下文')),
+          reason: 'R1-5 a failed summarization must NOT send a summary marker (no compaction)');
+      expect(projected, isNot(contains('(empty summary)')),
+          reason: 'R1-5 a failed summarization must NOT leak a placeholder');
+      expect(projected, isNot(contains('could not summarize')),
+          reason: 'R1-5 a failed summarization must NOT leak a provider placeholder');
+      expect(projected, contains('continue'),
+          reason: 'R1-5 the current user message must survive the verbatim fallback');
+    });
   });
+}
+
+/// A SummaryProvider that always throws (simulating done!=0 or empty-content
+/// summarization) — used to pin the R1-5 "never a silent placeholder; fall back to
+/// the full verbatim conversation" guarantee on the INLINE _callModel path.
+class _ThrowingSummaryProvider implements SummaryProvider {
+  @override
+  Future<SummaryResult> summarize({
+    required List<Message> folded,
+    required AgentTypeConfig config,
+  }) async {
+    throw StateError('summarization failed (simulated done!=0/empty)');
+  }
+
+  @override
+  Future<SummaryResult> summarizeText({
+    required String text,
+    required AgentTypeConfig config,
+  }) async {
+    throw StateError('summarization failed (simulated done!=0/empty)');
+  }
 }

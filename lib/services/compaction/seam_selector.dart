@@ -103,18 +103,15 @@ class ModelSeamSelector implements SeamSelector {
 
     final count = k - 1;
     final prompt = StringBuffer()
-      ..writeln('Choose the topic-seam boundaries for conversation summarization.')
-      ..writeln(
-          'The span below is being compressed into $k segments, so choose exactly '
-          '$count interior boundary positions (message indices within the span) '
-          'that split it into $k topically coherent segments.')
-      ..writeln('ONLY these indices are SAFE boundaries; pick exactly $count '
-          'distinct indices from this list, in increasing order:')
+      ..writeln('请为对话摘要选择话题分缝的边界。')
+      ..writeln('下面这段对话将被压缩成 $k 段，因此请从中选出恰好 $count 个内部边界位置'
+          '（区间内的消息下标），把它切成 $k 个话题连贯的片段。')
+      ..writeln('只有下面这些下标是安全边界；请从这些下标中按递增顺序选出恰好 '
+          '$count 个不同下标：')
       ..writeln('$candidates')
-      ..writeln('Do not reorder, do not choose an index outside the list, do not '
-          'invent indices.')
-      ..writeln('Return ONLY JSON, e.g. {"seams":[2,7]}.')
-      ..writeln('--- span ---');
+      ..writeln('不要重排、不要选列表之外的下标、不要编造下标。')
+      ..writeln('只输出 JSON，例如 {"seams":[2,7]}。')
+      ..writeln('--- 对话区间 ---');
     for (var i = 0; i < far.length; i++) {
       prompt.writeln('[$i] ${far[i].role.toUpperCase()}: ${far[i].content}');
     }
@@ -131,8 +128,7 @@ class ModelSeamSelector implements SeamSelector {
         baseUrl: provider.baseUrl,
         model: config.model,
         systemPrompt:
-            'You are a conversation summarizer for AliasAgent. Given a span of '
-            'messages and a set of safe boundary indices, pick the topic seams.',
+            '你是 AliasAgent 的对话分缝器。给定一段消息区间和一组安全边界下标，请挑选话题分缝。',
         messagesJson: messagesJson,
         toolsJson: '[]',
         thinkingMode: 'summary', // summary profile: thinking disabled, max_tokens 1024

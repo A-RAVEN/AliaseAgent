@@ -81,6 +81,11 @@ TEST_CASE("HTTP: request body with all fields", "[http_client]") {
     REQUIRE(body["messages"].is_array());
     REQUIRE(body["tools"].is_array());
     REQUIRE(body["tools"][0]["name"] == "read_file");
+    // Cheap layer (D10): DeepSeek prompt-caching — stable app-level user_id scopes
+    // the endpoint KVCache. On /v1/messages it is NESTED under metadata per
+    // Docs/DeepSeekAPIDoc.md §2.2 "metadata | 仅 user_id 支持" (NOT top-level —
+    // top-level user_id is the chat/completions §3.1 form, ignored on /v1/messages).
+    REQUIRE(body["metadata"]["user_id"] == "aliasagent");
 }
 
 // ============================================================================
