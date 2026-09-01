@@ -15,6 +15,14 @@ Message _msg(String role, String content, {String? toolCallsJson, int? seq}) {
   );
 }
 
+/// A message with a large, uniform raw proxy size (~755 tokens each): content
+/// `'$i:' + 3000×'x'` → estimateTokens = (3003+3)~/4 = 751 + 4 overhead = 755.
+/// Uniform so raw-token batch boundaries land deterministically (8×755 = 6040 >
+/// 6000 = T) — needed to exercise the D5 seam dual guard, which is only meaningful
+/// for LARGE batches (≥ the 1025 compressibility floor; a small budget's batches
+/// are all < 1025 so a seam is always rejected — the design's small-conversation case).
+Message _bigMsg(String role, int i) => _msg(role, '$i:${'x' * 3000}');
+
 void main() {
   group('CompactionEngine.buildTree (structure-only, no /4)', () {
     test('under budget -> no compact, everything verbatim', () {
@@ -170,22 +178,30 @@ void main() {
 
   group('4.3 seam (AI micro-adjusts the batch boundary to a safe topic seam)', () {
     test('valid seam repositions the L1 interior boundary (safe, cover dense+complete)', () {
-      // 20 all-safe msgs, budget 160 → T=80 → k=4 L1 batches (raw 19 each).
-      // The arithmetic boundaries are 5,10,15. A seam [1,6,11] (k-1=3) repositions.
+      // 30 all-safe msgs (~755 proxy each), budget 12000 → T=6000 → the newest
+      // verbatim span stops at 7 msgs (7×755=5285 ≤ 6000) → far = msgs[0..23) →
+      // k=3 (raw-token arithmetic boundaries [8,16]). The OLD deviation cut far at
+      // the AI seam [1,6,11] (tiny first batch < the 1025 floor → bloat-omitted);
+      // the D5 dual guard REJECTS that. A genuine micro-adjust seam [9,15] (within
+      // half a batch of [8,16]) passes SIZE (all segments ≥ T~/2 = 3000) + ANCHOR
+      // → the seam is KEPT (boundary moved to the nearest safe topic seam).
       final history = [
-        for (var i = 0; i < 20; i++) _msg(i.isEven ? 'user' : 'assistant', 'a$i ' * 20),
+        for (var i = 0; i < 30; i++) _bigMsg(i.isEven ? 'user' : 'assistant', i),
       ];
       final plan = CompactionEngine.buildTree(
-          history: history, maxContextTokens: 160, seamChooser: (far, k) => [1, 6, 11]);
+          history: history, maxContextTokens: 12000, seamChooser: (far, k) => [9, 15]);
       final summaries = plan.segments.where((s) => s.summary).toList();
       // ignore: avoid_print
-      print('  [OBS] seam summariges=${summaries.length} '
+      print('  [OBS] seam summaries=${summaries.length} '
           'firstLen=${summaries.isEmpty ? -1 : summaries.first.messages.length} '
           'projected=${plan.projectedTokens}');
-      // k is fixed by the raw-token batch count (4); the seam sets 3 interior cuts.
-      expect(summaries.length, 4, reason: 'k=4 → exactly four L1 batches');
-      expect(summaries.first.messages.length, 1,
-          reason: 'the seam at index 1 makes the first segment far[0..1)');
+      // k=3 (raw-token batching [8,16] → two interior cuts); a micro-adjust seam at
+      // 9 sets the first segment to far[0..9) — the seam IS applied, not overwritten.
+      expect(summaries.length, 3, reason: 'k=3 → exactly three L1 batches');
+      expect(summaries.first.messages.length, 9,
+          reason: 'the size+anchor-guarded seam at index 9 is kept (first batch = '
+              'far[0..9)); a rejected seam would fall back to the arithmetic boundary '
+              'at index 8 (first batch = 8 messages)');
       // Cover is dense + complete: the union of summary messages == the full far span.
       final covered = summaries.expand((s) => s.messages).toList();
       expect(covered.map((m) => m.content).toList(),
@@ -194,6 +210,54 @@ void main() {
       for (final seg in summaries) {
         expect(seg.messages.isEmpty || seg.messages.first.toolCallsJson == null, isTrue);
       }
+    });
+
+    test('size guard rejects a seam carving a tiny batch → arithmetic skeleton (keys stay large)', () {
+      // Same far (23 msgs, k=3, arithmetic [8,16]) but a seam [11,13] punches a tiny
+      // MIDDLE batch (far[11..13) = 2 msgs ~1510 raw < the 3000 size floor). It sits
+      // within the anchor window of [8,16] (|11-8|=3, |13-16|=3 ≤ 3), so the SIZE
+      // guard alone rejects it → the whole arithmetic skeleton is used. The first
+      // batch is far[0..8) (~6040 raw > 1024) — the key-bearing batch stays large
+      // and compressible, never a tiny independently-compressed (bloat-omitted) piece.
+      final history = [
+        for (var i = 0; i < 30; i++) _bigMsg(i.isEven ? 'user' : 'assistant', i),
+      ];
+      final plan = CompactionEngine.buildTree(
+          history: history, maxContextTokens: 12000, seamChooser: (far, k) => [11, 13]);
+      final summaries = plan.segments.where((s) => s.summary).toList();
+      // ignore: avoid_print
+      print('  [OBS] size-guard summaries=${summaries.length} '
+          'firstLen=${summaries.isEmpty ? -1 : summaries.first.messages.length} '
+          'firstRaw=${summaries.isEmpty ? 0 : CompactionEngine.rawTokens(summaries.first.messages)}');
+      // The tiny-batch seam is rejected → the arithmetic boundary at index 8 is used.
+      expect(summaries.first.messages.length, 8,
+          reason: 'a seam carving a tiny batch (< the size floor) is rejected → the '
+              'arithmetic boundary at index 8, not the seam at index 11');
+      expect(CompactionEngine.rawTokens(summaries.first.messages), greaterThan(1024),
+          reason: 'the key-bearing first batch stays > 1024 raw (compressible) — the '
+              'tiny-seam split-if-invalid would otherwise have bloat-omitted it');
+    });
+
+    test('anchor guard rejects a seam that wholesale-reorders the batches → arithmetic skeleton', () {
+      // Same far (23 msgs, k=3, arithmetic [8,16]). A seam [4,12] creates NO tiny
+      // batch (segments 4/8/11 msgs, all ≥ the 3000 floor — so the size guard would
+      // PASS), but it leaps ≥ 4 indices from the arithmetic boundaries (|4-8|=4,
+      // |12-16|=4 > the anchor window 3) → a wholesale re-pack of the batch structure
+      // (each seam-cut segment compressed separately again). The ANCHOR guard rejects
+      // it → arithmetic skeleton → first batch far[0..8).
+      final history = [
+        for (var i = 0; i < 30; i++) _bigMsg(i.isEven ? 'user' : 'assistant', i),
+      ];
+      final plan = CompactionEngine.buildTree(
+          history: history, maxContextTokens: 12000, seamChooser: (far, k) => [4, 12]);
+      final summaries = plan.segments.where((s) => s.summary).toList();
+      // ignore: avoid_print
+      print('  [OBS] anchor-guard summaries=${summaries.length} '
+          'firstLen=${summaries.isEmpty ? -1 : summaries.first.messages.length}');
+      expect(summaries.first.messages.length, 8,
+          reason: 'a seam that wholesale-reorders the batches (≥4 indices from the '
+              'arithmetic boundary, no tiny batch) is rejected by the anchor guard → '
+              'arithmetic boundary at index 8, not the seam at index 4');
     });
 
     test('invalid (unsafe / wrong-count) seam falls back to the arithmetic skeleton', () {
@@ -223,11 +287,14 @@ void main() {
   group('4.3/4.4 determinism + seam inputs', () {
     test('deterministic with seamChooser: same inputs -> same tree', () {
       final history = [
-        for (var i = 0; i < 20; i++) _msg(i.isEven ? 'user' : 'assistant', 'd$i ' * 20),
+        for (var i = 0; i < 30; i++) _bigMsg(i.isEven ? 'user' : 'assistant', i),
       ];
-      final chooser = (List<Message> far, int k) => [1, 6, 11];
-      final a = CompactionEngine.buildTree(history: history, maxContextTokens: 160, seamChooser: chooser);
-      final b = CompactionEngine.buildTree(history: history, maxContextTokens: 160, seamChooser: chooser);
+      // A genuine micro-adjust seam that PASSES the dual guard — so this asserts the
+      // guarded seam is applied deterministically (not vacuous: the seam is actually
+      // kept, exercising the seam path, not just the arithmetic fallback).
+      final chooser = (List<Message> far, int k) => [9, 15];
+      final a = CompactionEngine.buildTree(history: history, maxContextTokens: 12000, seamChooser: chooser);
+      final b = CompactionEngine.buildTree(history: history, maxContextTokens: 12000, seamChooser: chooser);
       expect(a.folded.length, b.folded.length);
       expect(a.projectedTokens, b.projectedTokens);
       expect(

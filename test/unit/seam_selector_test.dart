@@ -119,16 +119,19 @@ void main() {
     });
 
     test('4.3 end-to-end: memo-backed chooser preserves the LLM seam through buildTree', () async {
-      // k=4 (raw-token batching) → the memo must expose k-1=3 seams. Return 3
-      // seams; if the memoized seams were NOT preserved, the arithmetic barchers
-      // (5,10,15) would be used and the first segment would be 4 messages, not 1.
-      final sidecar = FakeSidecar()..queueChunk('{"seams":[1,6,11]}')..queueDone();
+      // 30 ~755-token msgs, budget 12000 → T=6000 → the newest verbatim span stops at
+      // 7 msgs → far = msgs[0..23) → k=3 (raw-token arithmetic [8,16]). Return a
+      // GENUINE micro-adjust seam [9,15] that passes the D5 dual guard (size + anchor),
+      // so the memoized seams ARE kept; a rejected seam would fall back to arithmetic
+      // [8,16] and the first segment would be 8 messages, not 9. (The old [1,6,11]
+      // carved a tiny first batch < the 1025 floor — the deviation this rework removes.)
+      final sidecar = FakeSidecar()..queueChunk('{"seams":[9,15]}')..queueDone();
       final sel = ModelSeamSelector(sidecar: sidecar, resolver: _resolver());
       final history = [
-        for (var i = 0; i < 20; i++) _msg(i.isEven ? 'user' : 'assistant', 's$i ' * 20),
+        for (var i = 0; i < 30; i++) _msg(i.isEven ? 'user' : 'assistant', '$i:${'x' * 3000}'),
       ];
       final seamInputs =
-          CompactionEngine.resolveFoldSeamInputs(history: history, maxContextTokens: 160);
+          CompactionEngine.resolveFoldSeamInputs(history: history, maxContextTokens: 12000);
       expect(seamInputs, isNotNull);
       await sel.ensure(far: seamInputs!.far, k: seamInputs.k, config: _config());
       // ignore: avoid_print
@@ -136,14 +139,15 @@ void main() {
           'memoized=${sel.memoizedSeams(far: seamInputs.far, k: seamInputs.k)}');
 
       final plan = CompactionEngine.buildTree(
-          history: history, maxContextTokens: 160,
+          history: history, maxContextTokens: 12000,
           seamChooser: (far, k) => sel.memoizedSeams(far: far, k: k) ?? const []);
       final summaries = plan.segments.where((s) => s.summary).toList();
-      // k=4 (raw-token batching) → four L1 batches; the memoized seam [1,6,11]
-      // repositions the interior boundaries (first segment = far[0..1)).
-      expect(summaries.length, 4, reason: 'k=4 → four L1 batches');
-      expect(summaries.first.messages.length, 1,
-          reason: 'the memoized LLM seam at index 1 is preserved (not overwritten by arithmetic)');
+      // k=3 (raw-token batching) → three L1 batches; the memoized micro-adjust seam
+      // [9,15] repositions the interior boundaries (first segment = far[0..9)).
+      expect(summaries.length, 3, reason: 'k=3 → three L1 batches');
+      expect(summaries.first.messages.length, 9,
+          reason: 'the memoized LLM micro-adjust seam at index 9 is preserved (not '
+              'overwritten by arithmetic)');
     });
   });
 }

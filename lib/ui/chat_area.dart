@@ -96,10 +96,16 @@ class _ChatAreaState extends State<ChatArea> {
                   itemCount: items.length,
                   itemBuilder: (context, i) {
                     return switch (items[i]) {
-                      ChatMessageItem(:final message) => MessageBubble(
-                          role: message.role,
-                          content: message.content,
-                        ),
+                      ChatMessageItem(:final message) => message.content.isEmpty
+                          // A content-empty message (e.g. a tool-call assistant whose
+                          // ToolCallCard represents the response, D7) — still tracked
+                          // in the message list (so the tool round reaches the model /
+                          // summarizer) but never renders an empty bubble.
+                          ? const SizedBox.shrink()
+                          : MessageBubble(
+                              role: message.role,
+                              content: message.content,
+                            ),
                       ChatToolCallItem(:final activity) => ToolCallCard(
                           activity: activity,
                         ),

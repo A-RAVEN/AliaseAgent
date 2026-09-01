@@ -16,6 +16,7 @@ import 'package:alias_agent/services/provider_resolver.dart';
 import '../widget/helpers/fakes.dart';
 import '../widget/helpers/test_utils.dart';
 import 'helpers/fake_sidecar.dart';
+import 'helpers/real_context_fixture.dart';
 
 void _setupAgentRegistry({
   int maxContextTokens = 200,
@@ -102,11 +103,191 @@ class _SizedFakeSummaryProvider implements SummaryProvider {
   }
 }
 
+/// Records EVERY folded span handed to the summarizer, so a test can assert that
+/// a given message (e.g. a content-empty tool-call assistant) reached the fold
+/// input regardless of how many L1 batches the measure→adjust loop produces.
+class _RecordingSummaryProvider implements SummaryProvider {
+  final List<List<Message>> foldedCalls = [];
+
+  @override
+  Future<SummaryResult> summarize({
+    required List<Message> folded,
+    required AgentTypeConfig config,
+  }) async {
+    foldedCalls.add(List.of(folded));
+    return SummaryResult(
+        text: 'FOLDED (${folded.length} msgs)', tokens: ContextEstimator.estimateTokens('FOLDED'));
+  }
+
+  @override
+  Future<SummaryResult> summarizeText({
+    required String text,
+    required AgentTypeConfig config,
+  }) async {
+    return SummaryResult(text: text, tokens: ContextEstimator.estimateTokens(text));
+  }
+}
+
 void main() {
   group('Compaction projection (Phase 1 MVP)', () {
     tearDown(() {
       registry.clear();
       resolver = null;
+    });
+
+    testWidgets('R-A2-5d FIX: a content-empty tool-call assistant reaches the fold input',
+        (tester) async {
+      // A content-empty tool-call assistant (carrying tool_use input.path = a
+      // re-execution key) must survive `_buildChatItems`/`_chatItemsToMessages` so
+      // buildTree's `folded` includes it and the summarizer sees the tool round.
+      // Before the fix `_buildChatItems` dropped it (old `continue`), so `folded`
+      // never contained it and the summarizer never saw the tool input. Pumps a
+      // real ChatScreen with the message repo so the message goes through
+      // `_loadMessages` -> `_buildChatItems`, then triggers an over-budget fold.
+      _setupAgentRegistry(maxContextTokens: 200);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final toolAssistant = Message(
+        id: 'm_tool',
+        seq: 2,
+        sessionId: 's1',
+        role: 'assistant',
+        content: '', // content-empty (D7): the ToolCallCard represents the response
+        toolCallsJson: jsonEncode([
+          {
+            'id': 'call_read_config',
+            'toolName': 'read_file',
+            'name': 'read_file',
+            'input': {'path': kConfigPath},
+            'result': '// connection timeout\nconst timeout = 120;',
+          }
+        ]),
+        createdAt: 2,
+      );
+      final msgs = [
+        Message(id: 'm_u1', seq: 1, sessionId: 's1', role: 'user',
+            content: '请读取 $kConfigPath。', createdAt: 1),
+        toolAssistant,
+        for (var i = 0; i < 12; i++)
+          Message(id: 'm_f$i', seq: 3 + i, sessionId: 's1',
+              role: i.isEven ? 'user' : 'assistant', content: 'A' * 100, createdAt: 3 + i),
+      ];
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(msgs);
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final summaryProvider = _RecordingSummaryProvider();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: summaryProvider,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), '继续');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      final foldedAll = summaryProvider.foldedCalls;
+      final hasToolRound = foldedAll.any((folded) => folded.any((m) =>
+          m.role == 'assistant' && (m.toolCallsJson ?? '').isNotEmpty));
+      final hasPathKey = foldedAll.any((folded) => folded.any((m) =>
+          (m.toolCallsJson ?? '').contains(kConfigPath)));
+      // ignore: avoid_print
+      print('  [OBS] R-A2-5d foldedCalls=${foldedAll.length} '
+          'hasToolRound=$hasToolRound hasPathKey=$hasPathKey');
+      expect(foldedAll, isNotEmpty,
+          reason: 'an over-budget conversation must fold a span into the summarizer');
+      expect(hasToolRound, isTrue,
+          reason: 'R-A2-5d: the content-empty tool-call assistant must reach the fold '
+              'input (folded), so the summarizer sees the tool round — it was dropped '
+              'before (_buildChatItems old `continue`)');
+      expect(hasPathKey, isTrue,
+          reason: 'R-A2-5d: the tool_use input absolute path (re-execution key) must '
+              'reach the summarizer in the folded span');
+    });
+
+    testWidgets(
+        'R-A2-5d-1 DEDUP: an intermediate tool round + the final allTurnToolCalls superset emit exactly one tool_use/tool_result',
+        (tester) async {
+      // R-A2-5d-1 regression: the round-1 HIGH finding. Production persists a tool
+      // round BOTH as the intermediate tool-call assistant (its own turnToolCalls,
+      // main.dart:1179-1187) AND as the FINAL assistant which redundantly re-carries
+      // the accumulated superset (allTurnToolCalls, main.dart:1143-1144). If
+      // _buildApiMessages re-emitted the round from BOTH (no dedup), the request
+      // would carry the same tool_use_id/tool_result TWICE. This drives the REAL
+      // send path (under budget -> _buildApiMessages) and asserts exactly one
+      // tool_use + one tool_result for the id. Reverting the dedup makes it fail.
+      _setupAgentRegistry(maxContextTokens: 100000); // under budget -> verbatim send
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final toolCall = {
+        'id': 'call_read',
+        'toolName': 'read_file',
+        'name': 'read_file',
+        'input': {'path': kConfigPath},
+        'result': '// connection timeout\nconst timeout = 120;',
+      };
+      final msgs = [
+        Message(id: 'm_u0', seq: 1, sessionId: 's1', role: 'user',
+            content: '请读取 $kConfigPath。', createdAt: 1),
+        // Intermediate: the tool-call assistant that actually made the call.
+        Message(id: 'm_int', seq: 2, sessionId: 's1', role: 'assistant',
+            content: '', toolCallsJson: jsonEncode([toolCall]), createdAt: 2),
+        // Final: the turn-ending assistant that redundantly re-carries the superset.
+        Message(id: 'm_fin', seq: 3, sessionId: 's1', role: 'assistant',
+            content: '已读取 $kConfigPath。', toolCallsJson: jsonEncode([toolCall]),
+            createdAt: 3),
+      ];
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(msgs);
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final summaryProvider = FakeSummaryProvider(text: 'FOLDED SUMMARY');
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: summaryProvider,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), '继续');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      final projected = sidecar.lastMessagesJson!;
+      final msgsDecoded = (jsonDecode(projected) as List);
+      var toolUseCount = 0;
+      var toolResultCount = 0;
+      for (final m in msgsDecoded) {
+        final content = (m as Map<String, dynamic>)['content'];
+        if (content is! List) continue;
+        for (final block in content) {
+          if (block is Map<String, dynamic>) {
+            if (block['type'] == 'tool_use' && block['id'] == 'call_read') toolUseCount++;
+            if (block['type'] == 'tool_result' && block['tool_use_id'] == 'call_read') {
+              toolResultCount++;
+            }
+          }
+        }
+      }
+      // ignore: avoid_print
+      print('  [OBS] R-A2-5d-1 dedup toolUseCount=$toolUseCount toolResultCount=$toolResultCount');
+      expect(toolUseCount, 1,
+          reason: 'R-A2-5d-1: the intermediate + final double-carry must yield '
+              'exactly ONE tool_use for the id (the first owner emits it); the '
+              'redundant final allTurnToolCalls must NOT re-emit it (duplicate)');
+      expect(toolResultCount, 1,
+          reason: 'R-A2-5d-1: exactly ONE tool_result for the id (paired with the '
+              'single tool_use), not a duplicate');
     });
 
     testWidgets('over-budget conversation is compacted into summary + near verbatim',

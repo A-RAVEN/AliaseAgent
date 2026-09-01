@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import '../../models/message.dart';
 import '../context_estimator.dart';
 
@@ -340,9 +342,12 @@ class CompactionEngine {
   /// WHEN a valid [seamChooser] is provided (design D5 option A: "AI micro-adjusts
   /// the batch boundary to the nearest safe topic seam"), its k-1 seams REPLACE
   /// the raw-token interior boundaries IF they validate (safe, strictly
-  /// increasing, exactly k-1, inside the span); otherwise the arithmetic raw-token
-  /// skeleton is used. A misbehaving seam can never split a tool round or change
-  /// the batch count.
+  /// increasing, exactly k-1, inside the span) AND pass the D5 dual guard
+  /// ([_seamSizeGuardAccepts] + [_seamAnchorGuardAccepts]); otherwise the whole
+  /// deterministic arithmetic raw-token skeleton is used. A misbehaving seam can
+  /// never split a tool round, change the batch count, split a batch into a tiny
+  /// (< the compressibility floor) independently-compressed piece, or wholesale
+  /// re-order the batch structure — it can only micro-adjust a boundary.
   static List<CompactionSegment> _batchL1(
       List<Message> far, int T, L1SeamChooser? seamChooser) {
     if (far.isEmpty) return [];
@@ -350,7 +355,11 @@ class CompactionEngine {
     final k = boundaries.length + 1;
     if (seamChooser != null && k > 1) {
       final seams = _normalizeSeams(seamChooser(far, k), far, k);
-      if (seams != null) return _segmentsFromSeams(far, seams);
+      if (seams != null &&
+          _seamSizeGuardAccepts(far, seams, T) &&
+          _seamAnchorGuardAccepts(seams, boundaries, far.length, k)) {
+        return _segmentsFromSeams(far, seams);
+      }
     }
     final segments = <CompactionSegment>[];
     var start = 0;
@@ -382,6 +391,55 @@ class CompactionEngine {
       prev = s;
     }
     return List<int>.of(seams);
+  }
+
+  /// The minimum RAW proxy-token size a seam-cut batch must have for the seam to
+  /// be accepted (design D5 size guard, 2026-09-01). `max(1, T~/2, 1025)`: 1025 is
+  /// the summary profile's `max_tokens` (1024) + 1 — the true compressibility
+  /// floor (only a batch with raw > 1024 is guaranteed to have a smaller summary).
+  /// `T~/2` — the "≈T batch" intuition — can dip below 1024 under a small or
+  /// self-tuned budget, so we take the max. A batch smaller than this CANNOT
+  /// compress (a summary is at most 1024 ≥ the batch), so `_resolveOpenLevel1`'s
+  /// split-if-invalid would bloat-omit it — dropping a re-execution key. Only a
+  /// small budget (where every batch is < 1025) makes the seam always fall back to
+  /// the deterministic arithmetic skeleton — the design's acknowledged
+  /// small-conversation case (no topic micro-adjust needed there).
+  static int _minBatchRaw(int T) => max(1, max(T ~/ 2, 1025));
+
+  /// Design D5 size guard: EVERY seam-cut batch must be ≥ [_minBatchRaw]. A seam
+  /// that isolates a tiny batch (e.g. the AI carving out a small, distinct topic
+  /// as its own batch — the observed config-topic seq1-5, ~150 raw tokens) is
+  /// REJECTED, so that topic stays folded into a large, compressible arithmetic
+  /// batch (the re-execution keys are preserved instead of bloat-omitted). This is
+  /// the guard that restores "accumulate > T → compress the whole batch once" —
+  /// the seam must never split a batch into independently-compressed tiny pieces.
+  static bool _seamSizeGuardAccepts(List<Message> far, List<int> seams, int T) {
+    final floor = _minBatchRaw(T);
+    var start = 0;
+    for (final s in seams) {
+      if (ContextEstimator.estimateConversation(far.sublist(start, s)) < floor) {
+        return false;
+      }
+      start = s;
+    }
+    return ContextEstimator.estimateConversation(far.sublist(start)) >= floor;
+  }
+
+  /// Design D5 anchor guard: each seam may only MICRO-ADJUST its corresponding
+  /// arithmetic batch boundary, never relocate it wholesale. seam[i] must lie
+  /// within `max(1, far.length ~/ (2*k))` indices of `boundaries[i]` — half the
+  /// average batch span ("± 该批的一部分"). A seam that stays within this window
+  /// merely snaps a boundary to the nearest safe topic seam (a genuine micro-
+  /// adjust); one that leaps farther re-opens the batch structure (each seam-cut
+  /// segment compressed separately again — the deviation this rework removes) and
+  /// is rejected. Together the two guards make the seam a touch-up, not a plan.
+  static bool _seamAnchorGuardAccepts(
+      List<int> seams, List<int> boundaries, int farLen, int k) {
+    final w = max(1, farLen ~/ (2 * k));
+    for (var i = 0; i < seams.length; i++) {
+      if ((seams[i] - boundaries[i]).abs() > w) return false;
+    }
+    return true;
   }
 
   /// Build L1 segments by cutting [far] at the validated [seams] (each the start

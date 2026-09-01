@@ -638,12 +638,12 @@ class ChatScreenState extends State<ChatScreen> {
           debugPrint('[AliasAgent] Failed to parse toolCallsJson: $e');
         }
       }
-      // Skip empty ChatMessageItem when tool cards represent the response (D7)
-      if (msg.content.isEmpty &&
-          msg.toolCallsJson != null &&
-          msg.toolCallsJson!.isNotEmpty) {
-        continue;
-      }
+      // Always keep the message item — even a content-empty tool call assistant
+      // (D7). Its tool_use input (often an absolute path = a re-execution key) must
+      // reach BOTH the fold input (the summarizer, model_summary_provider
+      // _toolRoundText) AND _buildApiMessages (the model sees the tool round). The
+      // empty Content bubble itself is NOT rendered (chat_area hides empty-content
+      // messages; the ToolCallCard above represents the response, D7).
       items.add(ChatMessageItem(msg));
     }
     return items;
@@ -2030,8 +2030,22 @@ class ChatScreenState extends State<ChatScreen> {
 
   /// Build API conversation messages from persisted Message objects,
   /// reconstructing tool_use content blocks and synthetic tool_result messages.
+  /// Build the API conversation from persisted [messages], reconstructing
+  /// tool_use blocks + synthetic tool_result user messages.
+  ///
+  /// A tool round is emitted EXACTLY ONCE per tool_use_id: an assistant message
+  /// carries its own tool calls (`turnToolCalls`), and — in the persisted history —
+  /// the turn's FINAL assistant redundantly re-carries the accumulated `allTurnToolCalls`
+  /// (a superset). Without deferring to the first owner, `_buildApiMessages` would
+  /// synthesize the same tool_use_id / tool_result twice (an invalid request). So
+  /// only the FIRST (oldest) assistant to carry a tool_use_id emits its tool_use
+  /// block + its tool_result; later duplicates are skipped. This is also why a
+  /// content-empty tool-call assistant must be retained in the message list: it is
+  /// the first owner of its tool calls, so the round (and its tool_use input, a
+  /// re-execution key) reaches the model and the summarizer.
   List<Map<String, dynamic>> _buildApiMessages(List<Message> messages) {
     final apiMessages = <Map<String, dynamic>>[];
+    final emittedToolUseIds = <String>{};
     for (final msg in messages) {
       final content = <Map<String, dynamic>>[
         {'type': 'text', 'text': msg.content},
@@ -2053,24 +2067,36 @@ class ChatScreenState extends State<ChatScreen> {
         }
       }
 
-      // If assistant message has tool calls, add tool_use blocks
+      // Determine which tool calls this assistant OWNS (its first occurrence of
+      // each id). A duplicate id carried by a later assistant is NOT re-emitted.
+      var ownedToolCalls = const <Map<String, dynamic>>[];
       if (msg.role == 'assistant' &&
           msg.toolCallsJson != null &&
           msg.toolCallsJson!.isNotEmpty) {
         try {
           final toolCalls = jsonDecode(msg.toolCallsJson!) as List<dynamic>;
+          ownedToolCalls = <Map<String, dynamic>>[];
           for (final tc in toolCalls) {
-            final tcMap = tc as Map<String, dynamic>;
-            content.add({
-              'type': 'tool_use',
-              'id': tcMap['id'] ?? '',
-              'name': tcMap['toolName'] ?? tcMap['name'] ?? '',
-              'input': tcMap['input'] ?? {},
-            });
+            final id = ((tc as Map<String, dynamic>)['id'] ?? '').toString();
+            // Empty id is treated as always-unique (never deduped wrongly).
+            if (id.isEmpty || emittedToolUseIds.add(id)) {
+              ownedToolCalls.add(tc);
+            }
           }
         } catch (e) {
           debugPrint('[AliasAgent] Failed to parse toolCallsJson: $e');
+          ownedToolCalls = const [];
         }
+      }
+
+      // If assistant message has tool calls, add tool_use blocks (owned only)
+      for (final tc in ownedToolCalls) {
+        content.add({
+          'type': 'tool_use',
+          'id': tc['id'] ?? '',
+          'name': tc['toolName'] ?? tc['name'] ?? '',
+          'input': tc['input'] ?? {},
+        });
       }
 
       apiMessages.add({
@@ -2078,22 +2104,18 @@ class ChatScreenState extends State<ChatScreen> {
         'content': content,
       });
 
-      // If assistant message has tool calls, add synthetic tool_result user message
-      if (msg.role == 'assistant' &&
-          msg.toolCallsJson != null &&
-          msg.toolCallsJson!.isNotEmpty) {
+      // If assistant message owns tool calls, add synthetic tool_result user message
+      if (ownedToolCalls.isNotEmpty) {
         try {
-          final toolCalls = jsonDecode(msg.toolCallsJson!) as List<dynamic>;
           final toolResults = <Map<String, dynamic>>[];
-          for (final tc in toolCalls) {
-            final tcMap = tc as Map<String, dynamic>;
-            final rawBody = (tcMap['result'] ?? tcMap['resultPreview'] ?? '').toString();
-            final tcInput = (tcMap['input'] as Map<String, dynamic>?) ?? const {};
-            final toolName = (tcMap['toolName'] ?? tcMap['name'] ?? '').toString();
+          for (final tc in ownedToolCalls) {
+            final rawBody = (tc['result'] ?? tc['resultPreview'] ?? '').toString();
+            final tcInput = (tc['input'] as Map<String, dynamic>?) ?? const {};
+            final toolName = (tc['toolName'] ?? tc['name'] ?? '').toString();
             final refetchPath = (tcInput['path'] as String?) ?? '';
             toolResults.add({
               'type': 'tool_result',
-              'tool_use_id': tcMap['id'] ?? '',
+              'tool_use_id': tc['id'] ?? '',
               // Near-zone oversized tool_result body elision (spec "Near-zone
               // oversized tool_result body elision"): a verbatim tool_result whose
               // body is extremely large is elided to a truncation marker + refetch

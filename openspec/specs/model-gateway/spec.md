@@ -2,6 +2,17 @@
 
 ## ADDED Requirements
 
+### Requirement: Usage telemetry
+The C++ Sidecar SHALL parse usage from the SSE `message_start` and `message_delta` events on the Anthropic-format `/v1/messages` endpoint and surface the measured input/output token counts to Dart. Field names follow the Anthropic `/v1/messages` usage format: `input_tokens` (message_start) and `output_tokens` (message_delta) — this exact DeepSeek field naming is **live-verified 2026-08-26**, so the sidecar SHALL parse the usage block defensively as a fallback (read whichever token-count field the endpoint returns). (`prompt_tokens`/`completion_tokens` are the DeepSeek chat/completions fields and do NOT apply to the `/v1/messages` endpoint.)
+
+#### Scenario: Input usage surfaced
+- **WHEN** the SSE stream contains `message_start` with a usage block
+- **THEN** the sidecar parses and forwards the measured input token count (`input_tokens`) to Dart
+
+#### Scenario: Output usage surfaced
+- **WHEN** the SSE stream contains `message_delta` with a usage block
+- **THEN** the sidecar forwards the measured output token count (`output_tokens`) to Dart
+
 ### Requirement: Anthropic-compatible Messages API call
 The C++ Sidecar SHALL construct and send HTTP POST requests to the Messages API endpoint with the correct headers (`x-api-key`, `anthropic-version`, `content-type`) and JSON body (model, messages, system, tools, stream: true). The base URL is configurable to support both Anthropic official (`https://api.anthropic.com`) and DeepSeek Anthropic-compatible (`https://api.deepseek.com/anthropic`) endpoints.
 
@@ -122,7 +133,7 @@ The C++ Sidecar SHALL write diagnostic logs to `~/.aliasagent/logs/` directory, 
 - **THEN** the full response body is written to the log (truncated to 2048 characters)
 
 ### Requirement: Adaptive thinking parameter in request body
-The C++ Sidecar SHALL conditionally include adaptive thinking configuration in the API request body based on the `thinking_mode` and `thinking_effort` parameters. When `thinking_mode` is `"adaptive"`, the body SHALL contain `"thinking":{"type":"adaptive","display":"summarized"}` and `"output_config":{"effort":"<level>"}`, and `max_tokens` SHALL be set to 16000. When `thinking_mode` is not `"adaptive"` or is empty, no thinking or output_config fields SHALL be included and `max_tokens` SHALL remain at 4096.
+The C++ Sidecar SHALL conditionally include adaptive thinking configuration in the API request body based on the `thinking_mode` and `thinking_effort` parameters. When `thinking_mode` is `"adaptive"`, the body SHALL contain `"thinking":{"type":"adaptive","display":"summarized"}` and `"output_config":{"effort":"<level>"}`, and `max_tokens` SHALL be set to 16000. When `thinking_mode` is not `"adaptive"` or is empty, no thinking or output_config fields SHALL be included and `max_tokens` SHALL remain at 4096. **Modified (this change): when a summary-profile request is used (thinking disabled for summarization), `max_tokens` SHALL be 512-1024 instead of 4096.**
 
 **External validation (official docs, verified 2026-08-02 via MCP webReader)**:
 - DeepSeek Anthropic-compatible endpoint (https://api-docs.deepseek.com/guides/anthropic_api/): "thinking | Supported (`budget_tokens` is ignored)" and "output_config | Only `effort` is supported" — the ONLY effective thinking control is `output_config.effort`; `budgetTokens`/`budget_tokens` is ignored by the API.
@@ -136,6 +147,10 @@ The C++ Sidecar SHALL conditionally include adaptive thinking configuration in t
 #### Scenario: Thinking disabled
 - **WHEN** `send_message` receives `thinking_mode = "disabled"` or empty string
 - **THEN** the request JSON body does NOT contain `thinking` or `output_config` keys, and `"max_tokens":4096`
+
+#### Scenario: Summary profile caps max_tokens
+- **WHEN** a summary-profile request is made (thinking disabled for summarization)
+- **THEN** `max_tokens` is 512-1024, overriding the 4096 non-adaptive default
 
 #### Scenario: display summarized always set
 - **WHEN** adaptive thinking is enabled
@@ -163,16 +178,20 @@ The C++ Sidecar SHALL serialize request execution: `execute()` SHALL hold a glob
 - **WHEN** two requests overlap in time
 - **THEN** the same CURL handle is never used by more than one thread at any given time (libcurl requirement)
 
-### Requirement: Cancellation support
-The C++ Sidecar SHALL support cancelling an in-flight request via an FFI `cancel_request()` call: an atomic flag SHALL be set, the curl thread SHALL observe it (e.g., via CURLOPT_XFERINFOFUNCTION) and terminate promptly (CURLE_ABORTED_BY_CALLBACK), and `on_done(-1, "cancelled")` SHALL be delivered after the join completes from the FFI thread **provided the stream's done has not already been dispatched** (measured rationale: native callbacks invoked from the curl thread outside the libcurl call stack were observed to never reach the Dart isolate, while the FFI-thread path does; the curl thread is fully terminated by then, so closing the Dart NativeCallables after this done remains safe). A late abort after the stream already delivered its done (e.g. the Dart side cancelling while the curl thread finishes the connection close) SHALL NOT deliver a second done and SHALL NOT be logged as a cancellation (single-done invariant; 14.7). After cancellation, `execute()` returns normally and the request mutex is released.
+### Requirement: Cancellation support (request-id targeted cancel)
+The C++ Sidecar SHALL support cancelling a request via an FFI `cancel_request(id)` call that is **request-id targeted** (modified from the base contract, which had a no-arg `cancel_request()` and a no-op cancel-before-start). The sidecar SHALL keep a `cancel_request_id` state that `execute()` does NOT reset at request start; when `cancel_request(id)` is called, a request whose id matches SHALL be aborted whether it is already in-flight (observed via the XFERINFO callback — `CURLE_ABORTED_BY_CALLBACK`, `cancelled` set, not mislabeled a connection error) OR only enqueued/not-yet-started (checked at execute() start, before any network I/O), and SHALL deliver `on_done(-1, "cancelled")` in both cases. The `cancel_request_id` SHALL be cleared once that specific request resolves, so a later request that reuses the id is not spuriously cancelled; other (non-matching-id) requests are unaffected, and a late abort after the stream already delivered its done SHALL NOT deliver a second done (single-done invariant). After cancellation, `execute()` returns normally and the request mutex is released.
 
-#### Scenario: Cancel terminates streaming
-- **WHEN** `cancel_request()` is called during an active stream whose done has not yet been dispatched
-- **THEN** the curl thread terminates promptly, on_done(-1, "cancelled") is delivered after join, and execute returns
+#### Scenario: In-flight request-id cancel
+- **WHEN** `cancel_request(id)` is called while the request with that id is streaming
+- **THEN** the transfer aborts (`CURLE_ABORTED_BY_CALLBACK`), `cancelled` is set (not mislabeled a connection error), and `on_done(-1, "cancelled")` is delivered after join
 
-#### Scenario: Cancel before request start is a no-op
-- **WHEN** `cancel_request()` is called with no active request
-- **THEN** it returns without effect
+#### Scenario: Enqueued-not-started request-id cancel
+- **WHEN** `cancel_request(id)` is called while the request with that id is queued but not yet running
+- **THEN** `execute()` aborts at its start check (before network I/O) and delivers `on_done(-1, "cancelled")`
+
+#### Scenario: Latch cleared after the target resolves
+- **WHEN** the request identified by `cancel_request_id` completes (cancelled or otherwise)
+- **THEN** `cancel_request_id` is cleared so a later request reusing that id is not spuriously cancelled
 
 ### Requirement: Single done delivery
 The Sidecar SHALL deliver exactly one done event per request. The `[DONE]` compatibility marker and `message_stop` SHALL be mutually exclusive at dispatch time (a `done_dispatched` guard checked when pushing the done event), so a successful response that contains both (as recorded in the DeepSeek endpoint fixture) triggers only one on_done.

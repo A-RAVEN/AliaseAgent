@@ -84,3 +84,47 @@ The system SHALL add a `thinking_json TEXT` column to the messages table when up
 #### Scenario: Both onCreate branches updated
 - **WHEN** the database is created via either `_init` or `openAt` paths
 - **THEN** both CREATE TABLE statements include the `thinking_json TEXT` column
+
+### Requirement: Stable seq column
+The messages table SHALL include a monotonic `seq` integer column (autoincrement) with a (session_id, seq) index, providing a stable total order even for messages inserted in the same millisecond. `seq` is used as the stable ordering key for compaction tree spans and for reconstructing the message sequence; the existing UI list load continues to order by `created_at` for display.
+
+#### Scenario: seq present
+- **WHEN** a message is inserted
+- **THEN** it receives a strictly increasing seq
+
+#### Scenario: seq indexed for spans
+- **WHEN** the compaction tree records a node span
+- **THEN** it uses (session_id, start_seq, end_seq), and the (session_id, seq) index supports span queries
+
+### Requirement: Summary nodes table
+The system SHALL persist the compaction tree in a `summary_nodes` table keyed by (session_id, level, start_seq, end_seq), storing summary_json (role blocks), token_cost, summary_prompt_version, model, parent_id, and covered_min/max_seq, with a leaf_owner index and a dense non-overlap constraint.
+
+#### Scenario: Summary node persisted
+- **WHEN** a fold completes
+- **THEN** a row is inserted into summary_nodes with its seq span and metadata
+
+#### Scenario: Non-overlapping coverage
+- **WHEN** multiple nodes cover a session
+- **THEN** their covered_seq ranges are dense and non-overlapping
+
+### Requirement: token_count write
+The `token_count` column SHALL be written with the measured provider usage at message persist time, rather than remaining unwritten.
+
+#### Scenario: token_count populated
+- **WHEN** a message is persisted after a completed request
+- **THEN** its token_count equals the measured usage from the provider
+
+### Requirement: Schema migration v3 to v4
+The system SHALL migrate schema version 3 to 4 by adding the `seq` column (backfilled best-effort by created_at, rowid), creating the `summary_nodes` table, and adding a per-session `tree_version`; it SHALL NOT pre-build rollup rows for legacy data (legacy messages remain uncompressed leaves, built lazily forward). The schema SHALL be mirrored in both `_init` and `openAt`.
+
+#### Scenario: Migration from v3
+- **WHEN** the database is opened with schema version 3 and the app expects version 4
+- **THEN** `ALTER TABLE messages ADD COLUMN seq INTEGER` is executed (backfilled best-effort by created_at, rowid), the `summary_nodes` table is created, and a per-session `tree_version` is added; existing data is preserved
+
+#### Scenario: Fresh install at v4
+- **WHEN** the database is created from scratch at schema version 4
+- **THEN** the messages table includes the `seq` column, the `summary_nodes` table exists, and sessions carry `tree_version`
+
+#### Scenario: No rollup pre-built for legacy
+- **WHEN** old messages are migrated to v4
+- **THEN** no rollup/summary rows are pre-built for them; they remain uncompressed leaves, built lazily forward
