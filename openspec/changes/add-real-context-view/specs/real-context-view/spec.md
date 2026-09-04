@@ -1,0 +1,81 @@
+# Real Context View — Spec
+
+## ADDED Requirements
+
+### Requirement: Context snapshot capture
+The system SHALL capture, for every main-conversation request it sends to the model gateway, a deep-copied snapshot of the exact context being sent (`systemPrompt`, `messages`, `toolsJson`, plus request parameters `model`, `thinkingMode`, `thinkingEffort`), and expose it as a readable getter `ChatScreenState.contextSnapshot`. The snapshot SHALL be captured at the moment each request is sent (per tool round), NOT reconstructed from the persisted history or `_chatItems`.
+
+#### Scenario: Single-turn send captures snapshot
+- **WHEN** a turn is sent with no tool calls
+- **THEN** `contextSnapshot` is non-null and its `messages` equals the messages array actually handed to the gateway (deep copy, not a live reference)
+
+#### Scenario: Multi-turn tool send captures the grown snapshot
+- **WHEN** a turn executes one or more tool calls (the request list grows via the tool loop)
+- **THEN** the most recent `contextSnapshot.messages` includes the accumulated assistant(tool_use) and user(tool_result) rounds actually sent on the last request
+
+#### Scenario: No snapshot ever captured shows a placeholder
+- **WHEN** no send has occurred since the app started (no snapshot captured in any session)
+- **THEN** `contextSnapshot` is null and the context view shows a placeholder
+
+#### Scenario: Session switch retains the last snapshot, labeled
+- **WHEN** the user switches to a session that has not sent, but a prior session captured a snapshot
+- **THEN** `contextSnapshot` is not null and holds the prior session's snapshot, labeled with its sessionId (the view shows "snapshot for session=&lt;id&gt;"), rather than a placeholder
+
+### Requirement: View mode toggle
+The system SHALL provide a control in the conversation area that toggles between the original conversation view (`ChatArea`) and the real context view (`ContextView`), defaulting to the conversation view.
+
+#### Scenario: Toggle switches view
+- **WHEN** the user activates the toggle
+- **THEN** the visible message area switches between the original conversation view and the real context view
+
+#### Scenario: Default is conversation view
+- **WHEN** a session is first opened
+- **THEN** the conversation view is shown by default
+
+### Requirement: Complete block rendering
+The real context view SHALL render every content block of each message in the captured snapshot, preserving block type and ordering: `text`, `thinking`, `tool_use`, `tool_result`, and summary `text` blocks. A content-empty assistant message SHALL NOT be hidden wholesale — its `tool_use` blocks (and any `thinking` blocks) SHALL be rendered, and the empty `text` block SHALL be shown as an explicit placeholder. Multiple summary `text` blocks merged into a single role:user message SHALL each be rendered as a distinct summary region.
+
+#### Scenario: Renders all block types
+- **WHEN** the snapshot contains a message with text, thinking, tool_use, and tool_result blocks
+- **THEN** the view renders each as its own distinct element, in the original order
+
+#### Scenario: Empty-content assistant shows its tool_use
+- **WHEN** a captured assistant message has empty text but owns tool_use blocks
+- **THEN** the view renders the tool_use blocks and shows an explicit `(no text)` placeholder for the empty text block, rather than hiding the whole message
+
+#### Scenario: Merged summary blocks are rendered distinctly
+- **WHEN** the compaction projection puts multiple summary text blocks into one role:user message
+- **THEN** the view renders each summary block as its own labeled summary region (not merged into one paragraph)
+
+### Requirement: Context fidelity boundary
+The real context view SHALL scope itself to the main-conversation request: it SHALL display the `systemPrompt`, `messages`, and `toolsJson` of that request and SHALL NOT display the seam-selector or summarizer requests that also call the gateway during a folding turn. For a `tool_result`, the view SHALL display the live-sent body as actually transmitted (un-elided) — the design SHALL state this and may note the `kToolResultElisionThreshold=8000` difference versus a replayed next-turn context.
+
+#### Scenario: Excludes internal folding requests
+- **WHEN** a folding turn also fires seam-selector and summarizer gateway calls
+- **THEN** the context view shows only the main-conversation request's context, and does not surface those internal calls
+
+#### Scenario: Shows live-sent tool_result body
+- **WHEN** a tool_result exceeds the elision threshold during a live turn
+- **THEN** the view displays the body as actually sent (un-elided), and the UI makes clear it shows the live-sent form
+
+### Requirement: Collapsible sections and raw copy
+The real context view SHALL present the system prompt, the tool definitions, and a raw-JSON copy affordance in collapsible / selectable form, so the complete context can be inspected and copied.
+
+#### Scenario: System prompt and tools are collapsible
+- **WHEN** the user opens the context view
+- **THEN** the system prompt and the tool list are available in collapsible sections
+
+#### Scenario: Raw JSON is copyable
+- **WHEN** the user requests it
+- **THEN** the view provides a selectable raw JSON rendering of the captured context (system prompt + messages + tools) that can be copied
+
+### Requirement: Test observability of the context view
+The real context view SHALL be observable by tests: `ChatScreenState.contextSnapshot` SHALL be readable, and the view's contents SHALL be attributable from test output via the existing observability convention (debugPrint before assert / `FakeSidecar.lastMessagesJson` headless channel / a live `dumpContext`).
+
+#### Scenario: Snapshot readable by a widget test
+- **WHEN** a widget test drives a send with a fake sidecar
+- **THEN** the test reads `ChatScreenState.contextSnapshot` and the captured messages match what was actually sent
+
+#### Scenario: Headless channel reports the sent projection
+- **WHEN** a compaction projection is sent
+- **THEN** `FakeSidecar.lastMessagesJson` reflects the same projection the snapshot captured, before any assert
