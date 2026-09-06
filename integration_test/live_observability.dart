@@ -24,6 +24,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:alias_agent/main.dart';
 import 'package:alias_agent/models/tool_call_activity.dart';
+import 'package:alias_agent/services/context_snapshot.dart';
 import 'package:alias_agent/ui/chat_area.dart';
 import 'package:alias_agent/ui/tool_call_card.dart';
 import '../test/integration/helpers/screenshot_utils.dart';
@@ -180,6 +181,34 @@ Future<void> dumpNoTool(WidgetTester tester, String phase) async {
   } else {
     await dumpToolCards(tester, phase: phase);
   }
+}
+
+/// Print the captured real-context snapshot (system + messages + tools) from
+/// STATE — the same channel the context view reads — so a live test is
+/// attributable to what was actually transmitted (change add-real-context-view
+/// task 4.3). Purely observational: never asserts, never changes pass/fail.
+/// Returns the number of captured message objects (0 when none yet).
+int dumpContext(WidgetTester tester, String phase) {
+  final screen = find.byType(ChatScreen);
+  _banner(phase);
+  if (screen.evaluate().isEmpty) {
+    debugPrint('[OBS] $phase — ChatScreen not mounted');
+    return 0;
+  }
+  final ContextSnapshot? snap =
+      tester.state<ChatScreenState>(screen).contextSnapshot;
+  if (snap == null) {
+    debugPrint('[OBS] $phase — no context snapshot captured yet');
+    return 0;
+  }
+  debugPrint('[OBS] $phase — session=${snap.sessionId} model=${snap.model} '
+      'thinking=${snap.thinkingMode}/${snap.thinkingEffort} '
+      'messages=${snap.messages.length}');
+  debugPrint('[OBS] $phase — systemPrompt:\n${snap.systemPrompt}');
+  debugPrint('[OBS] $phase — messages:\n'
+      '${_truncate(const JsonEncoder.withIndent('  ').convert(snap.messages), 2000)}');
+  debugPrint('[OBS] $phase — tools:\n${_truncate(snap.toolsJson, 1000)}');
+  return snap.messages.length;
 }
 
 /// Minimum on-disk PNG size for a shot to count as sane — rejects gross

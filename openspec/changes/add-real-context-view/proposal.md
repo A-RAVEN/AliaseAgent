@@ -7,7 +7,7 @@
 - 新增"真实上下文视图"视图模式，可与原版对话视图一键切换（对话区顶部加小工具栏）。
 - 每轮主对话请求发送时，深拷贝捕获实际待发的上下文快照（`systemPrompt` + `apiMessages` + `toolsJson` + 请求参数），暴露为可读 getter `ChatScreenState.contextSnapshot`。
 - `ContextView` 逐块渲染 `apiMessages`：text / thinking / tool_use(JSON 排版) / tool_result(tool_use_id+正文) / 摘要文字块(独立 SummaryItem)；额外可折叠 "System Prompt"、"Tools (N)"、"Copy 原始 JSON"。
-- 忠实边界（设计决策）：**仅主对话请求**——不含同一轮 seam 选择器 / 摘要器发的折叠内部请求；**tool_result 显示现场发送版原始正文**（非回放 elide 版）。
+- 忠实边界（设计决策）：**仅主对话请求**——不含同一轮 seam 选择器 / 摘要器发的折叠内部请求；**tool_result 显示现场发送版（本 send 实际转发正文）**——实时工具环轮为未 elide 的原始正文，完整历史发送 / 压缩投影回放则可能携带已 elide 正文（正文内含 `[tool_result body elided:` 标记），视图如实呈现该正文并按其是否含该标记如实标注，而**不无条件声称 un-elided**（见 design D4/D5 与 spec Context fidelity boundary）。
 - 处理渲染陷阱：空 content 纯工具 assistant 不得整条隐藏；多个摘要块合并进同一条 user 消息时逐块渲染；大 thinking / 嵌套 tool input 用折叠 + 限高滚动。
 - 测试：匹配层 widget + headless 观察（`contextSnapshot` + `FakeSidecar.lastMessagesJson`）+ live `dumpContext`。
 - 无 BREAKING 改动。

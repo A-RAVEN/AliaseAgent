@@ -268,6 +268,11 @@ void main() {
       return;
     }
 
+    // [OBS] dump the REAL context-view snapshot (system + messages + tools) of
+    // the model request that actually ran this turn — the live/real-model path of
+    // the real-context-view feature (task 4.6). Observability only; never asserts.
+    dumpContext(tester, 'compact_quality real context');
+
     // ------------------------------------------------------------------
     // Read back the REAL summary text from the window live's OWN temp DB. The
     // real fold materialized it into summary_nodes.summary_json (main.dart:

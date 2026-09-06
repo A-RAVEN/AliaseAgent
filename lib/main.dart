@@ -17,6 +17,7 @@ import 'services/compaction/model_summary_provider.dart';
 import 'services/compaction/seam_selector.dart';
 import 'services/compaction/summary_provider.dart';
 import 'services/config_service.dart';
+import 'services/context_snapshot.dart';
 import 'services/database_service.dart';
 import 'services/message_repository.dart';
 import 'services/provider_resolver.dart';
@@ -24,6 +25,7 @@ import 'services/session_repository.dart';
 import 'services/sidecar_bridge.dart';
 import 'services/summary_node_repository.dart';
 import 'ui/chat_area.dart';
+import 'ui/context_view.dart';
 import 'ui/session_sidebar.dart';
 import 'ui/setup_dialog.dart';
 
@@ -220,6 +222,20 @@ class ChatScreenState extends State<ChatScreen> {
   List<Session> _sessions = [];
   String? _currentId;
   List<ChatItem> _chatItems = [];
+
+  /// The most recent deep-copied context snapshot actually sent to the gateway
+  /// on a main-conversation request. `null` means nothing has been captured
+  /// since the app started. Retained (never silently cleared) across session
+  /// switches and labeled with its `sessionId` — see task 1.4 / design D6.
+  ContextSnapshot? _contextSnapshot;
+
+  /// Read-only view of the captured snapshot for the UI and tests. Returns null
+  /// only before the first send has captured anything.
+  ContextSnapshot? get contextSnapshot => _contextSnapshot;
+
+  /// Which view the conversation area shows: the original conversation view or
+  /// the real context view (task 3.1). Defaults to the conversation view.
+  ContextViewMode _viewMode = ContextViewMode.conversation;
 
   /// The MOST RECENT final assistant reply of the current turn, read from state
   /// (not the widget tree) by the live test. Returns null when no final reply
@@ -933,11 +949,40 @@ class ChatScreenState extends State<ChatScreen> {
           ? agentType.thinkingEffort!
           : '';
 
+      // (1.2) Pull the inline system-prompt expression into a named local so it
+      // is readable at the capture point below. Its final content is unchanged —
+      // purely a capture-side refactor.
+      final systemPrompt =
+          '${agentType.systemPrompt}\n${_guard.inject()}\nCurrent date: ${DateTime.now().toIso8601String().substring(0, 10)}. For precise time-sensitive queries, use the get_current_time tool.';
+
+      // (1.3) Before each send, deep-copy the exact context handed to the
+      // gateway. `messagesJson` (computed at :913) is the verbatim serialized
+      // `apiMessages` for THIS round, so re-decoding it is both a faithful deep
+      // copy and immune to the later in-place `.add` growth of `apiMessages` in
+      // the tool loop. Captured here — NOT at the :913 jsonEncode — because only
+      // here are systemPrompt / thinkingMode / thinkingEffort / toolsJson all in
+      // scope. The last send of a multi-round turn wins (the grown version).
+      if (mounted) {
+        setState(() {
+          _contextSnapshot = ContextSnapshot(
+            sessionId: sessionId,
+            systemPrompt: systemPrompt,
+            messages: (jsonDecode(messagesJson) as List<dynamic>)
+                .cast<Map<String, dynamic>>(),
+            toolsJson: toolsJson,
+            model: agentType.model,
+            thinkingMode: thinkingMode,
+            thinkingEffort: thinkingEffort,
+            capturedAt: DateTime.now(),
+          );
+        });
+      }
+
       await _sidecar.sendMessage(
         apiKey: provider.apiKey,
         baseUrl: baseUrl,
         model: agentType.model,
-        systemPrompt: '${agentType.systemPrompt}\n${_guard.inject()}\nCurrent date: ${DateTime.now().toIso8601String().substring(0, 10)}. For precise time-sensitive queries, use the get_current_time tool.',
+        systemPrompt: systemPrompt,
         messagesJson: messagesJson,
         toolsJson: toolsJson,
         thinkingMode: thinkingMode,
@@ -2514,10 +2559,45 @@ class ChatScreenState extends State<ChatScreen> {
         ),
         const VerticalDivider(width: 1),
         Expanded(
-          child: ChatArea(
-            items: _chatItems,
-            isStreaming: _isStreaming,
-            onSendMessage: _sendMessage,
+          // (3.2) Wrap the view area in a Column: a small toolbar at top toggles
+          // between the original conversation view and the real context view
+          // (task 3.2 / design D6). The default remains the conversation view.
+          child: Column(
+            children: [
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 12, vertical: 6),
+                  child: SegmentedButton<ContextViewMode>(
+                    segments: const [
+                      ButtonSegment(
+                        value: ContextViewMode.conversation,
+                        label: Text('对话视图'),
+                      ),
+                      ButtonSegment(
+                        value: ContextViewMode.context,
+                        label: Text('真实上下文'),
+                      ),
+                    ],
+                    selected: {_viewMode},
+                    onSelectionChanged: (selection) {
+                      setState(() => _viewMode = selection.first);
+                    },
+                    showSelectedIcon: false,
+                  ),
+                ),
+              ),
+              Expanded(
+                child: _viewMode == ContextViewMode.conversation
+                    ? ChatArea(
+                        items: _chatItems,
+                        isStreaming: _isStreaming,
+                        onSendMessage: _sendMessage,
+                      )
+                    : ContextView(snapshot: _contextSnapshot),
+              ),
+            ],
           ),
         ),
       ],

@@ -44,7 +44,7 @@
 - **备选（弃）**：一并展示（"完整"但易误导，见 D4）。
 
 ### D4 诚实边界声明
-视图"是主对话请求的上下文"，**不是**"本轮发给 AI 的一切"；`tool_result` 正文显示**现场发送版**（实际待发对象，含未 elide 的原始正文），同轮在一次回放时（next-turn 经 `_buildApiMessages`）可能变为 elide 版。理由：忠实于"这次调用到底发了什么"。此声明写入 spec，避免"完整"字样被从业者误读。
+视图"是主对话请求的上下文"，**不是**"本轮发给 AI 的一切"；`tool_result` 正文显示**现场发送版**（本 send 实际转发给网关的正文）。当本 send 为实时工具环轮时是未 elide 的原始正文；而当本 send 本身就是回放（完整历史发送或压缩投影，经 `_buildApiMessages`→`_elideOversizedToolResult`）时，超大正文可能已被 elide，且该 elide 标记就存在于正文中。视图如实呈现该正文（verbatim），并据其是否含 `[tool_result body elided:` 标记如实地标注 elided/un-elided——**绝不无条件声称 un-elided**（见 D5、风险与审查 F-impl-1）。理由：忠实于"这次调用到底发了什么"。此声明写入 spec，避免"完整"字样被从业者误读。
 
 ### D5 渲染：`ContextView` 逐块遍历 `apiMessages`
 - 消息 header：`[idx] role`（首个 user 从 0 编号）。
@@ -52,7 +52,7 @@
   - `text` → 复用 `MessageBubble(role, content)`；`content` 为空 → `(no text)` 占位（**不整条隐藏**——空 content 纯工具 assistant 是其 tool_use 的首属主，main.dart:2042-2045）。
   - `thinking` → 复用 `ThinkingCard`（构造静态 `ChatThinkingItem`：折叠 + maxHeight 400 滚动）。
   - `tool_use` → **新增 `JsonBlock`**：`const JsonEncoder.withIndent('  ').convert(input)` 美化 + 折叠 + 限高滚动（input 常含绝对路径=重执行键，不可截断）。
-  - `tool_result` → 显示 `tool_use_id` + `content`（JSON 内容走 `JsonBlock` 美化，纯文本直出）；正文为**现场发送版（未 elide 的完整正文）**，故**不显截断标记**；大正文折叠 + 限高；标注"现场发送版 (un-elided)"（见 D4）。
+  - `tool_result` → 显示 `tool_use_id` + `content`（JSON 内容走 `JsonBlock` 美化，纯文本直出）；正文为**现场发送版（本 send 实际转发正文，verbatim 呈现，含 elide 标记则如实呈现）**；大正文折叠 + 限高；标注"现场发送版 ({elided|un-elided})"，据正文是否含 `[tool_result body elided:` 标记决定（**绝不无条件声称 un-elided**，见 D4、审查 F-impl-1）。
   - 摘要文字块（`content` 以 `## 更早上下文` 开头）→ `SummaryItem`（marker/层级 + 折叠）。
 - 额外可折叠 section："System Prompt"、"Tools (N)"（列 name，细节可展开）、"Copy 原始 JSON"（`SelectableText` 承载 `jsonEncode({system,messages,tools})`）。
 
@@ -72,7 +72,7 @@
 
 - **[每次发送都深拷贝 `apiMessages`，多轮工具时次数多]** → 开销为消息量级，仅在发送点做、不常驻；可接受。
 - **[会话切换后 `_loadMessages` 不重跑 `_callModel`，无新快照]** → 保留最近一次快照并标注 `sessionId`（避免误导为当前会话），视图 header 显示 `snapshot for session=<id>`。
-- **[现场发送版 vs 回放 elide 版 tool_result 差异]** → spec 明确声明显示"现场发送版"，并注明 `kToolResultElisionThreshold=8000`。
+- **[现场发送版 vs 回放 elide 版 tool_result 差异]** → spec 明确声明显示"现场发送版（本 send 实际转发正文）"，并注明 `kToolResultElisionThreshold=8000`；视图据正文是否含 `[tool_result body elided:` 标记如实标注 elided/un-elided，不无条件声称 un-elided（回放/压缩投影路径可能携带已 elide 正文，见 D4）。
 - **["完整"字样可能被误读]** → spec 用限定语"主对话请求的上下文"。
 - **[大 JSON/thinking 占满视图]** → 折叠 + 限高 + 选择性 Copy，不阻塞列表。
 - **[测试观察性]** → 所有断言前 `debugPrint` 快照 / 响应，遵循 observability 原则；失败可归因。
