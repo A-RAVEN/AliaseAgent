@@ -27,7 +27,7 @@ App 工具边界在 **C++ FFI sidecar**（`dart:ffi` → `web_fetch`/`web_search
 ## Decisions
 
 1. **驱动栈 = Python Playwright，驱动系统 Edge/Chromium（`channel="msedge"`/`"chrome"`）。**
-   - 为什么 / 备选：预期可**免 ~150MB Chromium 下载**（归档里最重的成本项），Win11 自带 Edge。**但“channel 是否真正免下载”是外部、未验证事实**——需 spike（见 Risk / Open Question 1），不当作已定结论。备选“捆绑 Chromium”被否（下载+版本漂移）；“裸 CDP”被否（等于重造 Playwright）。
+   - 为什么 / 备选：预期可**免 ~150MB Chromium 下载**（归档里最重的成本项），Win11 自带 Edge。**“channel 免下载”已由 spike（2026-09-06）确认**——`channel="msedge"` 实测驱动系统 Edge（product=`Edg/151.0.4129.72`、进程全为系统 `msedge.exe`），未用 bundled chromium；**残差 caveat**：本机已有 crawl4ai 装的 chromium，全新机器未复现，但 channel→系统二进制、捆绑未用 的机制即免下载来源。备选“捆绑 Chromium”被否（下载+版本漂移）；“裸 CDP”被否（等于重造 Playwright）。
 2. **持久的 sidecar 子进程 worker（长驻），而非 per-call 一次性。**
    - 为什么：浏览器“点→看→再点”是**多步**；一次性不能维持多步状态。
    - 实现：sidecar 起一个 **Playwright worker daemon**，会话启动时拉起；一次任务一个会话。
@@ -47,11 +47,11 @@ App 工具边界在 **C++ FFI sidecar**（`dart:ffi` → `web_fetch`/`web_search
 
 ## Risks / Trade-offs
 
-- **[多轮 tool_use 循环深度] → 前置验证。** 浏览器是多步。**核实 sidecar 的 tool_use 循环**（`lib/main.dart:922` `while(true)`、50-turn cap `:1347`，等）已支持足够深的多步；若不够，**新增前置任务实现之**（不降低多步为单步）。实现前列验证。
+- **[多轮 tool_use 循环深度] → 前置验证。** 浏览器是多步。**核实 lib/main.dart 的 tool_use 循环（Flutter 客户端）**（`lib/main.dart:922` `while(true)`、50-turn cap `:1347`，等）已支持足够深的多步；若不够，**新增前置任务实现之**（不降低多步为单步）。**spike 2026-09-06（task 1.1）确认 PASS**：`while(true)` @922、`_executeTool` @1262、`tool_result` 回喂 @1338、50-turn cap @1347；多步前提成立，无需新增前置。
 - **[headed 资源成本] → 单会话 + 进程组清理 + 实测。** 300-500MB/tab、2-5s 冷启动、孤儿浏览器进程；单会话避免重复冷启动，`process-group/JobObject` kill 兜底。
-- **[窗口最小化/遮挡下的行为（外部、未验证）] → 实测（task 1.2）。** Edge 最小化 → AI 连续 navigate/click/snapshot → 记录①是否被拉回前台、②命令是否仍成功执行、③快照是否仍新/准；据结果决定是否加 `--disable-backgrounding-occluded-windows`，并把两类分支都回填 spec。
-- **[`channel` 是否真免 ~150MB Chromium 下载（外部、未验证）] → spike。** 实测 Playwright 能否不经 `playwright install` 直接驱动系统 Edge；确认前不作为收益事实。
-- **[单 tab / 弹窗 / 下载 / 权限抑制是否真能成立（外部、未验证 + 需机制）] → 实测（task 1.4）。** 单靠“复用 tab”不足以压制 `window.open`/`target=_blank` 或下载/权限弹窗；需显式 popup/新页关闭 handler + deny-downloads/permission-denial 配置，且需驱动一个会触发它们的页面实测记录，结论回填 spec/tasks 2.4。
+- **[窗口最小化/遮挡下的行为（外部、未验证）] → 实测（task 1.2）。** **spike 2026-09-06**：**最小化分支 PASS**（minimize → navigate/click/snapshot 成功、快照新、窗口未被拉回）；**遮挡分支（被另一窗口覆盖，非最小化）已由 task 1.5 实测 PASS**（不透明顶层全屏窗盖住 → navigate/click/snapshot 成功、快照新、rAF `123→123` 无节流）→ `--disable-backgrounding-occluded-windows` **无需**。**诚实 caveat**：遮挡窗为合成全屏窗，未单独读 Chromium 内部 occluded 标记，但「操作成功 + 帧率不变」运行信号已答。
+- **[`channel` 免 ~150MB Chromium 下载] → 已 spike（2026-09-06 确认）。** `channel="msedge"` 实测驱动系统 Edge（product=`Edg/151.0.4129.72`，进程全为系统 `msedge.exe`），未用 bundled chromium-1228 → **免下载成立**。**残差 caveat**：本机已有 crawl4ai 装的 chromium，「全新机器零安装」未直接复现，但 channel→系统二进制、捆绑未用的机制即免下载来源。
+- **[单 tab / 弹窗 / 下载 / 权限抑制是否真能成立（外部、未验证 + 需机制）] → 实测（task 1.4）。** 单靠“复用 tab”不足以压制 `window.open`/`target=_blank` 或下载/权限弹窗；需显式 popup/新页关闭 handler + deny-downloads/permission-denial 配置。**spike 2026-09-06**：单 tab/弹窗/下载 **PASS**；**权限抑制已由 task 1.6 的 HTTPS 实测**（不授予——Notifs `denied`；Geoloc 未授予、`error:3` TIMEOUT（6 秒超时）；无弹窗仅 Notifs 路径确认，Geoloc state=`prompt` 未演示无弹窗）。结论回填 spec/tasks 2.4。
 - **[反爬/ToS] → 用户可见 + 只读尊重。** 程序化访问部分站点会拦；本工具不替代付费搜索，用户可人工协助；不承诺绕过反爬。
 - **[Python/Playwright 依赖] → 优雅降级。** 缺失时工具不声明或返回可读错误，不静默占位。
 - **[文本快照 token 成本] → 快照限长/分块。** 避免撑爆上下文（项目已有上下文压缩体系）。
@@ -62,9 +62,9 @@ App 工具边界在 **C++ FFI sidecar**（`dart:ffi` → `web_fetch`/`web_search
 
 ## Open Questions
 
-1. **`channel="msedge"/"chrome"` 是否能不经 `playwright install` 免下载驱动系统 Edge**（外部、需 spike；若只能捆 Chromium，则资源成本上升）。
-2. **多轮 tool_use 循环深度**（是否需为多步浏览器补深；前置验证）。
+1. **`channel` 免下载** — **已由 spike 确认（2026-09-06）**：`channel="msedge"` 驱动系统 Edge、未用 bundled chromium → 免下载成立（残差：本机已装 chromium，全新机器未复现，但机制已证）。
+2. **多轮 tool_use 循环深度** — 已由 spike（task 1.1，2026-09-06）确认：多步前提成立，无需补深。
 3. **OCR**：纯图页面处理**本 change 不做**；若后续要做，需先选型（Tesseract vs PaddleOCR）。
 4. 快照取“结构化 JSON（accessibility）”还是“纯 `innerText`”——前者利于 AI 定位，但 DeepSeek 可用性需实测。
 5. **“显式可见请求”信号**：本 change 浏览器状态 UI 在范围外，若后续真的要让用户“主动把浏览器调到前台”，需另定义信号（如聊天里说“显示浏览器”→ agent 调某命令）；本 change 不承诺。
-6. **单 tab / 弹窗 / 下载 / 权限抑制机制**：是否/如何用显式 popup 关闭 handler + deny-downloads/permission-denial 配置实现（task 1.4 实测后定）。
+6. **单 tab / 弹窗 / 下载 / 权限抑制机制**：是否/如何用显式 popup 关闭 handler + deny-downloads/permission-denial 配置实现（**task 1.4 实测单 tab/弹窗/下载；task 1.6 HTTPS 实测权限抑制：不授予；无弹窗仅 Notifs 路径（Notifs `denied`；Geoloc 未授予、`prompt`）**）。
