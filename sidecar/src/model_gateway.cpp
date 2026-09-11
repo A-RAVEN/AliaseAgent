@@ -564,11 +564,11 @@ int ModelGateway::execute(
   body["metadata"]["user_id"] = "aliasagent";
 
   // Thinking on/off + intensity (unified for DeepSeek /v1/messages, Anthropic format).
-  // Docs/DeepSeekAPIDoc.md §2.5 "Thinking Mode（Anthropic 格式）":
-  //   thinking.type        | ON/OFF switch: "enabled" | "disabled" — per §2.5 documented
+  // Docs/DeepSeekAPIDoc.md §2.7 "思考模式（Thinking）相关":
+  //   thinking.type        | ON/OFF switch: "enabled" | "disabled" — per §2.7 documented
   //                          switch. Our code also sends "adaptive" for the interactive
-  //                          path (project/live-verified usage; §2.5 does NOT document
-  //                          adaptive — see doc L212 note). Live-verified 2026-08-26:
+  //                          path (project/live-verified usage; §2.7 does NOT document
+  //                          adaptive — see doc §2.7.5 note). Live-verified 2026-08-26:
   //                          thinking.type="disabled" turns thinking OFF; the endpoint
   //                          DEFAULTS thinking to enabled (default effort high), so
   //                          ABSENCE is NOT a disable — we must explicitly send it (see
@@ -591,8 +591,8 @@ int ModelGateway::execute(
   } else if (summary_mode) {
     // Summary profile: thinking.type="disabled" + capped output. Overrides the
     // 4096 default. DeepSeek's /v1/messages endpoint DEFAULTS thinking to enabled
-    // (Docs/DeepSeekAPIDoc.md §2.5 "默认行为": Thinking 默认启用, 默认 effort high — this
-    // is the §2.5 prose, NOT a field-table line; §3.1 line ~228 is chat/completions),
+    // (Docs/DeepSeekAPIDoc.md §2.7.1 注(1): 思考模式默认打开, 且 effort 默认为 high — this
+    // is the §2.7.1 prose, NOT a field-table line; §3.1 is chat/completions),
     // so absence is NOT a disable — without thinking.type="disabled" the summary
     // burns its 1024-token budget on reasoning.
     body["thinking"]["type"] = "disabled";
