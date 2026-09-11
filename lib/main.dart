@@ -261,7 +261,11 @@ class ChatScreenState extends State<ChatScreen> {
   bool _loading = true;
 
   // Dynamic tool definitions (task 8.3 — was static const, now late final)
-  late final Map<String, Map<String, dynamic>> _toolDefs;
+  // Tool definitions sent to the model. Mutable (not late): _initSearchAndTools
+  // assigns the base set synchronously BEFORE the browser-availability await, so
+  // a sendMessage that reads it while the probe is still pending never hits a
+  // LateInitializationError (browser/prober gates resolve later and mutate it).
+  Map<String, Map<String, dynamic>> _toolDefs = {};
 
   @override
   void initState() {
@@ -323,7 +327,7 @@ class ChatScreenState extends State<ChatScreen> {
   }
 
   /// Initialize search infrastructure and build tool definitions (tasks 8.2, 8.3, 8.6)
-  void _initSearchAndTools() {
+  Future<void> _initSearchAndTools() async {
     // Build base tool defs
     final base = <String, Map<String, dynamic>>{
       'read_file': const {
@@ -498,6 +502,87 @@ class ChatScreenState extends State<ChatScreen> {
         },
       },
     };
+
+    // Assign the base tool set SYNCHRONOUSLY before the browser-availability await
+    // so _toolDefs is never uninitialized (a message sent while the probe is still
+    // pending reads a valid, if browser-less, tool set).
+    _toolDefs = base;
+
+    // Browser tool (add-browser-tool): declare OUTSIDE the hasProviders gate so a
+    // browser-runtime probe decides it, independent of search-provider availability
+    // (design Decision 6 / spec "Graceful degradation / declaration gating"). When
+    // the browser stack (Playwright + Edge/Chromium) is unavailable, the tools are
+    // simply absent — never a silent placeholder. Mutates _toolDefs (== base ref).
+    bool browserAvailable = false;
+    try {
+      final probeJson = await _sidecar.browserAvailable();
+      final parsed = jsonDecode(probeJson);
+      if (parsed is Map) browserAvailable = parsed['available'] == true;
+    } catch (e) {
+      debugPrint('[AliasAgent] browser_available probe failed: $e');
+    }
+    if (browserAvailable) {
+      base['browser_navigate'] = const {
+        'name': 'browser_navigate',
+        'description': 'Navigate a user-visible browser to a URL and return a text '
+            'snapshot of the page. Drives a persistent headed browser session; '
+            'multi-step (navigate/click/type/snapshot) share one session.',
+        'input_schema': {
+          'type': 'object',
+          'properties': {
+            'url': {
+              'type': 'string',
+              'description': 'The URL to navigate to.',
+            },
+          },
+          'required': ['url'],
+        },
+      };
+      base['browser_click'] = const {
+        'name': 'browser_click',
+        'description': 'Click an element in the browser and return a text snapshot '
+            'of the page.',
+        'input_schema': {
+          'type': 'object',
+          'properties': {
+            'selector': {
+              'type': 'string',
+              'description': 'CSS selector of the element to click.',
+            },
+          },
+          'required': ['selector'],
+        },
+      };
+      base['browser_type'] = const {
+        'name': 'browser_type',
+        'description': 'Enter text into a field in the browser and return a text '
+            'snapshot of the page.',
+        'input_schema': {
+          'type': 'object',
+          'properties': {
+            'selector': {
+              'type': 'string',
+              'description': 'CSS selector of the field.',
+            },
+            'text': {
+              'type': 'string',
+              'description': 'The text to enter.',
+            },
+          },
+          'required': ['selector', 'text'],
+        },
+      };
+      base['browser_snapshot'] = const {
+        'name': 'browser_snapshot',
+        'description': 'Return a fresh text snapshot of the current browser page '
+            '(re-read live, not a cached copy).',
+        'input_schema': {
+          'type': 'object',
+          'properties': {},
+          'required': [],
+        },
+      };
+    }
 
     // Initialize search infra from config (task 8.2)
     try {
@@ -2266,6 +2351,21 @@ class ChatScreenState extends State<ChatScreen> {
           'url': input['url'] ?? '',
         });
         resultJson = await _sidecar.webFetch(request);
+      case 'browser_navigate':
+        resultJson = await _sidecar.browserNavigate(jsonEncode({
+          'url': input['url'] ?? '',
+        }));
+      case 'browser_click':
+        resultJson = await _sidecar.browserClick(jsonEncode({
+          'selector': input['selector'] ?? '',
+        }));
+      case 'browser_type':
+        resultJson = await _sidecar.browserType(jsonEncode({
+          'selector': input['selector'] ?? '',
+          'text': input['text'] ?? '',
+        }));
+      case 'browser_snapshot':
+        resultJson = await _sidecar.browserSnapshot(jsonEncode({}));
       case 'get_current_time':
         final now = DateTime.now();
         final dt = now.toIso8601String();
@@ -2290,6 +2390,26 @@ class ChatScreenState extends State<ChatScreen> {
       // Format tool results for display
       if (name == 'web_search' || name == 'web_fetch') {
         parsed['content'] = _formatSearchResultForDisplay(name!, parsed);
+      } else if (name == 'browser_navigate' ||
+          name == 'browser_click' ||
+          name == 'browser_type' ||
+          name == 'browser_snapshot') {
+        // Model-facing content = the page's text snapshot (plus url/title and a
+        // divergence note). The per-call counters stay in sidecar.log, NOT here.
+        final snap = (parsed['snapshot'] as String?) ?? '';
+        final url = (parsed['url'] as String?) ?? '';
+        final title = (parsed['title'] as String?) ?? '';
+        final note = (parsed['divergent'] == true)
+            ? (parsed['note'] as String? ?? '')
+            : '';
+        final sb = StringBuffer();
+        if (title.isNotEmpty) sb.writeln(title);
+        if (url.isNotEmpty) sb.writeln(url);
+        if (note.isNotEmpty) sb.writeln(note);
+        sb.write(snap);
+        parsed['content'] = sb.toString().trim().isEmpty
+            ? '(no page text captured)'
+            : sb.toString().trim();
       } else if (name == 'write_file') {
         final bytes = parsed['bytes_written'] as int? ?? 0;
         final created = parsed['created'] as bool? ?? false;

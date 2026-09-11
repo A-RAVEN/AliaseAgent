@@ -109,6 +109,23 @@ SIDECAR_API const char* glob_file(const char* request_json);
 ///                "count":N,"truncated":true|false}
 SIDECAR_API const char* grep_file(const char* request_json);
 
+/// Probe whether the browser tool stack is present (Playwright + a usable
+/// Edge/Chromium). One-shot. Returns JSON: {"ok":true,"available":bool,...}
+/// or {"ok":false,"error":"..."}
+SIDECAR_API const char* browser_available(void);
+
+/// Drive the browser. Each maps to the worker command and returns the worker's
+/// JSON response (the snapshot for the model; the per-call counters are logged
+/// to sidecar.log outside the text). request_json carries only tool params:
+///   browser_navigate: {"url":"..."}
+///   browser_click:    {"selector":"..."}
+///   browser_type:     {"selector":"...","text":"..."}
+///   browser_snapshot: {}
+SIDECAR_API const char* browser_navigate(const char* request_json);
+SIDECAR_API const char* browser_click(const char* request_json);
+SIDECAR_API const char* browser_type(const char* request_json);
+SIDECAR_API const char* browser_snapshot(const char* request_json);
+
 #ifdef __cplusplus
 }
 #endif

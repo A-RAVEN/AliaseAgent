@@ -5,6 +5,7 @@
 #include "crash_handler.h"
 #include "search_provider.h"
 #include "web_fetch.h"
+#include "browser.h"
 #include <string>
 #include <cstring>
 
@@ -242,6 +243,98 @@ SIDECAR_API const char* grep_file(const char* request_json) {
   }
   g_grep_file_result = tools::grep_file(request_json);
   return g_grep_file_result.c_str();
+}
+
+// ============================================================================
+// Browser tool (add-browser-tool) — persistent-headed Edge worker
+// ============================================================================
+
+// Per-function static buffers (D9 static string pattern, matching web_fetch).
+static std::string g_browser_available_result;
+static std::string g_browser_navigate_result;
+static std::string g_browser_click_result;
+static std::string g_browser_type_result;
+static std::string g_browser_snapshot_result;
+
+SIDECAR_API const char* browser_available(void) {
+  LOG_TRACE("browser_available called");
+  try {
+    g_browser_available_result = browser::browser_available();
+    return g_browser_available_result.c_str();
+  } catch (const std::exception& e) {
+    static std::string err_static;
+    err_static = "{\"ok\":true,\"available\":false,\"error\":\"" +
+                 tools::json_escape(e.what()) + "\"}";
+    LOG_ERR("browser_available exception: " + std::string(e.what()));
+    return err_static.c_str();
+  } catch (...) {
+    LOG_ERR("browser_available: unknown exception");
+    return "{\"ok\":true,\"available\":false,\"error\":\"Unknown internal error\"}";
+  }
+}
+
+SIDECAR_API const char* browser_navigate(const char* request_json) {
+  LOG_TRACE("browser_navigate called");
+  try {
+    g_browser_navigate_result = browser::browser_navigate(request_json ? request_json : "{}");
+    return g_browser_navigate_result.c_str();
+  } catch (const std::exception& e) {
+    static std::string err_static;
+    err_static = "{\"ok\":false,\"error\":\"" + tools::json_escape(e.what()) + "\"}";
+    LOG_ERR("browser_navigate exception: " + std::string(e.what()));
+    return err_static.c_str();
+  } catch (...) {
+    LOG_ERR("browser_navigate: unknown exception");
+    return "{\"ok\":false,\"error\":\"Unknown internal error\"}";
+  }
+}
+
+SIDECAR_API const char* browser_click(const char* request_json) {
+  LOG_TRACE("browser_click called");
+  try {
+    g_browser_click_result = browser::browser_click(request_json ? request_json : "{}");
+    return g_browser_click_result.c_str();
+  } catch (const std::exception& e) {
+    static std::string err_static;
+    err_static = "{\"ok\":false,\"error\":\"" + tools::json_escape(e.what()) + "\"}";
+    LOG_ERR("browser_click exception: " + std::string(e.what()));
+    return err_static.c_str();
+  } catch (...) {
+    LOG_ERR("browser_click: unknown exception");
+    return "{\"ok\":false,\"error\":\"Unknown internal error\"}";
+  }
+}
+
+SIDECAR_API const char* browser_type(const char* request_json) {
+  LOG_TRACE("browser_type called");
+  try {
+    g_browser_type_result = browser::browser_type(request_json ? request_json : "{}");
+    return g_browser_type_result.c_str();
+  } catch (const std::exception& e) {
+    static std::string err_static;
+    err_static = "{\"ok\":false,\"error\":\"" + tools::json_escape(e.what()) + "\"}";
+    LOG_ERR("browser_type exception: " + std::string(e.what()));
+    return err_static.c_str();
+  } catch (...) {
+    LOG_ERR("browser_type: unknown exception");
+    return "{\"ok\":false,\"error\":\"Unknown internal error\"}";
+  }
+}
+
+SIDECAR_API const char* browser_snapshot(const char* request_json) {
+  LOG_TRACE("browser_snapshot called");
+  try {
+    g_browser_snapshot_result = browser::browser_snapshot(request_json ? request_json : "{}");
+    return g_browser_snapshot_result.c_str();
+  } catch (const std::exception& e) {
+    static std::string err_static;
+    err_static = "{\"ok\":false,\"error\":\"" + tools::json_escape(e.what()) + "\"}";
+    LOG_ERR("browser_snapshot exception: " + std::string(e.what()));
+    return err_static.c_str();
+  } catch (...) {
+    LOG_ERR("browser_snapshot: unknown exception");
+    return "{\"ok\":false,\"error\":\"Unknown internal error\"}";
+  }
 }
 
 } // extern "C"

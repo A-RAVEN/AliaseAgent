@@ -49,6 +49,7 @@ set(SOURCES
   src/zhipuai_search.cpp
   src/searxng_search.cpp
   src/kimi_search.cpp
+  src/browser.cpp
 )
 
 # Shared library
@@ -61,6 +62,8 @@ target_link_libraries(sidecar PUBLIC CURL::libcurl ${PLATFORM_LIB})
 # Install
 install(TARGETS sidecar LIBRARY DESTINATION lib)
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/fetch_worker.py"
+        DESTINATION share/aliasagent/scripts)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/browser_worker.py"
         DESTINATION share/aliasagent/scripts)
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/requirements.txt"
         DESTINATION share/aliasagent/scripts)
@@ -93,6 +96,7 @@ add_executable(sidecar_tests
   src/zhipuai_search.cpp
   src/searxng_search.cpp
   src/kimi_search.cpp
+  src/browser.cpp
   test/sse_parser_test.cpp
   test/tool_execution_test.cpp
   test/subprocess_test.cpp
@@ -100,6 +104,7 @@ add_executable(sidecar_tests
   test/http_client_test.cpp
   test/ffi_tracing_test.cpp
   test/search_provider_test.cpp
+  test/browser_test.cpp
 )
 target_include_directories(sidecar_tests PRIVATE include src test "${JSON_INCLUDE_DIR}")
 target_compile_definitions(sidecar_tests PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN NOMINMAX

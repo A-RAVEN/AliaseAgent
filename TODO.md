@@ -90,3 +90,27 @@
 **下一步**：先跑聚焦验证（多轮循环 + headed 资源 + 最小化是否弹）通过后，再开 change 立项。
 
 **来源文件**：`sidecar/src/web_fetch.cpp`、`scripts/fetch_worker.py`、`Docs/DeepSeekAPIDoc.md`、`openspec/changes/archive/2026-07-27-upgrade-web-fetch-crawl4ai/design.md`。
+
+---
+
+### [ ] add-browser-tool live 真实桌面验证未通过（白屏卡死 + browser_available probe 超时）
+
+**性质**：真实缺陷（浏览器工具在真实桌面的端到端可靠性未确认）＋ 待查。**5.3 暂不视为验收通过**。
+
+**背景 / 证据（2026-09-06~07 实跑多次）**：
+- 一次运行 `flutter test --tags live --run-skipped integration_test/browser_live_test.dart -d windows` 返回 `exit 0 / All tests passed`（脚本断言层未抛错：模型真实调用 browser_navigate/browser_snapshot，sidecar.log `browser-record` 符合 raise_count=0/tabs=1/snapshot_len=29）。**但用户目击真窗口白屏、卡死**，据此不能判“通过”。
+- 另一次运行 **skipped**：`browser stack unavailable: {ok:true, available:false, error: browser probe did not run}`（`browser_available()` 的一次性 subprocess probe 30s 超时）。
+- 手动跑 probe（`python scripts/browser_worker.py` 发 `{"cmd":"available"}`）仅 ~1.5s 即返回 `available:true, channel=msedge`——worker 探测本身不慢，是 C++ `subprocess::run` 包装在真实桌面负载下超时。
+- 曾怀疑残留 `msedgewebview2.exe` 泄漏，**经查父进程为 SearchHost.exe / WidgetBoard.exe（Windows 系统组件），非本工具 worker**，排除该假设（此前误杀一批系统组件子进程，已向用户说明）。
+
+**根因（未定，待排查）**：
+- 白屏卡死：可能 headed Edge worker 在真实桌面的资源/渲染不稳、或 `lib/main.dart` 的 `_initSearchAndTools` 异步化（await browserAvailable）影响启动、或 integration_test `-d windows` 真窗口渲染。
+- probe 超时：`browser_available()` 一次性 subprocess probe（spawn python → headless 探测 Edge）在系统负载下不稳（30s 超时）。
+- headed Edge worker 进程清理：此前发现该环境下 `in_job=false`（宿主已在 job 内 → AssignProcessToJobObject 失败 → TerminateJobObject 无效）→ 孤儿 Edge 进程风险。
+
+**期望方向（后续 change/修复）**：
+1. 系统排查白屏卡死 + probe 超时确切根因（app 启动日志 / sidecar.log / probe 确切报错栈）。
+2. 修 `browser_available()` probe 稳定性（降一次性 headless Edge 冷启动成本 / 更长超时 / 重试 / 缓存结果；**不可**复用持久 worker——探针在 app init 阶段跑（`_initSearchAndTools`@main.dart:518），此时没有任何浏览器会话，持久 worker 是每次 browser 任务才懒启动，无可复用对象）；确保 headed Edge worker 退出时可靠清理，规避孤儿进程累积。
+3. live 真实桌面可用性需重新验证；在此之前 5.3 不视为通过。
+
+**来源**：`integration_test/browser_live_test.dart`、`sidecar/src/browser.cpp`（browser_available subprocess probe、run_browser_op 进程管理）、`lib/main.dart`（_initSearchAndTools 异步化）。

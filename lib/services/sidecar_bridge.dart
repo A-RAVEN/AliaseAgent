@@ -59,6 +59,11 @@ typedef EnsureSearchInfraDart = Pointer<Utf8> Function(Pointer<Utf8> configJson)
 typedef GetSearchProvidersDart = Pointer<Utf8> Function();
 typedef WebSearchDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef WebFetchDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
+typedef BrowserAvailableDart = Pointer<Utf8> Function();
+typedef BrowserNavigateDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
+typedef BrowserClickDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
+typedef BrowserTypeDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
+typedef BrowserSnapshotDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef WriteFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef EditFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef GlobFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
@@ -117,6 +122,15 @@ abstract class ISidecar {
   String getSearchProviders();
   Future<String> webSearch(String requestJson);
   Future<String> webFetch(String requestJson);
+
+  // Browser tool (add-browser-tool) — persistent headed Edge worker.
+  // browserAvailable probes Playwright + a usable Edge/Chromium at declaration
+  // time; the ops drive multi-step browsing on a persistent session.
+  Future<String> browserAvailable();
+  Future<String> browserNavigate(String requestJson);
+  Future<String> browserClick(String requestJson);
+  Future<String> browserType(String requestJson);
+  Future<String> browserSnapshot(String requestJson);
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +148,11 @@ class SidecarBridge implements ISidecar {
   late final GetSearchProvidersDart _getSearchProvidersFn;
   late final WebSearchDart _webSearchFn;
   late final WebFetchDart _webFetchFn;
+  late final BrowserAvailableDart _browserAvailableFn;
+  late final BrowserNavigateDart _browserNavigateFn;
+  late final BrowserClickDart _browserClickFn;
+  late final BrowserTypeDart _browserTypeFn;
+  late final BrowserSnapshotDart _browserSnapshotFn;
   late final WriteFileDart _writeFileFn;
   late final EditFileDart _editFileFn;
   late final GlobFileDart _globFileFn;
@@ -177,6 +196,16 @@ class SidecarBridge implements ISidecar {
         _lib.lookupFunction<SetWorkspaceNative, WebSearchDart>('web_search');
     _webFetchFn =
         _lib.lookupFunction<SetWorkspaceNative, WebFetchDart>('web_fetch');
+    _browserAvailableFn =
+        _lib.lookupFunction<Pointer<Utf8> Function(), BrowserAvailableDart>('browser_available');
+    _browserNavigateFn =
+        _lib.lookupFunction<SetWorkspaceNative, BrowserNavigateDart>('browser_navigate');
+    _browserClickFn =
+        _lib.lookupFunction<SetWorkspaceNative, BrowserClickDart>('browser_click');
+    _browserTypeFn =
+        _lib.lookupFunction<SetWorkspaceNative, BrowserTypeDart>('browser_type');
+    _browserSnapshotFn =
+        _lib.lookupFunction<SetWorkspaceNative, BrowserSnapshotDart>('browser_snapshot');
     _writeFileFn =
         _lib.lookupFunction<SetWorkspaceNative, WriteFileDart>('write_file');
     _editFileFn =
@@ -619,6 +648,51 @@ class SidecarBridge implements ISidecar {
     return result;
   }
 
+  // -- browser tool (add-browser-tool) --
+
+  @override
+  Future<String> browserAvailable() async {
+    final receivePort = ReceivePort();
+    await Isolate.spawn(_webWorkerMain, {
+      'sendPort': receivePort.sendPort,
+      'requestJson': '',
+      'workerType': 'browser_available',
+    });
+    final result = await receivePort.first.timeout(
+      const Duration(seconds: 120),
+      onTimeout: () => '{"ok":true,"available":false,"error":"browser_available timed out"}',
+    ) as String;
+    receivePort.close();
+    return result;
+  }
+
+  @override
+  Future<String> browserNavigate(String requestJson) async => _browserOp(requestJson, 'browser_navigate');
+
+  @override
+  Future<String> browserClick(String requestJson) async => _browserOp(requestJson, 'browser_click');
+
+  @override
+  Future<String> browserType(String requestJson) async => _browserOp(requestJson, 'browser_type');
+
+  @override
+  Future<String> browserSnapshot(String requestJson) async => _browserOp(requestJson, 'browser_snapshot');
+
+  Future<String> _browserOp(String requestJson, String workerType) async {
+    final receivePort = ReceivePort();
+    await Isolate.spawn(_webWorkerMain, {
+      'sendPort': receivePort.sendPort,
+      'requestJson': requestJson,
+      'workerType': workerType,
+    });
+    final result = await receivePort.first.timeout(
+      const Duration(seconds: 120),
+      onTimeout: () => '{"ok":false,"error":"$workerType timed out","dead":true}',
+    ) as String;
+    receivePort.close();
+    return result;
+  }
+
   /// Worker isolate entry point for web_search / web_fetch (tasks 8.5, 8.8)
   static void _webWorkerMain(Map<String, dynamic> args) {
     final sendPort = args['sendPort'] as SendPort;
@@ -627,15 +701,46 @@ class SidecarBridge implements ISidecar {
 
     try {
       final lib = _openLibrary();
-      final ptr = requestJson.toNativeUtf8();
+      final ptr = requestJson.isEmpty ? null : requestJson.toNativeUtf8();
       try {
         Pointer<Utf8> resultPtr;
-        if (workerType == 'web_search') {
-          final fn = lib.lookupFunction<SetWorkspaceNative, WebSearchDart>('web_search');
-          resultPtr = fn(ptr);
+        // browser_available takes no request JSON; its FFI signature is () -> ptr.
+        if (workerType == 'browser_available') {
+          final fn = lib.lookupFunction<Pointer<Utf8> Function(), BrowserAvailableDart>(
+              'browser_available');
+          resultPtr = fn();
         } else {
-          final fn = lib.lookupFunction<SetWorkspaceNative, WebFetchDart>('web_fetch');
-          resultPtr = fn(ptr);
+          switch (workerType) {
+            case 'web_search':
+              final fn = lib.lookupFunction<SetWorkspaceNative, WebSearchDart>('web_search');
+              resultPtr = fn(ptr!);
+              break;
+            case 'web_fetch':
+              final fn = lib.lookupFunction<SetWorkspaceNative, WebFetchDart>('web_fetch');
+              resultPtr = fn(ptr!);
+              break;
+            case 'browser_navigate':
+              final fn = lib.lookupFunction<SetWorkspaceNative, BrowserNavigateDart>(
+                  'browser_navigate');
+              resultPtr = fn(ptr!);
+              break;
+            case 'browser_click':
+              final fn = lib.lookupFunction<SetWorkspaceNative, BrowserClickDart>('browser_click');
+              resultPtr = fn(ptr!);
+              break;
+            case 'browser_type':
+              final fn = lib.lookupFunction<SetWorkspaceNative, BrowserTypeDart>('browser_type');
+              resultPtr = fn(ptr!);
+              break;
+            case 'browser_snapshot':
+              final fn = lib.lookupFunction<SetWorkspaceNative, BrowserSnapshotDart>(
+                  'browser_snapshot');
+              resultPtr = fn(ptr!);
+              break;
+            default:
+              sendPort.send('{"ok":false,"error":"unknown worker type: $workerType"}');
+              return;
+          }
         }
         // Guard against null pointer — ffi's toDartString() rejects nullptr
         // with UnsupportedError (11.2); dereferencing the result would crash
@@ -645,7 +750,7 @@ class SidecarBridge implements ISidecar {
           sendPort.send(resultPtr.toDartString());
         }
       } finally {
-        malloc.free(ptr);
+        if (ptr != null) malloc.free(ptr);
       }
     } catch (e, st) {
       sendPort.send('{"ok":false,"error":"$workerType isolate error: $e"}');

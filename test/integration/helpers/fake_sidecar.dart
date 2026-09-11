@@ -17,6 +17,14 @@ class FakeSidecar implements ISidecar {
   String _webFetchResult = '{"ok":true,"content":""}';
   String _ensureSearchInfraResult = '{"ok":true}';
 
+  // Browser tool stubs (add-browser-tool). Default: browser not available, ops
+  // degrade to a readable error.
+  String _browserAvailableResult = '{"ok":true,"available":false,"error":"no browser"}';
+  String _browserNavigateResult = '{"ok":false,"error":"browser unavailable"}';
+  String _browserClickResult = '{"ok":false,"error":"browser unavailable"}';
+  String _browserTypeResult = '{"ok":false,"error":"browser unavailable"}';
+  String _browserSnapshotResult = '{"ok":false,"error":"browser unavailable"}';
+
   // File edit stubs
   String _writeFileResult = '{"ok":true,"bytes_written":0,"created":true}';
   String _editFileResult = '{"ok":true,"replacements":1}';
@@ -27,6 +35,11 @@ class FakeSidecar implements ISidecar {
   void stubWebSearch(String json) { _webSearchResult = json; }
   void stubWebFetch(String json) { _webFetchResult = json; }
   void stubEnsureSearchInfra(String json) { _ensureSearchInfraResult = json; }
+  void stubBrowserAvailable(String json) { _browserAvailableResult = json; }
+  void stubBrowserNavigate(String json) { _browserNavigateResult = json; }
+  void stubBrowserClick(String json) { _browserClickResult = json; }
+  void stubBrowserType(String json) { _browserTypeResult = json; }
+  void stubBrowserSnapshot(String json) { _browserSnapshotResult = json; }
   void stubWriteFile(String json) { _writeFileResult = json; }
   void stubEditFile(String json) { _editFileResult = json; }
   void stubGlobFile(String json) { _globFileResult = json; }
@@ -86,6 +99,7 @@ class FakeSidecar implements ISidecar {
   String? lastThinkingMode;
   String? lastBaseUrl;
   String? lastModel;
+  String? lastToolsJson;
 
   /// Suspends the NEXT sendMessage's event delivery until [releaseGate] is
   /// called — lets tests interleave a mid-stream session switch (11.4).
@@ -136,6 +150,7 @@ class FakeSidecar implements ISidecar {
     lastThinkingMode = thinkingMode;
     lastBaseUrl = baseUrl;
     lastModel = model;
+    lastToolsJson = toolsJson;
 
     // Gate (11.4): suspend event delivery until the test releases it.
     // Per-send semantics (17.1): each sendMessage pops ITS OWN gate — the
@@ -193,6 +208,21 @@ class FakeSidecar implements ISidecar {
 
   @override
   Future<String> webFetch(String requestJson) async => _webFetchResult;
+
+  @override
+  Future<String> browserAvailable() async => _browserAvailableResult;
+
+  @override
+  Future<String> browserNavigate(String requestJson) async => _browserNavigateResult;
+
+  @override
+  Future<String> browserClick(String requestJson) async => _browserClickResult;
+
+  @override
+  Future<String> browserType(String requestJson) async => _browserTypeResult;
+
+  @override
+  Future<String> browserSnapshot(String requestJson) async => _browserSnapshotResult;
 
   @override
   String writeFile(String requestJson) => _writeFileResult;

@@ -96,6 +96,7 @@
 - **模型驱动测试（live / integration_test）**：在**断言前**输出实际**工具调用**（toolName、完整 input、result/status）与**文件最终状态**。
 - **失败必须可归因**：有该轮实际行为 + 文件内容 dump；"失败但日志无现场" = 规范缺陷。
 - **观察通道随形态**：headless harness 直接持工具调用记录；窗口版经 UI 卡片(`ToolCallCard.activity`)读出；**无论哪种形态内容必须可观察**，拿不到即违规。
+- **live/模型驱动测试必须留截图 + 走视觉验收（硬要求，非可选）**：每个 live 用例在 `try/finally` 里 `captureLiveShot` 留一张 `test/live_visual/<name>.png`，主循环用 `Read` 原生读图做**判断式视觉验收**（回答气泡完整 / 工具卡 done / 布局无 overflow），`[SHOT]` 记录。**无截图 → 不得判通过**；读图分不清（黑帧/空白/裁切/截图失败）→ 如实记"截图无效/异常"，也不得计为通过。**通道区分**：`captureLiveShot` 截的是 **Flutter 场景渲染**（`RepaintBoundary.toImage(pixelRatio:1.0)`，无 OS 标题栏/边框）；若缺陷在 **OS 级窗口**（如浏览器工具弹出的独立 Edge 窗口），Flutter toImage 捕获不到，须用 **OS 全屏截图（PowerShell `CopyFromScreen`）** 补获"用户所见的窗口"。
 - **实现**：`integration_test/live_observability.dart` 里 `dumpToolCards(tester,{phase})` / `dumpFile(path,{label})` / `dumpNoTool(tester, phase)` / `readFinalAssistantReply(tester)` / `captureLiveShot(...)` / `clearLiveVisualDir()`。每个 dump 是**纯 `debugPrint` 增量，绝不 assert、绝不改 expect/fail/markTestSkipped 行为**（零验收风险，不弱化断言）。
 - **每次断言前 & 每条失败路径**先 dump：`on TimeoutException` / 错误状态检测点，都在 `fail(...)`/`markTestSkipped(...)` **之前** `dumpToolCards`(+ 有文件就 `dumpFile`)。
 
@@ -149,9 +150,10 @@
 - **FFI 追踪**：`[ffi_tracing]` 测试覆盖;`crash.log` 的环形缓冲记录**元数据(type/payload 大小/时间戳)，不含回调参数内容**——它证明回调发生过、大小多少，不能还原参数字符串。
 - **ASan**：只用于 `sidecar_tests`，绝不用于 `sidecar.dll`(Dart VM 保留内存区与 ASan shadow 冲突)。构建：`scripts\rebuild_sidecar.bat Debug --asan`(需 vcpkg triplet `x64-windows-asan-static`)。ASan 构建落在**独立的 `sidecar/build/asan/`** 树,运行 `ctest --test-dir sidecar/build/asan -C Debug`(别指向 `sidecar/build/windows`,那是非 ASan 树)。
 
-### 4.4 截图 / 视觉验收
-- Live 截屏在 `test/live_visual/`(gitignore)。视觉回归 baseline 在 `test/smoke/references/`(tracked)，output 在 `test/smoke/output/`(gitignore)。
-- 读图：**用 Read 读 PNG 确认渲染**(如回复气泡完整、卡片 Done)。`[SHOT] captured <path> (N bytes)`。
+### 4.4 截图 / 视觉验收（硬要求）
+- **每个 live 用例必须留一张 `test/live_visual/<name>.png` 截图并通过主循环视觉验收**（`Read` 读图：回复气泡完整、工具卡 Done、布局无 overflow）。截图放 `try/finally`，非 `addTearDown`（teardown 在 tree reset 后才跑，boundary 已 unmount → pass 路径断裂）；失败 `delete-on-fail` + `[SHOT]` 记录。`setUpAll(clearLiveVisualDir)` 清旧图防 stale。字节下限 `_kMinShotBytes=2048`（仅拒零长/损坏，非 blank 检测器）。
+- **诚实三态**：图可读且正常 → 通过；图异常（黑帧/空白/裁切/overlay 溢出）→ 记"此图异常+原因"；图失败/看不清 → 记"截图无效"，**不算通过**。
+- **通道区分**：`captureLiveShot` 捕获 **Flutter 场景渲染**（非 OS 窗口，无标题栏/边框，HiDPI 为逻辑像素）。缺陷若在 **OS 级窗口**（如浏览器工具弹出的独立 Edge 窗口），Flutter toImage 捕获不到，须补 **OS 全屏截图**（PowerShell `CopyFromScreen`，参考 `test/smoke/utils.sh` 的 `capture_screenshot()`）核对"用户所见的窗口"。判断式验收 vs 像素回归：本通道是**判断式**，像素回归归 `visual-regression` spec + `test/smoke/references/`(tracked) / `test/smoke/output/`(gitignore)。
 
 ### 4.5 冒烟/集成日志
 - 冒烟：`test/smoke/output/run.log` + 最终 `SMOKE TEST REPORT`(每步 PASS/FAIL、Total、ALL_PASS vs FAILURES DETECTED)。`verify_logs` 在 `sidecar.log` 里 grep `ERROR|unrecognized`(用 `LOG_START_LINE` 切片忽略历史)。`verify_db` 用 sqlite3 查 `sessions`/`messages` 表。
@@ -168,3 +170,4 @@
 6. **步骤回读规范**：referenced `DEBUGGING.md`(崩溃/日志/ASan)。
 7. **分层策略**(点参考，按当前代码为准)：Tier1 叶子组件 / Tier2 widget+注入 / Tier3 集成;live 用窗口真模型形态。
 8. **新功能必须带测试**：新增逻辑/UI/工具/错误路径，应配套对应层的测试用例 + 更新对应 `openspec/specs/<capability>/spec.md`，并在 tasks.md 里落到可自测的验证任务。
+9. **live 测试必须带截图 + 视觉验收**（§3.1 硬要求）：每用例 `captureLiveShot` 留 `test/live_visual/<name>.png`，主循环 `Read` 读图判断式验收；无截图/截图无效 ≠ 通过。涉 OS 级窗口（如浏览器工具）另补 OS 全屏截图。
