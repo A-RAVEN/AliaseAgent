@@ -256,6 +256,50 @@ static bool read_response(std::string& out) {
   }
 }
 
+// Task 12.13: the AliasAgent window's own rect, so the worker can place the
+// headed browser clear of it. Measured 2026-09-11 over 237 frames: with the
+// browser sitting over the app only 10.5% of frames showed the app at all, and
+// while the browser was on about:blank the app's rect was pure white with no
+// text -- which reads exactly like "the app went white / froze". Moving the
+// browser beside the app keeps it user-visible (spec L6) without any
+// bring-to-front (spec L30-31). Returns "L,T,W,H", or "" when the window is not
+// found (the worker then keeps Playwright's default placement).
+static std::string app_window_rect() {
+#ifdef _WIN32
+  struct Ctx {
+    DWORD pid;
+    RECT rect;
+    bool found;
+  };
+  RECT zero = {0, 0, 0, 0};
+  Ctx ctx{GetCurrentProcessId(), zero, false};
+  EnumWindows(
+      [](HWND hwnd, LPARAM lp) -> BOOL {
+        Ctx* c = reinterpret_cast<Ctx*>(lp);
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid != c->pid) return TRUE;
+        char cls[64] = {0};
+        if (GetClassNameA(hwnd, cls, sizeof(cls) - 1) == 0) return TRUE;
+        if (std::string(cls) != "FLUTTER_RUNNER_WIN32_WINDOW") return TRUE;
+        RECT r = {0, 0, 0, 0};
+        if (!GetWindowRect(hwnd, &r)) return TRUE;
+        if (r.right - r.left <= 0 || r.bottom - r.top <= 0) return TRUE;
+        c->rect = r;
+        c->found = true;
+        return FALSE;  // stop at the first match
+      },
+      reinterpret_cast<LPARAM>(&ctx));
+  if (!ctx.found) return "";
+  char buf[96];
+  std::snprintf(buf, sizeof(buf), "%ld,%ld,%ld,%ld", ctx.rect.left, ctx.rect.top,
+                ctx.rect.right - ctx.rect.left, ctx.rect.bottom - ctx.rect.top);
+  return std::string(buf);
+#else
+  return "";
+#endif
+}
+
 static bool start_worker() {
   stop_worker();
   LOG_INFO("browser: starting persistent worker");
@@ -309,7 +353,16 @@ static bool start_worker() {
   }
 
   std::string script = resolve_script_path();
-  std::string args = subprocess::build_command_line({python_bin, script});
+  // Task 12.13: tell the worker where our window is so it can place the headed
+  // browser clear of it (the worker falls back to Playwright's default when the
+  // rect is empty).
+  std::vector<std::string> worker_argv{python_bin, script};
+  const std::string app_rect = app_window_rect();
+  if (!app_rect.empty()) {
+    worker_argv.push_back("--app-rect=" + app_rect);
+    LOG_INFO("browser: app window rect " + app_rect);
+  }
+  std::string args = subprocess::build_command_line(worker_argv);
   std::vector<char> cmd_buf(args.begin(), args.end());
   cmd_buf.push_back('\0');
 

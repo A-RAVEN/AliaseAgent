@@ -81,6 +81,115 @@ PROBE_ATTEMPTS = 2
 # for exactly this whole window when NO popup opens; a well-known tradeoff.)
 NEW_PAGE_WAIT_SEC = 1.0
 
+# --- Window placement (task 12.13) -------------------------------------------
+# The headed browser must stay user-visible (spec: "user-visible browser") but it
+# must NOT sit on top of the AliasAgent window. Measured 2026-09-11 over 237
+# frames of a live run: with the browser over the app only 10.5% of frames showed
+# the app at all, and while the browser sat on about:blank the app's rect was
+# pure white and text-free -- exactly the "the window went white / froze" symptom
+# users reported. The C++ side passes its own window rect as --app-rect=L,T,W,H
+# so the browser can be placed clear of it. Placement is a launch-time flag only:
+# the worker still never calls bring_to_front (spec: SHALL NOT per-step raise).
+PLACEMENT_GAP_PX = 8        # gap kept between the app window and the browser
+PLACEMENT_MIN_W = 480       # a side narrower than this is not considered usable
+PLACEMENT_MIN_H = 360
+
+_APP_RECT = None            # (left, top, width, height) or None
+
+
+def _parse_app_rect(argv) -> "tuple | None":
+    """Parse --app-rect=L,T,W,H from argv. None when absent or malformed."""
+    for arg in argv:
+        if not arg.startswith("--app-rect="):
+            continue
+        parts = arg.split("=", 1)[1].split(",")
+        if len(parts) != 4:
+            continue
+        try:
+            left, top, width, height = (int(p) for p in parts)
+        except ValueError:
+            continue
+        if width > 0 and height > 0:
+            return (left, top, width, height)
+    return None
+
+
+def _get_work_area() -> "tuple | None":
+    """Primary monitor work area (taskbar excluded) via SystemParametersInfoW."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        SPI_GETWORKAREA = 0x0030
+        rect = wintypes.RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(
+                SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
+            w = rect.right - rect.left
+            h = rect.bottom - rect.top
+            if w > 0 and h > 0:
+                return (rect.left, rect.top, w, h)
+    except Exception as e:
+        _log(f"work area query failed (no placement applied): {e}")
+    return None
+
+
+def compute_window_bounds(app_rect, work_area):
+    """Where to put the headed browser so it does not cover the app window.
+
+    Pure function (no I/O), so it is directly unit-testable. Returns
+    (x, y, w, h, mode) with mode one of:
+      "no-work-area" - screen unknown; caller keeps Playwright's default
+      "full"         - no app rect known; right half of the work area
+      "right"        - clear of the app, immediately to its right
+      "left"         - clear of the app, immediately to its left
+      "overlap"      - no clear side fits; least-overlap fallback (logged)
+    """
+    if not work_area:
+        return (None, None, None, None, "no-work-area")
+
+    wl, wt, ww, wh = work_area
+
+    if not app_rect:
+        w = min(ww, max(PLACEMENT_MIN_W, ww // 2))
+        return (wl + ww - w, wt, w, wh, "full")
+
+    al, _at, aw, _ah = app_rect
+
+    rx = al + aw + PLACEMENT_GAP_PX          # first x clear of the app, to its right
+    if rx + PLACEMENT_MIN_W <= wl + ww:
+        return (rx, wt, wl + ww - rx, wh, "right")
+
+    lx = al - PLACEMENT_GAP_PX               # last x clear of the app, to its left
+    if lx - PLACEMENT_MIN_W >= wl:
+        return (wl, wt, lx - wl, wh, "left")
+
+    # Neither side has room for a usable window: take the roomier side and
+    # RECORD the overlap rather than silently reverting to full coverage.
+    right_room = max(0, (wl + ww) - rx)
+    left_room = max(0, lx - wl)
+    if right_room >= left_room:
+        w = min(ww, max(PLACEMENT_MIN_W, right_room))
+        x = wl + ww - w
+    else:
+        w = min(ww, max(PLACEMENT_MIN_W, left_room))
+        x = wl
+    return (x, wt, w, wh, "overlap")
+
+
+def _placement_launch_args() -> "list":
+    """Chromium flags placing the headed window clear of the app (task 12.13)."""
+    if os.name != "nt":
+        return []
+    x, y, w, h, mode = compute_window_bounds(_APP_RECT, _get_work_area())
+    if mode == "no-work-area" or x is None:
+        _log("window placement: skipped (work area unknown)")
+        return []
+    if mode == "overlap":
+        _log("window placement: OVERLAP FALLBACK - no clear side fits, "
+             "the browser may cover the app window")
+    else:
+        _log(f"window placement: mode={mode} bounds={x},{y} {w}x{h}")
+    return [f"--window-position={x},{y}", f"--window-size={w},{h}"]
+
 
 class BrowserSession:
     """One headed Playwright browser session, reused across commands."""
@@ -166,8 +275,11 @@ class BrowserSession:
             return "no usable Edge/Chromium found (tried msedge, chrome)"
 
         try:
+            # Task 12.13: place the headed window clear of the app window so the
+            # browser does not read as "the app went white".
             self._browser = self._pw.chromium.launch(
-                channel=self._channel, headless=False, timeout=OP_TIMEOUT_SEC * 1000)
+                channel=self._channel, headless=False, timeout=OP_TIMEOUT_SEC * 1000,
+                args=_placement_launch_args())
             # accept_downloads=True so we can observe and cancel (deny) them via
             # the download handler — a cancelled download never persists a file
             # (spike 1.4 confirmed dl.cancel() leaves no file on disk). This makes
@@ -190,12 +302,44 @@ class BrowserSession:
             # BROWSER opens from now on (window.open / target=_blank) is handled
             # by _install_page_handler.
             self._page = self._context.new_page()
+            # Task 12.13: --window-position/--window-size are only HINTS. Measured
+            # 2026-09-11: Chromium honored the position but IGNORED the requested
+            # size (asked 750x1232, got 1296x808), which pushed the window off the
+            # right edge of the screen. CDP is authoritative, so pin it here.
+            self._apply_window_bounds()
             self._install_page_handler()
             return None
         except Exception as e:
             _log(f"launch failed: {e}")
             self._teardown()
             return f"browser launch failed: {e}"
+
+    def _apply_window_bounds(self) -> None:
+        """Pin the OS window bounds exactly, clear of the app window (task 12.13).
+
+        Keeps the browser user-visible while guaranteeing it neither covers the
+        app nor runs off the work area. Never raises or brings-to-front.
+        """
+        if _APP_RECT is None:
+            return
+        x, y, w, h, _mode = compute_window_bounds(_APP_RECT, _get_work_area())
+        if x is None:
+            return
+        try:
+            session = self._context.new_cdp_session(self._page)
+            win = session.send("Browser.getWindowForTarget")
+            session.send("Browser.setWindowBounds", {
+                "windowId": win["windowId"],
+                "bounds": {"left": x, "top": y, "width": w, "height": h,
+                           "windowState": "normal"},
+            })
+            back = session.send("Browser.getWindowForTarget").get("bounds", {})
+            _log("window placement applied: requested={},{} {}x{} actual={},{} {}x{}".format(
+                x, y, w, h, back.get("left"), back.get("top"),
+                back.get("width"), back.get("height")))
+            session.detach()
+        except Exception as e:
+            _log(f"window placement via CDP failed (launch flags only): {e}")
 
     def _install_page_handler(self) -> None:
         def on_page(page) -> None:
@@ -561,6 +705,11 @@ def main() -> None:
             stream.reconfigure(encoding="utf-8")
         except Exception:
             pass
+
+    global _APP_RECT
+    _APP_RECT = _parse_app_rect(sys.argv[1:])
+    if _APP_RECT is not None:
+        _log(f"app rect from argv: {_APP_RECT}")
 
     session = BrowserSession()
     while True:

@@ -255,6 +255,105 @@ void main() {
     expect(source.contains('.bring_to_front('), isFalse,
         reason: 'stay-hidden: the worker must never raise a window');
   });
+
+  test('browser_worker: window placement avoids the app window and stays in the work area (task 12.13)',
+      () {
+    // Task 12.13: with the headed browser sitting over the app, only 10.5% of
+    // observed frames showed the app at all, and on about:blank the app's rect
+    // was pure white and text-free -- the "the window went white" report. The
+    // placement must therefore keep the browser clear of the app AND inside the
+    // work area. Driven directly against the worker's PURE function (no browser
+    // launch), so this is a fast, deterministic check.
+    final python = _probePython();
+    if (python == null) {
+      markTestSkipped('python unavailable');
+      return;
+    }
+
+    const snippet = '''
+import json, sys
+sys.path.insert(0, "scripts")
+import browser_worker as bw
+
+# name, app_rect, work_area, overlap_is_expected
+cases = [
+    ("app-right",        (10, 10, 1280, 720),  (0, 0, 2048, 1232), False),
+    ("app-on-the-right", (1500, 10, 500, 700), (0, 0, 2048, 1232), False),
+    ("no-app-rect",      None,                 (0, 0, 2048, 1232), False),
+    ("no-work-area",     (10, 10, 1280, 720),  None,               False),
+    ("app-fills-screen", (0, 0, 2048, 1232),   (0, 0, 2048, 1232), True),
+]
+out = []
+for name, app, work, may_overlap in cases:
+    x, y, w, h, mode = bw.compute_window_bounds(app, work)
+    out.append({"name": name, "x": x, "y": y, "w": w, "h": h, "mode": mode,
+                "may_overlap": may_overlap, "app": app, "work": work})
+print(json.dumps(out))
+''';
+
+    final res = Process.runSync(python, ['-c', snippet]);
+    expect(res.exitCode, 0,
+        reason: 'placement probe must run; stderr: ${res.stderr}');
+    final rows = (jsonDecode((res.stdout as String).trim()) as List<dynamic>)
+        .cast<Map<String, dynamic>>();
+    expect(rows.length, 5, reason: 'all placement cases must be evaluated');
+
+    for (final row in rows) {
+      final name = row['name'] as String;
+      final mode = row['mode'] as String;
+      final mayOverlap = row['may_overlap'] as bool;
+      // Observable现场: print every computed placement before asserting.
+      debugPrint('[OBS] placement $name -> mode=$mode '
+          'bounds=${row['x']},${row['y']} ${row['w']}x${row['h']}');
+      for (final k in ['x', 'y', 'w', 'h', 'mode']) {
+        expect(row.containsKey(k), isTrue, reason: '$name missing $k');
+      }
+
+      if (mode == 'no-work-area') {
+        expect(row['x'], isNull,
+            reason: '$name: unknown screen must yield no placement (Playwright default)');
+        continue;
+      }
+
+      final work = (row['work'] as List<dynamic>).cast<int>();
+      final wl = work[0], wt = work[1], ww = work[2], wh = work[3];
+      final x = row['x'] as int, y = row['y'] as int;
+      final w = row['w'] as int, h = row['h'] as int;
+
+      expect(x, greaterThanOrEqualTo(wl), reason: '$name: left edge inside work area');
+      expect(y, greaterThanOrEqualTo(wt), reason: '$name: top edge inside work area');
+      expect(x + w, lessThanOrEqualTo(wl + ww),
+          reason: '$name: right edge must not run off-screen');
+      expect(y + h, lessThanOrEqualTo(wt + wh),
+          reason: '$name: bottom edge must not run off-screen');
+
+      final app = row['app'] as List<dynamic>?;
+      if (app != null) {
+        final al = app[0] as int, at = app[1] as int;
+        final aw = app[2] as int, ah = app[3] as int;
+        final ox = (x + w < al + aw ? x + w : al + aw) - (x > al ? x : al);
+        final oy = (y + h < at + ah ? y + h : at + ah) - (y > at ? y : at);
+        final overlap = (ox > 0 ? ox : 0) * (oy > 0 ? oy : 0);
+        debugPrint('[OBS] placement $name overlap_with_app=${overlap}px');
+        if (mayOverlap) {
+          expect(mode, 'overlap',
+              reason: '$name: an unavoidable overlap must be REPORTED, not silent');
+        } else {
+          expect(overlap, 0,
+              reason: '$name: the browser must not cover the app window');
+        }
+      }
+    }
+
+    // The placement must actually be wired into the headed launch, and corrected
+    // via CDP (measured 2026-09-11: launch flags are hints -- Chromium honored the
+    // position but IGNORED the requested size, pushing the window off-screen).
+    final source = File('scripts/browser_worker.py').readAsStringSync();
+    expect(source.contains('_placement_launch_args()'), isTrue,
+        reason: 'the headed launch must pass the placement flags');
+    expect(source.contains('Browser.setWindowBounds'), isTrue,
+        reason: 'bounds must be pinned authoritatively via CDP');
+  });
 }
 
 String? _probePython() {
