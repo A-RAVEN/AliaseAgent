@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "AliasAgent 架构",
+    "output": "Docs/architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/A-RAVEN/AliaseAgent.git",
+      "revision": "ec5e67d12a6d0f9af41440262e1dfdbd5a1ffad9"
+    },
+    "views": [
+      { "id": "message-path", "label": "对话主链路", "focus": ["user", "ui", "bridge", "sidecar", "gateway", "deepseek"], "note": "用户消息经 Flutter UI、dart:ffi 桥、C++ sidecar 到模型端点。" },
+      { "id": "browser-path", "label": "浏览器工具", "focus": ["sidecar", "browser", "pyworker", "edge"], "note": "浏览器工具由常驻 Python worker 驱动一个有头 Edge 会话。" },
+      { "id": "local-state", "label": "本地状态", "focus": ["ui", "core", "db"], "note": "会话、摘要节点与上下文压缩状态落在本地 SQLite。" }
+    ]
+  },
+  "components": [
+    { "id": "user", "type": "external", "label": "用户", "sublabel": "桌面交互", "pos": [40, 310], "size": [130, 62] },
+    { "id": "ui", "type": "frontend", "label": "Flutter 桌面 UI", "sublabel": "对话 / 工具卡 / 上下文视图", "pos": [240, 310], "size": [170, 62], "sources": [{ "path": "lib/ui/chat_area.dart" }, { "path": "lib/ui/tool_call_card.dart" }] },
+    { "id": "bridge", "type": "backend", "label": "dart:ffi 桥", "sublabel": "sidecar_bridge.dart", "pos": [450, 310], "size": [150, 62], "tag": "Isolate.spawn 下放", "sources": [{ "path": "lib/services/sidecar_bridge.dart" }] },
+    { "id": "sidecar", "type": "backend", "label": "C++ Sidecar", "sublabel": "sidecar.dll（进程内）", "pos": [660, 310], "size": [150, 62], "sources": [{ "path": "sidecar/src/sidecar_api.cpp" }] },
+    { "id": "gateway", "type": "backend", "label": "Model Gateway", "sublabel": "流式传输与请求组装", "pos": [880, 310], "size": [150, 62], "sources": [{ "path": "sidecar/src/model_gateway.cpp" }] },
+    { "id": "deepseek", "type": "external", "label": "DeepSeek API", "sublabel": "Anthropic 兼容端点", "pos": [1100, 310], "size": [160, 62], "tag": "/v1/messages" },
+    { "id": "tools", "type": "backend", "label": "本地工具", "sublabel": "文件读写 / 检索 / 抓取", "pos": [660, 470], "size": [150, 62], "sources": [{ "path": "sidecar/src/tools.cpp" }, { "path": "sidecar/src/web_fetch.cpp" }] },
+    { "id": "core", "type": "backend", "label": "会话与上下文", "sublabel": "自动压缩 / 摘要节点", "pos": [240, 470], "size": [170, 62], "sources": [{ "path": "lib/services/compaction/compaction_plan.dart" }] },
+    { "id": "db", "type": "database", "label": "SQLite", "sublabel": "会话 / 消息 / 摘要", "pos": [450, 470], "size": [150, 62], "sources": [{ "path": "lib/services/database_service.dart" }] },
+    { "id": "browser", "type": "backend", "label": "浏览器工具", "sublabel": "会话级有头浏览", "pos": [660, 150], "size": [150, 62], "sources": [{ "path": "sidecar/src/browser.cpp" }] },
+    { "id": "pyworker", "type": "backend", "label": "Playwright Worker", "sublabel": "Python 常驻进程", "pos": [880, 150], "size": [150, 62], "tag": "JSON 行协议", "sources": [{ "path": "scripts/browser_worker.py" }] },
+    { "id": "edge", "type": "external", "label": "Edge 浏览器", "sublabel": "用户可见窗口", "pos": [1100, 150], "size": [160, 62] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "AliasAgent 桌面进程（sidecar.dll 以 dart:ffi 载入，非独立服务）", "wraps": ["ui", "bridge", "sidecar", "gateway", "tools", "browser", "core", "db"] }
+  ],
+  "connections": [
+    { "id": "user-to-ui", "from": "user", "to": "ui", "label": "输入消息", "variant": "emphasis" },
+    { "id": "ui-to-bridge", "from": "ui", "to": "bridge", "label": "调用" },
+    { "id": "bridge-to-sidecar", "from": "bridge", "to": "sidecar", "label": "FFI" },
+    { "id": "sidecar-to-gateway", "from": "sidecar", "to": "gateway", "label": "组装请求" },
+    { "id": "gateway-to-deepseek", "from": "gateway", "to": "deepseek", "label": "HTTPS 流式", "variant": "emphasis" },
+    { "id": "ui-to-core", "from": "ui", "to": "core", "label": "会话状态", "labelDy": 40 },
+    { "id": "core-to-db", "from": "core", "to": "db", "label": "读写" },
+    { "id": "sidecar-to-tools", "from": "sidecar", "to": "tools", "label": "工具调用", "labelDy": 40 },
+    { "id": "sidecar-to-browser", "from": "sidecar", "to": "browser", "label": "工具调用" },
+    { "id": "browser-to-pyworker", "from": "browser", "to": "pyworker", "label": "下发命令" },
+    { "id": "pyworker-to-edge", "from": "pyworker", "to": "edge", "label": "驱动页面" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "进程边界", "items": ["sidecar.dll 以 dart:ffi 载入 Flutter 进程，不是独立服务", "浏览器与联网操作经 Isolate.spawn 下放到工作 isolate，主 isolate 不被同步 FFI 阻塞"] },
+    { "dot": "violet", "title": "模型接入", "items": ["走 DeepSeek 的 Anthropic 兼容端点 /v1/messages", "思考模式由 thinking.type 开关、output_config.effort 控强度"] },
+    { "dot": "emerald", "title": "本地状态", "items": ["SQLite 保存会话、消息与摘要节点", "运行日志落在 ~/.aliasagent/logs/sidecar.log"] }
+  ]
+}
