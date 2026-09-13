@@ -66,3 +66,18 @@ sidecar.dll
 libcurl.dll
 zlib1.dll
 _d9_log2.txt
+
+# Workflow-reviewer scratch (produced inside a review round; nothing references it)
+Docs/review-evidence/
+
+# Tool scratch and regenerable experiment output
+tools/__pycache__/
+tools/*.out.*.txt
+
+# archify visual-check QA byproducts (regenerable; see the archify commit's own note
+# that these are QA products and the repo does not track visual products)
+Docs/architecture.visual-check.*
+
+# Ad-hoc analysis dumps at the repo root
+context_view_review.txt
+live_real_context_output.txt
