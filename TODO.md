@@ -12,6 +12,19 @@
 
 ---
 
+### [ ] 把 38 个既有 spec 迁到当前格式（缺 `## Purpose` / `## Requirements`）
+
+**现象（可核）**：`openspec validate --specs` 报 **38 / 39 个 spec ✗**，唯一通过的是归档 `add-browser-tool` 时新生成的 `openspec/specs/browser-tool/spec.md`。报错原文：
+`Spec must have a Purpose section. Missing required sections. Expected headers: "## Purpose" and "## Requirements"`。
+
+**原因（已取证）**：既有 spec 用的是当时的 delta 格式（以 `## ADDED Requirements` 开头），例如 `openspec/specs/agent-config/spec.md` 首行是 `# Agent Config — Spec` 紧跟 `## ADDED Requirements`。它们最后一次改动来自 **2026-08-02（`91f627c`）** 与 **2026-08-08（`4d24aeb`）** 两次归档 —— 即**历史上每次归档产出的都是旧格式**，与本轮改动无关。
+
+**为什么没顺手改**：38 个文件的格式迁移是一次独立的仓库级改动，混进浏览器工具那次提交会让 diff 无法审阅。
+
+**验收（能失败的判据）**：`openspec validate --specs` 输出里**不再有 ✗**（或仅剩明确记为豁免的项）；且每个 spec 至少含一个 `#### Scenario:` 块。
+
+---
+
 ### [ ] 上下文压缩：L1 摘要泄漏 `ASSISTANT` 角色标签 + 重复对话下 L1 摘要冗余
 
 **性质**：真缺陷（角色标签泄漏）＋ 设计商榷（冗余收拢）。

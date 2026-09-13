@@ -1,7 +1,8 @@
 # browser-tool Specification
 
 ## Purpose
-TBD - created by archiving change add-browser-tool. Update Purpose after archive.
+Give the agent a real, user-visible browser it drives programmatically through the sidecar — navigate, click, type and read pages — independent of `web_search`. One persistent headed Edge session per task, no per-step raise, and a machine-readable per-call record so the behaviour stays observable by tests. Out of scope: OCR, in-app page display, and the harness-MCP route (the model endpoint does not support MCP server tools).
+
 ## Requirements
 ### Requirement: Independent agent-driven browser
 The system SHALL expose browser tools (`browser_navigate`, `browser_click`, `browser_type`, `browser_snapshot`) that are independent of `web_search`, letting the agent drive a real, user-visible browser to navigate, interact, and read pages. They SHALL share one persistent headed browser session per task (multi-step), driven programmatically via the sidecar, NOT through a harness MCP (the model endpoint does not support MCP server tools). The lib/main.dart tool_use loop depth (Flutter client) needed for multi-step was confirmed by the change's pre-apply verification (task 1.1, 2026-09-06): the loop supports deep multi-step (`while(true)` loop, tool results fed back as user messages, 50-turn cap), so no extra front-end depth work was needed.
