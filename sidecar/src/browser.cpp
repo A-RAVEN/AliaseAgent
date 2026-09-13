@@ -257,13 +257,26 @@ static bool read_response(std::string& out) {
 }
 
 // Task 12.13: the AliasAgent window's own rect, so the worker can place the
-// headed browser clear of it. Measured 2026-09-11 over 237 frames: with the
-// browser sitting over the app only 10.5% of frames showed the app at all, and
-// while the browser was on about:blank the app's rect was pure white with no
-// text -- which reads exactly like "the app went white / froze". Moving the
-// browser beside the app keeps it user-visible (spec L6) without any
-// bring-to-front (spec L30-31). Returns "L,T,W,H", or "" when the window is not
-// found (the worker then keeps Playwright's default placement).
+// headed browser with that in mind. Keeping the browser user-visible (spec L6)
+// while never bringing it to front (spec L30-31) is the whole point.
+//
+// Numbers: an earlier revision cited "237 frames, only 10.5% showed the app".
+// The round-8 adversarial review showed that measurement has no surviving
+// artifacts (its sub-counts did not even add up), so it is NOT restated.
+//
+// PROVENANCE, corrected by the round-10 review: the figure this comment used to
+// quote -- "max occlusion 2%, app's left >= 1254px" -- comes from the build
+// BEFORE the physical/logical pixel fix, whose real window was 1580,20 1600x1125
+// (right edge 3180 > 2560 screen = 620px off-screen), and whose 1254px was a
+// DPI-virtualized reading. The SHIPPED placement, same ruler: app 12,12 1600x900
+// vs browser 1264,16 1280x900 -> overlap 348x896 = 311,808px2 = 21.65% of the app,
+// app's left 1252px visible (task 12.15 accepted that overlap on purpose).
+//
+// Returns "L,T,W,H", or "" when the window is not found. NOTE (round-10 review):
+// an empty rect does NOT mean "no placement" -- the worker then still applies its
+// own right-anchored full-size "normal" placement (compute_window_bounds(None,
+// work_area) returns one) and logs the overlap rationale. The only thing skipped
+// is the CDP re-pin, which returns early on a null --app-rect.
 static std::string app_window_rect() {
 #ifdef _WIN32
   struct Ctx {
@@ -354,8 +367,9 @@ static bool start_worker() {
 
   std::string script = resolve_script_path();
   // Task 12.13: tell the worker where our window is so it can place the headed
-  // browser clear of it (the worker falls back to Playwright's default when the
-  // rect is empty).
+  // browser clear of it. If the rect is empty the flag is omitted; the worker
+  // still places the window itself (right-anchored, full-size) -- it does NOT fall
+  // back to Playwright's default (round-10 review corrected this comment).
   std::vector<std::string> worker_argv{python_bin, script};
   const std::string app_rect = app_window_rect();
   if (!app_rect.empty()) {
@@ -549,9 +563,9 @@ std::string browser_available() {
   req["cmd"] = "available";
   // The one-shot probe cold-launches a headless Edge; under load that can cross
   // the timeout (a transient condition, NOT "stack absent"). Retry once before
-  // concluding the stack is unusable. A genuine absence — the worker answering
-  // ok:true/available:false — is authoritative and cached, so a repeated probe
-  // never re-pays the cold-launch cost (12.2).
+  // concluding the stack is unusable. NOTE: available:false is deliberately NOT
+  // cached (see the pass-through below) -- it may be a genuine absence OR a
+  // transient load-induced slow cold-launch, so a later probe re-runs.
   std::string last_error = "browser probe did not run";
   for (int attempt = 0; attempt < AVAILABLE_PROBE_ATTEMPTS; ++attempt) {
     subprocess::Options opts;

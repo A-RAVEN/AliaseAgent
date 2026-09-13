@@ -38,7 +38,7 @@ App 工具边界在 **C++ FFI sidecar**（`dart:ffi` → `web_fetch`/`web_search
    - 备选：crawl4ai 直接当浏览器 → 否（`arun(url)` 每步新开会话）。
 3. **headed（`headless=False`）+ 默认藏后台 + 跟进新标签页（甲）。**
    - 用户可见；但**不每步 `bringToFront`**、**跟进点击的新标签页**（设计 甲——点 `target=_blank` 结果/`window.open` 弹窗时**跟随**它、不关闭，让 AI 读真实落地页；原 tab 保留、AI 经会话管理多标签页），**自动 `dialog` 处理**（Playwright 默认 auto-dismiss）、**deny 下载**（`accept_downloads`+`cancel`）**/权限**（Playwright 默认自动拒权 + `grant_permissions([])` 前置拒权，不授予；按步读 `navigator.permissions` 观测）。
-   - 这些作为**固化的 worker 行为**；worker **记录 raise/focus 计数**供测试断言“未 emit bringToFront”，同时记录 `browser_opened`/`adopted_tabs` 供测试断言“跟进”。
+   - 这些作为**固化的 worker 行为**；其中「不每步 emit bringToFront」的**可失败守卫**是**两处源码扫描**（`test/integration/browser_worker_test.dart`：对 `sidecar/src` 全部 `.cpp/.h` 断言 6 个 bring-to-front API 零命中**且扫描清单非空**；对 `scripts/browser_worker.py` 断言不出现 `.bring_to_front(`）—— **⚠️ round-11 更正（12.29）**：原写「扫 `sidecar/src` 全部 `.cpp/.h` + worker 脚本，断言 6 个 API 零命中」**高估了覆盖面**，6 API 扫描只覆盖 `sidecar/src`，worker 脚本只有单串检查（见 `browser_worker_test.dart:269`、`:281-292`）。worker 里的 `raise_count`/`popup_closed` **结构上恒为 0（无写入方）**，只作 tripwire，**不构成证据**（round-10 审查更正：本节原写「worker 记录 raise/focus 计数供测试断言」，而 `focus` 计数**全仓不存在**）。`browser_opened`/`adopted_tabs` 有真实写入方，仍用于断言「跟进」。
    - **设计变更（用户已拍板甲）**：原“单 tab 复用 + 显式 popup/新页关闭 handler”被替换为“跟进新标签页（保留多标签页）”；不再自动关弹窗/新页，会话关闭兜底。这与原单 tab 抑制弹窗不同，由选甲背书。
    - **“仅在某显式可见请求时才提升前台”**：本 change 的浏览器状态 UI 在范围外，因此该**可见请求信号需另行定义**（见 Open Question 5），本 change 不承诺任何 UI 触发；只承诺工具**自身不因逐动作**而 raise。
    - **风险**：窗口最小化/遮挡下，Edge/Chromium 的焦点/前台/是否仍执行、快照是否仍准是**外部事实**，可能需 `--disable-backgrounding-occluded-windows` 等 flags（见 Risk 3）。
@@ -56,6 +56,14 @@ App 工具边界在 **C++ FFI sidecar**（`dart:ffi` → `web_fetch`/`web_search
 - **[反爬/ToS] → 用户可见 + 只读尊重。** 程序化访问部分站点会拦；本工具不替代付费搜索，用户可人工协助；不承诺绕过反爬。
 - **[Python/Playwright 依赖] → 优雅降级。** 缺失时工具不声明或返回可读错误，不静默占位。
 - **[文本快照 token 成本] → 快照限长/分块。** 避免撑爆上下文（项目已有上下文压缩体系）。
+- **[窗口摆放：「不遮住 app」不再是硬目标] → 设计变更（task 12.15，用户目视反馈授权）。**
+  - **原目标**：task 12.13 把「浏览器窗口不遮住 AliasAgent 窗口」当成硬目标，据此把 headed 窗口压到 **520x900（宽高比 0.58）**。
+  - **用户反馈（2026-09-12）**：「你的浏览器还是瘦长的，很丑，你改了半天，我没看出来有啥改进」。**该反馈成立** —— 交付物目视确实仍是一条窄高条。
+  - **根因**：单屏机器上 app 窗口 1600px 宽，其右侧在同坐标系下虽有 940px，仍不足以容纳一个 1280px 的目标窗口；**「完全避让 app」与「窗口看起来正常」在本机几何下不可兼得**，而 12.13 选错了优先项。
+  - **新取舍（本设计变更）**：**优先让窗口看起来是一个正常比例的浏览器**（1280x900），**允许与 app 部分重叠**；同时**在工作区宽度 >= 约 1908px 的屏幕上**保证 app 左侧 >= 600px 持续可见，以免重演 12.1 目击的「整屏变白、误以为 app 冻死」。**⚠️ round-11 更正（12.29）**：原写「保证 app 左侧 >= 600px 持续可见」为**无条件**说法，实为**假** —— 用本 change 自己的 `compute_window_bounds` 实算：工作区宽 1907px 时左侧可见 599px、1680px 时 372px、1600px 时 292px、1000px（代码自带的 `PLACEMENT_MIN_W` 下限）时 0px。测试里 7 个放置用例中**有 6 个**的工作区是 2560x1540（第 5 条 `no-work-area` 传 `None`），因此那条 600px 断言**从未在窄屏上跑过**。此处按实际成立范围限定（与 `browser_worker.py` 中 `aspect >= 1.0` 的限定方式一致）。
+  - **代价（如实记录）**：app 会被浏览器遮住右侧一部分。**这是用户目视反馈授权的取舍，不在后续审查中视为「弱化验收」。**
+  - **不变量保持**：仍满足 spec 的 `user-visible`（浏览器始终可见）与 `SHALL NOT per-step bring-to-front`（摆放只发生在启动时一次，且只用 launch 参数 + CDP `setWindowBounds`，不触碰 z 序/前台）。
+  - **诚实边界**：`verify` 判据已从「app 一帧都不被遮」改为「**遮挡面积占比有界 + app 左侧 >= 600px 持续可见（限工作区宽度 >= 约 1908px，见上）+ 窗口宽高比 1.0–2.0（限工作区宽度 >= 1000px）**」；观测方法见 task 12.16（直接测交集面积，而非数近白像素）。
 
 ## Migration Plan
 

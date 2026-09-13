@@ -23,6 +23,8 @@ The system SHALL drive the browser programmatically (via browser-process protoco
 ### Requirement: Text snapshot for a non-multimodal model
 The system SHALL return, for each browser step, a text representation of the page (DOM inner-text / readable extraction) for the model, bounded/length-capped to control context cost. The worker SHALL expose an observable per-call record (tool name, input, result/status, snapshot length, plus tool-emitted bring-to-front count, browser-opened count, adopted-tab count, popup/new-tab-closed count, download-denied, permission-denied, and active-tab count) for test attribution via a machine-readable channel (not in the model-visible snapshot text), and SHALL keep these counters out of the model-visible content.
 
+**⚠️ round-12 更正（12.31）—— 上面两个计数器是"恒 0 的触发线"，不是可用证据**：`bring-to-front count`（`raise_count`）与 `popup/new-tab-closed count`（`popup_closed`）在本实现里**没有任何写入方**（只有初始化与读出），**结构上恒为 0**（`popup_closed` 在 design 甲 下更是死计数器 —— 新页是「跟随」而非「关闭」）。它们照旧被 emit（故本 SHALL 字面上仍成立），但**不得当作"未 emit bringToFront"的证据**；可强制执行的守卫是 `test/integration/browser_worker_test.dart` 里的源码扫描（对 `sidecar/src` 全部 `.cpp/.h` 扫 6 个 bring-to-front API + 对 worker 脚本扫其 bring-to-front 调用）。同见 `design.md` 与 `scripts/browser_worker.py` 中的 VACUITY 披露。
+
 #### Scenario: Text snapshot returned per step
 - **WHEN** the agent takes a snapshot of a text-bearing page
 - **THEN** the tool returns the page's readable text (not a raw image), bounded to control context cost

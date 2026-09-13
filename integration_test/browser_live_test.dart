@@ -114,9 +114,16 @@ List<Map<String, dynamic>> _readBrowserRecords({required int from}) {
 /// Whether a record's counter fields claim stay-hidden. Design 甲 (follow new
 /// tab) intentionally allows multi-tab (tabs may be > 1): clicking a target=_blank
 /// result follows the new page rather than closing it, so tabs==1 is NOT asserted
-/// here. What stays enforced is: the tool never bring_to_front (raise_count==0).
+/// here.
+///
+/// On `raise_count`: this counter has no writer in the worker -- only an init and
+/// a read -- so it is 0 no matter what the code does (already recorded under task
+/// 7.8). It is checked below as a cheap tripwire only. The ENFORCEABLE stay-hidden
+/// guard is the source scan in test/integration/browser_worker_test.dart, which
+/// checks both scripts/browser_worker.py and all of sidecar/src for raise APIs.
 void _expectStayHidden(Map<String, dynamic> r, {required String label}) {
-  expect(r['raise_count'], 0, reason: '$label: tool must never bring_to_front');
+  expect(r['raise_count'], 0,
+      reason: '$label: raise_count tripwire (vacuous counter; see doc comment)');
   // tabs is reported honestly (may be > 1 under design 甲) — not asserted to ==1.
   debugPrint('[OBS] $label tabs=${r['tabs']} (multi-tab allowed under design 甲)');
 }
@@ -327,11 +334,19 @@ void main() {
             debugPrint('[OBS] content-recognition landing url=${r['url']} '
                 'title=${r['title']}');
           }
+          // Round-10 review: removing only the EXACT capitalised keyword left
+          // 'flutter' / 'flutter.dev' in the set, and the landing url is
+          // https://flutter.dev/ -- so the check could be satisfied by a token the
+          // model can derive from the keyword it was told to search for. Exclude the
+          // whole keyword FAMILY (case-insensitive substring), and require the
+          // matching token to be UNIQUE to a landing record (a token that also
+          // occurs in a search-page record proves nothing about reading the target).
+          final kwFamily = _kKeyword.toLowerCase();
           final replyTokens = RegExp(r'[A-Za-z0-9._-]{6,}')
               .allMatches(reply)
               .map((m) => m.group(0)!)
-              .toSet()
-            ..remove(_kKeyword); // exclude the instructed keyword (search-page noise)
+              .where((t) => !t.toLowerCase().contains(kwFamily))
+              .toSet();
           final seen = StringBuffer();
           for (final r in landing) {
             seen.write((r['title'] as String?) ?? '');
@@ -339,21 +354,38 @@ void main() {
             seen.write((r['url'] as String?) ?? '');
             seen.write('\n');
           }
-          final anyTokenSeen = replyTokens.any((t) => seen.toString().contains(t));
+          final searchText = StringBuffer();
+          for (final r in records) {
+            final u = ((r['url'] as String?) ?? '').toLowerCase();
+            if (u.isEmpty || landing.contains(r)) continue;
+            searchText.write((r['title'] as String?) ?? '');
+            searchText.write(' ');
+            searchText.write((r['url'] as String?) ?? '');
+            searchText.write('\n');
+          }
+          final landingUnique = replyTokens
+              .where((t) => seen.toString().contains(t))
+              .where((t) => !searchText.toString().contains(t))
+              .toList();
+          final anyTokenSeen = landingUnique.isNotEmpty;
           debugPrint('[OBS] content-recognition: nonKeywordReplyTokens='
-              '${replyTokens.length} landingRecords=${landing.length} '
-              'anyTokenInLandingRecord=$anyTokenSeen');
+              '${replyTokens.length} landingUniqueMatches=${landingUnique.length} '
+              '$landingUnique landingRecords=${landing.length}');
           expect(landing, isNotEmpty,
               reason: 'expected at least one real landing-page record (the model '
                   'must have clicked/followed a result and read the target page, '
                   'not just the bing search page)');
           expect(anyTokenSeen, isTrue,
               reason: 'the model claimed to see a page whose title/url is NOT in '
-                  'any landing record. Hallucination check: a non-keyword token it '
-                  'reported must appear in a real visited landing page title/url.');
+                  'any landing record. Hallucination check: the reply must carry at '
+                  'least one token (>=6 chars, NOT derived from the keyword '
+                  '"$_kKeyword") that appears in a landing record and in NO '
+                  'search-page record. Got replyTokens=$replyTokens.');
         }
 
-        // (5) Stay-hidden + single-tab on EVERY record.
+        // (5) Stay-hidden on EVERY record: raise_count tripwire (a vacuous counter
+        // -- see _expectStayHidden) + tabs reported honestly (multi-tab expected
+        // under design 甲, so tabs==1 is deliberately NOT asserted here).
         for (final r in records) {
           if (r['ok'] == true) {
             _expectStayHidden(r, label: 'tool=${r['tool']}');
