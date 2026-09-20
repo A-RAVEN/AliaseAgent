@@ -553,10 +553,10 @@ int ModelGateway::execute(
   // the endpoint's KVCache is scoped to this app and consecutive requests with the
   // same prefix hit the cache. On the Anthropic-compatible /v1/messages endpoint
   // this field is NESTED under `metadata`, NOT top-level — Docs/DeepSeekAPIDoc.md
-  // §2.2 (/v1/messages Simple Fields, line ~101): "`metadata` | 仅 `user_id` 支持，
-  // 其他忽略", and §7 note 10 (line ~701): "`metadata.user_id`: 仅 `user_id` 被支持，
-  // 可用于 KVCache 缓存隔离和调度隔离". A top-level `user_id` is the chat/completions
-  // (§3.1) form and §2.2 marks unknown /v1/messages fields as Ignored, so it would
+  // §2.4 (/v1/messages 简单字段 / Simple Fields): "`metadata` | 支持 `user_id`，
+  // 其它字段忽略", and §7 第 9 条: "`metadata`：**仅** `user_id` 支持，其它字段忽略
+  // （`user_id` 可用于限速与隔离）". A top-level `user_id` is the chat/completions
+  // (§3.1) form and §2.4 marks unknown /v1/messages fields as Ignored, so it would
   // be a silent no-op. char set [a-zA-Z0-9\-_], max 512. A stable app identifier
   // (not a per-session id) is the first cut — it avoids threading session_id through
   // the summary profile, which has no session context; per-session isolation is a
@@ -576,8 +576,13 @@ int ModelGateway::execute(
   //   output_config.effort | intensity ONLY (low/high/max), NOT the on/off switch.
   //   reasoning.effort / reasoning_effort | chat/completions only; NO effect on
   //                          /v1/messages (live-verified) — do not use for on/off here.
-  // Summary-profile request (compaction): thinking.type="disabled" + a small
-  // max_tokens window (1024) — summarization only, never the interactive 16K path.
+  // Summary-profile request (compaction): thinking.type="disabled" only. The
+  // OUTPUT LENGTH is deliberately NOT pinned here — the codebase used to send a
+  // hardcoded max_tokens of 1024, a design constant nobody asked for and one more
+  // number to keep in sync. The request now carries no max_tokens at all, so the
+  // model/endpoint default applies. The guarantee that a summary is smaller than
+  // the content it replaced is enforced by MEASURING the real output tokens on the
+  // Dart side, not by a constant in the request.
   const bool summary_mode = (thinking_mode && std::string(thinking_mode) == "summary");
   const bool thinking_enabled = (thinking_mode && std::string(thinking_mode) == "adaptive");
   if (thinking_enabled) {
@@ -589,15 +594,14 @@ int ModelGateway::execute(
     body["max_tokens"] = 16000;
     LOG_INFO("Thinking: adaptive, effort=" + std::string(thinking_effort ? thinking_effort : "default"));
   } else if (summary_mode) {
-    // Summary profile: thinking.type="disabled" + capped output. Overrides the
-    // 4096 default. DeepSeek's /v1/messages endpoint DEFAULTS thinking to enabled
+    // Summary profile: thinking.type="disabled" and NO max_tokens. DeepSeek's
+    // /v1/messages endpoint DEFAULTS thinking to enabled
     // (Docs/DeepSeekAPIDoc.md §2.7.1 注(1): 思考模式默认打开, 且 effort 默认为 high — this
     // is the §2.7.1 prose, NOT a field-table line; §3.1 is chat/completions),
     // so absence is NOT a disable — without thinking.type="disabled" the summary
-    // burns its 1024-token budget on reasoning.
+    // burns the output budget on reasoning.
     body["thinking"]["type"] = "disabled";
-    body["max_tokens"] = 1024;
-    LOG_INFO("Summary profile: thinking disabled, max_tokens=1024");
+    LOG_INFO("Summary profile: thinking disabled, output length left to the model default");
   } else {
     // Interactive "disabled" path (agent has no / invalid thinkingEffort).
     // DeepSeek's Anthropic-format endpoint DEFAULTS thinking to enabled, so

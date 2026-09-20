@@ -53,6 +53,26 @@ Windows 上还有仓库根的 `run.bat`：一键 `flutter build windows --debug`
 
 首次启动应用会弹出设置对话框，引导输入 Anthropic API key。配置文件保存在 `~/.aliasagent/config.json`。
 
+## 功能文档索引
+
+每个功能一份使用说明（面向使用者，不假设你读过代码）：
+
+| 功能 | 一句话说明 |
+|------|-----------|
+| [配置](Docs/user-guide/configuration.md) | 配置文件在哪、每个键什么意思、缺 key 或写错 JSON 会看到什么 |
+| [对话](Docs/user-guide/chat.md) | 新建/删除会话、发消息、工具卡片与思考卡片、会话标题 |
+| [真实上下文视图](Docs/user-guide/real-context-view.md) | 看模型这一步**实际**收到了什么（系统提示词、工具、每条消息） |
+| [上下文压缩](Docs/user-guide/context-compaction.md) | 对话变长后什么时候压、怎么认出来、阈值怎么调 |
+| [文件工具](Docs/user-guide/tools-file.md) | 读写/编辑/查找文件这六个工具、工作区边界、各类拒绝 |
+| [联网工具](Docs/user-guide/tools-web.md) | 搜索、抓网页、当前时间；搜索要付费服务的 key |
+| [浏览器工具](Docs/user-guide/tools-browser.md) | 开真实浏览器窗口操作网页；下载与权限请求会被拦 |
+| [常见现象与排查](Docs/user-guide/troubleshooting.md) | 看到某个报错是什么意思、下一步做什么、日志在哪 |
+
+**两条最容易踩的前提：**
+
+- **文件类工具只能碰工作区里的路径**，而工作区就是**你的用户主目录** —— 越界的路径会被直接拒绝（不会悄悄放行）。
+- **`web_search` 需要付费搜索服务的 key**（`zhipuai` 或 `kimi`）；没配的话模型根本没有搜索工具。
+
 ## 测试
 
 完整的测试流程、各层写法、实现规范和调试数据读取方式，见 **[Docs/TESTING.md](Docs/TESTING.md)**（测试分层、单元/widget/集成/live/侧车 C++/冒烟测试、报错处理、log/dmp/截屏输出、如何读 sidecar.log 与 crash 数据）。

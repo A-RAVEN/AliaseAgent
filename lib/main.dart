@@ -170,6 +170,14 @@ class ChatScreen extends StatefulWidget {
   final SummaryProvider? summaryProvider;
   final SeamSelector? seamSelector;
   final GuardAnchors? guard;
+
+  /// The compaction tree store (summary_nodes). Injectable so a hermetic widget
+  /// test can preset "nodes already persisted by an earlier round" and read back
+  /// what the pipeline stored — a real sqflite database cannot be driven from a
+  /// `testWidgets` body, because that body runs in a FakeAsync zone where real
+  /// async I/O completions are never delivered (measured: the test hangs).
+  final SummaryNodeRepository? summaryNodeRepo;
+
   /// Idle-gated background folding (2.6). Defaults to production behavior
   /// (enabled when no summary provider is injected). Hermetic widget tests inject
   /// a fake summary provider, so it defaults OFF there; a test may override this
@@ -185,6 +193,7 @@ class ChatScreen extends StatefulWidget {
     this.summaryProvider,
     this.seamSelector,
     this.guard,
+    this.summaryNodeRepo,
     this.backgroundFoldEnabled,
   });
 
@@ -295,7 +304,7 @@ class ChatScreenState extends State<ChatScreen> {
         (widget.summaryProvider == null && resolver != null
             ? ModelSeamSelector(sidecar: _sidecar, resolver: resolver!)
             : null);
-    _summaryNodeRepo = SummaryNodeRepository();
+    _summaryNodeRepo = widget.summaryNodeRepo ?? SummaryNodeRepository();
     // 2.6: production enables background folding (real summary provider); a
     // hermetic test injects a fake provider and must opt in explicitly.
     _backgroundFoldEnabled =
@@ -939,61 +948,56 @@ class ChatScreenState extends State<ChatScreen> {
     final maxContextTokens = agentType.maxContextTokens ?? 0;
     final List<Map<String, dynamic>> apiMessages;
     if (maxContextTokens > 0) {
-      // D10 cost discipline: a session that exhausted its fold budget skips ALL
-      // on-demand compaction — INCLUDING the seam-chooser LLM call, which would
-      // otherwise fire before the budget check and remain unbounded — and sends
-      // verbatim (best-effort over-budget known limit), so it cannot pay unbounded
-      // fold-related LLM cost per turn. The seam call is a real /v1/messages call
-      // (seam_selector.dart) and is NOT counted in the fold-budget token proxy.
-      if (await _foldBudgetExceeded(sessionId)) {
-        debugPrint('[AliasAgent] fold budget exceeded for session $sessionId — '
-            'skipping on-demand fold, sending verbatim (best-effort)');
-        apiMessages = _buildApiMessages(messages);
-      } else {
-        final closed = await _loadClosedSegments(sessionId);
-        // 4.3 design D5 option A: when a seam selector is available, prefetch/memoize
-        // the LLM L1 topic seams for the current fold BEFORE building the plan, then
-        // pass a memo-backed L1SeamChooser. A seam failure degrades gracefully to the
-        // arithmetic-safe skeleton (never splits a tool round, never blocks the turn).
-        final seamChooser =
-            await _prepareSeamChooser(messages, closed, agentType, maxContextTokens);
-        final plan = CompactionEngine.buildTree(
-            history: messages,
-            maxContextTokens: maxContextTokens,
-            closed: closed,
-            seamChooser: seamChooser);
-        if (plan.shouldCompact) {
-          ({List<CompactionSegment> segments, List<SummaryResult> summaries}) resolved =
-              (segments: const [], summaries: const []);
-          try {
-            resolved = await _resolveSummaries(
-                sessionId, plan, agentType, maxContextTokens);
-          } catch (e) {
-            // Summarization failed — never silently replace the folded context with
-            // a placeholder. Fall back to sending the conversation verbatim.
-            debugPrint('[AliasAgent] compaction summary failed, sending verbatim: $e');
-            resolved = (segments: const [], summaries: const []);
-          }
-          if (resolved.segments.isEmpty) {
-            // Empty-far pathological case: compaction split-omitted the ENTIRE far
-            // span (no compressible batch) and there was no verbatim tail, so the
-            // projection is empty — we fall back to the full conversation (which is
-            // over budget, since we entered the fold path). Surface it rather than
-            // silently resend over budget.
-            debugPrint('[AliasAgent] compaction produced no projection (far fully '
-                'omit-worthy, no verbatim tail) — resending the full over-budget '
-                'conversation (known pathological limit)');
-            apiMessages = _buildApiMessages(messages);
-          } else {
-            // segments carries the (measure→adjusted) summary segments + the verbatim
-            // tail; summaries may be empty after an omit-most-of-the-far, in which
-            // case _buildCompactionProjection sends only the verbatim tail (the older
-            // omitted content stays on disk, D9).
-            apiMessages = _buildCompactionProjection(resolved.summaries, resolved.segments);
-          }
-        } else {
-          apiMessages = _buildApiMessages(messages);
+      // NOTE (2026-09-20): a per-session cap on how much a session may compress
+      // used to sit here and skip ALL on-demand compaction once the session had
+      // produced enough summary rows. It was removed on purpose — see the note
+      // above [_summaryStoreOpen]. Compaction now always runs when the threshold
+      // is crossed; "cost must not run away" is currently unowned (nothing guards
+      // it).
+      final closed = await _loadClosedSegments(sessionId);
+      // 4.3 design D5 option A: when a seam selector is available, prefetch/memoize
+      // the LLM L1 topic seams for the current fold BEFORE building the plan, then
+      // pass a memo-backed L1SeamChooser. A seam failure degrades gracefully to the
+      // arithmetic-safe skeleton (never splits a tool round, never blocks the turn).
+      final seamChooser =
+          await _prepareSeamChooser(messages, closed, agentType, maxContextTokens);
+      final plan = CompactionEngine.buildTree(
+          history: messages,
+          maxContextTokens: maxContextTokens,
+          closed: closed,
+          seamChooser: seamChooser,
+          thresholdPercent: agentType.compactionThresholdPercent);
+      if (plan.shouldCompact) {
+        ({List<CompactionSegment> segments, List<SummaryResult> summaries}) resolved =
+            (segments: const [], summaries: const []);
+        try {
+          resolved = await _resolveSummaries(
+              sessionId, plan, agentType, maxContextTokens);
+        } catch (e) {
+          // Summarization failed — never silently replace the folded context with
+          // a placeholder. Fall back to sending the conversation verbatim.
+          debugPrint('[AliasAgent] compaction summary failed, sending verbatim: $e');
+          resolved = (segments: const [], summaries: const []);
         }
+        if (resolved.segments.isEmpty) {
+          // Empty-far pathological case: compaction split-omitted the ENTIRE far
+          // span (no compressible batch) and there was no verbatim tail, so the
+          // projection is empty — we fall back to the full conversation (which is
+          // over budget, since we entered the fold path). Surface it rather than
+          // silently resend over budget.
+          debugPrint('[AliasAgent] compaction produced no projection (far fully '
+              'omit-worthy, no verbatim tail) — resending the full over-budget '
+              'conversation (known pathological limit)');
+          apiMessages = _buildApiMessages(messages);
+        } else {
+          // segments carries the (measure→adjusted) summary segments + the verbatim
+          // tail; summaries may be empty after an omit-most-of-the-far, in which
+          // case _buildCompactionProjection sends only the verbatim tail (the older
+          // omitted content stays on disk, D9).
+          apiMessages = _buildCompactionProjection(resolved.summaries, resolved.segments);
+        }
+      } else {
+        apiMessages = _buildApiMessages(messages);
       }
     } else {
       // maxContextTokens not configured — keep the current full-send behavior.
@@ -1473,7 +1477,10 @@ class ChatScreenState extends State<ChatScreen> {
       int maxContextTokens, {bool Function()? isAborted}) async {
     if (_seamSelector == null) return null;
     final seamInputs = CompactionEngine.resolveFoldSeamInputs(
-        history: history, maxContextTokens: maxContextTokens, closed: closed);
+        history: history,
+        maxContextTokens: maxContextTokens,
+        closed: closed,
+        thresholdPercent: agentType.compactionThresholdPercent);
     if (seamInputs == null) return null;
     final seamSel = _seamSelector;
     // 2.6 abort gate: the seam ensure makes its own model call (SeamSelector.ensure
@@ -1538,10 +1545,6 @@ class ChatScreenState extends State<ChatScreen> {
       final messages = await _msgRepo.queryBySession(sessionId);
       if (messages.isEmpty) return;
       final closed = await _loadClosedSegments(sessionId);
-      // D10 cost discipline: a session that has exhausted its fold budget stops
-      // auto-folding (best-effort) so a runaway session cannot spend unbounded
-      // summarization cost. Logged as a debug/replay view (not user-facing).
-      if (await _foldBudgetExceeded(sessionId)) return;
       // Durable resume point (D8 progressive closure) = the persisted `closed`
       // segments passed into buildTree; the top closed seq is only logged for
       // observability (there is no separate in-memory checkpoint control value).
@@ -1554,10 +1557,12 @@ class ChatScreenState extends State<ChatScreen> {
           history: messages,
           maxContextTokens: maxContextTokens,
           closed: closed,
-          seamChooser: seamChooser);
+          seamChooser: seamChooser,
+          thresholdPercent: agentType.compactionThresholdPercent);
       if (!plan.shouldCompact) {
-        debugPrint('[AliasAgent] background fold: conversation within budget, '
-            'nothing to fold (top closed seq=$topClosedMax) -> no-op');
+        debugPrint('[AliasAgent] background fold: nothing to fold — the '
+            'accumulated content has not passed the threshold yet '
+            '(top closed seq=$topClosedMax) -> no-op');
         return;
       }
       final resolved = await _resolveSummaries(
@@ -1576,59 +1581,59 @@ class ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  /// Per-session fold budget caps (D10 cost discipline, "折卷次数/token 上限").
-  /// These bound how much a single session is allowed to spend on folding — a
-  /// cost guard, visible only via logs (a debug/replay view), NOT a user-facing
-  /// "manage compression" control. A normal session folds a handful of times
-  /// over its life; the caps are set generously so they only trip on runaway
-  /// folding, then the session reverts to best-effort (sends verbatim / at the
-  /// known over-budget limit) rather than paying unbounded summarization cost.
-  static const int kMaxFoldsPerSession = 30;
-  static const int kMaxFoldTokensPerSession = 500000;
+  // NOTE (2026-09-20): a per-session cap on how much a session may compress used
+  // to live here. It was
+  // removed on purpose — do NOT reinvent it. What it was: two constants (a cap of
+  // 30 and a cap of 500000), a pure check, a DB-backed check, and two early exits
+  // (one in _callModel, one at the top of _runBackgroundFold) that made a session
+  // stop compacting once either cap tripped. Why it was removed:
+  //  1. It measured the WRONG thing. It counted the summary rows the session had
+  //     ever produced (`summary_nodes` rows with level >= 1 and a token cost).
+  //     Rows covered by a coarser summary are never deleted, so that count only
+  //     ever grows: it treated finished, useful work as if it were the cost.
+  //  2. Its failure mode was worse than the thing it guarded. Crossing it once
+  //     turned compaction OFF for good — both the inline path and the background
+  //     fold — so the session went back to sending the whole conversation every
+  //     turn. That is not a degradation, it is a permanent stop, and it never
+  //     recovers. Compaction existing at all is what it destroyed.
+  //  3. Its thresholds were both of the kinds the user has forbidden: 30 is a
+  //     COUNT gate, and 500000 is an absolute number unrelated to the model
+  //     window. The threshold is only ever the model's context window times a
+  //     percentage (see CompactionEngine.thresholdTokens and the locked
+  //     requirement in TODO.md).
+  //  4. It tripped BEFORE that threshold did, so the behaviour the user asked for
+  //     (compress once enough has accumulated) could never even happen.
+  // As a result, "cost must not run away" currently has NO owner: nothing guards
+  // summarization spend (each pass that produces a new batch is one more model
+  // call, so it grows with the conversation). That is stated plainly rather than
+  // papered over. If a guard is ever added again, it must (a) measure the resource
+  // it protects — tokens or money, not a count, (b) derive its threshold from the
+  // model window, and (c) DEGRADE (compress less, or coarser) rather than stop,
+  // and recover on its own.
 
-  /// Public cap getter so tests can reference the fold-budget limit.
-  static int get maxFoldsPerSession => kMaxFoldsPerSession;
-  static int get maxFoldTokensPerSession => kMaxFoldTokensPerSession;
+  /// True when the compaction tree store (summary_nodes) can be used.
+  ///
+  /// An INJECTED repository is always usable — it is the in-memory stand-in a
+  /// hermetic widget test supplies, and it needs no database. The production
+  /// repository needs the real database to be open. Using this instead of a raw
+  /// `DatabaseService.isOpen` is what lets a widget test preset "nodes already
+  /// persisted by an earlier round" and still exercise the real pipeline.
+  bool get _summaryStoreOpen =>
+      widget.summaryNodeRepo != null || DatabaseService.isOpen;
 
-  /// Pure fold-budget cap check (D10): a session exceeds its budget when it has
-  /// folded more than [kMaxFoldsPerSession] times OR spent more than
-  /// [kMaxFoldTokensPerSession] tokens. Exposed for deterministic unit tests;
-  /// the widget path computes [foldCount]/[foldTokens] from the persisted nodes
-  /// and calls this.
-  static bool isFoldBudgetExceeded({required int foldCount, required int foldTokens}) =>
-      foldCount > kMaxFoldsPerSession || foldTokens > kMaxFoldTokensPerSession;
-
-  /// True when [sessionId] has exhausted its fold budget. Uses the persisted
-  /// [SummaryNodeRepository.queryBySession] accounting (count of nodes + sum of
-  /// their measured output `token_cost` as a monotonic proxy for fold cost —
-  /// fold INPUT cost is not stored per-session, so the summary output size is
-  /// the available bounded proxy). Hermetic tests (no DB) return false.
-  Future<bool> _foldBudgetExceeded(String sessionId) async {
-    if (!DatabaseService.isOpen) return false;
-    try {
-      final nodes = await _summaryNodeRepo.queryBySession(sessionId);
-      var foldCount = 0;
-      var foldTokens = 0;
-      for (final n in nodes) {
-        if (n.level >= 1 && n.tokenCost != null && n.tokenCost! > 0) {
-          foldCount++;
-          foldTokens += n.tokenCost!;
-        }
-      }
-      if (isFoldBudgetExceeded(foldCount: foldCount, foldTokens: foldTokens)) {
-        debugPrint('[AliasAgent] fold budget exceeded for session $sessionId: '
-            '$foldCount folds / $foldTokens fold-tokens (cap '
-            '$kMaxFoldsPerSession / $kMaxFoldTokensPerSession) — skipping auto-fold');
-        return true;
-      }
-    } catch (e) {
-      debugPrint('[AliasAgent] fold budget query failed: $e');
-    }
-    return false;
-  }
-
+  /// Load the summaries an earlier round already persisted, as the fixed floor the
+  /// new fold builds on. Two kinds come back, and the difference is only whether
+  /// they may be an input to a NEW roll-up (see [ClosedSummary.rollable]):
+  ///  - level 1 → may be combined with other level-1 summaries into a coarser
+  ///    level-2 summary. This is what lets accumulation carry across rounds: a
+  ///    summary written last round is not dead weight, it counts toward the
+  ///    threshold together with this round's.
+  ///  - level 2 and above → frozen, never an input to another roll-up.
+  /// BOTH kinds keep excluding the raw conversation they cover: [CompactionEngine]
+  /// takes the highest covered sequence of every loaded node as the floor, so the
+  /// original messages under any of them are never compressed a second time.
   Future<List<ClosedSummary>> _loadClosedSegments(String sessionId) async {
-    if (!DatabaseService.isOpen) return const [];
+    if (!_summaryStoreOpen) return const [];
     try {
       final nodes = await _summaryNodeRepo.queryBySession(sessionId);
       // Prefer the COARSEST covering node for each span (R8-d). A coarsened
@@ -1636,8 +1641,9 @@ class ChatScreenState extends State<ChatScreen> {
       // rolled up; sorting by (coveredMinSeq ASC, coveredMaxSeq DESC, level DESC)
       // puts the covering coarser node FIRST, so the greedy non-overlap advance
       // below adopts it and subsumes the L1s — instead of skipping the L2 in favor
-      // of the larger frozen L1s (which discarded the coarsening + inflated the
-      // fold budget). Still yields D9 dense non-overlap.
+      // of the larger frozen L1s (which threw away the coarsening and inflated how
+      // much of the model window the summaries occupy). Still yields D9 dense
+      // non-overlap.
       final sorted = nodes
           .where((n) =>
               n.level >= 1 &&
@@ -1778,9 +1784,9 @@ class ChatScreenState extends State<ChatScreen> {
 
   Future<({List<CompactionSegment> segments, List<SummaryResult> summaries})>
       _resolveSummaries(String sessionId, CompactionPlan plan,
-          AgentTypeConfig agentType, int budget,
+          AgentTypeConfig agentType, int maxContextTokens,
           {bool Function()? isAborted}) async {
-    final dbOpen = DatabaseService.isOpen;
+    final dbOpen = _summaryStoreOpen;
     // Dirty-since-seq watermark (D8 lazy recompute): a cached summary may be
     // reused only if its covered span is strictly below the watermark (clean —
     // no leaf content changed in it). Spans reaching the dirty region are stale
@@ -1955,131 +1961,192 @@ class ChatScreenState extends State<ChatScreen> {
       }
     }
 
-    // Phase B — fold→measure→adjust (⑪.3). Closed segments are FROZEN; only the
-    // OPEN (tail) L1 batches are adjustable. Over budget → coarsen the OLDEST
-    // open L1s into a level-2 "summary of summaries" (measured token > T) and
-    // re-measure; when no coarsening would merge ≥2 → OMIT the oldest open.
-    final closedEntries = entries.where((e) => e.isClosed).toList();
-    var open = entries.where((e) => !e.isClosed).toList();
+    // Phase B — fold→measure→adjust over ONE table, oldest → newest.
+    //
+    // The table holds every entry that goes into the projection: summaries loaded
+    // from earlier rounds and the batches produced by this pass, in time order.
+    // What an entry may be used for depends on its LEVEL, not on whether it was
+    // loaded or freshly produced:
+    //  - level 1 → adjustable: consecutive level-1 entries may be rolled up into
+    //    one coarser level-2 summary, and may be dropped from THIS request;
+    //  - level 2+ → frozen: never an input to another roll-up (two levels only).
+    //    A level-2 persisted by an earlier round is also never dropped from the
+    //    request — that is the real "frozen closed summary" guarantee.
+    //
+    // Two independent reasons to keep going, and nothing else:
+    //  - the projection is still over the model capacity ⇒ keep rolling up or
+    //    drop the oldest adjustable entry from THIS request (data stays on disk);
+    //  - a run of level-1 summaries has accumulated past the threshold T and has
+    //    not been submitted yet ⇒ roll it up, EVEN IF the projection already
+    //    fits. The threshold alone is the trigger; spare room in the window is
+    //    not a reason to skip it (the user's pinned rule) — and this is what makes
+    //    accumulation carry across rounds instead of resetting each request.
+    //
+    // Termination rule (explicit, else this loop can spin): a roll-up that was
+    // REJECTED (the level-2 measured no smaller than the L1s it would replace) is
+    // recorded, and its entries are never submitted again in this pass. Below the
+    // capacity bound a rejection just stops that attempt — the valid L1s stay,
+    // nothing is dropped, and no second model call is made for the same futile merge.
     final verbatimRaw = CompactionEngine.rawTokens(plan.verbatim);
-    final closedSum = closedEntries.fold(0, (m, e) => m + e.tokens);
-    var openSum = open.fold(0, (m, e) => m + e.tokens);
-    final T = budget ~/ 2;
-    var total = closedSum + openSum + verbatimRaw;
-    while (total > budget && open.isNotEmpty) {
+    final T = CompactionEngine.thresholdTokens(
+        maxContextTokens, agentType.compactionThresholdPercent);
+    var table = List.of(entries);
+    var tableSum = table.fold(0, (m, e) => m + e.tokens);
+    var total = tableSum + verbatimRaw;
+    // May this entry be left out of THIS request? A level-1 summary may (it is
+    // projection-only — the data stays on disk, and it can be rebuilt later);
+    // so may anything this pass just produced. A level-2 summary persisted by an
+    // earlier round may not.
+    bool omittable(({CompactionSegment seg, String text, int tokens, bool isClosed}) e) =>
+        e.seg.level == 1 || !e.isClosed;
+    // Identity set: entry records compare structurally, so identity is what tells
+    // "this exact entry was already submitted" apart from an equal-looking one.
+    final attempted = Set<Object>.identity();
+    while (table.isNotEmpty) {
       if (isAborted?.call() ?? false) {
         throw const _BackgroundFoldCancelled('background fold aborted during coarsen');
       }
-      // Never re-coarsen an existing level-2 into a new level-2: that would make
-      // the new L2 a "summary of a summary + more L1s" (violates design D1 "只做两
-      // 级 / L2 的输入是 L1 摘要文本") and persist overlapping level-2 rows. An
-      // already-coarse L2 is handled by omission only.
-      if (open[0].seg.level >= 2) {
-        open.removeAt(0);
-        openSum = open.fold(0, (m, e) => m + e.tokens);
-        total = closedSum + openSum + verbatimRaw;
+      final overCapacity = total > maxContextTokens;
+      // The roll-up target: the OLDEST run of consecutive level-1 summaries whose
+      // accumulated measured tokens pass T, skipping entries already submitted.
+      // A level-2 entry only ever BREAKS a run; it is never merged (merging it
+      // would make the new one "a summary of a summary + more" and persist
+      // overlapping level-2 rows).
+      var candStart = -1;
+      var candCount = 0;
+      var candGroup = <({CompactionSegment seg, String text, int tokens, bool isClosed})>[];
+      var i = 0;
+      while (i < table.length) {
+        if (!table[i].seg.rollable) {
+          i++;
+          continue;
+        }
+        final runStart = i;
+        while (i < table.length && table[i].seg.rollable) {
+          i++;
+        }
+        // Already-submitted entries form a PREFIX of their run (groups are always
+        // taken from the run's oldest), so skip them and consider the fresh tail.
+        var fresh = runStart;
+        while (fresh < i && attempted.contains(table[fresh])) {
+          fresh++;
+        }
+        if (fresh >= i) continue;
+        final freshTokens = <int>[
+          for (var k = fresh; k < i; k++) table[k].tokens,
+        ];
+        final count = CompactionEngine.l2GroupCount(freshTokens, T);
+        if (count > 0) {
+          candStart = fresh;
+          candCount = count;
+          candGroup = table.sublist(fresh, fresh + count);
+          break;
+        }
+      }
+      if (candStart < 0) {
+        // Nothing left to roll up. Over capacity ⇒ leave the OLDEST adjustable
+        // entry out of this request (data kept on disk); otherwise this pass is done.
+        if (!overCapacity) break;
+        final dropAt = table.indexWhere(omittable);
+        if (dropAt < 0) break;
+        table.removeAt(dropAt);
+        tableSum = table.fold(0, (m, e) => m + e.tokens);
+        total = tableSum + verbatimRaw;
         continue;
       }
-      // Prefer coarsening the OLDEST consecutive open L1s whose cumulative
-      // measured tokens exceed T into ONE level-2 "summary of summaries".
-      final l1Tokens = <int>[];
-      var consecutiveL1 = 0;
-      for (final e in open) {
-        if (e.seg.level >= 2) break;
-        l1Tokens.add(e.tokens);
-        consecutiveL1++;
-      }
-      final groupCount = CompactionEngine.l2GroupCount(l1Tokens, T);
-      if (consecutiveL1 >= 2 && groupCount >= 2) {
-        final group = open.sublist(0, groupCount);
-        final groupSum = group.fold(0, (m, e) => m + e.tokens);
-        final l2 = await _summaryProvider.summarizeText(
-            text: group.map((e) => e.text).join('\n\n'), config: agentType);
-        if (l2.tokens >= groupSum) {
-          // INVALID coarsen: the level-2 is NOT smaller than the L1 summaries it
-          // would replace — the same "valid only if measured < replaced" criterion
-          // split-if-invalid enforces for L1. A bloated L2 would INFLATE total, so
-          // reject it and DRAIN (omit) the group's entries one-at-a-time, re-measuring
-          // total, WITHOUT re-coarsening the same futile group — this avoids O(n)
-          // fresh summarizeText calls while preserving the still-valid L1s (each omit
-          // is projection-only; data kept on disk, D9).
-          var drain = groupCount;
-          while (drain > 0 && open.isNotEmpty && total > budget) {
-            open.removeAt(0);
-            drain--;
-            openSum = open.fold(0, (m, e) => m + e.tokens);
-            total = closedSum + openSum + verbatimRaw;
-          }
-        } else {
-          final mergedMsgs = group.expand((e) => e.seg.messages).toList();
-          final l2seg = CompactionSegment(
-              messages: mergedMsgs,
-              summary: true,
-              level: 2,
-              l2SubSpans:
-                  group.map((e) => CompactionEngine.segmentSpan(e.seg)).toList());
-          final l2Entry =
-              (seg: l2seg, text: l2.text, tokens: l2.tokens, isClosed: false);
-          if (dbOpen && mergedMsgs.isNotEmpty &&
-              mergedMsgs.first.seq != null && mergedMsgs.last.seq != null) {
-            final lo = mergedMsgs.first.seq!;
-            final hi = mergedMsgs.last.seq!;
-            try {
-              await _summaryNodeRepo.materialize(
-                sessionId: sessionId,
-                level: 2,
-                startSeq: lo,
-                endSeq: hi,
-                nodeType: 'summary',
-                summaryJson: jsonEncode({
-                  'role': 'user',
-                  'content': [
-                    {'type': 'text', 'text': l2.text},
-                  ],
-                }),
-                tokenCost: l2.tokens,
-                summaryPromptVersion: 1,
-                model: agentType.model,
-                coveredMinSeq: lo,
-                coveredMaxSeq: hi,
-              );
-            } catch (e) {
-              persistFailed = true;
-              debugPrint('[AliasAgent] persist level-2 summary failed: $e');
-            }
-          }
-          open = [l2Entry, ...open.sublist(groupCount)];
-          openSum = open.fold(0, (m, e) => m + e.tokens);
+      final groupSum = candGroup.fold(0, (m, e) => m + e.tokens);
+      final l2 = await _summaryProvider.summarizeText(
+          text: candGroup.map((e) => e.text).join('\n\n'), config: agentType);
+      if (l2.tokens >= groupSum) {
+        // INVALID coarsen: the level-2 is NOT smaller than the L1 summaries it
+        // would replace — the same "valid only if measured < replaced" criterion
+        // split-if-invalid enforces for L1. A bloated L2 would INFLATE total.
+        for (final e in candGroup) {
+          attempted.add(e);
         }
-      } else {
-        // Fully coarsened (no merge of ≥2 L1s) — OMIT the OLDEST open content from
-        // the projection (data kept on disk, D9).
-        open.removeAt(0);
-        openSum = open.fold(0, (m, e) => m + e.tokens);
+        if (!overCapacity) {
+          // Not over capacity ⇒ do NOT retry this merge and do NOT drop the
+          // still-valid L1s. The next iteration finds no fresh candidate and ends.
+          continue;
+        }
+        // Over capacity ⇒ DRAIN (omit) the group's entries one-at-a-time,
+        // re-measuring total, preserving the still-valid L1s (each omit is
+        // projection-only; data kept on disk).
+        var drain = candCount;
+        while (drain > 0 && table.isNotEmpty && total > maxContextTokens) {
+          table.removeAt(candStart);
+          drain--;
+          tableSum = table.fold(0, (m, e) => m + e.tokens);
+          total = tableSum + verbatimRaw;
+        }
+        continue;
       }
-      total = closedSum + openSum + verbatimRaw;
+      final mergedMsgs = candGroup.expand((e) => e.seg.messages).toList();
+      final l2seg = CompactionSegment(
+          messages: mergedMsgs,
+          summary: true,
+          level: 2,
+          l2SubSpans:
+              candGroup.map((e) => CompactionEngine.segmentSpan(e.seg)).toList());
+      final l2Entry =
+          (seg: l2seg, text: l2.text, tokens: l2.tokens, isClosed: false);
+      if (dbOpen && mergedMsgs.isNotEmpty &&
+          mergedMsgs.first.seq != null && mergedMsgs.last.seq != null) {
+        final lo = mergedMsgs.first.seq!;
+        final hi = mergedMsgs.last.seq!;
+        try {
+          await _summaryNodeRepo.materialize(
+            sessionId: sessionId,
+            level: 2,
+            startSeq: lo,
+            endSeq: hi,
+            nodeType: 'summary',
+            summaryJson: jsonEncode({
+              'role': 'user',
+              'content': [
+                {'type': 'text', 'text': l2.text},
+              ],
+            }),
+            tokenCost: l2.tokens,
+            summaryPromptVersion: 1,
+            model: agentType.model,
+            coveredMinSeq: lo,
+            coveredMaxSeq: hi,
+          );
+        } catch (e) {
+          persistFailed = true;
+          debugPrint('[AliasAgent] persist level-2 summary failed: $e');
+        }
+      }
+      table = [
+        ...table.sublist(0, candStart),
+        l2Entry,
+        ...table.sublist(candStart + candCount),
+      ];
+      tableSum = table.fold(0, (m, e) => m + e.tokens);
+      total = tableSum + verbatimRaw;
     }
-    // Residual-over-budget detection (⑪ review finding): the loop exits on
-    // `open.isEmpty`, NOT on `total <= budget`. If open is fully coarsened+omitted
-    // and closedSum + verbatimRaw alone still exceeds budget (frozen closed
-    // summaries + newest verbatim are both excluded from omission — D8 "闭段冻结"
-    // and D3/D4 "最新始终 verbatim"), the projection is sent over budget. This is
-    // the acknowledged pathological "known limit"; surface it rather than hide it.
-    if (total > budget) {
+    // Residual-over-capacity detection: the loop can exit because nothing is left
+    // to roll up or drop. If what remains (a frozen level-2 from an earlier round
+    // plus the newest verbatim span, both excluded from dropping) still exceeds the
+    // capacity, the projection is sent over it. This is the acknowledged
+    // pathological "known limit"; surface it rather than hide it.
+    if (total > maxContextTokens) {
       debugPrint('[AliasAgent] compaction projection still over budget by '
-          '${total - budget} tokens (closed+verbatim alone exceed maxContextTokens; '
-          'sending best-effort projection — a pathological known limit)');
+          '${total - maxContextTokens} tokens (frozen level-2 summaries + newest '
+          'verbatim alone exceed maxContextTokens; sending best-effort projection — '
+          'a pathological known limit)');
     }
 
+    // Both lists come out in the ONE table's order (oldest → newest), so the
+    // projection's coverage is strictly increasing by construction.
     final finalSegments = <CompactionSegment>[
-      ...closedEntries.map((e) => e.seg),
-      ...open.map((e) => e.seg),
+      ...table.map((e) => e.seg),
       if (plan.verbatim.isNotEmpty)
         CompactionSegment(messages: plan.verbatim, summary: false),
     ];
     final finalSummaries = <SummaryResult>[
-      ...closedEntries.map((e) => SummaryResult(text: e.text, tokens: e.tokens)),
-      ...open.map((e) => SummaryResult(text: e.text, tokens: e.tokens)),
+      ...table.map((e) => SummaryResult(text: e.text, tokens: e.tokens)),
     ];
 
     // Consume the dirty watermark ONLY if every stale span was re-summarized AND

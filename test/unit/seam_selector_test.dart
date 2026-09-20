@@ -131,7 +131,7 @@ void main() {
         for (var i = 0; i < 30; i++) _msg(i.isEven ? 'user' : 'assistant', '$i:${'x' * 3000}'),
       ];
       final seamInputs =
-          CompactionEngine.resolveFoldSeamInputs(history: history, maxContextTokens: 12000);
+          CompactionEngine.resolveFoldSeamInputs(history: history, maxContextTokens: 24000);
       expect(seamInputs, isNotNull);
       await sel.ensure(far: seamInputs!.far, k: seamInputs.k, config: _config());
       // ignore: avoid_print
@@ -139,7 +139,7 @@ void main() {
           'memoized=${sel.memoizedSeams(far: seamInputs.far, k: seamInputs.k)}');
 
       final plan = CompactionEngine.buildTree(
-          history: history, maxContextTokens: 12000,
+          history: history, maxContextTokens: 24000,
           seamChooser: (far, k) => sel.memoizedSeams(far: far, k: k) ?? const []);
       final summaries = plan.segments.where((s) => s.summary).toList();
       // k=3 (raw-token batching) → three L1 batches; the memoized micro-adjust seam

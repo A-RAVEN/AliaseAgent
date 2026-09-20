@@ -1,7 +1,10 @@
 # Model Gateway — Spec
 
-## ADDED Requirements
+## Purpose
 
+Define the C++ sidecar's behavior when it calls the Anthropic-format `/v1/messages` endpoint and
+streams SSE events back to Dart over FFI.
+## Requirements
 ### Requirement: Usage telemetry
 The C++ Sidecar SHALL parse usage from the SSE `message_start` and `message_delta` events on the Anthropic-format `/v1/messages` endpoint and surface the measured input/output token counts to Dart. Field names follow the Anthropic `/v1/messages` usage format: `input_tokens` (message_start) and `output_tokens` (message_delta) — this exact DeepSeek field naming is **live-verified 2026-08-26**, so the sidecar SHALL parse the usage block defensively as a fallback (read whichever token-count field the endpoint returns). (`prompt_tokens`/`completion_tokens` are the DeepSeek chat/completions fields and do NOT apply to the `/v1/messages` endpoint.)
 
@@ -133,7 +136,7 @@ The C++ Sidecar SHALL write diagnostic logs to `~/.aliasagent/logs/` directory, 
 - **THEN** the full response body is written to the log (truncated to 2048 characters)
 
 ### Requirement: Adaptive thinking parameter in request body
-The C++ Sidecar SHALL conditionally include adaptive thinking configuration in the API request body based on the `thinking_mode` and `thinking_effort` parameters. When `thinking_mode` is `"adaptive"`, the body SHALL contain `"thinking":{"type":"adaptive","display":"summarized"}` and `"output_config":{"effort":"<level>"}`, and `max_tokens` SHALL be set to 16000. When `thinking_mode` is not `"adaptive"` or is empty, no thinking or output_config fields SHALL be included and `max_tokens` SHALL remain at 4096. **Modified (this change): when a summary-profile request is used (thinking disabled for summarization), `max_tokens` SHALL be 512-1024 instead of 4096.**
+The C++ Sidecar SHALL conditionally include adaptive thinking configuration in the API request body based on the `thinking_mode` and `thinking_effort` parameters. When `thinking_mode` is `"adaptive"`, the body SHALL contain `"thinking":{"type":"adaptive","display":"summarized"}` and `"output_config":{"effort":"<level>"}`, and `max_tokens` SHALL be set to 16000. When `thinking_mode` is not `"adaptive"` or is empty, no thinking or output_config fields SHALL be included and `max_tokens` SHALL remain at 4096. **Modified (this change): when a summary-profile request is used (thinking disabled for summarization), `thinking.type` SHALL be `"disabled"` and the request SHALL NOT carry a `max_tokens` constant chosen by the context-compaction design — the summarization output length SHALL be governed by the model/provider profile instead of a fixed design constant, and the "a summary is valid only if it is measured smaller than what it replaced" rule SHALL be the only size guarantee.**
 
 **External validation (official docs, verified 2026-08-02 via MCP webReader)**:
 - DeepSeek Anthropic-compatible endpoint (https://api-docs.deepseek.com/guides/anthropic_api/): "thinking | Supported (`budget_tokens` is ignored)" and "output_config | Only `effort` is supported" — the ONLY effective thinking control is `output_config.effort`; `budgetTokens`/`budget_tokens` is ignored by the API.
@@ -148,9 +151,9 @@ The C++ Sidecar SHALL conditionally include adaptive thinking configuration in t
 - **WHEN** `send_message` receives `thinking_mode = "disabled"` or empty string
 - **THEN** the request JSON body does NOT contain `thinking` or `output_config` keys, and `"max_tokens":4096`
 
-#### Scenario: Summary profile caps max_tokens
+#### Scenario: Summary profile output length is model-governed
 - **WHEN** a summary-profile request is made (thinking disabled for summarization)
-- **THEN** `max_tokens` is 512-1024, overriding the 4096 non-adaptive default
+- **THEN** the request body sets `thinking.type` to `"disabled"` (so the summary does not spend its budget on reasoning) and does NOT carry a `max_tokens` constant chosen by the compaction design — the output length is the model/provider's default
 
 #### Scenario: display summarized always set
 - **WHEN** adaptive thinking is enabled
@@ -206,3 +209,4 @@ Tool use JSON SHALL continue to be delivered only at `content_block_stop` after 
 #### Scenario: Tool use delivered at block stop
 - **WHEN** a tool_use block streams input_json_delta fragments
 - **THEN** on_tool_call fires once at content_block_stop with the complete JSON
+

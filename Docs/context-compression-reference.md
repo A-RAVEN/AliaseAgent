@@ -84,7 +84,7 @@ AliasAgent(Flutter 桌面 AI 对话应用,经 dart:ffi 调 C++ Sidecar,走 DeepS
 - **工整性保障**:带 tool_calls 的 assistant 消息**永远原样展开**(node_type 标记或被推导为 has_tool_calls),无论多旧;包含 tool_calls 叶子的 span 一律不塌缩。
 - **近端超大 tool_result 会单独爆预算**:recency 规则保留近端原样,但近端恰好是大体落点 → 允许**近区轮内裁剪**:把大结果体替换为"截断标记 + 再取记录(path/字节/line 范围)",保住该轮的文本与工具意图。
 - **后台折卷必须 idle-gated + 可抢占 + 断点续** [V:C6 结论成立,但前提要收窄]:串行的**只是模型路径**(g_gateway/request_mutex/curl join/Dart `_enqueue`);**web_search/web_fetch 在独立 worker isolate + 本地 CURL 句柄**(web_search 还 `std::async` 扇出),**文件工具是主 isolate 同步 FFI**——所以"单在飞"≠全 sidecar [R,原 RD10]。折卷须避开模型路径;且当前抢占原始对象是**全局 `cancel_flag`(无 request-id 目标)+ FIFO `_enqueue`** → 折卷排前面会让用户请求等它;TOCTOU 下 cancel 可能**误杀用户自己的请求**。**需 request-id 定向 cancel 或独立折卷通道(见决策点 D2)**。
-- **折卷是"贵的",不是默认路径**:折叠要重读本要省下的 input token。先评估便宜层——**DeepSeek prompt-caching**(`user_id`,DeepSeekAPIDoc.md:241)+ 直接裁剪远端历史;LLM 树仅作长会话升级。折卷用**专用 profile**(关 thinking、`max_tokens` 512-1024、更便宜模型),**绝不**用交互式 16K 路径。
+- **折卷是"贵的",不是默认路径**:折叠要重读本要省下的 input token。先评估便宜层——**DeepSeek prompt-caching**(`user_id`,DeepSeekAPIDoc.md:241)+ 直接裁剪远端历史;LLM 树仅作长会话升级。折卷用**专用 profile**(关 thinking、更便宜模型),**绝不**用交互式 16K 路径。(原文此处还写了 `max_tokens` 512-1024 —— **2026-09-20 作废**：摘要的输出长度不再由本设计写死，改用模型/接口自己的默认值；"摘要一定更小"这个保证只由**实测**承担。)
 - **树是派生索引,原文永不破坏** [V]>rollup 只作请求 payload 投影,原始 `messages` 表逐字保留;树节点带 `(session_id, start_seq, end_seq)` 主键 + 按需展开路径(harness 注入,非 agent 工具),否则"原文留盘"是惰的。
 - **树形与存储**:`summary_nodes` 表按 `(session_id, level, start_seq, end_seq, node_type, parent_id, summary_json, token_cost, summary_prompt_version, model, covered_min_seq, covered_max_seq)`;用 `summary_json`(role blocks)而非单段 `summary_text`;memo 化摘要(content hash + prompt version + model)保可复现;`covered_min/max_seq` 稠密非重叠 + `leaf_owner` 平面索引保 O(1) 失效;parent_id 仅作导航。
 - **失效与重算**:加每会话 `tree_version` / dirty-seq 水位线;insert / delete / updateToolCalls 会 bump 并标记受影响 span + 祖先为 stale,lazy 重算。
@@ -118,7 +118,13 @@ Phase 3  全树 + canonical-cover 前锋(knob R, L)+ 摘要之摘要
     - 测:cover 稠密且完整;梯度单调(近详→远略);总预算 ≤ 阈值;工具相邻完整
 Phase 4  成本纪律 + 便宜层
     - 钉 DeepSeek 真实上下文窗口;触发预算由测得 usage 推,非魔法常数
-    - 每会话折卷预算(折卷次数/折卷 token)+ opt-in + 可见成本
+    - ~~每会话折卷预算(折卷次数/折卷 token)+ opt-in + 可见成本~~
+      **2026-09-20 删除**：这一条做出来的东西是"每会话 30 条摘要 / 累计 50 万 token"
+      两个写死的上限，它量的不是花费而是"已经产出过多少条摘要"（只增不减），越过一次
+      就**永久关闭压缩**——比它要防的成本失控更糟，且两个阈值都撞用户明令禁止的类型
+      （条数门槛 + 与窗口无关的绝对数）。**当前"成本不能失控"这个意图无人承担。**
+      删除理由与将来再加护栏必须满足的三条，见 `lib/main.dart` 中
+      `_summaryStoreOpen` 上方的注释与 `Docs/rejected-approaches.md` 第 22 条。
     - 破平衡点回归测试(折卷 input_tokens ≪ 每请求省下的 input_tokens)
     - 评估 prompt-caching(user_id / KVCache)+ 裁剪远端作为默认便宜层
 Phase 5  对抗式 Workflow 诚实循环(逐轮回归核查)
@@ -174,11 +180,12 @@ for (final fixture in toolHeavyFixtures) {
 用户一轮结束(assistant 回完)
       │
       ▼ ① 触发评估
-  有新满的段?  且  槽空闲 + _chain 空 + 用户不在输入/发送  且  折卷预算未超
+  有新满的段?  且  槽空闲 + _chain 空 + 用户不在输入/发送
+      （原来的第三个条件"折卷预算未超"已于 2026-09-20 删除，见上面 Phase 4）
       │ 是
       ▼ ② 发起折卷(占空槽)
   同 system/tools + 【被折那段的 messages】+ 末条 user 追加 summarize 指令
-  (关 thinking、max_tokens 512-1024、可选更便宜模型)
+  (关 thinking、可选更便宜模型;输出长度由模型默认值决定，2026-09-20 起不再写死)
       │
       ▼ ③ 用户此时发新消息 ──► 抢占
   定向 cancel(带 request-id,非全局 flag)+ 存断点 "fold pending on segment N"
@@ -194,7 +201,7 @@ for (final fixture in toolHeavyFixtures) {
   未折完的段读不到(dirty-seq → lazy 补折)
 ```
 
-- **①触发(精确条件)**:不是定时器——每轮完成后评估一次,三者都满足才折:①有新满的段(未折叠历史超过一段阈值,暴露"新料");②空闲(模型槽空 + `_chain` 空 + 用户不在输入/发送);③折卷预算未超(每会话折卷次数/token 上限)。缺一 → 不折,零成本。
+- **①触发(精确条件)**:不是定时器——每轮完成后评估一次,三者都满足才折:①有新满的段(未折叠历史超过一段阈值,暴露"新料");②空闲(模型槽空 + `_chain` 空 + 用户不在输入/发送);③~~折卷预算未超(每会话折卷次数/token 上限)~~ **该条已于 2026-09-20 删除**（理由见上面 Phase 4 与 `Docs/rejected-approaches.md` 第 22 条）。缺一 → 不折,零成本。
 - **②折卷请求**:复用 `model_gateway`,用**摘要 profile**(逻辑同 Claude Code:同 system/tools + 末条 user 追加 summarize 指令、`querySource:'compact'`、关 thinking、小 `max_tokens`)。L1 折段原文;L2 折"下层的若干摘要"。
 - **③抢占/断点**:折卷在飞、用户发消息 → **定向取消该折卷**(D2:request-id 定向,非全局 flag,避免误杀用户请求)+ 写断点;下次空闲从 N 续折,不重读已折部分。
 - **④落库(原子)**:折卷结果写 `summary_nodes`,单事务提交 + `tree_version` 递增。**用户界面完全不变**(原始对话仍在磁盘/界面);同步的是"发给模型用的派生树",不是聊天记录。写另一半时不会被读到(dirty-seq / 未提交事务)。

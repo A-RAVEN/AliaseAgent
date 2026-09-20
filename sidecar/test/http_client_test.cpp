@@ -83,7 +83,7 @@ TEST_CASE("HTTP: request body with all fields", "[http_client]") {
     REQUIRE(body["tools"][0]["name"] == "read_file");
     // Cheap layer (D10): DeepSeek prompt-caching — stable app-level user_id scopes
     // the endpoint KVCache. On /v1/messages it is NESTED under metadata per
-    // Docs/DeepSeekAPIDoc.md §2.2 "metadata | 仅 user_id 支持" (NOT top-level —
+    // Docs/DeepSeekAPIDoc.md §2.4 "metadata | 支持 user_id，其它字段忽略" (NOT top-level —
     // top-level user_id is the chat/completions §3.1 form, ignored on /v1/messages).
     REQUIRE(body["metadata"]["user_id"] == "aliasagent");
 }
@@ -361,9 +361,13 @@ TEST_CASE("HTTP: thinking disabled when mode is not adaptive", "[http_client][th
     REQUIRE(body["max_tokens"] == 4096);
 }
 
-// Summary-profile request (compaction): thinking disabled + max_tokens capped at
-// 1024 (overrides the 4096 non-adaptive default). Spec: "Summary profile caps
-// max_tokens — max_tokens is 512-1024, overriding the 4096 non-adaptive default."
+// Summary-profile request (compaction): thinking disabled, and NO output-length
+// constant of this codebase's own. This case used to assert
+// `body["max_tokens"] == 1024`; that constant was removed on 2026-09-20 because
+// the summary length is not something this design gets to pin (the model/endpoint
+// default applies, and "smaller than what it replaced" is enforced by measuring
+// the real output). The two assertions that carry the real requirement — thinking
+// explicitly disabled, and no output_config — are unchanged.
 TEST_CASE("HTTP: summary profile caps max_tokens", "[http_client][thinking]") {
     MockServer server;
     server.start(fixture("text_delta.txt"));
@@ -386,7 +390,43 @@ TEST_CASE("HTTP: summary profile caps max_tokens", "[http_client][thinking]") {
     REQUIRE(body.contains("thinking"));
     REQUIRE(body["thinking"]["type"] == "disabled");
     REQUIRE(!body.contains("output_config"));
-    REQUIRE(body["max_tokens"] == 1024);         // within the 512-1024 window
+    const bool still_sends_the_design_constant =
+        body.contains("max_tokens") && body["max_tokens"] == 1024;
+    REQUIRE_FALSE(still_sends_the_design_constant);
+}
+
+// Summary-profile request (compaction): the output length is NOT pinned by this
+// codebase. A hardcoded max_tokens here would be a design constant nobody asked
+// for, and the sentence "the summary is smaller than what it replaced" is
+// enforced by measuring the real output, not by a number in the request.
+// The assertion may only say "not the constant this design used to send" — it
+// must NOT say "equals 8000/8192": the local API notes document an 8K default
+// only in the chat/completions field table, not for /v1/messages.
+TEST_CASE("HTTP: summary profile leaves max_tokens to the model", "[http_client][thinking]") {
+    MockServer server;
+    server.start(fixture("text_delta.txt"));
+    server.wait_ready();
+
+    ModelGateway gw;
+    gw.set_timeout(5);
+
+    gw.execute(
+        "sk-key", server.base_url().c_str(), "claude-sonnet-4-6",
+        "", VALID_MSG, "",
+        "summary", "",
+        nullptr, nullptr, nullptr, s_done_nop
+    );
+    server.join();
+
+    auto body = json::parse(server.last_body());
+    // Thinking must stay EXPLICITLY disabled (DeepSeek's /v1/messages defaults
+    // thinking to enabled, so absence is NOT a disable).
+    REQUIRE(body.contains("thinking"));
+    REQUIRE(body["thinking"]["type"] == "disabled");
+    REQUIRE(!body.contains("output_config"));
+    const bool still_sends_the_design_constant =
+        body.contains("max_tokens") && body["max_tokens"] == 1024;
+    REQUIRE_FALSE(still_sends_the_design_constant);
 }
 
 TEST_CASE("HTTP: thinking disabled with empty mode string", "[http_client][thinking]") {

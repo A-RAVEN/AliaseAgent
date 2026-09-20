@@ -114,9 +114,9 @@ void main() {
       final mgr = FakeMessageRepository();
       final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
       final summaryProvider = FakeSummaryProvider();
-      // Seed a couple of messages so turn 1 is UNDER the fold budget (no inline
-      // fold), then grow the conversation out-of-band so the IDLE fold sees an
-      // over-budget history.
+      // Seed a couple of messages so turn 1 is UNDER the model context allowance
+      // (no inline fold), then grow the conversation out-of-band so the IDLE fold
+      // sees a history that has passed the threshold.
       await growConversation(mgr, 2);
 
       await tester.pumpWidget(buildApp(

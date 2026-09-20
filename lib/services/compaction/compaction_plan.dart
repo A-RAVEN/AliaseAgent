@@ -1,5 +1,6 @@
 import 'dart:math';
 
+import '../../models/agent_type_config.dart';
 import '../../models/message.dart';
 import '../context_estimator.dart';
 
@@ -45,12 +46,31 @@ class CompactionSegment {
   });
 
   bool get isClosed => reuse != null;
+
+  /// True when this segment may be an input to a level-2 roll-up (合成一条更粗的
+  /// 摘要). Only level-1 summaries qualify: level 2 and above are frozen — rolling
+  /// a level-2 into another level-2 would make it "a summary of a summary plus
+  /// more", which this design does not do (two levels only).
+  ///
+  /// Note this says nothing about whether the segment still COUNTS AS COVERED. It
+  /// always does: every loaded node's span is already covered, so the verbatim
+  /// (原文) under it is never compressed a second time.
+  bool get rollable => summary && level == 1;
 }
 
 /// A conversation segment already delimited by two cut markers — FIXED history
 /// (progressive closure). Its content and summary never change: the reuse-gate
 /// MUST always cache-hit it and never re-summarize it. Persisted in
 /// `summary_nodes`, keyed by its covered (start_seq, end_seq) span.
+///
+/// "Never re-summarized" means the ORIGINAL conversation under it is never
+/// compressed again. It does NOT mean the summary text is out of play: a level-1
+/// summary may still be an input to a level-2 roll-up ([rollable]), and the two
+/// kinds differ only in that respect:
+///  - [level] == 1 → rollable: may be combined with other level-1 summaries into
+///    one coarser level-2 summary (its stored text is reused verbatim; the
+///    original messages are still never re-compressed).
+///  - [level] >= 2 → frozen: never an input to another roll-up (two levels only).
 class ClosedSummary {
   final int level; // 1 = level-1 summary, 2 = level-2 summary (for cache lookup)
   final int coveredMinSeq;
@@ -62,6 +82,9 @@ class ClosedSummary {
     required this.coveredMaxSeq,
     required this.tokenCost,
   });
+
+  /// Whether this already-persisted summary may be rolled up into a level-2.
+  bool get rollable => level == 1;
 }
 
 /// The deterministic fold plan (decision/execution separation).
@@ -104,13 +127,26 @@ class CompactionPlan {
 /// gradient is a pure function of segment index + config. Phase 1 reduced to a
 /// single root summary; this generalizes to multiple level-1 segments.
 class CompactionEngine {
-  /// Batch threshold (design D3/D4): a batch is cut when its accumulated RAW
-  /// proxy token total exceeds `T = maxContextTokens ~/ 2`. Half the budget is a
-  /// structural, tunable knob ("doesn't need to be precise"); boundaries are
-  /// pure/deterministic (raw tokens are additive). No compression-ratio assumed
-  /// (no `/4`) — a summary's size is only known after the summarization call and
-  /// SHALL be measured at runtime ([_foldTail] only fixes batch boundaries).
-  static int _batchThreshold(int maxContextTokens) => maxContextTokens ~/ 2;
+  /// The compaction threshold — the ONLY place it is computed.
+  ///
+  /// It is always DERIVED from the model's context window and a percentage:
+  /// `maxContextTokens × percent ÷ 100` (100 万 token 的窗口、25% ⇒ 25 万 token）。
+  /// There is deliberately no absolute token number here: the user pinned "only a
+  /// token threshold, and the threshold must be the model window times a
+  /// percentage" (see `TODO.md`, the locked original requirement). A missing or
+  /// illegal [percent] falls back to
+  /// [AgentTypeConfig.kDefaultCompactionThresholdPercent].
+  ///
+  /// Every consumer of the threshold calls this: where a batch is cut, how much
+  /// newest content stays verbatim, and when accumulated summary tokens roll up
+  /// into a level-2 summary.
+  static int thresholdTokens(int maxContextTokens, int? percent) {
+    if (maxContextTokens <= 0) return 0;
+    final p = (percent != null && percent > 0 && percent <= 100)
+        ? percent
+        : AgentTypeConfig.kDefaultCompactionThresholdPercent;
+    return (maxContextTokens * p) ~/ 100;
+  }
 
   /// Build the fold plan for a conversation.
   ///
@@ -124,6 +160,7 @@ class CompactionEngine {
     required int maxContextTokens,
     List<ClosedSummary> closed = const [],
     L1SeamChooser? seamChooser,
+    int? thresholdPercent,
   }) {
     final t = _tailOf(history, closed, maxContextTokens);
     final frozenCost = closed.fold(0, (m, c) => m + c.tokenCost);
@@ -137,8 +174,11 @@ class CompactionEngine {
           reuse: c,
         ),
     ];
-    final tailPlan =
-        _foldTail(t.tail, t.budget, _batchThreshold(maxContextTokens), seamChooser);
+    final tailPlan = _foldTail(
+        t.tail,
+        t.budget,
+        thresholdTokens(maxContextTokens, thresholdPercent),
+        seamChooser);
     return CompactionPlan(
       segments: [
         ...closedSegments,
@@ -152,22 +192,24 @@ class CompactionEngine {
   /// The (far, k) seam inputs the runtime needs to PREFETCH/MEMOIZE the LLM
   /// level-1 seams (design D5 option A) BEFORE building the final plan.
   ///
-  /// Mirrors the pure decision inside [_foldTail] (closed floor → tail → greedy
-  /// foldEnd → far → k) so the seam memo key computed here equals the far span +
-  /// k that `_batchL1(far, T, seamChooser)` will re-derive internally.
+  /// Mirrors the pure decision inside [_foldTail] (closed floor → tail → foldEnd
+  /// → far → k) so the seam memo key computed here equals the far span + k that
+  /// `_batchL1(far, T, seamChooser)` will re-derive internally. Both go through
+  /// [_foldEndFor], so they cannot drift apart.
   /// Still a pure function — it only exposes the seam inputs so the LLM seam can
   /// be computed once (memoized), then replayed deterministically. Returns null
-  /// when there is nothing to fold (empty tail / under budget).
+  /// when there is nothing to fold (empty tail / below the threshold and within
+  /// the budget).
   static ({List<Message> far, int k})? resolveFoldSeamInputs({
     required List<Message> history,
     required int maxContextTokens,
     List<ClosedSummary> closed = const [],
+    int? thresholdPercent,
   }) {
     final t = _tailOf(history, closed, maxContextTokens);
     if (t.tail.isEmpty) return null;
-    if (ContextEstimator.estimateConversation(t.tail) <= t.budget) return null;
-    final T = _batchThreshold(maxContextTokens);
-    final foldEnd = _nominalFoldEnd(t.tail, T);
+    final T = thresholdTokens(maxContextTokens, thresholdPercent);
+    final foldEnd = _foldEndFor(t.tail, t.budget, T);
     if (foldEnd <= 0) return null;
     final far = t.tail.sublist(0, foldEnd);
     if (far.isEmpty) return null;
@@ -205,11 +247,17 @@ class CompactionEngine {
   /// Fold plan for the not-yet-closed tail: far span batched into level-1
   /// summary segments, near span kept verbatim (newest).
   ///
+  /// TRIGGER (design D4, the user's pinned rule): folding starts as soon as
+  /// accumulated RAW content passes the threshold [T] — it does NOT wait for the
+  /// window to fill up. The model capacity ([budget]) is only the STOP/OMIT
+  /// bound: if the projection still does not fit after folding and rolling up,
+  /// the oldest part is left out of THIS request (data stays on disk).
+  ///
   /// Pure/deterministic STRUCTURE only (design D4): it fixes the batch
   /// boundaries (accumulated RAW token > T, oldest-first) and which newest
   /// content stays verbatim. It does NOT estimate any summary's size (no `/4`),
   /// so [projectedTokens] is the RAW trigger size — the real post-compaction
-  /// budget fit is measured at runtime by the measure→adjust loop (⑪.3), which
+  /// budget fit is measured at runtime by the measure→adjust loop, which
   /// performs the level-2 coarsening and oldest-omit.
   static CompactionPlan _foldTail(
       List<Message> messages, int budget, int T, L1SeamChooser? seamChooser) {
@@ -218,7 +266,10 @@ class CompactionEngine {
           segments: [], projectedTokens: 0, shouldCompact: false);
     }
     final totalProxy = ContextEstimator.estimateConversation(messages);
-    if (totalProxy <= budget) {
+    final foldEnd = _foldEndFor(messages, budget, T);
+    if (foldEnd <= 0) {
+      // Nothing accumulated past the threshold AND the tail fits the budget:
+      // send it verbatim, no compaction.
       return CompactionPlan(
         segments: [CompactionSegment(messages: List.of(messages), summary: false)],
         projectedTokens: totalProxy,
@@ -226,34 +277,6 @@ class CompactionEngine {
       );
     }
 
-    // Nominal far/near split: keep a bounded NEWEST (recent-chunk) span verbatim
-    // (raw ≤ T = maxContextTokens~/2 — the spec's "which newest content stays
-    // verbatim", a recent-chunk cap, not "all newest up to budget"), fold the older
-    // rest. Runtime refines the budget fit via measurement (⑪.3). Safe-aligned
-    // inside [_nominalFoldEnd] so the near span begins on a legal cut point (never
-    // splits a tool round).
-    var foldEnd = _nominalFoldEnd(messages, T);
-    // Heavy-closed edge (budget < T, so the whole tail's raw ≤ T but > budget):
-    // _nominalFoldEnd returns 0 — every message fits the batch threshold, so all
-    // would be verbatim, but raw > budget so we MUST fold to fit. Fold only the
-    // OLDER content and KEEP a bounded NEWEST-verbatim tail (D3/D4 "最新始终
-    // verbatim" — never fold the newest): grow verbatim from the newest while its
-    // raw ≤ budget, then safe-align. A single newest message > budget is folded
-    // anyway (D3's documented pathological known-limit), not dropped.
-    if (foldEnd <= 0) {
-      foldEnd = messages.length;
-      var acc = 0;
-      for (var i = messages.length - 1; i >= 0; i--) {
-        final mCost = ContextEstimator.estimateMessage(messages[i]);
-        if (acc + mCost <= budget) {
-          acc += mCost;
-          foldEnd = i;
-        } else {
-          break;
-        }
-      }
-      foldEnd = _alignToSafeBoundary(messages, foldEnd);
-    }
     // far[0] (the fold's first message) is EXEMPT from "never begin a summary on an
     // assistant carrying tool_calls": it is the fold's FIRST message, so there is no
     // foldable message before it to split a tool round WITH — its synthetic
@@ -277,23 +300,59 @@ class CompactionEngine {
     );
   }
 
-  /// Nominal verbatim (near) split: keep the newest messages verbatim while the
-  /// accumulated RAW token total stays ≤ [T] (= maxContextTokens~/2, a bounded
-  /// recent-chunk cap — the spec's "which newest content stays verbatim"); the
-  /// remaining older messages are the fold (far) span. Safe-boundary aligned (near
-  /// never starts mid-tool). Shared by [_foldTail] and [resolveFoldSeamInputs].
-  static int _nominalFoldEnd(List<Message> messages, int T) {
-    var foldEnd = messages.length;
+  /// Where the foldable (far) span ends — the SINGLE definition shared by
+  /// [_foldTail] and [resolveFoldSeamInputs] so the plan and the seam inputs can
+  /// never disagree. Returns 0 when there is nothing to fold.
+  ///
+  /// Normal rule (design D4): cut every batch whose accumulated RAW passes the
+  /// threshold [T], oldest-first; what is left after the last complete batch is
+  /// the verbatim tail. Returns 0 when not even the oldest content reaches [T] —
+  /// i.e. the threshold has not been crossed and there is nothing to fold.
+  ///
+  /// Fallback (capacity as the stop/omit bound): when the threshold is NOT
+  /// reached but the tail still does not fit [budget] (frozen closed summaries
+  /// already consumed most of the window), fold the OLDER content and keep a
+  /// bounded NEWEST-verbatim tail (grow verbatim from the newest while its raw
+  /// stays within [budget], then safe-align). A single newest message larger than
+  /// [budget] is folded anyway (the documented pathological case), never dropped.
+  static int _foldEndFor(List<Message> messages, int budget, int T) {
+    var foldEnd = _nominalFoldEnd(messages, T);
+    if (foldEnd > 0) return foldEnd;
+    if (ContextEstimator.estimateConversation(messages) <= budget) return 0;
+    foldEnd = messages.length;
     var acc = 0;
     for (var i = messages.length - 1; i >= 0; i--) {
       final mCost = ContextEstimator.estimateMessage(messages[i]);
-      if (acc + mCost <= T) {
+      if (acc + mCost <= budget) {
         acc += mCost;
         foldEnd = i;
       } else {
         break;
       }
     }
+    return _alignToSafeBoundary(messages, foldEnd);
+  }
+
+  /// Nominal verbatim (near) split under the threshold rule: cut [messages] into
+  /// batches from the OLDEST, starting a new batch whenever the accumulated RAW
+  /// total passes [T]; the START index of the LAST (incomplete, sub-threshold)
+  /// chunk is the returned fold end — everything before it folds, that trailing
+  /// chunk stays verbatim. Returns 0 when no batch ever passes [T] (nothing to
+  /// fold). Safe-boundary aligned (the verbatim tail never starts mid-tool round).
+  /// Shared by [_foldTail] and [resolveFoldSeamInputs].
+  static int _nominalFoldEnd(List<Message> messages, int T) {
+    var foldEnd = 0;
+    var acc = 0;
+    var chunkStart = 0;
+    for (var i = 0; i < messages.length; i++) {
+      acc += ContextEstimator.estimateMessage(messages[i]);
+      if (acc > T) {
+        chunkStart = i + 1;
+        acc = 0;
+      }
+    }
+    foldEnd = chunkStart;
+    if (foldEnd <= 0) return 0;
     return _alignToSafeBoundary(messages, foldEnd);
   }
 
@@ -394,17 +453,16 @@ class CompactionEngine {
   }
 
   /// The minimum RAW proxy-token size a seam-cut batch must have for the seam to
-  /// be accepted (design D5 size guard, 2026-09-01). `max(1, T~/2, 1025)`: 1025 is
-  /// the summary profile's `max_tokens` (1024) + 1 — the true compressibility
-  /// floor (only a batch with raw > 1024 is guaranteed to have a smaller summary).
-  /// `T~/2` — the "≈T batch" intuition — can dip below 1024 under a small or
-  /// self-tuned budget, so we take the max. A batch smaller than this CANNOT
-  /// compress (a summary is at most 1024 ≥ the batch), so `_resolveOpenLevel1`'s
-  /// split-if-invalid would bloat-omit it — dropping a re-execution key. Only a
-  /// small budget (where every batch is < 1025) makes the seam always fall back to
-  /// the deterministic arithmetic skeleton — the design's acknowledged
-  /// small-conversation case (no topic micro-adjust needed there).
-  static int _minBatchRaw(int T) => max(1, max(T ~/ 2, 1025));
+  /// be accepted (design D5 size guard): half the threshold. It is DERIVED, and
+  /// deliberately carries no absolute token number — a hardcoded floor (this used
+  /// to be `max(T ~/ 2, 1025)`, where 1025 was the old hardcoded summary length
+  /// plus one) silently disabled seam selection for every window whose threshold
+  /// fell below 2050, and it contradicted the rule that the only threshold knob is
+  /// the model window times a percentage (see the locked requirement in TODO.md).
+  /// A batch smaller than this CANNOT compress (the summary would be at least as
+  /// large as the batch), so `_resolveOpenLevel1`'s split-if-invalid would
+  /// bloat-omit it — dropping a re-execution key.
+  static int _minBatchRaw(int T) => max(1, T ~/ 2);
 
   /// Design D5 size guard: EVERY seam-cut batch must be ≥ [_minBatchRaw]. A seam
   /// that isolates a tiny batch (e.g. the AI carving out a small, distinct topic
@@ -494,10 +552,13 @@ class CompactionEngine {
   static int rawTokens(List<Message> msgs) => ContextEstimator.estimateConversation(msgs);
 
   /// How many of the OLDEST summary entries roll into ONE level-2 "summary of
-  /// summaries" group (design D3/D4): accumulate the oldest entries' MEASURED
-  /// [tokens] from the start and cut when the running sum first exceeds the
-  /// threshold [T] (0 → empty input). Pure + deterministic given measured sizes;
-  /// a single entry already exceeding T yields a group of 1.
+  /// summaries" group (design D2/D3/D4): accumulate the oldest entries' MEASURED
+  /// [tokens] from the start and cut at the first running sum that EXCEEDS the
+  /// threshold [T]. Returns 0 when the whole input never exceeds [T] — the
+  /// threshold is the only criterion, so "not enough yet" must be distinguishable
+  /// from "enough to roll up" (a count of entries is NOT a criterion). A single
+  /// entry already exceeding T yields a group of 1. Pure + deterministic given
+  /// measured sizes.
   static int l2GroupCount(List<int> tokens, int T) {
     if (tokens.isEmpty) return 0;
     var acc = 0;
@@ -505,7 +566,7 @@ class CompactionEngine {
       acc += tokens[i];
       if (acc > T) return i + 1;
     }
-    return tokens.length;
+    return 0;
   }
 
   /// [startSeq, endSeq] span of a segment's messages, for recording an L2's

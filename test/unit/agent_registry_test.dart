@@ -136,5 +136,54 @@ void main() {
       final result = resolver.resolve('openai');
       expect(result, isNull);
     });
+
+    // ── 上下文压缩阈值百分比（配置键 compaction_threshold_percent）─────
+    // 阈值 = 模型能装下的上下文总量 × 这个百分比 ÷ 100（用户钉死的规则：
+    // 只设 token 阈值、阈值由容量乘百分比算出）。缺省 25 表示配置里不写这项
+    // 就按 25% 算。下面三例覆盖「有值 / 没有这一项 / 值非法」。
+    group('compactionThresholdPercent', () {
+      test('reads an explicit compaction_threshold_percent from JSON', () {
+        final config = AgentTypeConfig.fromJson('general', {
+          'provider': 'anthropic',
+          'model': 'claude-sonnet-4-6',
+          'system_prompt': '',
+          'max_context_tokens': 1000000,
+          'compaction_threshold_percent': 10,
+        });
+        // ignore: avoid_print
+        print('  [OBS] explicit percent -> ${config.compactionThresholdPercent}');
+        expect(config.compactionThresholdPercent, 10);
+      });
+
+      test('defaults to 25 when compaction_threshold_percent is absent', () {
+        final config = AgentTypeConfig.fromJson('general', {
+          'provider': 'anthropic',
+          'model': 'claude-sonnet-4-6',
+          'system_prompt': '',
+          'max_context_tokens': 1000000,
+        });
+        // ignore: avoid_print
+        print('  [OBS] absent percent -> ${config.compactionThresholdPercent}');
+        expect(config.compactionThresholdPercent, 25,
+            reason: 'a config without the key falls back to 25%');
+      });
+
+      test('falls back to 25 for illegal values (0 / over 100 / not an integer)', () {
+        for (final bad in <Object>['abc', 0, -5, 101, 12.5, true]) {
+          final config = AgentTypeConfig.fromJson('general', {
+            'provider': 'anthropic',
+            'model': 'claude-sonnet-4-6',
+            'system_prompt': '',
+            'max_context_tokens': 1000000,
+            'compaction_threshold_percent': bad,
+          });
+          // ignore: avoid_print
+          print('  [OBS] illegal percent $bad -> '
+              '${config.compactionThresholdPercent}');
+          expect(config.compactionThresholdPercent, 25,
+              reason: 'illegal value $bad must fall back to the 25% default');
+        }
+      });
+    });
   });
 }

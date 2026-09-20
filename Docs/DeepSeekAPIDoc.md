@@ -1,8 +1,15 @@
 # DeepSeek API 参考文档
 
-> **抓取时间**: 2026-09-10
-> **来源**: DeepSeek 官方 API 文档站（`https://api-docs.deepseek.com/zh-cn/`），本文全部内容均由 `web_fetch` 于本次实际抓取（见 §8 来源表），逐字搬运，**未使用任何记忆、先验知识或推测内容**。
-> **已知缺口**: 官方「对话补全 API」页面在抓取时被工具截断，其响应示例 JSON 与 `200 (Streaming)` 部分**未能抓取到**，已在 §3.4 / §8 明确标注；官方「思考模式」页面同样在末尾被截断（§2.7）。
+> **抓取时间**: 2026-09-20 14:53（UTC+8）
+> **来源**: DeepSeek 官方 API 文档站（`https://api-docs.deepseek.com/zh-cn/`）。本文全部官方内容均由 `web_fetch` 与 `curl.exe` 于本次实际抓取（见 §8 来源表），逐字搬运，**未使用任何记忆、先验知识或推测内容**。
+> **保留的非官方内容**: §2.7.5「本地实测记录（非官方抓取）」是本项目本地 live 探测结论，**不是官方文档内容**，已原样保留并保留其标注。
+>
+> **本次（2026-09-20）相对上一版（2026-09-10）的抓取变化**
+>
+> 1. **上一版的截断缺口本次已全部补齐。** 上一版记录的「`create-chat-completion` 页被工具截断，响应示例 JSON 与 `200 (Streaming)` 未能抓取到」，本次改用 `curl.exe` 取原始 HTML 后**已完整取得**（见 §3.3–§3.7）。原因：截断是 `web_fetch` 工具的正文长度上限所致，不是服务端缺内容。
+> 2. **上一版 §2.7.1 的「控制表列归属无法确定」已解决。** 本次从 HTML 的 `colspan` / `rowspan` 精确确认了三列归属（见 §2.7.1）。
+> 3. **官方「首次调用 API」页删除了 `deepseek-v4-pro` 的下线/路由脚注 (2)**，`model` 行现在只带脚注 (1)（见 §1.1 的变化提示）。
+> 4. **本项目 §2.7.5 的实测结论与本次确认后的官方表格不再冲突**，说明见 §2.7.5 末尾的补充段落。
 
 ---
 
@@ -17,24 +24,27 @@ DeepSeek API 使用与 OpenAI/Anthropic 兼容的 API 格式，通过修改配�
 | base_url (OpenAI) | `https://api.deepseek.com` |
 | base_url (Anthropic) | `https://api.deepseek.com/anthropic` |
 | api_key | 申请一个 [API key](https://platform.deepseek.com/api_keys) |
-| model | `deepseek-flash`(1)<br>`deepseek-v4-pro`(2) |
+| model | `deepseek-flash`(1)<br>`deepseek-v4-pro` |
 
 (1) 模型名请使用 `deepseek-flash`。旧模型名 `deepseek-v4-flash`、`deepseek-v4-flash-vision-exp` 仍可调用，但对应模型已下线，请求将由 DeepSeek-V4.1-Flash 模型提供服务，并按 Flash 价格计费。
 
-(2) 经多方测试，V4.1 Flash 在性能、费用、速度、总用时等各项指标上已全面超越 V4 Pro，因此我们计划有序下线 V4 Pro。北京时间 2026 年 9 月 14 日 12:00 之后，至未来 V4.1 Pro 上线之前，您访问 `deepseek-v4-pro` 的请求将全部路由到 V4.1 Flash，并按 V4.1 Flash 价格计费。
+> **本次抓取发现的变化（如实记录）**：上一版（抓取于 2026-09-10）此处另有一条脚注 **(2)**，大意为「V4.1 Flash 已全面超越 V4 Pro，计划有序下线 V4 Pro；北京时间 2026 年 9 月 14 日 12:00 之后，`deepseek-v4-pro` 的请求将全部路由到 V4.1 Flash，并按 V4.1 Flash 价格计费」。
+>
+> **本次抓取（`web_fetch` 与 `curl.exe` 原始 HTML 双向核对）该脚注已不存在**：`model` 单元格只带 `(1)`，全页检索不到「9 月 14」「路由」「V4 Pro」字样（「V4.1」仅出现在脚注 (1) 的 `DeepSeek-V4.1-Flash` 中）。因此**本文件不再保留该「下线 / 路由到 V4.1 Flash」说法**，如需该信息请以官方页面当前显示为准。
 
 > 补充（来自 §4 Tool Calls 页面）：`strict` 模式等 Beta 功能需要设置 `base_url="https://api.deepseek.com/beta"` 来开启。（原文见 §4.4）
 
 ### 1.2 可用模型列表
 
+官方「首次调用 API」页只给出 §1.1 表格中 `model` 一行的两个取值；官方「对话补全 API」页对 `model` 字段的枚举值为 **Possible values:** [`deepseek-flash`, `deepseek-v4-pro`]（见 §3.1）。
+
 | 模型 ID | 说明（原文照录） |
 | --- | --- |
-| `deepseek-flash` | 官方推荐使用的模型名 |
-| `deepseek-v4-pro` | 计划有序下线；2026-09-14 12:00（北京时间）后请求全部路由到 V4.1 Flash，并按 V4.1 Flash 价格计费 |
+| `deepseek-flash` | 官方推荐使用的模型名（脚注 (1)：「模型名请使用 `deepseek-flash`」） |
+| `deepseek-v4-pro` | 与 `deepseek-flash` 并列为 `model` 字段的合法取值；官方「使用 Anthropic API」页称 claude-opus 开头的模型名会映射到它，且「按 V4 Pro 价格计费」（见 §2.2） |
+| `deepseek-v4-flash`、`deepseek-v4-flash-vision-exp` | 旧模型名，仍可调用，但对应模型已下线，请求将由 DeepSeek-V4.1-Flash 模型提供服务，并按 Flash 价格计费（脚注 (1) 原文） |
 
-> 官方「对话补全 API」页面对 `model` 字段的枚举值为：**Possible values:** [`deepseek-flash`, `deepseek-v4-pro`]（详见 §3.1）。
->
-> **注意**：当您给 DeepSeek 的 Anthropic API 传入不支持的模型名时，API 后端会自动将其映射到 `deepseek-flash` 模型。
+> **注意**：当您给 DeepSeek 的 Anthropic API 传入不支持的模型名时，API 后端会自动将其映射到 `deepseek-flash` 模型。（§2.1 原文）
 
 ### 1.3 接入 Agent 工具
 
@@ -45,6 +55,8 @@ DeepSeek API 已接入多种主流 AI Agent 与编程助手工具。如果你使
 ### 1.4 调用对话 API（OpenAI 格式，curl）
 
 在创建 API key 之后，你可以使用以下样例脚本，通过 OpenAI API 格式来访问 DeepSeek 模型。样例为非流式输出，您可以将 stream 设置为 true 来使用流式输出。
+
+官方页面在本节提供 `curl` / `python` / `nodejs` 三个标签页，本文件照录 `curl` 标签页（原文另有一句：「Anthropic API 格式的访问样例，请参考 [Anthropic API](https://api-docs.deepseek.com/zh-cn/guides/anthropic_api)」）：
 
 ```bash
 curl https://api.deepseek.com/chat/completions \
@@ -62,7 +74,7 @@ curl https://api.deepseek.com/chat/completions \
       }'
 ```
 
-> 抓取说明：官方页面的 curl 代码块在被 `web_fetch` 提取时换行被压平为一行；以上按语句边界还原了换行，**未增删任何字符内容**。全文所有还原换行的代码块同理（§2.7、§4.1 已另行标注）。
+> 抓取说明：官方页面的代码块在 `web_fetch` 提取时换行被压平为一行；以上按语句边界还原了换行，**未增删任何字符内容**。全文所有还原换行的代码块同理（§2.1、§2.7.2、§4.1 已另行标注）。
 
 ---
 
@@ -71,6 +83,8 @@ curl https://api.deepseek.com/chat/completions \
 为了满足大家对 Anthropic API 生态的使用需求，我们的 API 新增了对 Anthropic API 格式的支持，其 `base_url` 为 `https://api.deepseek.com/anthropic`。
 
 通过简单的配置，即可将 DeepSeek 的能力，接入到 Anthropic API 生态中。
+
+官方本页在开头另有一小节「将 DeepSeek 模型接入 Claude Code」，正文仅为一句指引：请参考 [接入 Claude Code](https://api-docs.deepseek.com/zh-cn/quick_start/agent_integrations/claude_code)。（该指南页不在本次抓取范围内，本文件未收录其内容。）
 
 ### 2.1 通过 Anthropic API 调用 DeepSeek 模型
 
@@ -120,9 +134,11 @@ print(message.content)
 - claude-opus 开头的模型，会映射到 `deepseek-v4-pro`
 - claude-haiku、claude-sonnet 开头的模型，会映射到 `deepseek-flash`
 
-claude-opus 映射到的 `deepseek-v4-pro` 在 2026 年 9 月 14 日 12:00 之前仍按 V4 Pro 价格计费；此后 `deepseek-v4-pro` 也将路由到 V4.1 Flash，并按 Flash 价格计费。
+claude-opus 映射到的 `deepseek-v4-pro` 按 V4 Pro 价格计费。
 
 通过这样的映射，您在使用新版 Claude Desktop APP 的 developer 模式时，可以绕过 APP 对模型名的限制，只需改动 base_url 和 api_key，即可在其中接入 DeepSeek 模型。
+
+> **本次抓取发现的变化**：上一版此处的原文为「claude-opus 映射到的 `deepseek-v4-pro` 在 2026 年 9 月 14 日 12:00 之前仍按 V4 Pro 价格计费；此后 `deepseek-v4-pro` 也将路由到 V4.1 Flash，并按 Flash 价格计费」。**本次抓取到的原文已不含该时间点与路由说法**，只剩「按 V4 Pro 价格计费」。中英文两版一致（英文："The claude-opus mapping points to `deepseek-v4-pro`, which is billed at the V4 Pro price."）。
 
 ### 2.3 HTTP Header
 
@@ -151,6 +167,8 @@ claude-opus 映射到的 `deepseek-v4-pro` 在 2026 年 9 月 14 日 12:00 之�
 | top_k | 忽略 |
 | top_p | 仅思考模式下生效（下限为 `0.95`）；非思考模式下恒为 `1.0` |
 
+> **本次抓取未发现变化**：上表 14 行与上一版逐字一致；英文版（`https://api-docs.deepseek.com/guides/anthropic_api`）的 Simple Fields 表 14 行亦逐条对应——`model` = "Use DeepSeek Model Instead"、`max_tokens` = "Fully Supported"、`container` / `mcp_servers` / `service_tier` / `top_k` = "Ignored"、`metadata` = "`user_id` is supported, others are ignored"、`stop_sequences` / `stream` / `system` = "Fully Supported"、`temperature` = "Fully Supported (range \[0.0 ~ 2.0\])"、`thinking` = "Supported (`budget_tokens` is ignored)"、`output_config` = "Only `effort` is supported"、`top_p` = "Only takes effect in thinking mode (with a lower bound of `0.95`); in non-thinking mode it is fixed at `1.0`"。
+
 ### 2.5 Tool 字段（Tool Fields）
 
 #### tools
@@ -170,6 +188,8 @@ claude-opus 映射到的 `deepseek-v4-pro` 在 2026 年 9 月 14 日 12:00 之�
 | auto | 支持（`disable_parallel_tool_use` 被忽略） |
 | any | 支持（`disable_parallel_tool_use` 被忽略） |
 | tool | 支持（`disable_parallel_tool_use` 被忽略） |
+
+> **中英文对照核验**：英文版 `tools` 表为 name / input_schema / description = "Fully Supported"、cache_control = "Ignored"；`tool_choice` 表为 none = "Fully Supported"，auto / any / tool = "Supported (`disable_parallel_tool_use` is ignored)"。与中文版逐条一致。
 
 ### 2.6 Message 字段（Message Fields，完整对照表）
 
@@ -201,20 +221,32 @@ claude-opus 映射到的 `deepseek-v4-pro` 在 2026 年 9 月 14 日 12:00 之�
 
 > **表格结构说明**：官方页面的 Message Fields 表为 4 列（`字段 | 变体 | 子字段 | 支持情况`），其中「字段」列首行为 `content`，后续各行的该列为空白（同一 `content` 字段的各个变体）。上表已按此逻辑显式补齐 `content`，**未合并、未删减任何变体或子字段**，支持情况文字逐字照录。
 >
-> **中英文对照核验**：本次同时抓取了英文版 `https://api-docs.deepseek.com/guides/anthropic_api`，其上列 HTTP Header / Simple Fields / Tool Fields / Message Fields 四张表与中文版条目一一对应、内容一致（英文为 "Fully Supported / Ignored / Not Supported / Supported"），可交叉确证。
+> **中英文对照核验**：本次同时抓取了英文版 `https://api-docs.deepseek.com/guides/anthropic_api`，其上 HTTP Header / Simple Fields / Tool Fields / Message Fields 四张表与中文版条目一一对应、内容一致（英文为 "Fully Supported / Ignored / Not Supported / Supported"），可交叉确证。
 
 ### 2.7 思考模式（Thinking）相关（来自官方「思考模式」指南）
 
+官方页面开头原文：DeepSeek 模型支持思考模式：在输出最终回答之前，模型会先输出一段思维链内容，以提升最终答案的准确性。
+
 #### 2.7.1 思考模式开关与思考强度控制
 
-官方页面原始表格为 4 列（空表头 + OpenAI 格式 / Anthropic 格式 / Responses API 格式），抓取时部分空单元格丢失，**列归属无法完全确定**。以下按抓取到的原始单元格顺序照录：
+官方表格结构（**本次已从页面 HTML 的 `colspan` / `rowspan` 精确确认，不再存在列归属歧义**）：
 
-| 项 | 抓取到的控制参数 |
-| --- | --- |
-| 思考模式开关(1) | `{"thinking": {"type": "enabled/disabled"}}`；`{"reasoning": {"effort": "none/low/high/max"}}`（none 表示关闭思考模式） |
-| 思考强度控制(2) | `{"reasoning_effort": "low/high/max"}`；`{"output_config": {"effort": "low/high/max"}}` |
+| （行标签） | 控制参数（OpenAI 格式） | 控制参数（Anthropic 格式） | 控制参数（Responses API 格式） |
+| --- | --- | --- | --- |
+| 思考模式开关(1) | `{"thinking": {"type": "enabled/disabled"}}` | （同左：该单元格 `colspan="2"`，同时覆盖 OpenAI 与 Anthropic 两列） | `{"reasoning": {"effort": "none/low/high/max"}}`<br>(none 表示关闭思考模式) |
+| 思考强度控制(2) | `{"reasoning_effort": "low/high/max"}` | `{"output_config": {"effort": "low/high/max"}}` | （由上一行的 `rowspan="2"` 覆盖，即同为 `{"reasoning": {"effort": ...}}`） |
+
+> **列归属的证据（原文 HTML 结构）**：
+>
+> - 表头行 4 个单元格：空 / `控制参数（OpenAI 格式）` / `控制参数（Anthropic 格式）` / `控制参数（Responses API 格式）`；
+> - 「思考模式开关」行的 `{"thinking": {"type": "enabled/disabled"}}` 单元格带 **`colspan="2"`** ⇒ 它同时属于 **OpenAI 格式列与 Anthropic 格式列**；
+> - 「思考模式开关」行的 `{"reasoning": {"effort": "none/low/high/max"}}` 单元格带 **`rowspan="2"`** ⇒ 它只属于 **Responses API 格式列**，并被下一行共用；
+> - 「思考强度控制」行的两个单元格分别是 `{"reasoning_effort": "low/high/max"}`（OpenAI 列）与 `{"output_config": {"effort": "low/high/max"}}`（Anthropic 列）。
+>
+> 结论：**Anthropic 格式的开关是 `thinking.type`，强度是 `output_config.effort`；`reasoning.effort` / `reasoning_effort` 都不是 Anthropic 格式的字段。**
 
 (1) 思考模式默认打开，且 effort 默认为 `high`
+
 (2) 用户设置的 effort 与模型推理 effort 映射表如下：
 
 | 请求传入 effort | 实际映射 effort |
@@ -227,13 +259,9 @@ claude-opus 映射到的 `deepseek-v4-pro` 在 2026 年 9 月 14 日 12:00 之�
 | max | max |
 | ultra | max |
 
-> 交叉确证（依据本次抓取到的其它官方页面原文）：
-> - `{"thinking": {"type": ...}}` 属 **OpenAI 格式**：本页示例将其放入 `extra_body`，原文为 `extra_body={"thinking": {"type": "enabled"}}`；
-> - `{"output_config": {"effort": ...}}` 属 **Anthropic 格式**：§2.4 简单字段表载明 Anthropic 的 `output_config`「仅支持 `effort`」；
-> - `{"reasoning": {"effort": ...}}` 与 Responses API 相关：本页表头列名为「Responses API 格式」。
-> 以上仅为**列的归属**提供已抓取原文的旁证；列归属本身在抓取结果中有歧义，如与官方页面显示不一致，请以官方页面为准。
-
 #### 2.7.2 在 OpenAI SDK 中设置 thinking 参数
+
+官方原文：您在 OpenAI SDK 中使用 Chat Completion 设置 thinking 参数时，需要将 thinking 参数传入 `extra_body` 中：
 
 ```
 response = client.chat.completions.create(
@@ -248,20 +276,182 @@ response = client.chat.completions.create(
 
 思考模式不支持 `temperature`、`presence_penalty`、`frequency_penalty` 参数。请注意，为了兼容已有软件，设置参数不会报错，但也不会生效。
 
-`top_p` 在思考模式下生效，但下限为 `0.95`：小于 `0.95` 的值会被抬升至 `0.95`。在非思考模式下，该参数恒为 `1.0`，传入的值会被忽略。
+`top_p` 仅在思考模式下生效，有效取值范围为 0.95–1.0，低于 0.95 的取值会按 0.95 处理。在非思考模式下，该参数恒为 1.0，传入的值会被忽略。
 
 在思考模式下，思维链内容通过 `reasoning_content` 参数返回，与 `content` 同级。在后续轮次的请求中，`reasoning_content` 是否需要回传、是否会被拼接进上下文，取决于请求是否携带 `tools` 参数：
 
-- 若请求**携带 `tools` 参数**：历史轮次的 `reasoning_content` 均应回传给 API，并会被拼接进上下文。
-- 若请求**未携带 `tools` 参数**：`reasoning_content` 无需回传；即使传入 API，也会被忽略，不会拼接进上下文。
+- 若请求**携带 `tools` 参数**：历史轮次的 `reasoning_content` 均应回传给 API，并会被拼接进上下文。详见工具调用。
+- 若请求**未携带 `tools` 参数**：`reasoning_content` 无需回传；即使传入 API，也会被忽略，不会拼接进上下文。详见多轮对话拼接。
+
+##### 多轮对话拼接（官方小节）
+
+在每一轮对话过程中，模型会输出思维链内容（`reasoning_content`）和最终回答（`content`）。如果请求未携带 `tools` 参数，则在下一轮对话中，之前轮输出的思维链内容不会被拼接到上下文中，如下图所示：
+
+（官方此处配有一张示意图；图为前端资源，本文件未收录图片本身。）
+
+官方随后给出「非流式」与「流式」两个标签页的样例代码，原文如下（代码块换行已按语句边界还原，未增删字符）——非流式：
+
+```
+from openai import OpenAI
+client = OpenAI(api_key="<DeepSeek API Key>", base_url="https://api.deepseek.com")
+# Turn 1
+messages = [{"role": "user", "content": "9.11 and 9.8, which is greater?"}]
+response = client.chat.completions.create(
+    model="deepseek-flash",
+    messages=messages,
+    reasoning_effort="high"
+    extra_body={"thinking": {"type": "enabled"}},
+)
+reasoning_content = response.choices[0].message.reasoning_content
+content = response.choices[0].message.content
+# Turn 2
+# The reasoning_content will be ignored by the API
+messages.append(response.choices[0].message)
+messages.append({'role': 'user', 'content': "How many Rs are there in the word 'strawberry'?"})
+response = client.chat.completions.create(
+    model="deepseek-flash",
+    messages=messages,
+    reasoning_effort="high"
+    extra_body={"thinking": {"type": "enabled"}},
+)
+# ...
+```
+
+流式：
+
+```
+from openai import OpenAI
+client = OpenAI(api_key="<DeepSeek API Key>", base_url="https://api.deepseek.com")
+# Turn 1
+messages = [{"role": "user", "content": "9.11 and 9.8, which is greater?"}]
+response = client.chat.completions.create(
+    model="deepseek-flash",
+    messages=messages,
+    stream=True,
+    reasoning_effort="high"
+    extra_body={"thinking": {"type": "enabled"}},
+)
+reasoning_content = ""
+content = ""
+for chunk in response:
+    if chunk.choices[0].delta.reasoning_content:
+        reasoning_content += chunk.choices[0].delta.reasoning_content
+    else:
+        content += chunk.choices[0].delta.content
+# Turn 2
+# The reasoning_content will be ignored by the API
+messages.append({"role": "assistant", "reasoning_content": reasoning_content, "content": content})
+messages.append({'role': 'user', 'content': "How many Rs are there in the word 'strawberry'?"})
+response = client.chat.completions.create(
+    model="deepseek-flash",
+    messages=messages,
+    stream=True,
+    reasoning_effort="high"
+    extra_body={"thinking": {"type": "enabled"}},
+)
+# ...
+```
 
 #### 2.7.4 工具调用（思考模式）
 
-DeepSeek 模型的思考模式支持工具调用功能。模型在输出最终答案之前，可以进行多轮的思考与工具调用，以提升答案的质量。
+DeepSeek 模型的思考模式支持工具调用功能。模型在输出最终答案之前，可以进行多轮的思考与工具调用，以提升答案的质量。其调用模式如下图所示：（官方此处配图，本文件未收录图片本身。）
 
-请注意，携带了 `tools` 参数的请求，在后续所有请求中，必须完整回传 `reasoning_content` 给 API——即使该轮模型未实际进行工具调用。若您的代码中未正确回传 `reasoning_content`，API 会返回 400 报错。
+请注意，携带了 `tools` 参数的请求，在后续所有请求中，必须完整回传 `reasoning_content` 给 API——即使该轮模型未实际进行工具调用。若您的代码中未正确回传 `reasoning_content`，API 会返回 400 报错。正确回传方法请您参考下面的样例代码。
 
-`response.choices[0].message` 携带了 `assistant` 消息的所有必要字段，包括 `content`、`reasoning_content`、`tool_calls`。简单起见，可以直接用如下代码将消息 append 到 messages 结尾：
+官方样例代码（完整照录；代码块换行已按语句边界还原）：
+
+```
+import os
+import json
+from openai import OpenAI
+from datetime import datetime
+# The definition of the tools
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_date",
+            "description": "Get the current date",
+            "parameters": { "type": "object", "properties": {} },
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather of a location, the user should supply the location and date.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": { "type": "string", "description": "The city name" },
+                    "date": { "type": "string", "description": "The date in format YYYY-mm-dd" },
+                },
+                "required": ["location", "date"]
+            },
+        }
+    },
+]
+# The mocked version of the tool calls
+def get_date_mock():
+    return datetime.now().strftime("%Y-%m-%d")
+def get_weather_mock(location, date):
+    return "Cloudy 7~13°C"
+TOOL_CALL_MAP = {
+    "get_date": get_date_mock,
+    "get_weather": get_weather_mock
+}
+def run_turn(turn, messages):
+    sub_turn = 1
+    while True:
+        response = client.chat.completions.create(
+            model='deepseek-flash',
+            messages=messages,
+            tools=tools,
+            reasoning_effort="high",
+            extra_body={ "thinking": { "type": "enabled" } },
+        )
+        messages.append(response.choices[0].message)
+        reasoning_content = response.choices[0].message.reasoning_content
+        content = response.choices[0].message.content
+        tool_calls = response.choices[0].message.tool_calls
+        print(f"Turn {turn}.{sub_turn}\n{reasoning_content=}\n{content=}\n{tool_calls=}")
+        # If there is no tool calls, then the model should get a final answer and we need to stop the loop
+        if tool_calls is None:
+            break
+        for tool in tool_calls:
+            tool_function = TOOL_CALL_MAP[tool.function.name]
+            tool_result = tool_function(**json.loads(tool.function.arguments))
+            print(f"tool result for {tool.function.name}: {tool_result}\n")
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool.id,
+                "content": tool_result,
+            })
+        sub_turn += 1
+    print()
+client = OpenAI(
+    api_key=os.environ.get('DEEPSEEK_API_KEY'),
+    base_url=os.environ.get('DEEPSEEK_BASE_URL'),
+)
+# The user starts a question
+turn = 1
+messages = [{
+    "role": "user",
+    "content": "How's the weather in Hangzhou Tomorrow"
+}]
+run_turn(turn, messages)
+# The user starts a new question
+turn = 2
+messages.append({
+    "role": "user",
+    "content": "How's the weather in Guangzhou Tomorrow"
+})
+run_turn(turn, messages)
+```
+
+官方随后原文说明：
+
+在 Turn 1 的每个子请求中，都携带了该 Turn 下产生的 `reasoning_content` 给 API，从而让模型继续之前的思考。`response.choices[0].message` 携带了 `assistant` 消息的所有必要字段，包括 `content`、`reasoning_content`、`tool_calls`。简单起见，可以直接用如下代码将消息 append 到 `messages` 结尾：
 
 ```
 messages.append(response.choices[0].message)
@@ -278,7 +468,11 @@ messages.append({
 })
 ```
 
-> **抓取缺口**：官方「思考模式」页面（`https://api-docs.deepseek.com/zh-cn/guides/thinking_mode`）在本次抓取中同样被工具截断，其**流式样例代码及其后内容未能抓取到**，本节仅覆盖已抓取到的部分。本页中的长篇样例代码未收录（未抓全，避免断章取义）。
+且在 Turn 2 的请求中，我们仍然携带着 Turn1 所产生的 `reasoning_content` 给 API。
+
+> 官方页面在该样例后另给出「该代码的样例输出」（覆盖 Turn 1.1 / 1.2 / 1.3 与 Turn 2.1 / 2.2 的 `reasoning_content` / `content` / `tool_calls` 实际取值）。那属于运行输出而非接口定义，本文件未逐行转录；如需请查官方页面。
+
+> **抓取情况说明**：上一版记录「官方『思考模式』页面在末尾被 `web_fetch` 截断，其流式样例代码及其后内容未能抓取到」。**本次改用 `curl.exe` 取原始 HTML，该页已完整取得**，上面的多轮对话样例、工具调用样例与说明均为本次实际抓到的原文。
 
 #### 2.7.5 本地实测记录（非官方抓取）
 
@@ -298,6 +492,12 @@ messages.append({
 >
 > 本项目实际走 `https://api.deepseek.com/anthropic`（Anthropic 路径），故禁用思考统一使用 `{"thinking":{"type":"disabled"}}`。§2.7.1 自身也已标注该表的列归属存在歧义，两节请结合阅读。
 
+> **本次抓取后的补充说明（2026-09-20，属官方抓取内容，不是 §2.7.5 的实测结论；§2.7.5 的实测内容本身未作任何改动）**：
+>
+> 上面这段「与 §2.7.1 官方表格的冲突提示」写于上一版，当时 §2.7.1 表格的三列归属无法从抓取文本判定。本次已从官方页面 HTML 的 `colspan` / `rowspan` 精确确认：`{"reasoning": {"effort": "none/low/high/max"}}` 位于**「控制参数（Responses API 格式）」列**，官方从未把它列在 Anthropic 格式列。
+>
+> 也就是说：**官方表格与本项目实测并不冲突**——`reasoning.effort` 本来就不是 Anthropic 路径的开关（与实测一致），而 Anthropic 格式的开关确实是 `thinking.type`、强度确实是 `output_config.effort`（与实测一致）。上面那段提示中「§2.7.1 自身也已标注该表的列归属存在歧义」一句已因本次抓取而失效，其余实测结论仍然有效。
+
 ---
 
 ## 3. 对话补全 API
@@ -306,42 +506,52 @@ messages.append({
 
 请求体类型：`application/json`。
 
+> **本章抓取情况**：官方页面对 `web_fetch` 存在正文长度上限，会在 `usage.completion_tokens_details.reasoning_tokens` 处截断（本次 `web_fetch` 复现了该截断）。**本章改用 `curl.exe` 抓取原始 HTML（HTTP 200，跟随 1 次 302 重定向到带尾斜杠的地址，145,964 字节）后已完整取得全部内容**，包括响应示例 JSON 与 `200 (Streaming)` 部分。
+
 ### 3.1 Request Body
 
 | 参数 | 类型 | 必填 | 说明（原文照录） |
 | --- | --- | --- | --- |
-| `messages` | object[] | **required** | 对话的消息列表。**Possible values:** `>= 1`。数组元素 `oneOf` 四个变体：**System message / User message / Assistant message / Tool message**。（抓取到的字段明细仅展开了 System message 变体，见下方说明） |
+| `messages` | object[] | **required** | 对话的消息列表。**Possible values:** `>= 1`。数组元素 `oneOf` 四个变体：**System message / User message / Assistant message / Tool message**。（抓取到的页面内容仅展开了 System message 变体，见下方说明） |
 | `model` | string | **required** | 使用的模型的 ID。请使用 `deepseek-flash` 或 `deepseek-v4-pro`。**Possible values:** [`deepseek-flash`, `deepseek-v4-pro`] |
 | `thinking` | object \| nullable | 否 | 控制思考模式与非思考模式的转换 |
 | `thinking.type` | string | 否 | **Possible values:** [`enabled`, `disabled`]；**Default value:** `enabled`。如果设为 `enabled`，则使用思考模式。如果设为 `disabled`，则使用非思考模式 |
 | `reasoning_effort` | string | 否 | **Possible values:** [`none`, `low`, `high`, `max`]。控制思考模式开关与思考强度。`none` 关闭思考模式；`low` / `high` / `max` 开启思考模式。默认强度为 `high`。出于兼容考虑，`minimal` 映射为 `low`，`medium` / `xhigh` 映射为 `high`。 |
-| `max_tokens` | integer \| nullable | 否 | 限制一次请求中模型生成 completion 的最大 token 数。取值范围为 1 到 384K（393216）。未设置时，非思考模式默认 8K，思考模式默认 64K（`reasoning_effort` 为 `max` 时为 128K）。输入 token 和输出 token 的总长度受模型的上下文长度的限制。 |
-| `response_format` | object \| nullable | 否 | 一个 object，指定模型必须输出的格式。设置为 `{ "type": "json_object" }` 以启用 JSON 模式，该模式保证模型生成的消息是有效的 JSON。 |
+| `max_tokens` | integer \| nullable | 否 | 限制一次请求中模型生成 completion 的最大 token 数。取值范围为 1 到 384K（393216）。未设置时，非思考模式默认 8K，思考模式默认 64K（`reasoning_effort` 为 `max` 时为 128K）。输入 token 和输出 token 的总长度受模型的上下文长度的限制。详见[模型 & 价格](https://api-docs.deepseek.com/zh-cn/quick_start/pricing)。 |
+| `response_format` | object \| nullable | 否 | 一个 object，指定模型必须输出的格式。设置为 `{ "type": "json_object" }` 以启用 JSON 模式，该模式保证模型生成的消息是有效的 JSON。**注意:** 使用 JSON 模式时，你还必须通过系统或用户消息指示模型生成 JSON。否则，模型可能会生成不断的空白字符，直到生成达到令牌限制，从而导致请求长时间运行并显得“卡住”。此外，如果 finish_reason="length"，这表示生成超过了 max_tokens 或对话超过了最大上下文长度，消息内容可能会被部分截断。 |
 | `response_format.type` | string | 否 | **Possible values:** [`text`, `json_object`]；**Default value:** `text`。Must be one of `text` or `json_object`. |
 | `stop` | object \| **nullable** | 否 | 一个 string 或最多包含 16 个 string 的 list，在遇到这些词时，API 将停止生成更多的 token。`oneOf`: MOD1 / MOD2（string） |
 | `stream` | boolean \| nullable | 否 | 如果设置为 True，将会以 SSE（server-sent events）的形式以流式发送消息增量。消息流以 `data: [DONE]` 结尾。 |
 | `stream_options` | object \| nullable | 否 | 流式输出相关选项。必须与 `stream: true` 一起使用；如果 `stream` 未设置为 `true`，API 会返回 `400` 错误。 |
 | `stream_options.include_usage` | boolean | 否 | 见下方「include_usage 语义」 |
 | `temperature` | number \| nullable | 否 | **Possible values:** `<= 2`；**Default value:** `1`。采样温度，介于 0 和 2 之间。更高的值，如 0.8，会使输出更随机，而更低的值，如 0.2，会使其更加集中和确定。我们通常建议可以更改这个值或者更改 `top_p`，但不建议同时对两者进行修改。思考模式下不生效。 |
-| `top_p` | number \| nullable | 否 | **Possible values:** `<= 1`；**Default value:** `1`。作为调节采样温度的替代方案，模型会考虑前 `top_p` 概率的 token 的结果。所以 0.1 就意味着只有包括在最高 10% 概率中的 token 会被考虑。取值必须大于 0 且不超过 1。我们通常建议修改这个值或者更改 `temperature`，但不建议同时对两者进行修改。该参数在思考模式下生效，但小于 0.95 的值会被抬升至 0.95；在非思考模式下恒为 1.0，传入的值会被忽略。 |
+| `top_p` | number \| nullable | 否 | **Possible values:** `<= 1`；**Default value:** `1`。作为调节采样温度的替代方案，模型会考虑前 `top_p` 概率的 token 的结果。所以 0.1 就意味着只有包括在最高 10% 概率中的 token 会被考虑。取值必须大于 0 且不超过 1。我们通常建议修改这个值或者更改 `temperature`，但不建议同时对两者进行修改。该参数仅在思考模式下生效，有效取值范围为 0.95–1.0，低于 0.95 的取值会按 0.95 处理；在非思考模式下恒为 1.0，传入的值会被忽略。 |
 | `tools` | object[] \| nullable | 否 | 模型可能会调用的 tool 的列表。目前，仅支持 function 作为工具。使用此参数来提供以 JSON 作为输入参数的 function 列表。tool 名称必须唯一。 |
 | `tools[].type` | string | **required** | **Possible values:** [`function`]。tool 的类型。目前仅支持 function。 |
 | `tools[].function` | object | **required** | — |
 | `tools[].function.description` | string | 否 | function 的功能描述，供模型理解何时以及如何调用该 function。 |
 | `tools[].function.name` | string | **required** | 要调用的 function 名称。必须由 a-z、A-Z、0-9 字符组成，或包含下划线和连字符，最大长度为 128 个字符。 |
-| `tools[].function.parameters` | object | 否 | function 的输入参数，以 JSON Schema 对象描述。请参阅 Tool Calls 指南获取示例，并参阅 JSON Schema 参考了解有关格式的文档。省略 `parameters` 会定义一个参数列表为空的 function。 |
-| `tools[].function.parameters.property name*` | any | 否 | function 的输入参数，以 JSON Schema 对象描述。（同上说明） |
-| `tools[].function.strict` | boolean | 否 | **Default value:** `false`。如果设置为 true，API 将在函数调用中使用 strict 模式，以确保输出始终符合函数的 JSON schema 定义。该功能为 Beta 功能。 |
-| `tool_choice` | object \| **nullable** | 否 | 控制模型调用 tool 的行为（详见下方「tool_choice 语义」）。`oneOf`: ChatCompletionToolChoice / ChatCompletionNamedToolChoice；string **Possible values:** [`none`, `auto`, `required`] |
+| `tools[].function.parameters` | object | 否 | function 的输入参数，以 JSON Schema 对象描述。请参阅 [Tool Calls 指南](https://api-docs.deepseek.com/zh-cn/guides/tool_calls)获取示例，并参阅 [JSON Schema 参考](https://json-schema.org/understanding-json-schema/)了解有关格式的文档。省略 `parameters` 会定义一个参数列表为空的 function。 |
+| `tools[].function.parameters.property name*` | any | 否 | function 的输入参数，以 JSON Schema 对象描述。请参阅 [Tool Calls 指南](https://api-docs.deepseek.com/zh-cn/guides/tool_calls)获取示例，并参阅 [JSON Schema 参考](https://json-schema.org/understanding-json-schema/)了解有关格式的文档。省略 `parameters` 会定义一个参数列表为空的 function。 |
+| `tools[].function.strict` | boolean | 否 | **Default value:** `false`。如果设置为 true，API 将在函数调用中使用 strict 模式，以确保输出始终符合函数的 JSON schema 定义。该功能为 Beta 功能，详细使用方式请参阅 [Tool Calls 指南](https://api-docs.deepseek.com/zh-cn/guides/tool_calls) |
+| `tool_choice` | object \| **nullable** | 否 | 控制模型调用 tool 的行为（原文在此字段内直接给出语义，见下方「tool_choice 语义」）。`oneOf`: ChatCompletionToolChoice / ChatCompletionNamedToolChoice；string **Possible values:** [`none`, `auto`, `required`] |
 | `logprobs` | boolean \| nullable | 否 | 是否返回所输出 token 的对数概率。如果为 true，则在 `message` 的 `content` 中返回每个输出 token 的对数概率。 |
 | `top_logprobs` | integer \| nullable | 否 | **Possible values:** `<= 20`。一个介于 0 到 20 之间的整数 N，指定每个输出位置返回输出概率 top N 的 token，且返回这些 token 的对数概率。指定此参数时，logprobs 必须为 true。 |
-| `user_id` | nullable | 否 | 您自定义的 user_id，可选字符集为 `[a-zA-Z0-9\-_]`，最大长度为 512。请不要在 user_id 中包含用户隐私信息。 |
+| `user_id` | nullable | 否 | 您自定义的 user_id，可选字符集为 `[a-zA-Z0-9\-_]`，最大长度为 512。请不要在 user_id 中包含用户隐私信息。（原文在此字段内直接列出三条用途，见下方「user_id 用途」） |
 | `frequency_penalty` | **deprecated** | — | 该参数已不再支持。传入该参数将不会产生任何效果。 |
 | `presence_penalty` | **deprecated** | — | 该参数已不再支持。传入该参数将不会产生任何效果。 |
 
+> **本次抓取发现的措辞变化（相对上一版）**，均为官方原文更新，如实记录：
+>
+> 1. `max_tokens` 末尾新增指引「详见[模型 & 价格](https://api-docs.deepseek.com/zh-cn/quick_start/pricing)。」；
+> 2. `top_p` 的说明由「该参数在思考模式下生效，但小于 0.95 的值会被抬升至 0.95」改为「该参数**仅**在思考模式下生效，**有效取值范围为 0.95–1.0**，低于 0.95 的取值**会按 0.95 处理**」（与 §2.7.3 一致）；
+> 3. `tools[].function.parameters.property name*` 不再写「（同上说明）」，而是重复完整说明；
+> 4. `tools[].function.strict` 由「该功能为 Beta 功能。」补充为「该功能为 Beta 功能，详细使用方式请参阅 [Tool Calls 指南]」；
+> 5. `tool_choice` 的语义说明与 `user_id` 的三条用途，本次都**内联在字段说明里**（上一版把它们另列为两个小节），内容本身一致。
+
 #### messages 数组说明
 
-官方 schema 中 `messages` 的 `oneOf` 声明了四个变体：**System message / User message / Assistant message / Tool message**。抓取到的页面文本**只展开了 System message 变体的字段明细**：
+官方 schema 中 `messages` 的 `oneOf` 声明了四个变体：**System message / User message / Assistant message / Tool message**。抓取到的页面内容**只展开了 System message 变体的字段明细**：
 
 | 字段 | 类型 | 必填 | 说明（原文照录） |
 | --- | --- | --- | --- |
@@ -349,7 +559,7 @@ messages.append({
 | `role` | string | **required** | **Possible values:** [`system`]。该消息的发起角色，其值为 `system`。 |
 | `name` | string | 否 | 可以选填的参与者的名称，为模型提供信息以区分相同角色的参与者。 |
 
-> **诚实标注**：User message / Assistant message / Tool message 三个变体的字段明细在本次抓取到的页面文本中**未展开**（属于官方页面的折叠区块），因此**本文件不列其字段**。`role: "tool"` 与 `tool_call_id` 的用法可在 §4.1 的官方样例代码中看到（`{"role": "tool", "tool_call_id": tool.id, "content": "24℃"}`）。
+> **诚实标注**：User message / Assistant message / Tool message 三个变体的字段明细**本次仍未抓取到**。这三个变体在官方页面上是「嵌套标签页」形式，**服务端返回的 HTML 里只有 System message 面板的内容**——本次对原始 HTML 检索 `User message` / `Assistant message` / `Tool message` / `tool_call_id`，各只出现 1 次（即标签文字本身），**没有对应的字段明细**。因此**本文件不列其字段**，也不以记忆补写。`role: "tool"` 与 `tool_call_id` 的用法可在 §4.1 的官方样例代码中看到（`{"role": "tool", "tool_call_id": tool.id, "content": "24℃"}`）。
 
 #### tool_choice 语义（原文照录）
 
@@ -360,7 +570,7 @@ messages.append({
 - `required` 意味着模型必须调用一个或多个 tool。
 - 通过 `{"type": "function", "function": {"name": "my_function"}}` 指定特定 tool，会强制模型调用该 tool。
 - 当没有 tool 时，默认值为 `none`。如果有 tool 存在，默认值为 `auto`。
-- **思考模式下不支持 `required` 和指定具体 tool 的用法，API 会返回 `400` 错误。请先关闭思考模式。**
+- 思考模式下不支持 `required` 和指定具体 tool 的用法，API 会返回 `400` 错误。请先关闭思考模式。
 
 #### include_usage 语义（原文照录）
 
@@ -368,15 +578,12 @@ messages.append({
 
 无论是否设置，`data: [DONE]` 之前的最后一个块都会在其 `usage` 字段中给出整个请求的 token 使用统计信息。请注意，这里不会单独下发一个只含 usage 的块：统计信息附加在最后一个内容块上，该块的 `choices` 数组始终只包含一个元素，其中不含新增内容且 `finish_reason` 非 null。
 
-#### response_format 注意事项（原文照录）
-
-**注意:** 使用 JSON 模式时，你还必须通过系统或用户消息指示模型生成 JSON。否则，模型可能会生成不断的空白字符，直到生成达到令牌限制，从而导致请求长时间运行并显得“卡住”。此外，如果 finish_reason="length"，这表示生成超过了 max_tokens 或对话超过了最大上下文长度，消息内容可能会被部分截断。
-
 #### user_id 用途（原文照录）
 
 - user_id 可用于区分您业务侧的用户身份，以帮助我们进行内容安全处理。
 - user_id 可用于 KVCache 缓存隔离，以进行隐私管理。
 - user_id 可用于我们对您业务侧用户进行调度隔离。
+- 关于 user_id 参数更详细的描述，请参考[限速与隔离](https://api-docs.deepseek.com/zh-cn/quick_start/rate_limit)
 
 ### 3.2 Response Schema（200, No streaming）
 
@@ -386,7 +593,7 @@ OK, 返回一个 `chat completion` 对象。响应类型：`application/json`。
 | --- | --- | --- | --- |
 | `id` | string | required | 该对话的唯一标识符。 |
 | `choices` | object[] | required | 模型生成的 completion 的选择列表。 |
-| `choices[].finish_reason` | string | required | **Possible values:** [`stop`, `length`, `content_filter`, `tool_calls`, `insufficient_system_resource`, `aborted`]（逐项含义见 §3.3） |
+| `choices[].finish_reason` | string | required | **Possible values:** [`stop`, `length`, `content_filter`, `tool_calls`, `insufficient_system_resource`, `aborted`]（逐项含义见 §3.8） |
 | `choices[].index` | integer | required | 该 completion 在模型生成的 completion 的选择列表中的索引。 |
 | `choices[].message` | object | required | 模型生成的 completion 消息。 |
 | `choices[].message.content` | string \| nullable | required | 该 completion 的内容。 |
@@ -406,15 +613,15 @@ OK, 返回一个 `chat completion` 对象。响应类型：`application/json`。
 | `choices[].logprobs.content[].top_logprobs` | object[] | required | 一个包含在该输出位置上，输出概率 top N 的 token 的列表，以及它们的对数概率。在罕见情况下，返回的 token 数量可能少于请求参数中指定的 `top_logprobs` 值。 |
 | `choices[].logprobs.content[].top_logprobs[].token` | string | required | 输出的 token。 |
 | `choices[].logprobs.content[].top_logprobs[].logprob` | number | required | 该 token 的对数概率。`-9999.0` 代表该 token 的输出概率极小，不在 top 20 最可能输出的 token 中。 |
-| `choices[].logprobs.content[].top_logprobs[].bytes` | integer[] \| nullable | required | 一个包含该 token UTF-8 字节表示的整数列表。（同上说明） |
+| `choices[].logprobs.content[].top_logprobs[].bytes` | integer[] \| nullable | required | 一个包含该 token UTF-8 字节表示的整数列表。一般在一个 UTF-8 字符被拆分成多个 token 来表示时有用。如果 token 没有对应的字节表示，则该值为 `null`。 |
 | `choices[].logprobs.reasoning_content` | object[] \| nullable | 否 | 一个包含输出 token 对数概率信息的列表。 |
 | `choices[].logprobs.reasoning_content[].token` | string | required | 输出的 token。 |
 | `choices[].logprobs.reasoning_content[].logprob` | number | required | 该 token 的对数概率。`-9999.0` 代表该 token 的输出概率极小，不在 top 20 最可能输出的 token 中。 |
-| `choices[].logprobs.reasoning_content[].bytes` | integer[] \| nullable | required | 一个包含该 token UTF-8 字节表示的整数列表。（同上说明） |
-| `choices[].logprobs.reasoning_content[].top_logprobs` | object[] | required | 一个包含在该输出位置上，输出概率 top N 的 token 的列表，以及它们的对数概率。（同上说明） |
+| `choices[].logprobs.reasoning_content[].bytes` | integer[] \| nullable | required | 一个包含该 token UTF-8 字节表示的整数列表。一般在一个 UTF-8 字符被拆分成多个 token 来表示时有用。如果 token 没有对应的字节表示，则该值为 `null`。 |
+| `choices[].logprobs.reasoning_content[].top_logprobs` | object[] | required | 一个包含在该输出位置上，输出概率 top N 的 token 的列表，以及它们的对数概率。在罕见情况下，返回的 token 数量可能少于请求参数中指定的 `top_logprobs` 值。 |
 | `choices[].logprobs.reasoning_content[].top_logprobs[].token` | string | required | 输出的 token。 |
 | `choices[].logprobs.reasoning_content[].top_logprobs[].logprob` | number | required | 该 token 的对数概率。`-9999.0` 代表该 token 的输出概率极小，不在 top 20 最可能输出的 token 中。 |
-| `choices[].logprobs.reasoning_content[].top_logprobs[].bytes` | integer[] \| nullable | required | 一个包含该 token UTF-8 字节表示的整数列表。（同上说明） |
+| `choices[].logprobs.reasoning_content[].top_logprobs[].bytes` | integer[] \| nullable | required | 一个包含该 token UTF-8 字节表示的整数列表。一般在一个 UTF-8 字符被拆分成多个 token 来表示时有用。如果 token 没有对应的字节表示，则该值为 `null`。 |
 | `created` | integer | required | 创建聊天完成时的 Unix 时间戳（以秒为单位）。 |
 | `model` | string | required | 生成该 completion 的模型名。 |
 | `system_fingerprint` | string | required | This fingerprint represents the backend configuration that the model runs with.（官方中文页此描述为英文原文） |
@@ -430,17 +637,280 @@ OK, 返回一个 `chat completion` 对象。响应类型：`application/json`。
 | `usage.completion_tokens_details` | object | 否 | completion tokens 的详细信息。 |
 | `usage.completion_tokens_details.reasoning_tokens` | integer | 否 | 推理模型所产生的思维链 token 数量 |
 
-> ⚠️ **抓取截断点**：官方页面在该行（`usage.completion_tokens_details.reasoning_tokens`）之后的内容**未能抓取到**（`web_fetch` 在两次尝试中均于同一位置截断）。因此以下内容**本文件无法提供**，绝不以记忆填充：
-> 1. `usage.completion_tokens_details` 之后是否还有其它响应字段；
-> 2. 官方页面的 `Example (from schema)` 与 `Example` 两段示例 JSON；
-> 3. 响应标签页中的 **`200 (Streaming)`** 部分（流式 chunk 的 schema 与示例）——**完全未能抓取到**。
-> 英文版 `https://api-docs.deepseek.com/api/create-chat-completion` 亦被抓取用于对照，同样在同一位置截断，无法补齐。
+> **Schema 的最后一个字段就是 `usage.completion_tokens_details.reasoning_tokens`**（本次从原始 HTML 确认其后不再有其它响应字段；上一版记录的「截断点之后是否还有字段」这一疑问，答案是没有）。
 
-### 3.3 finish_reason 枚举值
+### 3.3 Example (from schema)
+
+官方 `Example (from schema)` 标签页的完整 JSON（原文照录）：
+
+```json
+{
+  "id": "string",
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "string",
+        "reasoning_content": "string",
+        "tool_calls": [
+          {
+            "id": "string",
+            "type": "function",
+            "function": {
+              "name": "string",
+              "arguments": "string"
+            }
+          }
+        ],
+        "role": "assistant"
+      },
+      "logprobs": {
+        "content": [
+          {
+            "token": "string",
+            "logprob": 0,
+            "bytes": [
+              0
+            ],
+            "top_logprobs": [
+              {
+                "token": "string",
+                "logprob": 0,
+                "bytes": [
+                  0
+                ]
+              }
+            ]
+          }
+        ],
+        "reasoning_content": [
+          {
+            "token": "string",
+            "logprob": 0,
+            "bytes": [
+              0
+            ],
+            "top_logprobs": [
+              {
+                "token": "string",
+                "logprob": 0,
+                "bytes": [
+                  0
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "created": 0,
+  "model": "string",
+  "system_fingerprint": "string",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 0,
+    "prompt_tokens": 0,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 0,
+    "total_tokens": 0,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    }
+  }
+}
+```
+
+> **原文自身的不一致（如实记录，不作修正）**：在 §3.2 的 Schema 表里，`prompt_cache_hit_tokens` 与 `prompt_cache_miss_tokens` 是 `usage.prompt_tokens_details` 的**子字段**；但在上面这个 `Example (from schema)` 里，它们是 `usage` 的**直接子字段**（与 `prompt_tokens_details` 平级）。本次已回原始 HTML 逐字核对，官方页面确实如此。
+
+### 3.4 Example
+
+官方 `Example` 标签页的完整 JSON（原文照录）：
+
+```json
+{
+  "id": "930c60df-bf64-41c9-a88e-3ec75f81e00e",
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "Hello! How can I help you today?",
+        "role": "assistant"
+      },
+      "logprobs": null
+    }
+  ],
+  "created": 1705651092,
+  "model": "deepseek-flash",
+  "object": "chat.completion",
+  "system_fingerprint": "fp_7a09fdf9c2",
+  "usage": {
+    "completion_tokens": 10,
+    "prompt_tokens": 16,
+    "total_tokens": 26,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 16
+  }
+}
+```
+
+### 3.5 Response Schema（200, Streaming）
+
+官方原文：OK, 返回包含一系列 `chat completion chunk` 对象的流式输出。响应类型：`text/event-stream`。页面同样提供 `Schema` / `Example (from schema)` / `Example` 三个标签页。
+
+| 字段路径 | 类型 | 必填 | 说明（原文照录） |
+| --- | --- | --- | --- |
+| `id` | string | required | 该对话的唯一标识符。 |
+| `choices` | object[] | required | 模型生成的 completion 的选择列表。 |
+| `choices[].delta` | object | required | 流式返回的一个 completion 增量。 |
+| `choices[].delta.content` | string \| nullable | — | completion 增量的内容。 |
+| `choices[].delta.reasoning_content` | string \| nullable | — | 仅适用于思考模式。内容为 assistant 消息中在最终答案之前的推理内容。 |
+| `choices[].delta.role` | string | — | **Possible values:** [`assistant`]。产生这条消息的角色。 |
+| `choices[].delta.tool_calls` | object[] | — | 模型生成的 tool 调用，例如 function 调用。**每个 tool 调用的第一个 chunk 携带 `id`、`type` 和 `function` 字段，后续 chunk 只携带 `function` 参数。** |
+| `choices[].delta.tool_calls[].index` | integer | required | —（原文该字段无说明文字） |
+| `choices[].delta.tool_calls[].id` | string | — | tool 的 ID。 |
+| `choices[].delta.tool_calls[].type` | string | — | **Possible values:** [`function`]。tool 的类型。目前仅支持 function。 |
+| `choices[].delta.tool_calls[].function.name` | string | — | 要调用的 function 名。 |
+| `choices[].delta.tool_calls[].function.arguments` | string | — | 要调用的 function 的参数，由模型生成，格式为 JSON。请注意，模型并不总是生成有效的 JSON，并且可能会臆造出你的函数模式中未定义的参数。在调用函数之前，请在代码中验证这些参数。 |
+| `choices[].logprobs` | object \| nullable | required | 该 choice 的对数概率信息。 |
+| `choices[].logprobs.content` | object[] \| nullable | required | 一个包含输出 token 对数概率信息的列表。 |
+| `choices[].logprobs.content[].token` | string | required | 输出的 token。 |
+| `choices[].logprobs.content[].logprob` | number | required | 该 token 的对数概率。`-9999.0` 代表该 token 的输出概率极小，不在 top 20 最可能输出的 token 中。 |
+| `choices[].logprobs.content[].bytes` | integer[] \| nullable | required | 一个包含该 token UTF-8 字节表示的整数列表。一般在一个 UTF-8 字符被拆分成多个 token 来表示时有用。如果 token 没有对应的字节表示，则该值为 `null`。 |
+| `choices[].logprobs.content[].top_logprobs` | object[] | required | 一个包含在该输出位置上，输出概率 top N 的 token 的列表，以及它们的对数概率。在罕见情况下，返回的 token 数量可能少于请求参数中指定的 `top_logprobs` 值。 |
+| `choices[].logprobs.content[].top_logprobs[].token` | string | required | 输出的 token。 |
+| `choices[].logprobs.content[].top_logprobs[].logprob` | number | required | 该 token 的对数概率。`-9999.0` 代表该 token 的输出概率极小，不在 top 20 最可能输出的 token 中。 |
+| `choices[].logprobs.content[].top_logprobs[].bytes` | integer[] \| nullable | required | 一个包含该 token UTF-8 字节表示的整数列表。一般在一个 UTF-8 字符被拆分成多个 token 来表示时有用。如果 token 没有对应的字节表示，则该值为 `null`。 |
+| `choices[].logprobs.reasoning_content` | object[] \| nullable | 否 | 一个包含输出 token 对数概率信息的列表。 |
+| `choices[].logprobs.reasoning_content[].token` | string | required | 输出的 token。 |
+| `choices[].logprobs.reasoning_content[].logprob` | number | required | 该 token 的对数概率。`-9999.0` 代表该 token 的输出概率极小，不在 top 20 最可能输出的 token 中。 |
+| `choices[].logprobs.reasoning_content[].bytes` | integer[] \| nullable | required | 一个包含该 token UTF-8 字节表示的整数列表。一般在一个 UTF-8 字符被拆分成多个 token 来表示时有用。如果 token 没有对应的字节表示，则该值为 `null`。 |
+| `choices[].logprobs.reasoning_content[].top_logprobs` | object[] | required | 一个包含在该输出位置上，输出概率 top N 的 token 的列表，以及它们的对数概率。在罕见情况下，返回的 token 数量可能少于请求参数中指定的 `top_logprobs` 值。 |
+| `choices[].logprobs.reasoning_content[].top_logprobs[].token` | string | required | 输出的 token。 |
+| `choices[].logprobs.reasoning_content[].top_logprobs[].logprob` | number | required | 该 token 的对数概率。`-9999.0` 代表该 token 的输出概率极小，不在 top 20 最可能输出的 token 中。 |
+| `choices[].logprobs.reasoning_content[].top_logprobs[].bytes` | integer[] \| nullable | required | 一个包含该 token UTF-8 字节表示的整数列表。一般在一个 UTF-8 字符被拆分成多个 token 来表示时有用。如果 token 没有对应的字节表示，则该值为 `null`。 |
+| `choices[].finish_reason` | string \| nullable | required | **Possible values:** [`stop`, `length`, `content_filter`, `tool_calls`, `insufficient_system_resource`, `aborted`]。模型停止生成 token 的原因：`stop`：模型自然停止生成，或遇到 `stop` 序列中列出的字符串。`length` ：输出长度达到了模型上下文长度限制，或达到了 `max_tokens` 的限制。`content_filter`：输出内容因触发过滤策略而被过滤。`tool_calls`：模型进行了工具调用。**`insufficient_system_resource`: 由于后端推理资源受限，请求被打断。**`aborted`：生成过程被中断。 |
+| `choices[].index` | integer | required | 该 completion 在模型生成的 completion 的选择列表中的索引。 |
+| `created` | integer | required | 创建聊天完成时的 Unix 时间戳（以秒为单位）。**流式响应的每个 chunk 的时间戳相同。** |
+| `model` | string | required | 生成该 completion 的模型名。 |
+| `system_fingerprint` | string | required | This fingerprint represents the backend configuration that the model runs with. |
+| `object` | string | required | **Possible values:** [`chat.completion.chunk`]。对象的类型, 其值为 `chat.completion.chunk`。 |
+
+> **两处原文差异（如实记录，不作修正）**：
+>
+> 1. `insufficient_system_resource` 的说明，非流式 Schema 写「系统推理资源不足，生成被打断。」，流式 Schema 写「由于后端推理资源受限，请求被打断。」——两处措辞不同。
+> 2. 流式 Schema 中**没有列出 `usage` 字段**，但官方下方 `Example` 的最后一个 SSE chunk 里确实带有 `usage`。
+
+### 3.6 Example (from schema)（Streaming）
+
+官方 `Example (from schema)` 标签页的完整 JSON（原文照录，外层是一个数组）：
+
+```json
+[
+  {
+    "id": "string",
+    "choices": [
+      {
+        "delta": {
+          "content": "string",
+          "reasoning_content": "string",
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "index": 0,
+              "id": "string",
+              "type": "function",
+              "function": {
+                "name": "string",
+                "arguments": "string"
+              }
+            }
+          ]
+        },
+        "logprobs": {
+          "content": [
+            {
+              "token": "string",
+              "logprob": 0,
+              "bytes": [
+                0
+              ],
+              "top_logprobs": [
+                {
+                  "token": "string",
+                  "logprob": 0,
+                  "bytes": [
+                    0
+                  ]
+                }
+              ]
+            }
+          ],
+          "reasoning_content": [
+            {
+              "token": "string",
+              "logprob": 0,
+              "bytes": [
+                0
+              ],
+              "top_logprobs": [
+                {
+                  "token": "string",
+                  "logprob": 0,
+                  "bytes": [
+                    0
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "finish_reason": "stop",
+        "index": 0
+      }
+    ],
+    "created": 0,
+    "model": "string",
+    "system_fingerprint": "string",
+    "object": "chat.completion.chunk"
+  }
+]
+```
+
+### 3.7 Example（Streaming, SSE）
+
+官方 `Example` 标签页的完整 SSE 流（原文照录）：
+
+```
+data: {"id": "1f633d8bfc032625086f14113c411638", "choices": [{"index": 0, "delta": {"content": "", "role": "assistant"}, "finish_reason": null, "logprobs": null}], "created": 1718345013, "model": "deepseek-flash", "system_fingerprint": "fp_a49d71b8a1", "object": "chat.completion.chunk"}
+data: {"choices": [{"delta": {"content": "Hello", "role": "assistant"}, "finish_reason": null, "index": 0, "logprobs": null}], "created": 1718345013, "id": "1f633d8bfc032625086f14113c411638", "model": "deepseek-flash", "object": "chat.completion.chunk", "system_fingerprint": "fp_a49d71b8a1"}
+data: {"choices": [{"delta": {"content": "!", "role": "assistant"}, "finish_reason": null, "index": 0, "logprobs": null}], "created": 1718345013, "id": "1f633d8bfc032625086f14113c411638", "model": "deepseek-flash", "object": "chat.completion.chunk", "system_fingerprint": "fp_a49d71b8a1"}
+data: {"choices": [{"delta": {"content": " How", "role": "assistant"}, "finish_reason": null, "index": 0, "logprobs": null}], "created": 1718345013, "id": "1f633d8bfc032625086f14113c411638", "model": "deepseek-flash", "object": "chat.completion.chunk", "system_fingerprint": "fp_a49d71b8a1"}
+data: {"choices": [{"delta": {"content": " can", "role": "assistant"}, "finish_reason": null, "index": 0, "logprobs": null}], "created": 1718345013, "id": "1f633d8bfc032625086f14113c411638", "model": "deepseek-flash", "object": "chat.completion.chunk", "system_fingerprint": "fp_a49d71b8a1"}
+data: {"choices": [{"delta": {"content": " I", "role": "assistant"}, "finish_reason": null, "index": 0, "logprobs": null}], "created": 1718345013, "id": "1f633d8bfc032625086f14113c411638", "model": "deepseek-flash", "object": "chat.completion.chunk", "system_fingerprint": "fp_a49d71b8a1"}
+data: {"choices": [{"delta": {"content": " assist", "role": "assistant"}, "finish_reason": null, "index": 0, "logprobs": null}], "created": 1718345013, "id": "1f633d8bfc032625086f14113c411638", "model": "deepseek-flash", "object": "chat.completion.chunk", "system_fingerprint": "fp_a49d71b8a1"}
+data: {"choices": [{"delta": {"content": " you", "role": "assistant"}, "finish_reason": null, "index": 0, "logprobs": null}], "created": 1718345013, "id": "1f633d8bfc032625086f14113c411638", "model": "deepseek-flash", "object": "chat.completion.chunk", "system_fingerprint": "fp_a49d71b8a1"}
+data: {"choices": [{"delta": {"content": " today", "role": "assistant"}, "finish_reason": null, "index": 0, "logprobs": null}], "created": 1718345013, "id": "1f633d8bfc032625086f14113c411638", "model": "deepseek-flash", "object": "chat.completion.chunk", "system_fingerprint": "fp_a49d71b8a1"}
+data: {"choices": [{"delta": {"content": "?", "role": "assistant"}, "finish_reason": null, "index": 0, "logprobs": null}], "created": 1718345013, "id": "1f633d8bfc032625086f14113c411638", "model": "deepseek-flash", "object": "chat.completion.chunk", "system_fingerprint": "fp_a49d71b8a1"}
+data: {"choices": [{"delta": {"content": "", "role": null}, "finish_reason": "stop", "index": 0, "logprobs": null}], "created": 1718345013, "id": "1f633d8bfc032625086f14113c411638", "model": "deepseek-flash", "object": "chat.completion.chunk", "system_fingerprint": "fp_a49d71b8a1", "usage": {"completion_tokens": 9, "prompt_tokens": 17, "total_tokens": 26, "prompt_tokens_details": {"cached_tokens": 0}, "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 17}}
+data: [DONE]
+```
+
+> 官方页面的这个示例块在原始 HTML 里以 `Loading...` 占位符结尾，即该段是前端异步渲染的代码块；上面转录的是渲染后的完整内容（含 `data: [DONE]` 结束行）。
+
+### 3.8 finish_reason 枚举值
 
 模型停止生成 token 的原因。**Possible values:** [`stop`, `length`, `content_filter`, `tool_calls`, `insufficient_system_resource`, `aborted`]
 
-| 取值 | 含义（原文照录） |
+| 取值 | 含义（原文照录，非流式 Schema） |
 | --- | --- |
 | `stop` | 模型自然停止生成，或遇到 `stop` 序列中列出的字符串。 |
 | `length` | 输出长度达到了模型上下文长度限制，或达到了 `max_tokens` 的限制。 |
@@ -449,15 +919,11 @@ OK, 返回一个 `chat completion` 对象。响应类型：`application/json`。
 | `insufficient_system_resource` | 系统推理资源不足，生成被打断。 |
 | `aborted` | 生成过程被中断。 |
 
-### 3.4 本章节的抓取缺口
+### 3.9 补充：/chat/completions 是无状态 API
 
-**本章节未能抓取到官方以下内容**（页面被工具截断，重试一次仍截断，英文对照页同样截断）：
+与 `/chat/completions` 相关的、本次**已抓取到**的补充官方说明（来源：官方「多轮对话」页，`https://api-docs.deepseek.com/zh-cn/guides/multi_round_chat`，上一版抓取）：DeepSeek `/chat/completions` API 是一个“无状态” API，即服务端不记录用户请求的上下文，用户在每次请求时，**需将之前所有对话历史拼接好后**，传递给对话 API。
 
-- 响应示例 JSON（`Example (from schema)` / `Example`）；
-- `200 (Streaming)` 的响应 schema 与示例；
-- `usage.completion_tokens_details.reasoning_tokens` 之后（若有）的响应字段。
-
-> 与 /chat/completions 相关的、本次**已抓取到**的补充官方说明（来源：官方「多轮对话」页，`https://api-docs.deepseek.com/zh-cn/guides/multi_round_chat`）：DeepSeek `/chat/completions` API 是一个“无状态” API，即服务端不记录用户请求的上下文，用户在每次请求时，**需将之前所有对话历史拼接好后**，传递给对话 API。
+> 该页本次未重新抓取，该句沿用上一版（2026-09-10）的抓取结果。
 
 ---
 
@@ -823,7 +1289,7 @@ token 是模型用来表示自然语言文本的基本单位，也是我们的�
 
 ### 6.3 Usage 响应字段
 
-响应中的 `usage` 字段结构见 §3.2（`completion_tokens` / `prompt_tokens` / `prompt_tokens_details` / `total_tokens` / `completion_tokens_details`）。
+响应中的 `usage` 字段结构见 §3.2（非流式：`completion_tokens` / `prompt_tokens` / `prompt_tokens_details` / `total_tokens` / `completion_tokens_details`）与 §3.3 的示例 JSON。流式响应中 `usage` 出现在最后一个 chunk 上，见 §3.7 最后一个 `data:` 行与 §3.1 的「include_usage 语义」。
 
 ---
 
@@ -831,7 +1297,7 @@ token 是模型用来表示自然语言文本的基本单位，也是我们的�
 
 ### DeepSeek Anthropic 兼容 API 与官方 Anthropic API 的关键差异
 
-> **本节依据**：**仅**依据本次抓取到的 DeepSeek 官方「使用 Anthropic API」页面（`https://api-docs.deepseek.com/zh-cn/guides/anthropic_api`，中英文版互校）中的「支持情况」列。官方 Anthropic API 规范细节**不在本次抓取范围内**，故本节不做“官方 Anthropic 如何如何”的断言，只陈述 **DeepSeek 侧明确记载的行为**。
+> **本节依据**：**仅**依据本次抓取到的 DeepSeek 官方「使用 Anthropic API」页面（`https://api-docs.deepseek.com/zh-cn/guides/anthropic_api`，中英文版互校）中的「支持情况」列，以及本次抓取的其它官方页面（§2.7、§4）。官方 Anthropic API 规范细节**不在本次抓取范围内**，故本节不做“官方 Anthropic 如何如何”的断言，只陈述 **DeepSeek 侧明确记载的行为**。
 
 **入口与鉴权**
 
@@ -843,32 +1309,38 @@ token 是模型用来表示自然语言文本的基本单位，也是我们的�
 **模型名**
 
 5. `model`：「改为使用 DeepSeek 模型」。传入不支持的模型名时后端自动映射到 `deepseek-flash`。
-6. claude 模型名会被映射：`claude-opus*` → `deepseek-v4-pro`；`claude-haiku*` / `claude-sonnet*` → `deepseek-flash`。据此可在 Claude Desktop APP developer 模式下仅改 base_url 与 api_key 接入。
+6. claude 模型名会被映射：`claude-opus*` → `deepseek-v4-pro`（按 V4 Pro 价格计费）；`claude-haiku*` / `claude-sonnet*` → `deepseek-flash`。据此可在 Claude Desktop APP developer 模式下仅改 base_url 与 api_key 接入。
+7. 走 Anthropic 兼容入口时，`model` 的合法取值来自 §3.1 的枚举 [`deepseek-flash`, `deepseek-v4-pro`]。
 
 **请求字段：被忽略 / 仅部分支持（对本项目最关键的差异面）**
 
-7. **忽略**的字段：`container`、`mcp_servers`、`service_tier`、`top_k`；tools 的 `cache_control`；text 块的 `cache_control` 与 `citations`；tool_use 块的 `cache_control`；tool_result 块的 `cache_control` 与 `is_error`。
+8. **忽略**的字段：`container`、`mcp_servers`、`service_tier`、`top_k`；tools 的 `cache_control`；text 块的 `cache_control` 与 `citations`；tool_use 块的 `cache_control`；tool_result 块的 `cache_control` 与 `is_error`。
    - 推论（工程影响）：**`cache_control` 不生效**，按 Anthropic 习惯打缓存断点无效；**`tool_result.is_error` 不生效**，工具失败信息不能依赖该标记传递，须写进 `content`。
-8. `metadata`：**仅** `user_id` 支持，其它字段忽略（`user_id` 可用于限速与隔离）。
-9. `thinking`：支持，但 **`budget_tokens` 被忽略**。
-10. `output_config`：**仅支持 `effort`**。
-11. `top_p`：**仅思考模式下生效**（下限 `0.95`）；**非思考模式下恒为 `1.0`**，传入值被忽略。
-12. `temperature`：完全支持，范围 `[0.0 ~ 2.0]`。
-13. `max_tokens`、`stop_sequences`、`stream`、`system`：完全支持。
+9. `metadata`：**仅** `user_id` 支持，其它字段忽略（`user_id` 可用于限速与隔离）。
+10. `thinking`：支持（开关为 `{"thinking": {"type": "enabled/disabled"}}`），但 **`budget_tokens` 被忽略**。
+11. `output_config`：**仅支持 `effort`**（`low` / `high` / `max`），这是 Anthropic 格式的强度控制；`reasoning` / `reasoning_effort` 属 OpenAI 与 Responses API 格式，**不是 Anthropic 路径的字段**（§2.7.1 列归属已确认）。
+12. `top_p`：**仅思考模式下生效**（下限 `0.95`）；**非思考模式下恒为 `1.0`**，传入值被忽略。
+13. `temperature`：完全支持，范围 `[0.0 ~ 2.0]`（但在思考模式下不生效，见 §2.7.3）。
+14. `max_tokens`、`stop_sequences`、`stream`、`system`：完全支持。
 
 **工具字段**
 
-14. `tools`：`name` / `input_schema` / `description` 完全支持。
-15. `tool_choice`：`none` 完全支持；`auto` / `any` / `tool` 支持，但 **`disable_parallel_tool_use` 被忽略**（即无法通过该开关禁止并行工具调用）。
+15. `tools`：`name` / `input_schema` / `description` 完全支持。
+16. `tool_choice`：`none` 完全支持；`auto` / `any` / `tool` 支持，但 **`disable_parallel_tool_use` 被忽略**（即无法通过该开关禁止并行工具调用）。
 
 **消息内容块：不支持的类型（会导致该块无法使用）**
 
-16. **不支持**：`document`、`search_result`、`redacted_thinking`、`code_execution_tool_result`、`mcp_tool_use`、`mcp_tool_result`、`container_upload`。
-17. **支持**：`text`、`image`（`source.type` 可为 base64（jpeg/png/gif/webp）、url、file（需 `anthropic-beta: files-api-2025-04-14` 头））、`thinking`、`tool_use`（`id`/`input`/`name`）、`tool_result`（`tool_use_id`/`content`）、`server_tool_use`、`web_search_tool_result`；`content` 为 string 时完全支持。
+17. **不支持**：`document`、`search_result`、`redacted_thinking`、`code_execution_tool_result`、`mcp_tool_use`、`mcp_tool_result`、`container_upload`。
+18. **支持**：`text`、`image`（`source.type` 可为 base64（jpeg/png/gif/webp）、url、file（需 `anthropic-beta: files-api-2025-04-14` 头））、`thinking`、`tool_use`（`id`/`input`/`name`）、`tool_result`（`tool_use_id`/`content`）、`server_tool_use`、`web_search_tool_result`；`content` 为 string 时完全支持。
 
 **对话结构能力（本项目 Agent 循环直接相关）**
 
-18. Anthropic API（`/messages`）**支持在对话中间插入工具调用消息**，也**支持在对话中间插入 `system` 消息**；Chat Completion 接口**不支持**在对话中间插入工具调用（但支持中间插入 `system` 消息）。（来源：§4.3 官方 Tool Calls 页面）
+19. Anthropic API（`/messages`）**支持在对话中间插入工具调用消息**，也**支持在对话中间插入 `system` 消息**；Chat Completion 接口**不支持**在对话中间插入工具调用（但支持中间插入 `system` 消息）。（来源：§4.3 官方 Tool Calls 页面）
+
+**思考模式往返（本项目上下文压缩与工具循环直接相关，来源 §2.7.3 / §2.7.4）**
+
+20. 携带 `tools` 的请求，**历史轮次的 `reasoning_content` 必须完整回传**，否则 API 返回 `400`；未携带 `tools` 时 `reasoning_content` 无需回传，传了也被忽略。
+21. 思考模式**默认开启**（`thinking.type` 默认 `enabled`，effort 默认 `high`）⇒ **不发送 `thinking` 字段不等于关闭思考**（与 §2.7.5 实测一致）。
 
 **本项目落地时的检查清单（由上述条款直接推出）**
 
@@ -876,36 +1348,39 @@ token 是模型用来表示自然语言文本的基本单位，也是我们的�
 - 不要把 prompt 缓存寄托在 `cache_control` 上（被忽略）；
 - 工具错误不要靠 `is_error` 传（被忽略），要写进 `tool_result.content`；
 - 想限制并行工具调用不能用 `disable_parallel_tool_use`（被忽略）；
-- 思考预算不能用 `budget_tokens` 控制（被忽略），用 `thinking.type` 与 `output_config.effort`；
-- 非思考模式下 `top_p` 恒为 1.0；思考模式下小于 0.95 会被抬到 0.95；
+- 思考预算不能用 `budget_tokens` 控制（被忽略）；Anthropic 路径上开关用 `thinking.type`、强度用 `output_config.effort`，**不要用 `reasoning` / `reasoning_effort`**；
+- 非思考模式下 `top_p` 恒为 1.0；思考模式下有效范围 0.95–1.0，低于 0.95 按 0.95 处理；
 - 不要发送 `document` / `search_result` / `redacted_thinking` / `mcp_*` / `code_execution_tool_result` / `container_upload` 内容块；
-- 若需要在对话历史中间插入工具调用消息，必须走 Anthropic API 或 Responses API，不能用 Chat Completions。
+- 若需要在对话历史中间插入工具调用消息，必须走 Anthropic API 或 Responses API，不能用 Chat Completions；
+- 只要请求带 `tools`，就不要丢历史 `reasoning_content`（否则 400）。
 
 ---
 
 ## 8. 来源
 
-| 页面 | URL | 抓取状态 |
+| 页面 | URL | 抓取状态（2026-09-20） |
 | --- | --- | --- |
-| 首次调用 API（中文） | https://api-docs.deepseek.com/zh-cn/ | ✅ 成功（HTTP 200，1 次成功） |
-| 使用 Anthropic API（中文，§2 主源） | https://api-docs.deepseek.com/zh-cn/guides/anthropic_api | ✅ 成功（HTTP 200，1 次成功，内容完整） |
-| Chat Completions API（中文，§3 主源） | https://api-docs.deepseek.com/zh-cn/api/create-chat-completion | ⚠️ **部分成功**：HTTP 200，抓取 2 次均在同一位置（`usage.completion_tokens_details.reasoning_tokens`）被工具截断；响应示例 JSON 与 `200 (Streaming)` 部分**未获取到** |
+| 首次调用 API（中文） | https://api-docs.deepseek.com/zh-cn/ | ✅ 成功（HTTP 200，1 次成功；另用 `curl.exe` 取原始 HTML 44479 字节复核，确认脚注 (2) 已移除） |
+| 使用 Anthropic API（中文，§2 主源） | https://api-docs.deepseek.com/zh-cn/guides/anthropic_api | ✅ 成功（HTTP 200，内容完整；另取原始 HTML 31290 字节复核） |
+| 使用 Anthropic API（英文，§2 对照） | https://api-docs.deepseek.com/guides/anthropic_api | ✅ 成功（HTTP 200；HTTP Header / Simple Fields / Tool Fields / Message Fields 四张表与中文版逐条对应一致） |
+| Chat Completions API（中文，§3 主源） | https://api-docs.deepseek.com/zh-cn/api/create-chat-completion | ✅ **本次已完整取得**。`web_fetch` 仍在 `usage.completion_tokens_details.reasoning_tokens` 处截断（与上一版同一位置，已复现）；改用 `curl.exe -L` 取原始 HTML（HTTP 200，经 1 次 302 跳转到带尾斜杠地址，145964 字节）后取得全部内容，含 `Example (from schema)`、`Example` 与 `200 (Streaming)` 的 Schema / 两个示例 |
 | Tool Calls（中文，§4 主源） | https://api-docs.deepseek.com/zh-cn/guides/tool_calls | ✅ 成功（HTTP 200，1 次成功，内容完整） |
 | 错误码（中文，§5 主源） | https://api-docs.deepseek.com/zh-cn/quick_start/error_codes | ✅ 成功（HTTP 200，1 次成功，内容完整） |
 | Token 用量计算（中文，§6 主源） | https://api-docs.deepseek.com/zh-cn/quick_start/token_usage | ✅ 成功（HTTP 200，1 次成功，内容完整） |
-| 使用 Anthropic API（英文，§2 对照补充） | https://api-docs.deepseek.com/guides/anthropic_api | ✅ 成功（HTTP 200，1 次成功；四张对照表与中文版一致） |
-| Chat Completions API（英文，§3 对照补充） | https://api-docs.deepseek.com/api/create-chat-completion | ⚠️ **部分成功**：与中文版在同一位置截断，未能补齐缺口 |
-| 思考模式（中文，§2.7 补充源，非任务指定） | https://api-docs.deepseek.com/zh-cn/guides/thinking_mode | ⚠️ **部分成功**：HTTP 200，末尾（流式样例代码及其后内容）被工具截断 |
-| 多轮对话（中文，§3.4 补充源，非任务指定） | https://api-docs.deepseek.com/zh-cn/guides/multi_round_chat | ✅ 成功（HTTP 200，1 次成功，内容完整） |
-| 探测尝试：`.md` 后缀变体 | https://api-docs.deepseek.com/zh-cn/api/create-chat-completion.md | ❌ 无效（HTTP 200 但返回英文首页，非目标页面内容） |
-| 探测尝试：锚点片段 | https://api-docs.deepseek.com/api/create-chat-completion#example | ❌ 无效（锚点不改变服务端返回，仍在同一位置截断） |
+| 思考模式（中文，§2.7 来源，非任务指定） | https://api-docs.deepseek.com/zh-cn/guides/thinking_mode | ✅ **本次已完整取得**（上一版此处被截断）。`curl.exe -L` 取原始 HTML 108003 字节，取得控制参数表（含 `colspan`/`rowspan` 结构）、两个多轮样例代码、工具调用样例与说明 |
 
-**未能覆盖的章节/内容（如实记录）**
+**未能覆盖的章节 / 内容（如实记录）**
 
-1. **§3.4**：`/chat/completions` 的响应示例 JSON、`200 (Streaming)` 响应 schema 与示例、`usage.completion_tokens_details.reasoning_tokens` 之后（若有）的字段——官方页面被抓取工具截断，重试一次仍截断，英文对照页同样截断。
-2. **§3.1 messages**：`messages` 数组的 User message / Assistant message / Tool message 三个变体的字段明细未在抓取到的页面文本中展开，故未列出（未以记忆补写）。
-3. **§2.7**：官方「思考模式」页面的末尾（流式样例代码及其后内容）被截断；该页长样例代码未收录。
-4. **§2.7.1**：思考模式控制参数表的「Anthropic 格式 / Responses API 格式」两列归属在抓取结果中存在歧义（表格空单元格丢失），已按原始单元格照录并标注旁证，未强行断定。
-5. **§6.2**：官方「图片 Token 计算器」为前端交互组件，抓取文本中不含计算公式。
+1. **§3.1 `messages` 数组**：`messages` 的 `oneOf` 四个变体中，**User message / Assistant message / Tool message 三个变体的字段明细未能抓取到**。这不是长度截断，而是官方页面把它们放在**嵌套标签页**里，服务端返回的 HTML 中只有 System message 面板的字段；对原始 HTML 检索 `User message` / `Assistant message` / `Tool message` / `tool_call_id`，各只出现 1 次（标签文字本身），无字段明细。**本文件不列其字段，也不以记忆补写。**
+2. **§2 开头「将 DeepSeek 模型接入 Claude Code」**：官方该小节只有一句指引，指向 `https://api-docs.deepseek.com/zh-cn/quick_start/agent_integrations/claude_code`；该指南页不在本次抓取范围，未收录其内容。
+3. **§2.7.3 与 §2.7.4 的示意图**：官方页面各配有一张调用流程示意图，属前端图片资源，本文件未收录图片本身。
+4. **§2.7.4 的样例输出**：官方给出该工具调用样例的完整运行输出（Turn 1.1 ~ Turn 2.2），属运行输出而非接口定义，本文件未逐行转录。
+5. **§6.2 图片 Token 计算器**：官方为前端交互组件，抓取到的页面文本中不含其计算公式。
+6. **§1.4 的 `python` / `nodejs` 标签页**：官方「调用对话 API」提供三个标签页，本文件只照录了 `curl` 标签页。
+7. **§3.9 的无状态说明**：来自「多轮对话」页，本次未重新抓取，沿用上一版结果。
 
-> 抓取时间：2026-09-10
+**本次抓取方式说明（供复核）**
+
+- 正文优先用 `web_fetch`；`web_fetch` 出现正文长度截断或需要核对 HTML 结构（表格 `colspan`/`rowspan`、嵌套标签页）时，改用 `curl.exe -sL <url>` 取原始 HTML，再用 PowerShell 去标签后逐字转录。
+- `https://api-docs.deepseek.com/zh-cn/api/create-chat-completion` 直接 GET 返回 **302**，`Location: /zh-cn/api/create-chat-completion/`；必须跟随重定向（`curl -L`）才能取到正文。
+- 所有转录内容均未使用记忆或推测；发现官方页面自相矛盾之处（§3.3 的 `prompt_cache_*` 层级、§3.5 的 `insufficient_system_resource` 措辞与缺失的 `usage` 字段）均在原处如实标注，未作"修正"。

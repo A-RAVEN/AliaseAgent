@@ -61,51 +61,23 @@ Widget _buildApp({
   );
 }
 
-/// Phase 4 cost discipline (D10): 5.1 per-session fold budget cap + 5.2
-/// break-even regression.
+/// Break-even regression: a valid fold must pay for itself.
+///
+/// REMOVED 2026-09-20, with the user's explicit authorisation (2026-09-13:
+/// 「对于这种狗屎设计，没有任何留着的理由」 / "there is no reason to keep a design
+/// this bad"): the `5.1 fold budget cap` case used to pin a per-session cap of 30
+/// summaries and 500000 summary tokens. That cap was deleted from the product
+/// (see the NOTE above `ChatScreenState._summaryStoreOpen` in lib/main.dart for
+/// why it was a defect, not a guard). Deleting the case is a change to the
+/// acceptance criteria and is authorised — it is NOT a quietly loosened
+/// assertion: the behaviour it pinned no longer exists on purpose.
+///
+/// The break-even case below is a DIFFERENT property ("does compaction actually
+/// save anything") and is kept.
 void main() {
   tearDown(() {
     registry.clear();
     resolver = null;
-  });
-
-  // 5.1 — per-session fold budget cap (D10 cost discipline): a session whose
-  // accumulated fold accounting exceeds the cap stops auto-folding, so it cannot
-  // pay unbounded summarization cost. Tested as the pure cap check
-  // (deterministic; no DB/FakeAsync). The widget GATE wiring — the on-demand fold
-  // path (main.dart _callModel) + the idle background fold both call
-  // `_foldBudgetExceeded`, which queries the persisted nodes then invokes
-  // [ChatScreenState.isFoldBudgetExceeded] — uses the public static pinned here.
-  // (The full widget+real-DB path is a known FakeAsync black-hole harness
-  // limitation; the accounting LOGIC is thus tested directly.)
-  test('5.1 fold budget cap: count cap, token cap, at-cap-not-exceeded', () {
-    // ignore: avoid_print
-    print('  [OBS] 5.1 fold caps: count=${ChatScreenState.maxFoldsPerSession} '
-        'tokens=${ChatScreenState.maxFoldTokensPerSession}');
-    expect(ChatScreenState.maxFoldsPerSession, greaterThan(0),
-        reason: '5.1 a fold-count cap is defined');
-    expect(ChatScreenState.maxFoldTokensPerSession, greaterThan(0),
-        reason: '5.1 a fold-token cap is defined');
-
-    // Count cap: 1 fold over the limit trips.
-    expect(
-        ChatScreenState.isFoldBudgetExceeded(
-            foldCount: ChatScreenState.maxFoldsPerSession + 1, foldTokens: 0),
-        isTrue,
-        reason: '5.1 fold COUNT over the cap must trip the budget');
-    // Token cap: 1 token over the limit trips.
-    expect(
-        ChatScreenState.isFoldBudgetExceeded(
-            foldCount: 0, foldTokens: ChatScreenState.maxFoldTokensPerSession + 1),
-        isTrue,
-        reason: '5.1 fold TOKENS over the cap must trip the budget');
-    // Exactly at the cap is NOT exceeded.
-    expect(
-        ChatScreenState.isFoldBudgetExceeded(
-            foldCount: ChatScreenState.maxFoldsPerSession,
-            foldTokens: ChatScreenState.maxFoldTokensPerSession),
-        isFalse,
-        reason: '5.1 at the cap is within budget (not exceeded)');
   });
 
   // 5.2 — break-even regression: a valid fold must be repaid by the per-request
