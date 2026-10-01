@@ -419,12 +419,37 @@ void main() {
       expect(l2Nodes, isNotEmpty,
           reason: '④ 层级 1 的实测合计超过阈值 ⇒ 必须真的合成出层级 2；这里空着就说明'
               '"攒够阈值就压"没有实现');
-      expect(l2Nodes.first.coveredMinSeq,
-          lessThanOrEqualTo(l1Nodes.map((n) => n.coveredMinSeq).reduce((a, b) => a < b ? a : b)),
+      // 更粗摘要盖住的范围 = 从最旧那条层级 1 开始、实测 token 累加**首次超过阈值**的那一段
+      // （规范原文：starting from the OLDEST, accumulate the MEASURED token counts … and roll
+      // that group up … as soon as the accumulated total exceeds `T`）。所以它**不一定**包住
+      // 所有层级 1：2026-09-26 这次运行里前 4 条的实测合计就已经超过阈值 2165，第 5 条
+      // （覆盖 seq 646..807）自然留在外面 —— 它离末尾更近，本来也不该被顶替。
+      // 旧断言写的是"必须包住所有被它替换的层级 1"（`greaterThanOrEqualTo` 最大的那个
+      // coveredMaxSeq），这条不是规则的要求，规则算出来的范围更小 ⇒ 按规则改写成**精确相等**。
+      final l1Sorted = List.of(l1Nodes)
+        ..sort((a, b) => a.coveredMinSeq - b.coveredMinSeq);
+      final tNow = CompactionEngine.thresholdTokens(kBudget, null);
+      var acc = 0;
+      var groupEnd = -1;
+      for (var i = 0; i < l1Sorted.length; i++) {
+        acc += l1Sorted[i].tokenCost ?? 0;
+        if (acc > tNow) {
+          groupEnd = i;
+          break;
+        }
+      }
+      debugPrint('[OBS] ④ 按规则算出的合成范围：从 seq ${l1Sorted.first.coveredMinSeq} 到 '
+          'seq ${groupEnd < 0 ? "(谁都没超过阈值)" : l1Sorted[groupEnd].coveredMaxSeq}'
+          '（最旧起前 ${groupEnd + 1} 条的实测累计 $acc，阈值 $tNow）');
+      expect(groupEnd, greaterThanOrEqualTo(0),
+          reason: '④ 前提：从最旧开始累加，确实在某一处首次超过阈值');
+      final oldestL2 = l2Nodes.reduce((a, b) =>
+          a.coveredMinSeq <= b.coveredMinSeq ? a : b);
+      expect(oldestL2.coveredMinSeq, l1Sorted.first.coveredMinSeq,
           reason: '④ 合成出来的那条更粗摘要，覆盖范围要从最旧那条层级 1 开始');
-      expect(l2Nodes.first.coveredMaxSeq,
-          greaterThanOrEqualTo(l1Nodes.map((n) => n.coveredMaxSeq).reduce((a, b) => a > b ? a : b)),
-          reason: '④ 合成出来的那条更粗摘要，覆盖范围要包住所有被它替换的层级 1');
+      expect(oldestL2.coveredMaxSeq, l1Sorted[groupEnd].coveredMaxSeq,
+          reason: '④ 覆盖范围要正好是"从最旧开始累加、实测首次超过阈值"的那一段 —— '
+              '多盖一条或少盖一条都说明成组规则没按阈值走');
 
       // 合成出来的那条更粗的摘要，必须真的进了发给模型的内容。
       final sentJson = _snapshotMessagesJson(tester);
@@ -447,21 +472,76 @@ void main() {
           }
         }
       }
-      final l2Text = _summaryText(l2Nodes.first).trim();
+      final l2Text = _summaryText(oldestL2).trim();
       final l2Head = l2Text.length <= 40 ? l2Text : l2Text.substring(0, 40);
       debugPrint('[OBS] ④ sent text blocks=${sentTexts.length} '
           'l2TextChars=${l2Text.length} l2Head="$l2Head"');
       expect(sentTexts, isNotEmpty,
           reason: '④ 前提：要能从发给模型的内容里解出文本块');
-      expect(sentTexts.any((t) => t.contains(kLevel2SummaryMarker)), isTrue,
-          reason: '④ 合成出来的层级 2 摘要必须真的出现在发给模型的内容里 '
-              '（只写进数据库不算数）');
-      // 被合成掉的那 5 条层级 1 摘要，文本不应再作为独立条目重复出现（它们的内容
-      // 已经被那条更粗的摘要接过去了）。
-      expect(sentTexts.any((t) => t.contains(kSummaryMarker)), isFalse,
-          reason: '④ 被合成掉的层级 1 摘要不该再单独出现在投影里');
-      expect(sentTexts.any((t) => t.contains(l2Head)), isTrue,
-          reason: '④ 发给模型的那条更粗摘要，文本要和库里存的一致（取开头 40 字比对）');
+
+      // 投影口径（2026-09-26 的裁定）：这条层级 2 这一趟**要不要**进投影，取决于它盖住的
+      // **整段**是不是都已经落到最远档（最旧端与最新端距离都超过 2T）。够远就必须出现；
+      // 不够远就必须不出现，那一段由它盖住的层级 1 摘要表示。判据由产品代码自己算
+      // （`CompactionEngine.spanIndices` + `substitutesSpan`），不靠人眼读数。
+      final t = CompactionEngine.thresholdTokens(kBudget, null);
+      final distances = CompactionEngine.distancesFromNewest(preHistory);
+      final l2Span = CompactionEngine.spanIndices(
+          preHistory, oldestL2.coveredMinSeq, oldestL2.coveredMaxSeq);
+      final l2FarEnough = l2Span != null &&
+          CompactionEngine.substitutesSpan(
+            distanceAtOldest: distances[l2Span.oldest],
+            distanceAtNewest: distances[l2Span.newest],
+            level: 2,
+            t: t,
+          );
+      final l2InProjection =
+          sentTexts.any((text) => text.contains(kLevel2SummaryMarker));
+      debugPrint('[OBS] ④ 这条 2 级这一趟该不该进投影=$l2FarEnough '
+          '（它覆盖 seq ${oldestL2.coveredMinSeq}..${oldestL2.coveredMaxSeq}，'
+          '最旧端距离=${l2Span == null ? "不在历史里" : distances[l2Span.oldest]}、'
+          '最新端距离=${l2Span == null ? "不在历史里" : distances[l2Span.newest]}，'
+          '最远档下界 2T=${2 * t}）；投影里实际有没有=$l2InProjection');
+      if (l2FarEnough) {
+        expect(l2InProjection, isTrue,
+            reason: '④ 这条层级 2 盖住的整段都落到最远档了 ⇒ 它必须真的出现在发给模型的'
+                '内容里（只写进数据库不算数）');
+        expect(sentTexts.any((text) => text.contains(l2Head)), isTrue,
+            reason: '④ 发给模型的那条更粗摘要，文本要和库里存的一致（取开头 40 字比对）');
+      } else {
+        expect(l2InProjection, isFalse,
+            reason: '④ 这条层级 2 盖住的整段还没落到最远档 ⇒ 这一趟不许拿它顶替，'
+                '那一段该由它的层级 1 摘要表示（用户 2026-09-26 的要求：只有位置足够靠后'
+                '时才对模型换成摘要）');
+      }
+
+      // 不重复：被这条层级 2 盖住的那些层级 1 摘要，只要 2 级这一趟进了投影，它们的文本
+      // 就不许再单独出现（同一段内容两种表示）。反过来说，2 级没进投影时，这一段必须
+      // 真的由至少一条层级 1 表示 —— 不许两头都没有（那一段就凭空消失了）。
+      final coveredL1 = l1Nodes
+          .where((n) =>
+              n.coveredMinSeq >= oldestL2.coveredMinSeq &&
+              n.coveredMaxSeq <= oldestL2.coveredMaxSeq)
+          .toList();
+      final coveredTexts = [
+        for (final n in coveredL1)
+          if (_summaryText(n).trim().length >= 20) _summaryText(n).trim()
+      ];
+      final coveredSentSeparately = coveredTexts
+          .where((text) => sentTexts.any((block) => block.contains(text)))
+          .toList();
+      debugPrint('[OBS] ④ 被 2 级盖住的层级 1 共 ${coveredL1.length} 条，'
+          '其中单独出现在投影里的=${coveredSentSeparately.length} 条');
+      expect(coveredL1, isNotEmpty,
+          reason: '④ 前提：这条层级 2 确实盖住了层级 1 摘要，否则"会不会重复"无从谈起');
+      if (l2FarEnough) {
+        expect(coveredSentSeparately, isEmpty,
+            reason: '④ 2 级已经进了投影 ⇒ 被它盖住的层级 1 不许再单独出现一份'
+                '（同一段内容不能既是 1 级又是 2 级）');
+      } else {
+        expect(coveredSentSeparately, isNotEmpty,
+            reason: '④ 2 级这一趟没进投影 ⇒ 被它盖住的这一段必须由层级 1 摘要表示，'
+                '不能两头顶替掉之后什么都不发');
+      }
 
       // ------------------------------------------------------------------
       // 切到「真实上下文」视图再截图：这一屏显示的就是**真正发给模型的内容**，

@@ -27,8 +27,8 @@ Message _bigMsg(String role, int i) => _msg(role, '$i:${'x' * 3000}');
 /// `estimateMessage` = ceil(len/4) + 4, so len = (rawPerMsg - 4) * 4 - 3.
 /// Batch geometry depends on the per-message raw size, so tests that assert
 /// "which span got folded" pin it here instead of using a magic length.
-Message _msgOfRaw(String role, int rawPerMsg) =>
-    _msg(role, 'A' * ((rawPerMsg - 4) * 4 - 3));
+Message _msgOfRaw(String role, int rawPerMsg, {int? seq}) =>
+    _msg(role, 'A' * ((rawPerMsg - 4) * 4 - 3), seq: seq);
 
 void main() {
   group('CompactionEngine.buildTree (structure-only, no /4)', () {
@@ -583,6 +583,88 @@ void main() {
           reason: '第一批 raw 不超过阈值加一条消息');
       expect(largeSegs.length, lessThanOrEqualTo(smallSegs.length),
           reason: '容量翻倍、阈值同步翻倍 ⇒ L1 批数不变多');
+    });
+  });
+
+  // 投影分档：一段内容离现在多远，决定它在投影里发原文、1 级摘要还是 2 级摘要。
+  // 两个档边界都由同一个阈值 T 推出来：中距档从 T 起，最远档从 2T 起。
+  group('投影分档（距离与档边界，唯一计算点）', () {
+    test('档边界随模型容量按比例翻倍：20000 ⇒ 5000/10000，40000 ⇒ 10000/20000', () {
+      final t20 = CompactionEngine.thresholdTokens(20000, null);
+      final t40 = CompactionEngine.thresholdTokens(40000, null);
+      // ignore: avoid_print
+      print('  [OBS] 容量 20000 ⇒ T=$t20，中距档下界 '
+          '${CompactionEngine.bandFloorTokens(1, t20)}、最远档下界 '
+          '${CompactionEngine.bandFloorTokens(2, t20)}；容量 40000 ⇒ T=$t40，'
+          '中距档下界 ${CompactionEngine.bandFloorTokens(1, t40)}、最远档下界 '
+          '${CompactionEngine.bandFloorTokens(2, t40)}');
+      expect(t20, 5000, reason: '20000 × 25% = 5000');
+      expect(CompactionEngine.bandFloorTokens(1, t20), 5000,
+          reason: '中距档的下界就是阈值本身');
+      expect(CompactionEngine.bandFloorTokens(2, t20), 10000,
+          reason: '最远档的下界是阈值的两倍 —— 不引入任何写死的绝对 token 数');
+      expect(CompactionEngine.bandFloorTokens(1, t40), 10000,
+          reason: '容量翻倍 ⇒ 中距档下界跟着翻倍');
+      expect(CompactionEngine.bandFloorTokens(2, t40), 20000,
+          reason: '容量翻倍 ⇒ 最远档下界跟着翻倍');
+    });
+
+    test('距离按「它后面还有多少原文」算；1 级看起点，2 级要整段都够远', () {
+      // 10 条 × 100 raw（seq 1..10）+ 末尾当前这条用户消息（raw 6）。
+      final history = [
+        for (var i = 0; i < 10; i++)
+          _msgOfRaw(i.isEven ? 'user' : 'assistant', 100, seq: i + 1),
+        _msgOfRaw('user', 6, seq: 11),
+      ];
+      final d = CompactionEngine.distancesFromNewest(history);
+      // ignore: avoid_print
+      print('  [OBS] 距离（比它更新的原文之和）: '
+          '${[for (var i = 0; i < history.length; i++) 'seq${history[i].seq}=${d[i]}'].join(' ')} '
+          '；spanIndices(1..6)=${CompactionEngine.spanIndices(history, 1, 6)}');
+      expect(d[10], 0, reason: '最新那条后面没有原文 ⇒ 距离 0');
+      expect(d[9], 6, reason: 'seq10 后面只有当前这条用户消息（raw 6）');
+      expect(d[0], 906,
+          reason: 'seq1 后面是 seq2..10 共 9 条 × 100 = 900 raw，再加当前这条 6；'
+              '它自己不算进去');
+      expect(d[4], 506,
+          reason: 'seq5 后面是 seq6..10 共 500 raw，再加当前这条 6 —— '
+              '距离只算比它更新的原文');
+      expect(CompactionEngine.spanIndices(history, 1, 6), (oldest: 0, newest: 5),
+          reason: '覆盖 seq 1..6 的那一段在历史里是下标 0..5');
+      expect(CompactionEngine.spanIndices(history, 20, 30), isNull,
+          reason: '这个跨度不在当前历史里 ⇒ 查不到（调用方按"还不够远"处理）');
+
+      // 假设阈值就是 400（这里只看口径，不看真实容量）：中距档下界 400、
+      // 最远档下界 800。
+      const t = 400;
+      expect(
+          CompactionEngine.substitutesSpan(
+              distanceAtOldest: d[0], distanceAtNewest: d[5], level: 1, t: t),
+          isTrue,
+          reason: '1 级看起点：seq1 的距离 906 > 400 ⇒ 用它的 1 级摘要表示这一段');
+      expect(
+          CompactionEngine.substitutesSpan(
+              distanceAtOldest: d[0], distanceAtNewest: d[6], level: 1, t: t),
+          isTrue,
+          reason: '1 级仍看起点：一段内容的档按它最旧那条消息算，最新端落在最近档里'
+              '不影响这一段的判定（规范原文：distance measured at its OLDEST '
+              'covered message）');
+      expect(
+          CompactionEngine.substitutesSpan(
+              distanceAtOldest: d[6], distanceAtNewest: d[7], level: 1, t: t),
+          isFalse,
+          reason: '起点自己还没离开最近档（seq7 的距离 306 ≤ 400）⇒ 这一段还发原文');
+      expect(
+          CompactionEngine.substitutesSpan(
+              distanceAtOldest: d[0], distanceAtNewest: d[1], level: 2, t: t),
+          isTrue,
+          reason: '2 级要整段都超过 2T=800：seq1..2 两端是 906 / 806 ⇒ 够远');
+      expect(
+          CompactionEngine.substitutesSpan(
+              distanceAtOldest: d[0], distanceAtNewest: d[2], level: 2, t: t),
+          isFalse,
+          reason: '2 级要整段都够远，最新端 seq3 只有 706 ≤ 800 ⇒ 还不够远，'
+              '这一段继续用它自己的 1 级摘要表示');
     });
   });
 }

@@ -148,6 +148,68 @@ class CompactionEngine {
     return (maxContextTokens * p) ~/ 100;
   }
 
+  /// 一段内容「离现在多远」：按 [history] 的列表顺序（也就是持久化顺序），每条消息的
+  /// 距离 = **比它更新的**所有原文的估算 token 之和。返回的读数与 [history] 下标一一
+  /// 对应（按 seq 区间查一段的两端用 [spanIndices]）。
+  ///
+  /// 纯函数：只看原文，**不看摘要的实测大小**。规范的《Deterministic fold plan》要求
+  /// 档结构是 history + config + 已闭合分割的纯函数，把摘要实测大小折进来就会破坏它；
+  /// 用本地估算也保证同一个历史永远给出同一套档。
+  static List<int> distancesFromNewest(List<Message> history) {
+    final out = List<int>.filled(history.length, 0);
+    var newer = 0;
+    for (var i = history.length - 1; i >= 0; i--) {
+      out[i] = newer;
+      newer += ContextEstimator.estimateMessage(history[i]);
+    }
+    return out;
+  }
+
+  /// [distancesFromNewest] 的读数里，覆盖 seq `[minSeq..maxSeq]` 的那一段两端各在哪个
+  /// 下标；这段不在当前历史里时返回 null。
+  static ({int oldest, int newest})? spanIndices(
+      List<Message> history, int minSeq, int maxSeq) {
+    var oldest = -1;
+    var newest = -1;
+    for (var i = 0; i < history.length; i++) {
+      final seq = history[i].seq;
+      if (seq == null || seq < minSeq || seq > maxSeq) continue;
+      if (oldest < 0) oldest = i;
+      newest = i;
+    }
+    if (oldest < 0 || newest < 0) return null;
+    return (oldest: oldest, newest: newest);
+  }
+
+  /// 某一档的下界：中距档（用 1 级摘要表示）从 `T` 起，最远档（用 2 级摘要表示）从
+  /// `2T` 起。两个数都由同一个阈值 [t] 推出来 —— 这里不引入任何写死的绝对 token
+  /// 数，换一个大窗口的模型时两条边界一起变大。
+  static int bandFloorTokens(int level, int t) => level >= 2 ? 2 * t : t;
+
+  /// 一条摘要能不能在这次投影里顶替它盖住的那一段。
+  ///
+  /// 判据按层级分（规范《Recency-gradient hierarchical compaction》）：
+  ///  - **1 级**：那一段的起点（最旧那条消息）已经离开最近的原文窗口 —— 它的距离超过
+  ///    `T` —— 就用 1 级摘要表示它。一段内容的档按它**最旧那条消息**算，这是规范钉死的
+  ///    距离口径。
+  ///  - **2 级**：那一段**整段**都要落到最远档（最旧端与最新端都超过 `2T`）才用它顶替。
+  ///    这正是用户 2026-09-26 要的那条：刚合成出来的 2 级不许立刻把被它盖住的 1 级挤掉，
+  ///    只有位置足够靠后时才对模型换成摘要。
+  ///
+  /// 距离随消息变新而单调变小，所以 2 级的两个端点里真正卡住的是最新端；两端都写出来是
+  /// 为了让边界条件在代码里看得见。
+  static bool substitutesSpan({
+    required int distanceAtOldest,
+    required int distanceAtNewest,
+    required int level,
+    required int t,
+  }) {
+    final floor = bandFloorTokens(level, t);
+    if (distanceAtOldest <= floor) return false;
+    if (level >= 2 && distanceAtNewest <= floor) return false;
+    return true;
+  }
+
   /// Build the fold plan for a conversation.
   ///
   /// Progressive closure (D8): the passed-in [closed] segments are FROZEN fixed
@@ -155,14 +217,24 @@ class CompactionEngine {
   /// Only the unclosed TAIL (messages newer than the newest closed segment) is a
   /// candidate for new folding. So this is a pure function of
   /// (history, budget, closed-segmentation): deterministic given those inputs.
+  ///
+  /// [coverageFloorSeq] is the newest seq **any** persisted summary covers — which
+  /// is not the same thing as the newest seq the *projected* summaries cover: a
+  /// summary that is not far enough back yet stays out of the projection (see
+  /// [substitutesWholeSpan]) while the raw content under it has still already been
+  /// summarized once and must never be folded a second time. Everything up to that
+  /// floor that no projected summary covers is emitted as RAW segments, in time
+  /// order, so no message ever ends up with no representation at all.
   static CompactionPlan buildTree({
     required List<Message> history,
     required int maxContextTokens,
     List<ClosedSummary> closed = const [],
+    int? coverageFloorSeq,
     L1SeamChooser? seamChooser,
     int? thresholdPercent,
   }) {
-    final t = _tailOf(history, closed, maxContextTokens);
+    final t = _tailOf(history, closed, maxContextTokens,
+        coverageFloorSeq: coverageFloorSeq);
     final frozenCost = closed.fold(0, (m, c) => m + c.tokenCost);
 
     final closedSegments = <CompactionSegment>[
@@ -174,6 +246,12 @@ class CompactionEngine {
           reuse: c,
         ),
     ];
+    // 已闭合区间里，没有被选中的摘要盖住的那部分按原文发（见 [_coveredRegionInOrder]）。
+    final coveredRegion = history.sublist(0, history.length - t.tail.length);
+    final coveredSegments = _coveredRegionInOrder(coveredRegion, closedSegments);
+    final gapRaw = coveredSegments
+        .where((s) => !s.summary)
+        .fold(0, (m, s) => m + rawTokens(s.messages));
     final tailPlan = _foldTail(
         t.tail,
         t.budget,
@@ -181,12 +259,49 @@ class CompactionEngine {
         seamChooser);
     return CompactionPlan(
       segments: [
-        ...closedSegments,
+        ...coveredSegments,
         ...tailPlan.segments,
       ],
-      projectedTokens: frozenCost + tailPlan.projectedTokens,
+      projectedTokens: frozenCost + gapRaw + tailPlan.projectedTokens,
       shouldCompact: closedSegments.isNotEmpty || tailPlan.shouldCompact,
     );
+  }
+
+  /// 已闭合区间里"按时间排好的表示"：选中的摘要段发它自己，没有摘要盖住的那部分一律
+  /// 发原文 —— 每一段内容都必须有一种表示，不许出现谁也不管的空档。
+  ///
+  /// [closedSegments] 互不重叠、从旧到新（调用方保证）。返回的段同样按时间排好，摘要段
+  /// 与原文段交错出现。
+  static List<CompactionSegment> _coveredRegionInOrder(
+      List<Message> covered, List<CompactionSegment> closedSegments) {
+    final out = <CompactionSegment>[];
+    var cursor = 0; // covered 里下一个还没安排的消息下标
+    for (final seg in closedSegments) {
+      if (seg.messages.isEmpty) continue;
+      final lo = seg.messages.first.seq ?? 0;
+      final hi = seg.messages.last.seq ?? 0;
+      var first = -1;
+      var last = -1;
+      for (var i = cursor; i < covered.length; i++) {
+        final s = covered[i].seq ?? 0;
+        if (s < lo) continue;
+        if (s > hi) break;
+        if (first < 0) first = i;
+        last = i;
+      }
+      if (first < 0) continue; // 这一段的消息不在当前历史里
+      if (first > cursor) {
+        out.add(CompactionSegment(
+            messages: covered.sublist(cursor, first), summary: false));
+      }
+      out.add(seg);
+      cursor = last + 1;
+    }
+    if (cursor < covered.length) {
+      out.add(CompactionSegment(
+          messages: covered.sublist(cursor), summary: false));
+    }
+    return out;
   }
 
   /// The (far, k) seam inputs the runtime needs to PREFETCH/MEMOIZE the LLM
@@ -204,9 +319,11 @@ class CompactionEngine {
     required List<Message> history,
     required int maxContextTokens,
     List<ClosedSummary> closed = const [],
+    int? coverageFloorSeq,
     int? thresholdPercent,
   }) {
-    final t = _tailOf(history, closed, maxContextTokens);
+    final t = _tailOf(history, closed, maxContextTokens,
+        coverageFloorSeq: coverageFloorSeq);
     if (t.tail.isEmpty) return null;
     final T = thresholdTokens(maxContextTokens, thresholdPercent);
     final foldEnd = _foldEndFor(t.tail, t.budget, T);
@@ -219,11 +336,19 @@ class CompactionEngine {
 
   /// The unclosed tail + its budget, shared by [buildTree] and
   /// [resolveFoldSeamInputs] (single source of truth for progressive closure).
+  ///
+  /// [coverageFloorSeq] overrides how far the CLOSED region reaches; it defaults
+  /// to the highest seq the passed-in [closed] segments cover. The override exists
+  /// because a persisted summary that is still too near to be projected is not in
+  /// [closed] any more, yet the raw content under it is still already summarized
+  /// and must not be folded again.
   static ({List<Message> tail, int budget}) _tailOf(
-      List<Message> history, List<ClosedSummary> closed, int maxContextTokens) {
-    final closedFloor = closed.isEmpty
-        ? -1
-        : closed.map((c) => c.coveredMaxSeq).reduce((a, b) => a > b ? a : b);
+      List<Message> history, List<ClosedSummary> closed, int maxContextTokens,
+      {int? coverageFloorSeq}) {
+    final closedFloor = coverageFloorSeq ??
+        (closed.isEmpty
+            ? -1
+            : closed.map((c) => c.coveredMaxSeq).reduce((a, b) => a > b ? a : b));
     final frozenCost = closed.fold(0, (m, c) => m + c.tokenCost);
     var tailStart = 0;
     while (tailStart < history.length &&

@@ -43,6 +43,15 @@ class _BackgroundFoldCancelled implements Exception {
   String toString() => reason;
 }
 
+/// 投影时间线上的一段：要么发摘要（[summary] 非空，标记由 [segment] 的层级决定），
+/// 要么把 [segment] 里的原文原样发出去（[summary] 为空）。两种段在时间里交错排列：
+/// 离现在还不够远的那一段即使已经被压成摘要，这一趟也仍然发原文。
+class ProjectionPiece {
+  final CompactionSegment segment;
+  final SummaryResult? summary;
+  const ProjectionPiece({required this.segment, this.summary});
+}
+
 void main() {
   sqfliteFfiInit();
   databaseFactory = databaseFactoryFfi;
@@ -954,32 +963,36 @@ class ChatScreenState extends State<ChatScreen> {
       // above [_summaryStoreOpen]. Compaction now always runs when the threshold
       // is crossed; "cost must not run away" is currently unowned (nothing guards
       // it).
-      final closed = await _loadClosedSegments(sessionId);
+      final loaded = await _loadClosedSegments(sessionId, messages,
+          maxContextTokens, agentType.compactionThresholdPercent);
       // 4.3 design D5 option A: when a seam selector is available, prefetch/memoize
       // the LLM L1 topic seams for the current fold BEFORE building the plan, then
       // pass a memo-backed L1SeamChooser. A seam failure degrades gracefully to the
       // arithmetic-safe skeleton (never splits a tool round, never blocks the turn).
-      final seamChooser =
-          await _prepareSeamChooser(messages, closed, agentType, maxContextTokens);
+      final seamChooser = await _prepareSeamChooser(
+          messages, loaded.projected, agentType, maxContextTokens,
+          coverageFloorSeq: loaded.coveredThrough);
       final plan = CompactionEngine.buildTree(
           history: messages,
           maxContextTokens: maxContextTokens,
-          closed: closed,
+          closed: loaded.projected,
+          coverageFloorSeq: loaded.coveredThrough,
           seamChooser: seamChooser,
           thresholdPercent: agentType.compactionThresholdPercent);
       if (plan.shouldCompact) {
-        ({List<CompactionSegment> segments, List<SummaryResult> summaries}) resolved =
-            (segments: const [], summaries: const []);
+        ({List<ProjectionPiece> timeline, List<SummaryResult> summaries})
+            resolved = (timeline: const [], summaries: const []);
         try {
-          resolved = await _resolveSummaries(
-              sessionId, plan, agentType, maxContextTokens);
+          resolved = await _resolveSummaries(sessionId, plan, agentType,
+              maxContextTokens,
+              history: messages);
         } catch (e) {
           // Summarization failed — never silently replace the folded context with
           // a placeholder. Fall back to sending the conversation verbatim.
           debugPrint('[AliasAgent] compaction summary failed, sending verbatim: $e');
-          resolved = (segments: const [], summaries: const []);
+          resolved = (timeline: const [], summaries: const []);
         }
-        if (resolved.segments.isEmpty) {
+        if (resolved.timeline.isEmpty) {
           // Empty-far pathological case: compaction split-omitted the ENTIRE far
           // span (no compressible batch) and there was no verbatim tail, so the
           // projection is empty — we fall back to the full conversation (which is
@@ -990,11 +1003,9 @@ class ChatScreenState extends State<ChatScreen> {
               'conversation (known pathological limit)');
           apiMessages = _buildApiMessages(messages);
         } else {
-          // segments carries the (measure→adjusted) summary segments + the verbatim
-          // tail; summaries may be empty after an omit-most-of-the-far, in which
-          // case _buildCompactionProjection sends only the verbatim tail (the older
-          // omitted content stays on disk, D9).
-          apiMessages = _buildCompactionProjection(resolved.summaries, resolved.segments);
+          // timeline 是这条投影的时间线：发摘要的段与发原文的段按时间排好；某一趟把
+          // 远端几乎全省略时摘要会为空，那时投影里只剩原文（更早的内容留在磁盘上，D9）。
+          apiMessages = _buildCompactionProjection(resolved.timeline);
         }
       } else {
         apiMessages = _buildApiMessages(messages);
@@ -1474,12 +1485,13 @@ class ChatScreenState extends State<ChatScreen> {
   /// tool round, never blocks the turn).
   Future<L1SeamChooser?> _prepareSeamChooser(List<Message> history,
       List<ClosedSummary> closed, AgentTypeConfig agentType,
-      int maxContextTokens, {bool Function()? isAborted}) async {
+      int maxContextTokens, {int? coverageFloorSeq, bool Function()? isAborted}) async {
     if (_seamSelector == null) return null;
     final seamInputs = CompactionEngine.resolveFoldSeamInputs(
         history: history,
         maxContextTokens: maxContextTokens,
         closed: closed,
+        coverageFloorSeq: coverageFloorSeq,
         thresholdPercent: agentType.compactionThresholdPercent);
     if (seamInputs == null) return null;
     final seamSel = _seamSelector;
@@ -1544,19 +1556,22 @@ class ChatScreenState extends State<ChatScreen> {
       // (the materialize calls inside _resolveSummaries are `if (dbOpen)`).
       final messages = await _msgRepo.queryBySession(sessionId);
       if (messages.isEmpty) return;
-      final closed = await _loadClosedSegments(sessionId);
-      // Durable resume point (D8 progressive closure) = the persisted `closed`
-      // segments passed into buildTree; the top closed seq is only logged for
-      // observability (there is no separate in-memory checkpoint control value).
-      final topClosedMax = closed.isEmpty
-          ? 0
-          : closed.map((c) => c.coveredMaxSeq).reduce((a, b) => a > b ? a : b);
-      final seamChooser = await _prepareSeamChooser(messages, closed, agentType,
-          maxContextTokens, isAborted: () => _foldGen != myGen);
+      final loaded = await _loadClosedSegments(sessionId, messages,
+          maxContextTokens, agentType.compactionThresholdPercent);
+      // Durable resume point (D8 progressive closure) = how far the persisted
+      // summaries already cover; logged only for observability (there is no
+      // separate in-memory checkpoint control value).
+      final topClosedMax =
+          loaded.coveredThrough < 0 ? 0 : loaded.coveredThrough;
+      final seamChooser = await _prepareSeamChooser(
+          messages, loaded.projected, agentType, maxContextTokens,
+          coverageFloorSeq: loaded.coveredThrough,
+          isAborted: () => _foldGen != myGen);
       final plan = CompactionEngine.buildTree(
           history: messages,
           maxContextTokens: maxContextTokens,
-          closed: closed,
+          closed: loaded.projected,
+          coverageFloorSeq: loaded.coveredThrough,
           seamChooser: seamChooser,
           thresholdPercent: agentType.compactionThresholdPercent);
       if (!plan.shouldCompact) {
@@ -1567,7 +1582,7 @@ class ChatScreenState extends State<ChatScreen> {
       }
       final resolved = await _resolveSummaries(
           sessionId, plan, agentType, maxContextTokens,
-          isAborted: () => _foldGen != myGen);
+          history: messages, isAborted: () => _foldGen != myGen);
       debugPrint('[AliasAgent] background fold: folded '
           '${resolved.summaries.length} summary segment(s) for session $sessionId, '
           'top closed seq=$topClosedMax');
@@ -1632,24 +1647,44 @@ class ChatScreenState extends State<ChatScreen> {
   /// BOTH kinds keep excluding the raw conversation they cover: [CompactionEngine]
   /// takes the highest covered sequence of every loaded node as the floor, so the
   /// original messages under any of them are never compressed a second time.
-  Future<List<ClosedSummary>> _loadClosedSegments(String sessionId) async {
-    if (!_summaryStoreOpen) return const [];
+  ///
+  /// 返回两个东西：
+  ///  - [projected]：这次投影要用的节点，互不重叠、从旧到新；
+  ///  - [coveredThrough]：**所有**已落盘节点覆盖到的最远 seq（不只是被选中的那些）。
+  ///    那段原文已经压过一次，不许再被当成尾部重新压，所以它单独给出来；一条节点都
+  ///    没有时是 -1。
+  ///
+  /// 选谁进投影按"离现在多远"判（用户 2026-09-26 的要求：压缩随时做，但只有位置足够
+  /// 靠后时才对模型换成摘要；判据见 [CompactionEngine.substitutesWholeSpan]）：
+  ///  - 一条摘要要顶替它盖住的整段，那段得**整段**都落到它该在的档里（1 级要整段超过
+  ///    阈值，2 级要整段超过两倍阈值）。
+  ///  - 所以一条 2 级还不够远时**不收它、改收它盖住的那几条 1 级**（更细、多花一点
+  ///    token，但不重复、也不提前顶替）；够远才收它，那时它盖住的 1 级整条跳过。
+  ///  - 谁都没盖住的那部分不会丢：[CompactionEngine.buildTree] 拿 [coveredThrough] 当
+  ///    已闭合区间的上界，把那部分按原文补进投影。
+  Future<({List<ClosedSummary> projected, int coveredThrough})>
+      _loadClosedSegments(String sessionId, List<Message> history,
+          int maxContextTokens, int? thresholdPercent) async {
+    if (!_summaryStoreOpen) {
+      return (projected: const <ClosedSummary>[], coveredThrough: -1);
+    }
     try {
       final nodes = await _summaryNodeRepo.queryBySession(sessionId);
-      // Prefer the COARSEST covering node for each span (R8-d). A coarsened
-      // level-2 "summary of summaries" covers the same span as the level-1s it
-      // rolled up; sorting by (coveredMinSeq ASC, coveredMaxSeq DESC, level DESC)
-      // puts the covering coarser node FIRST, so the greedy non-overlap advance
-      // below adopts it and subsumes the L1s — instead of skipping the L2 in favor
-      // of the larger frozen L1s (which threw away the coarsening and inflated how
-      // much of the model window the summaries occupy). Still yields D9 dense
-      // non-overlap.
-      final sorted = nodes
+      final candidates = nodes
           .where((n) =>
-              n.level >= 1 &&
-              n.summaryJson != null &&
-              n.coveredMinSeq > 0)
-          .toList()
+              n.level >= 1 && n.summaryJson != null && n.coveredMinSeq > 0)
+          .toList();
+      if (candidates.isEmpty) {
+        return (projected: const <ClosedSummary>[], coveredThrough: -1);
+      }
+      final coveredThrough =
+          candidates.map((n) => n.coveredMaxSeq).reduce((a, b) => a > b ? a : b);
+      final t = CompactionEngine.thresholdTokens(
+          maxContextTokens, thresholdPercent);
+      final distances = CompactionEngine.distancesFromNewest(history);
+      // 同一起点上跨度大的排前面：够远的 2 级因此先被选中，它盖住的 1 级接着被跳过，
+      // 仍然得到"互不重叠、从旧到新"的一份。
+      final sorted = List.of(candidates)
         ..sort((a, b) {
           final c = a.coveredMinSeq - b.coveredMinSeq;
           if (c != 0) return c;
@@ -1660,20 +1695,34 @@ class ChatScreenState extends State<ChatScreen> {
       final picked = <ClosedSummary>[];
       var lastMax = 0;
       for (final n in sorted) {
-        if (n.coveredMinSeq > lastMax) {
-          picked.add(ClosedSummary(
-            level: n.level,
-            coveredMinSeq: n.coveredMinSeq,
-            coveredMaxSeq: n.coveredMaxSeq,
-            tokenCost: n.tokenCost ?? 0,
-          ));
-          lastMax = n.coveredMaxSeq;
-        }
+        // 已经被前面选中的那条盖住了 ⇒ 同一段不许有两种表示。
+        if (n.coveredMinSeq <= lastMax) continue;
+        final span = CompactionEngine.spanIndices(
+            history, n.coveredMinSeq, n.coveredMaxSeq);
+        final farEnough = span != null &&
+            CompactionEngine.substitutesSpan(
+              distanceAtOldest: distances[span.oldest],
+              distanceAtNewest: distances[span.newest],
+              level: n.level,
+              t: t,
+            );
+        // 2 级还不够远 ⇒ 不收它，改收它盖住的那几条 1 级（更细的表示）。
+        // 1 级不够远也要收：它是这一段最细的摘要表示，而且"1 级攒够阈值就合成 2 级"这条
+        // 规则要靠它的实测 token 参与累加 —— 收进来由投影那一趟决定它到底发摘要还是发
+        // 原文（见 [_resolveSummaries]），压缩本身不受影响。
+        if (!farEnough && n.level >= 2) continue;
+        picked.add(ClosedSummary(
+          level: n.level,
+          coveredMinSeq: n.coveredMinSeq,
+          coveredMaxSeq: n.coveredMaxSeq,
+          tokenCost: n.tokenCost ?? 0,
+        ));
+        lastMax = n.coveredMaxSeq;
       }
-      return picked;
+      return (projected: picked, coveredThrough: coveredThrough);
     } catch (e) {
       debugPrint('[AliasAgent] closed segments load failed: $e');
-      return const [];
+      return (projected: const <ClosedSummary>[], coveredThrough: -1);
     }
   }
 
@@ -1782,10 +1831,10 @@ class ChatScreenState extends State<ChatScreen> {
     return const [];
   }
 
-  Future<({List<CompactionSegment> segments, List<SummaryResult> summaries})>
+  Future<({List<ProjectionPiece> timeline, List<SummaryResult> summaries})>
       _resolveSummaries(String sessionId, CompactionPlan plan,
           AgentTypeConfig agentType, int maxContextTokens,
-          {bool Function()? isAborted}) async {
+          {required List<Message> history, bool Function()? isAborted}) async {
     final dbOpen = _summaryStoreOpen;
     // Dirty-since-seq watermark (D8 lazy recompute): a cached summary may be
     // reused only if its covered span is strictly below the watermark (clean —
@@ -1987,18 +2036,65 @@ class ChatScreenState extends State<ChatScreen> {
     // recorded, and its entries are never submitted again in this pass. Below the
     // capacity bound a rejection just stops that attempt — the valid L1s stay,
     // nothing is dropped, and no second model call is made for the same futile merge.
+    //
+    // 合成与投影是两件事：这一趟合出来的 2 级如果**还没整段落到最远档**，就只落盘、
+    // 不拿它顶替（被它盖住的 1 级照旧留在表里参与投影），同样标记成已提交以免反复合成。
+    // 判据见 [CompactionEngine.substitutesSpan]；这一条不影响"阈值到了就做合成"。
     final verbatimRaw = CompactionEngine.rawTokens(plan.verbatim);
     final T = CompactionEngine.thresholdTokens(
         maxContextTokens, agentType.compactionThresholdPercent);
+    // 这一条会不会真的以"摘要"的形式发出去：1 级看它盖住的整段的起点是否已经离开最近
+    // 的原文窗口（距离超过 T），2 级要求整段都落到最远档（两端都超过 2T）。还不够远的
+    // 那些这一趟按更细的表示发 —— 压缩照做、也照落盘，只是还没有轮到它顶替（用户
+    // 2026-09-26 的要求：只有位置足够靠后时才对模型换成摘要）。
+    final distances = CompactionEngine.distancesFromNewest(history);
+    // 同一条段会被反复问"它在历史里的下标"（收拢循环每一轮都要问），所以按段缓存一次；
+    // 用 identity 的 Map：段是按对象认的，不是按内容相等。
+    final spanCache =
+        Map<CompactionSegment, ({int oldest, int newest})?>.identity();
+    ({int oldest, int newest})? spanOf(CompactionSegment seg) =>
+        spanCache.putIfAbsent(seg, () {
+          if (seg.messages.isEmpty) return null;
+          final oldest = history.indexOf(seg.messages.first);
+          final newest = history.indexOf(seg.messages.last);
+          if (oldest < 0 || newest < 0) return null;
+          return (oldest: oldest, newest: newest);
+        });
+
+    bool sentAsSummary(({CompactionSegment seg, String text, int tokens, bool isClosed}) e) {
+      final span = spanOf(e.seg);
+      if (span == null) return false;
+      return CompactionEngine.substitutesSpan(
+        distanceAtOldest: distances[span.oldest],
+        distanceAtNewest: distances[span.newest],
+        level: e.seg.level,
+        t: T,
+      );
+    }
+
+    // 投影的真实大小：会当摘要发出去的按摘要实测 token 算，其余（照原文发的）按原文
+    // 估算算 —— 不许拿"存下来了但这一趟不会发"的摘要去抵投影大小。
+    int projectedTotal(
+            List<({CompactionSegment seg, String text, int tokens, bool isClosed})> t) =>
+        t.fold(
+            0,
+            (m, e) =>
+                m +
+                (sentAsSummary(e)
+                    ? e.tokens
+                    : CompactionEngine.rawTokens(e.seg.messages))) +
+        verbatimRaw;
+
     var table = List.of(entries);
-    var tableSum = table.fold(0, (m, e) => m + e.tokens);
-    var total = tableSum + verbatimRaw;
-    // May this entry be left out of THIS request? A level-1 summary may (it is
-    // projection-only — the data stays on disk, and it can be rebuilt later);
-    // so may anything this pass just produced. A level-2 summary persisted by an
-    // earlier round may not.
+    var total = projectedTotal(table);
+    // May this entry be left out of THIS request? Only one that is actually being
+    // sent as a summary: a level-1 summary may be omitted (it is projection-only —
+    // the data stays on disk, and it can be rebuilt later), so may anything this
+    // pass just produced; a level-2 summary persisted by an earlier round may not.
+    // An entry that is being sent as RAW text is NOT omittable: leaving it out
+    // would not shrink the projection at all, it would just drop the content.
     bool omittable(({CompactionSegment seg, String text, int tokens, bool isClosed}) e) =>
-        e.seg.level == 1 || !e.isClosed;
+        (e.seg.level == 1 || !e.isClosed) && sentAsSummary(e);
     // Identity set: entry records compare structurally, so identity is what tells
     // "this exact entry was already submitted" apart from an equal-looking one.
     final attempted = Set<Object>.identity();
@@ -2050,8 +2146,7 @@ class ChatScreenState extends State<ChatScreen> {
         final dropAt = table.indexWhere(omittable);
         if (dropAt < 0) break;
         table.removeAt(dropAt);
-        tableSum = table.fold(0, (m, e) => m + e.tokens);
-        total = tableSum + verbatimRaw;
+        total = projectedTotal(table);
         continue;
       }
       final groupSum = candGroup.fold(0, (m, e) => m + e.tokens);
@@ -2076,8 +2171,7 @@ class ChatScreenState extends State<ChatScreen> {
         while (drain > 0 && table.isNotEmpty && total > maxContextTokens) {
           table.removeAt(candStart);
           drain--;
-          tableSum = table.fold(0, (m, e) => m + e.tokens);
-          total = tableSum + verbatimRaw;
+          total = projectedTotal(table);
         }
         continue;
       }
@@ -2118,13 +2212,23 @@ class ChatScreenState extends State<ChatScreen> {
           debugPrint('[AliasAgent] persist level-2 summary failed: $e');
         }
       }
-      table = [
-        ...table.sublist(0, candStart),
-        l2Entry,
-        ...table.sublist(candStart + candCount),
-      ];
-      tableSum = table.fold(0, (m, e) => m + e.tokens);
-      total = tableSum + verbatimRaw;
+      if (sentAsSummary(l2Entry)) {
+        // 够远 ⇒ 这一组 1 级由它顶替（同一段只有一种表示）。
+        table = [
+          ...table.sublist(0, candStart),
+          l2Entry,
+          ...table.sublist(candStart + candCount),
+        ];
+      } else {
+        // 还不够远 ⇒ 这一趟先不拿它顶替：它盖住的 1 级继续按各自的距离决定怎么发
+        // （更细、多花一点 token，但不重复、也不提前顶替）。合成与落盘照做 —— 用户
+        // 钉死的是"阈值到了就做合成"，这里改的只是"什么时候对模型换成摘要"。
+        // 标记成已提交，避免同一组在本趟被反复送去合成。
+        for (final e in candGroup) {
+          attempted.add(e);
+        }
+      }
+      total = projectedTotal(table);
     }
     // Residual-over-capacity detection: the loop can exit because nothing is left
     // to roll up or drop. If what remains (a frozen level-2 from an earlier round
@@ -2138,16 +2242,64 @@ class ChatScreenState extends State<ChatScreen> {
           'a pathological known limit)');
     }
 
-    // Both lists come out in the ONE table's order (oldest → newest), so the
-    // projection's coverage is strictly increasing by construction.
-    final finalSegments = <CompactionSegment>[
-      ...table.map((e) => e.seg),
-      if (plan.verbatim.isNotEmpty)
-        CompactionSegment(messages: plan.verbatim, summary: false),
-    ];
-    final finalSummaries = <SummaryResult>[
-      ...table.map((e) => SummaryResult(text: e.text, tokens: e.tokens)),
-    ];
+    // Phase C —— 按时间顺序拼出这条投影的时间线，一段内容只用一种表示：
+    //  - 表里剩下的条目：够远的发摘要；还不够远的（它自己那一档还没轮到）发原文；
+    //  - 计划里还没被任何摘要盖住的原文段（含尾部）：原样发；
+    //  - 其余的摘要段：这一趟什么都不发（要么已经被更粗的那条顶替，要么按容量省略）。
+    final pieces = <({int at, ProjectionPiece piece})>[];
+    final finalSummaries = <SummaryResult>[];
+    // 位置按消息在历史里的下标算：seq 允许为空（合成测试的历史就没有 seq），位置永远在。
+    final posOf = Map<Message, int>.identity();
+    for (var i = 0; i < history.length; i++) {
+      posOf[history[i]] = i;
+    }
+    int startPos(List<Message> msgs) =>
+        msgs.isEmpty ? -1 : (posOf[msgs.first] ?? -1);
+
+    for (final e in table) {
+      if (e.seg.messages.isEmpty) continue;
+      final at = startPos(e.seg.messages);
+      if (sentAsSummary(e)) {
+        final summary = SummaryResult(text: e.text, tokens: e.tokens);
+        finalSummaries.add(summary);
+        pieces.add((
+          at: at,
+          piece: ProjectionPiece(segment: e.seg, summary: summary),
+        ));
+      } else {
+        pieces.add((
+          at: at,
+          piece: ProjectionPiece(
+              segment: CompactionSegment(
+                  messages: e.seg.messages, summary: false)),
+        ));
+      }
+    }
+    for (final seg in plan.segments) {
+      if (seg.summary || seg.messages.isEmpty) continue;
+      pieces.add((at: startPos(seg.messages), piece: ProjectionPiece(segment: seg)));
+    }
+    pieces.sort((a, b) => a.at - b.at);
+
+    // 时间线上相邻的原文段合成一段：`_buildApiMessages` 一次处理一段连续的原文，
+    // 顺带避免同一条 tool_use 被两段各发一遍。
+    final orderedTimeline = <ProjectionPiece>[];
+    for (final p in pieces) {
+      final piece = p.piece;
+      if (piece.summary == null &&
+          orderedTimeline.isNotEmpty &&
+          orderedTimeline.last.summary == null) {
+        orderedTimeline[orderedTimeline.length - 1] = ProjectionPiece(
+            segment: CompactionSegment(
+                messages: [
+                  ...orderedTimeline.last.segment.messages,
+                  ...piece.segment.messages,
+                ],
+                summary: false));
+        continue;
+      }
+      orderedTimeline.add(piece);
+    }
 
     // Consume the dirty watermark ONLY if every stale span was re-summarized AND
     // persisted in this pass. If any materialize write failed, the stale cached
@@ -2161,7 +2313,7 @@ class ChatScreenState extends State<ChatScreen> {
         debugPrint('[AliasAgent] clear dirty watermark failed: $e');
       }
     }
-    return (segments: finalSegments, summaries: finalSummaries);
+    return (timeline: orderedTimeline, summaries: finalSummaries);
   }
 
   /// Extract the summary text from a stored summary_json block document.
@@ -2177,50 +2329,52 @@ class ChatScreenState extends State<ChatScreen> {
     return '';
   }
 
-  /// Build the compacted projection: leading role:user summary-prefix messages
-  /// (one per summary segment, oldest → newest) followed by the near-verbatim
-  /// span replayed via [_buildApiMessages]. If the verbatim span starts on a user
-  /// turn, the LAST summary's marker+text is merged into that leading user
-  /// message to keep valid role alternation (user,user would violate the schema).
+  /// Build the compacted projection from its TIMELINE: summary entries and raw
+  /// spans in the order they happened — oldest → newest, and they interleave
+  /// (a span too near to be summarized yet is sent as raw text even when older
+  /// spans are already summarized).
   ///
-  /// [segments] is the FINAL (measure→adjusted) segment list (⑪.3); summaries are
-  /// aligned one-to-one with the summary segments, in order.
+  /// Role alternation: every summary is emitted as role:user text (with its own
+  /// marker). Raw spans are replayed via [_buildApiMessages]. To keep the request
+  /// from carrying two consecutive role:user messages — DeepSeek does NOT document
+  /// same-role merging, so user,user would be fragile — a summary's text blocks are
+  /// merged INTO the next raw span when that span starts on a user turn; only when
+  /// there is no such span (nothing after it, or the span starts on an assistant
+  /// message) does the summary get a role:user message of its own.
   List<Map<String, dynamic>> _buildCompactionProjection(
-      List<SummaryResult> summaries, List<CompactionSegment> segments) {
-    final summarySegs =
-        segments.where((s) => s.summary && s.messages.isNotEmpty).toList();
-    final verbatimMsg =
-        segments.where((s) => !s.summary).expand((s) => s.messages).toList();
-    final verbatim = _buildApiMessages(verbatimMsg);
-    // Concatenate ALL summary segments into a SINGLE role:user prefix message
-    // (one text block per segment, each with its own marker). This guarantees the
-    // projection never emits consecutive role:user messages — DeepSeek does NOT
-    // document same-role merging, so user,user would be fragile — keeping
-    // role alternation valid.
-    final summaryBlocks = <Map<String, dynamic>>[];
-    for (var i = 0; i < summaries.length; i++) {
-      final count = i < summarySegs.length ? summarySegs[i].messages.length : summaries.length;
-      summaryBlocks.add({
-        'type': 'text',
-        'text': buildSummaryContent(
-            result: summaries[i], foldedCount: count, level: summarySegs[i].level),
-      });
-    }
+      List<ProjectionPiece> timeline) {
     final out = <Map<String, dynamic>>[];
-    if (summaryBlocks.isNotEmpty) {
-      if (verbatim.isNotEmpty && verbatim.first['role'] == 'user') {
-        // Merge the summary blocks into the leading user message (preserves the
-        // current user's text; avoids a leading user,user when the safe boundary
-        // lands on a real user text).
-        final content = (verbatim.first['content'] as List<Map<String, dynamic>>);
-        content.insertAll(0, summaryBlocks);
-        out.addAll(verbatim);
-      } else {
-        out.add({'role': 'user', 'content': summaryBlocks});
-        out.addAll(verbatim);
+    // Summary text blocks that have not been placed yet (they belong just before
+    // the next raw span).
+    var pendingBlocks = <Map<String, dynamic>>[];
+    for (final piece in timeline) {
+      final summary = piece.summary;
+      if (summary != null) {
+        pendingBlocks.add({
+          'type': 'text',
+          'text': buildSummaryContent(
+              result: summary,
+              foldedCount: piece.segment.messages.length,
+              level: piece.segment.level),
+        });
+        continue;
       }
-    } else {
-      out.addAll(verbatim);
+      final raw = _buildApiMessages(piece.segment.messages);
+      if (raw.isEmpty) continue;
+      if (pendingBlocks.isNotEmpty) {
+        if (raw.first['role'] == 'user') {
+          // 并进这段原文的第一条 user 消息：既不丢摘要，也不产生相邻的 role:user。
+          (raw.first['content'] as List<Map<String, dynamic>>)
+              .insertAll(0, pendingBlocks);
+        } else {
+          out.add({'role': 'user', 'content': pendingBlocks});
+        }
+        pendingBlocks = <Map<String, dynamic>>[];
+      }
+      out.addAll(raw);
+    }
+    if (pendingBlocks.isNotEmpty) {
+      out.add({'role': 'user', 'content': pendingBlocks});
     }
     return out;
   }

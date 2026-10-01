@@ -95,6 +95,81 @@ List<Message> _convOfRaw(int n, int rawPerMsg, {int startSeq = 1}) {
   ];
 }
 
+/// Like [_convOfRaw], but every message carries its own seq in its body
+/// (`m<seq>:` + padding) at the SAME estimated size, so a test can read straight
+/// out of the real projection which messages were sent as raw text and which
+/// were covered by a summary span — instead of inferring it from lengths.
+List<Message> _convLabeled(int n, int rawPerMsg, {int startSeq = 1}) {
+  final len = (rawPerMsg - 4) * 4 - 3;
+  final out = <Message>[];
+  for (var i = 0; i < n; i++) {
+    final seq = startSeq + i;
+    final prefix = 'm$seq:';
+    out.add(Message(
+      id: 'p$i',
+      seq: seq,
+      sessionId: 's1',
+      role: i.isEven ? 'user' : 'assistant',
+      content: '$prefix${'A' * (len - prefix.length)}',
+      createdAt: i,
+    ));
+  }
+  return out;
+}
+
+/// The seq spans of the summary entries that reached the model, in the order
+/// they appear. Summary text always carries its covered span (`seq a..b`: either
+/// preset node text or the echo summarizer's label), so this reads the real
+/// projection rather than a re-derived plan.
+List<({int lo, int hi})> _summarySpansIn(String projected) =>
+    RegExp(r'seq (\d+)\.\.(\d+)')
+        .allMatches(projected)
+        .map((m) => (lo: int.parse(m.group(1)!), hi: int.parse(m.group(2)!)))
+        .toList();
+
+/// How many representations of message [seq] the projection carries: once as
+/// raw text (its body shows `m<seq>:`) and once per covering summary span.
+/// "Exactly one representation" means this returns exactly 1 for every message.
+int _representationsOf(int seq, String projected, List<({int lo, int hi})> spans) {
+  var hits = 0;
+  if (projected.contains('m$seq:')) hits++;
+  for (final s in spans) {
+    if (seq >= s.lo && seq <= s.hi) hits++;
+  }
+  return hits;
+}
+
+/// 「每一段内容都恰好有一种表示」这条不变量的**通用守卫**：把 1..[upToSeq] 每条消息在
+/// 真实投影里数一遍，返回"一次都没出现"和"出现了不止一次"的 seq。
+///
+/// 为什么要有这么一条：这条不变量是本变更的核心（规范《Recency-gradient hierarchical
+/// compaction》原文 `every span of history SHALL be projected with EXACTLY ONE
+/// representation`），而投影是把"计划里的段""库里载入的摘要""本轮新压出来的批次"三路拼
+/// 起来的，最容易出的错就是某一路因为对象对不上、位置排错、或者被顶替之后没人接手而**整
+/// 段漏掉**（这次真的发生过：seq 41..91 曾经在投影里一条表示都没有）。
+/// 要求 fixture 用 [_convLabeled]（正文里带 `m<seq>:`），否则读不出原文那一路。
+({List<int> missing, List<int> doubled}) _accountEveryMessage(String projected,
+    {required int upToSeq}) {
+  final spans = _summarySpansIn(projected);
+  final missing = <int>[];
+  final doubled = <int>[];
+  for (var seq = 1; seq <= upToSeq; seq++) {
+    final n = _representationsOf(seq, projected, spans);
+    if (n == 0) missing.add(seq);
+    if (n > 1) doubled.add(seq);
+  }
+  return (missing: missing, doubled: doubled);
+}
+
+/// [_accountEveryMessage] 的断言版：一次都没出现的 seq、出现了不止一次的 seq，都必须为空。
+void _expectEveryMessageExactlyOnce(String projected, {required int upToSeq}) {
+  final account = _accountEveryMessage(projected, upToSeq: upToSeq);
+  expect(account.missing, isEmpty,
+      reason: '每一段都必须有一种表示 —— 这些 seq 在投影里凭空消失了：${account.missing}');
+  expect(account.doubled, isEmpty,
+      reason: '同一段内容只许出现一次 —— 这些 seq 出现了两种以上表示：${account.doubled}');
+}
+
 /// Fake with controllable summary sizes so the measure→adjust loop (⑪.3) can be
 /// forced off the "fits-budget" path: `l1Tokens` is what every level-1 summary
 /// reports, `l2Tokens` what the level-2 "summary of summaries" reports.
@@ -153,6 +228,13 @@ class _SizedFakeSummaryProvider implements SummaryProvider {
 /// the model straight out of the real projection, so the text has to carry the
 /// span it came from.
 class _EchoSummaryProvider implements SummaryProvider {
+  /// 报给调用方的实测 token 数（默认 1 / 300）。需要"按尺寸驱动收拢循环"的用例可以调，
+  /// 这样它既能带上覆盖区间（`seq a..b`，供"每段恰好一种表示"那条通用守卫读），
+  /// 又能控制尺寸。
+  final int l1Tokens;
+  final int l2Tokens;
+  _EchoSummaryProvider({this.l1Tokens = 1, this.l2Tokens = 300});
+
   int summarizeCalls = 0;
   int summarizeTextCalls = 0;
 
@@ -164,7 +246,7 @@ class _EchoSummaryProvider implements SummaryProvider {
     summarizeCalls++;
     final lo = folded.isEmpty ? 0 : (folded.first.seq ?? 0);
     final hi = folded.isEmpty ? 0 : (folded.last.seq ?? 0);
-    return SummaryResult(text: '层级 1 摘要 seq $lo..$hi', tokens: 1);
+    return SummaryResult(text: '层级 1 摘要 seq $lo..$hi', tokens: l1Tokens);
   }
 
   @override
@@ -174,7 +256,8 @@ class _EchoSummaryProvider implements SummaryProvider {
   }) async {
     summarizeTextCalls++;
     // The rolled-up summary keeps the labels of its inputs, in the order given.
-    return SummaryResult(text: '合成结果[${text.replaceAll('\n', ' | ')}]', tokens: 300);
+    return SummaryResult(
+        text: '合成结果[${text.replaceAll('\n', ' | ')}]', tokens: l2Tokens);
   }
 }
 
@@ -718,9 +801,9 @@ void main() {
 
       final sessions = testSessions(1);
       final sessionRepo = FakeSessionRepository(sessions);
-      final msgRepo = FakeMessageRepository(_convOfRaw(15, 100));
+      final msgRepo = FakeMessageRepository(_convLabeled(15, 100));
       final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
-      final summaryProvider = _SizedFakeSummaryProvider(l1Tokens: 1050, l2Tokens: 1200);
+      final summaryProvider = _EchoSummaryProvider(l1Tokens: 1050, l2Tokens: 1200);
 
       await tester.pumpWidget(_buildApp(
         sessionRepo: sessionRepo,
@@ -750,6 +833,9 @@ void main() {
               '同一组会被反复送进模型，这个数会一直涨、这趟压缩不结束');
       expect(projected, contains('continue'),
           reason: '这趟压缩必须正常结束并把请求发出去');
+      // 「每一段恰好一种表示」这条不变量在这一场也要成立：15 条消息里 1..11 该由那条 1 级
+      // 摘要接走、12..15 该逐字发。通用守卫一次把"谁都少了一段"和"同一段发了两遍"都查了。
+      _expectEveryMessageExactlyOnce(projected, upToSeq: 15);
     });
 
     testWidgets('3.4/6.4 跨轮次累加：上一轮的两条层级 1 + 本轮新压的一条 ⇒ 合成同一条更粗的',
@@ -787,9 +873,9 @@ void main() {
       await putL1(5, 8);
 
       final sessionRepo = FakeSessionRepository(testSessions(1));
-      final msgRepo = FakeMessageRepository(_convOfRaw(19, 100));
+      final msgRepo = FakeMessageRepository(_convLabeled(19, 100));
       final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
-      final summaryProvider = _SizedFakeSummaryProvider(l1Tokens: 500, l2Tokens: 300);
+      final summaryProvider = _EchoSummaryProvider(l1Tokens: 500, l2Tokens: 300);
 
       await tester.pumpWidget(_buildApp(
         sessionRepo: sessionRepo,
@@ -824,8 +910,29 @@ void main() {
           reason: '6.4：合成出来的那条要包含上一轮那两条的范围（从 seq 1 起）');
       expect(l2.first.coveredMaxSeq, greaterThanOrEqualTo(9),
           reason: '6.4：也要包含本轮新压那一批的范围（到 seq 9 之后）');
-      expect(projected, contains(kLevel2SummaryMarker));
+      // 投影口径（2026-09-26 的裁定）：这条 2 级盖住的整段还没落到最远档（它最新端就是
+      // 刚压出来的那一批，离末尾不到一个 2T）⇒ 这一趟不许拿它顶替，该由它盖住的那几条
+      // 1 级表示。旧断言写的是"2 级必须出现在投影里"，与这条口径相反，故按新口径改写。
+      expect(projected, isNot(contains(kLevel2SummaryMarker)),
+          reason: '这条 2 级盖住的整段还没整段落到最远档 ⇒ 这一趟不进投影');
+      expect(projected, contains(kSummaryMarker),
+          reason: '该由它盖住的那几条 1 级表示这一段');
+      final spans = _summarySpansIn(projected);
+      for (final expect1 in [
+        (lo: 1, hi: 4),
+        (lo: 5, hi: 8),
+      ]) {
+        expect(spans, contains(expect1),
+            reason: '被 2 级盖住的那条 1 级 $expect1 必须真的进投影');
+      }
+      for (var i = 1; i < spans.length; i++) {
+        expect(spans[i].lo, greaterThan(spans[i - 1].hi),
+            reason: '各段互不重叠、严格从旧到新：第 $i 段的起点 ${spans[i].lo} 必须大于'
+                '前一段的终点 ${spans[i - 1].hi}');
+      }
       expect(projected, contains('continue'));
+      // 通用守卫：1..19 每条消息都恰好有一种表示（这一场是 1..4、5..8、9..19 三段 1 级接走）
+      _expectEveryMessageExactlyOnce(projected, upToSeq: 19);
     });
 
     testWidgets('3.2/3.3/6.5 交错场景：层级 1 照常成组合成，层级 2 不参与，条目顺序严格从旧到新',
@@ -865,7 +972,7 @@ void main() {
       await put(2, 9, 12, 500);
 
       final sessionRepo = FakeSessionRepository(testSessions(1));
-      final msgRepo = FakeMessageRepository(_convOfRaw(15, 100));
+      final msgRepo = FakeMessageRepository(_convLabeled(15, 100));
       final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
       final summaryProvider = _EchoSummaryProvider();
 
@@ -887,39 +994,711 @@ void main() {
       final projected = sidecar.lastMessagesJson ?? '';
       final nodesAfter = await repo.queryBySession(dbSessionId);
       final l2 = nodesAfter.where((n) => n.level == 2).toList();
-      // 发给模型的内容里，各段摘要按出现顺序留下的覆盖起点。每条摘要文本都带
-      // "seq a..b" 标签（假摘要器把输入原样回显），所以能直接从真实投影里读顺序。
-      final startSeqInOrder = RegExp(r'seq (\d+)\.\.')
-          .allMatches(projected)
-          .map((m) => int.parse(m.group(1)!))
-          .toList();
+      // 发给模型的内容里，各段摘要覆盖的 seq 区间（摘要文本都带 "seq a..b" 标签）。
+      final spans = _summarySpansIn(projected);
       // ignore: avoid_print
       print('  [OBS] 3.2/3.3 交错: summarizeCalls=${summaryProvider.summarizeCalls} '
           'summarizeTextCalls=${summaryProvider.summarizeTextCalls} '
           '层级2覆盖=${l2.map((n) => '[${n.coveredMinSeq},${n.coveredMaxSeq}]').join(",")} '
-          '投影里的覆盖起点（按出现顺序）=$startSeqInOrder '
+          '投影里的摘要段（按出现顺序）='
+          '${spans.map((s) => '${s.lo}..${s.hi}').join(",")} '
           'hasL2Marker=${projected.contains(kLevel2SummaryMarker)} '
           'hasContinue=${projected.contains('continue')}');
       expect(summaryProvider.summarizeCalls, 0,
           reason: '前提：这一轮尾部没产生新的层级 1 批次（否则"只合成一次"不好归因）');
       expect(summaryProvider.summarizeTextCalls, 1,
           reason: '两条连续的层级 1（600+600=1200 > 阈值 1000）合成为一条更粗的；'
-              '那条已落盘的层级 2 不参与 ⇒ 只合成这一次');
+              '那条已落盘的层级 2 不参与 ⇒ 只合成这一次。合成照旧"阈值到了就做"，'
+              '与它这一趟进不进投影无关');
       expect(
           l2.where((n) => n.coveredMinSeq == 1 && n.coveredMaxSeq == 8).length, 1,
           reason: '新合成的那条覆盖 seq 1..8（正好是被合成掉那两条的并集）');
       expect(l2.where((n) => n.coveredMinSeq == 9 && n.coveredMaxSeq == 12).length, 1,
           reason: '库里原有的那条层级 2 原样保留，没有被重新合成、也没有被删');
-      expect(projected, contains(kLevel2SummaryMarker));
+      // 投影口径（2026-09-26 的裁定）：两条 2 级盖住的整段都还贴着末尾（离最远档差得远）
+      // ⇒ 这一趟都不进投影，由各自的 1 级摘要表示。旧断言写的是"2 级必须出现在投影里"，
+      // 按新口径改写成"2 级还不该出现、1 级该出现"。
+      expect(projected, isNot(contains(kLevel2SummaryMarker)),
+          reason: '两条 2 级的整段都还没落到最远档 ⇒ 这一趟都不进投影');
+      expect(projected, contains(kSummaryMarker),
+          reason: '这一段该由它的 1 级摘要表示');
       expect(projected, contains('continue'));
-      // 顺序不变式：发给模型的内容里，各段覆盖起点严格从旧到新递增。
-      expect(startSeqInOrder.length, greaterThanOrEqualTo(2),
+      // 顺序不变式（新口径）：发给模型的内容里，各段覆盖的 seq 区间**互不重叠**、起点严格
+      // 从旧到新。旧断言只比"起点递增"（允许区间重叠），这里换成更强的一条。
+      expect(spans.length, greaterThanOrEqualTo(2),
           reason: '前提：投影里确实有多段摘要，否则"顺序"无从谈起');
-      for (var i = 1; i < startSeqInOrder.length; i++) {
-        expect(startSeqInOrder[i], greaterThan(startSeqInOrder[i - 1]),
-            reason: '第 $i 段的覆盖起点（${startSeqInOrder[i]}）必须严格大于前一段的'
-                '（${startSeqInOrder[i - 1]}）—— 改成单一有序表之后顺序不能乱');
+      for (var i = 1; i < spans.length; i++) {
+        expect(spans[i].lo, greaterThan(spans[i - 1].hi),
+            reason: '第 $i 段的覆盖起点（${spans[i].lo}）必须大于前一段的覆盖终点'
+                '（${spans[i - 1].hi}）—— 各段互不重叠，且严格从旧到新');
       }
+      // 通用守卫：1..15 每条消息都恰好有一种表示。这一场正好把三条路都走了一遍 ——
+      // 1..4 / 5..8 由落盘的 1 级接走、9..12 那条 2 级还没进投影所以照原文发、
+      // 13..15 是尾部原文。
+      _expectEveryMessageExactlyOnce(projected, upToSeq: 15);
+    });
+
+    // ---------------------------------------------------------------------
+    // 投影分档：一段内容离现在多远，决定它在投影里发的是原文、1 级摘要还是 2 级摘要。
+    //
+    // 两条用例共用同一套几何：容量 20000 ⇒ 阈值 T = 5000、外边界 2T = 10000；
+    // 对话 130 条 × 100 raw（seq 1..130）+ 当前这条用户消息（raw 6）。按"它后面还有
+    // 多少原文"算距离：distance(seq s) = 100 × (130 − s) + 6，于是
+    //   · seq ≤ 30 的段：整段都在 2T 之外（2 级该在的档）
+    //   · seq 31..80 的段：起点在 T 之外、但没到 2T（1 级该在的档）
+    //   · seq > 80 的段：起点还没离开最近档（发原文）
+    // 口径：一段内容的档按它**最旧那条消息**算；1 级只要起点够远就顶替，2 级要它盖住的
+    // **整段**都落到最远档才顶替（刚合成出来的 2 级因此不会立刻把 1 级挤掉）。
+    // ---------------------------------------------------------------------
+
+    testWidgets('投影分档 · 状态 A：2 级还不够远 ⇒ 发它盖住的 1 级，2 级不进投影',
+        (tester) async {
+      // 库里预置：2 级 [1..40]，它最新端 seq 40 的距离是 9006 ≤ 2T ⇒ 整段还没落到
+      // 最远档；它盖住的两条 1 级 [1..15]、[16..40] 起点都够远 ⇒ 该由它们表示。
+      // 期望：投影里发的是那两条 1 级（1 级标记在、2 级标记不在），每一段恰好一种表示。
+      _setupAgentRegistry(maxContextTokens: 20000);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final repo = _FakeSummaryNodeRepository();
+      const dbSessionId = 's1';
+      Future<void> put(int level, int lo, int hi, int tokens) =>
+          repo.materialize(
+            sessionId: dbSessionId,
+            level: level,
+            startSeq: lo,
+            endSeq: hi,
+            nodeType: 'summary',
+            summaryJson: jsonEncode({
+              'role': 'user',
+              'content': [
+                {'type': 'text', 'text': '层级 $level 摘要 seq $lo..$hi'},
+              ],
+            }),
+            tokenCost: tokens,
+            summaryPromptVersion: 1,
+            model: 'test-model',
+            coveredMinSeq: lo,
+            coveredMaxSeq: hi,
+          );
+      await put(1, 1, 15, 400);
+      await put(1, 16, 40, 400);
+      await put(2, 1, 40, 700);
+
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(_convLabeled(130, 100));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final summaryProvider = _EchoSummaryProvider();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: summaryProvider,
+        summaryNodeRepo: repo,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      final projected = sidecar.lastMessagesJson ?? '';
+      final spans = _summarySpansIn(projected);
+      final rawSeqs = RegExp(r'm(\d+):')
+          .allMatches(projected)
+          .map((m) => int.parse(m.group(1)!))
+          .toSet();
+      final missing = [
+        for (var s = 1; s <= 130; s++)
+          if (_representationsOf(s, projected, spans) == 0) s
+      ];
+      final doubled = [
+        for (var s = 1; s <= 130; s++)
+          if (_representationsOf(s, projected, spans) > 1) s
+      ];
+      // ignore: avoid_print
+      print('  [OBS] 状态A（2 级还不够远）: 发出去 '
+          '${(jsonDecode(projected) as List).length} 条消息；'
+          '1级标记=${projected.contains(kSummaryMarker)} '
+          '2级标记=${projected.contains(kLevel2SummaryMarker)}；'
+          '摘要段=${spans.map((s) => '${s.lo}..${s.hi}').join(",")}；'
+          '原文逐条出现的 seq 有 ${rawSeqs.length} 个'
+          '（最小 ${rawSeqs.reduce((a, b) => a < b ? a : b)}，'
+          '最大 ${rawSeqs.reduce((a, b) => a > b ? a : b)}）；'
+          '没有任何表示的 seq=$missing；出现两次的 seq=$doubled');
+
+      expect(projected, contains(kSummaryMarker),
+          reason: '状态A：2 级还不够远 ⇒ 这一段必须由它的 1 级摘要表示，'
+              '投影里要有 1 级标记');
+      expect(projected, isNot(contains(kLevel2SummaryMarker)),
+          reason: '状态A：这条 2 级盖住的整段还没落到最远档（最新端 seq 40 的距离 '
+              '9006 ≤ 2T=10000）⇒ 不许拿它顶替。改之前这里必然红：'
+              '旧代码把最粗的那条当唯一表示，直接发 2 级');
+      expect(spans, contains((lo: 1, hi: 15)),
+          reason: '状态A：被 2 级盖住、但自己够远的 1 级 [1..15] 必须真的进投影');
+      expect(spans, contains((lo: 16, hi: 40)),
+          reason: '状态A：同上，[16..40] 这条也要在');
+      expect(spans, contains((lo: 41, hi: 91)),
+          reason: '状态A：本轮刚压出来的那一批起点 seq41 的距离是 8906 > T ⇒ '
+              '按 1 级摘要发（一段内容的档按它最旧那条消息算）');
+      expect(rawSeqs, containsAll(<int>[92, 130]),
+          reason: '状态A：还没离开最近档的那一段与最新的原文都必须逐条原样发出去');
+      expect(missing, isEmpty,
+          reason: '状态A：每一段都必须有一种表示 —— 不许出现谁也不管的空档');
+      expect(doubled, isEmpty,
+          reason: '状态A：同一段内容只许出现一次（不许既有 1 级文本、又有覆盖它的 '
+              '2 级文本）');
+      expect(projected, contains('continue'), reason: '当前用户消息必须活下来');
+    });
+
+    testWidgets('投影分档 · 状态 B：2 级整段够远 ⇒ 2 级与中距的 1 级并存、互不重叠',
+        (tester) async {
+      // 库里预置：2 级 [1..26]，最新端 seq 26 的距离是 10406 > 2T ⇒ 整段落到最远档，
+      // 可以用；它盖住的两条 1 级 [1..12]、[13..26] 不许再单独出现；另有一条中距的
+      // 1 级 [31..60]（整段在 T 之外、没到 2T）该照常发。
+      _setupAgentRegistry(maxContextTokens: 20000);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final repo = _FakeSummaryNodeRepository();
+      const dbSessionId = 's1';
+      Future<void> put(int level, int lo, int hi, int tokens) =>
+          repo.materialize(
+            sessionId: dbSessionId,
+            level: level,
+            startSeq: lo,
+            endSeq: hi,
+            nodeType: 'summary',
+            summaryJson: jsonEncode({
+              'role': 'user',
+              'content': [
+                {'type': 'text', 'text': '层级 $level 摘要 seq $lo..$hi'},
+              ],
+            }),
+            tokenCost: tokens,
+            summaryPromptVersion: 1,
+            model: 'test-model',
+            coveredMinSeq: lo,
+            coveredMaxSeq: hi,
+          );
+      await put(1, 1, 12, 400);
+      await put(1, 13, 26, 400);
+      await put(2, 1, 26, 700);
+      await put(1, 31, 60, 400);
+
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(_convLabeled(130, 100));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final summaryProvider = _EchoSummaryProvider();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: summaryProvider,
+        summaryNodeRepo: repo,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      final projected = sidecar.lastMessagesJson ?? '';
+      final spans = _summarySpansIn(projected);
+      final rawSeqs = RegExp(r'm(\d+):')
+          .allMatches(projected)
+          .map((m) => int.parse(m.group(1)!))
+          .toSet();
+      final missing = [
+        for (var s = 1; s <= 130; s++)
+          if (_representationsOf(s, projected, spans) == 0) s
+      ];
+      final doubled = [
+        for (var s = 1; s <= 130; s++)
+          if (_representationsOf(s, projected, spans) > 1) s
+      ];
+      // ignore: avoid_print
+      print('  [OBS] 状态B（2 级整段够远）: 发出去 '
+          '${(jsonDecode(projected) as List).length} 条消息；'
+          '1级标记=${projected.contains(kSummaryMarker)} '
+          '2级标记=${projected.contains(kLevel2SummaryMarker)}；'
+          '摘要段=${spans.map((s) => '${s.lo}..${s.hi}').join(",")}；'
+          '原文逐条出现的 seq 有 ${rawSeqs.length} 个'
+          '（最小 ${rawSeqs.reduce((a, b) => a < b ? a : b)}，'
+          '最大 ${rawSeqs.reduce((a, b) => a > b ? a : b)}）；'
+          '没有任何表示的 seq=$missing；出现两次的 seq=$doubled');
+
+      expect(projected, contains(kLevel2SummaryMarker),
+          reason: '状态B：这条 2 级盖住的整段都落到最远档了 ⇒ 该它上场');
+      expect(spans, contains((lo: 1, hi: 26)),
+          reason: '状态B：2 级覆盖 seq 1..26，整个跨度只由它一个表示');
+      expect(projected, contains(kSummaryMarker),
+          reason: '状态B：中距那一段（seq 31..60）自己的 1 级摘要必须同时还在');
+      expect(spans, contains((lo: 31, hi: 60)),
+          reason: '状态B：中距 1 级的覆盖范围要原样发出');
+      expect(projected, isNot(contains('seq 13..26')),
+          reason: '状态B：被这条 2 级盖住的 1 级不许再单独发一份（同一段两种表示）');
+      expect(spans, contains((lo: 61, hi: 111)),
+          reason: '状态B：本轮刚压出来的那一批起点 seq61 的距离是 6906 > T ⇒ '
+              '按 1 级摘要发');
+      expect(rawSeqs, containsAll(<int>[27, 30, 112, 130]),
+          reason: '状态B：seq 27..30 这一段没有任何摘要盖住（夹在 2 级与中距 1 级之间）'
+              '—— 必须按原文发出去，不许在投影里凭空消失；最近的原文同样要原样发');
+      expect(missing, isEmpty,
+          reason: '状态B：每一段都必须有一种表示 —— 不许出现谁也不管的空档');
+      expect(doubled, isEmpty,
+          reason: '状态B：同一段内容只许出现一次');
+      expect(projected, contains('continue'), reason: '当前用户消息必须活下来');
+    });
+
+    testWidgets('投影分档 · 状态 C：某一段一条摘要都没有 ⇒ 照原文发，不许留下空档',
+        (tester) async {
+      // 库里只有一条 2 级 [1..40]，它还不够远（最新端 seq 40 的距离 9006 ≤ 2T），而且没有
+      // 对应的 1 级节点可回落。期望：seq 1..40 这一段按原文发出去 —— 不许在投影里凭空
+      // 消失（改之前这一段谁都不管：它不在任何已选摘要里，又被"已覆盖到 seq 40"挡在
+      // 尾部之外，发出去的内容里根本没有它）。
+      _setupAgentRegistry(maxContextTokens: 20000);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final repo = _FakeSummaryNodeRepository();
+      const dbSessionId = 's1';
+      await repo.materialize(
+        sessionId: dbSessionId,
+        level: 2,
+        startSeq: 1,
+        endSeq: 40,
+        nodeType: 'summary',
+        summaryJson: jsonEncode({
+          'role': 'user',
+          'content': [
+            {'type': 'text', 'text': '层级 2 摘要 seq 1..40'},
+          ],
+        }),
+        tokenCost: 700,
+        summaryPromptVersion: 1,
+        model: 'test-model',
+        coveredMinSeq: 1,
+        coveredMaxSeq: 40,
+      );
+
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(_convLabeled(130, 100));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final summaryProvider = _EchoSummaryProvider();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: summaryProvider,
+        summaryNodeRepo: repo,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      final projected = sidecar.lastMessagesJson ?? '';
+      final spans = _summarySpansIn(projected);
+      final rawSeqs = RegExp(r'm(\d+):')
+          .allMatches(projected)
+          .map((m) => int.parse(m.group(1)!))
+          .toSet();
+      final missing = [
+        for (var s = 1; s <= 130; s++)
+          if (_representationsOf(s, projected, spans) == 0) s
+      ];
+      final doubled = [
+        for (var s = 1; s <= 130; s++)
+          if (_representationsOf(s, projected, spans) > 1) s
+      ];
+      // ignore: avoid_print
+      print('  [OBS] 状态C（这一段一条摘要都没有）: 发出去 '
+          '${(jsonDecode(projected) as List).length} 条消息；'
+          '1级标记=${projected.contains(kSummaryMarker)} '
+          '2级标记=${projected.contains(kLevel2SummaryMarker)}；'
+          '摘要段=${spans.map((s) => '${s.lo}..${s.hi}').join(",")}；'
+          '原文逐条出现的 seq 有 ${rawSeqs.length} 个'
+          '（最小 ${rawSeqs.reduce((a, b) => a < b ? a : b)}，'
+          '最大 ${rawSeqs.reduce((a, b) => a > b ? a : b)}）；'
+          '没有任何表示的 seq=$missing；出现两次的 seq=$doubled');
+
+      expect(projected, isNot(contains(kLevel2SummaryMarker)),
+          reason: '状态C：这条 2 级盖住的整段还没落到最远档 ⇒ 不进投影');
+      expect(rawSeqs, containsAll(<int>[1, 20, 40]),
+          reason: '状态C：seq 1..40 这一段没有任何摘要可发 ⇒ 必须按原文逐条发出去');
+      expect(missing, isEmpty,
+          reason: '状态C：每一段都必须有一种表示 —— 不许出现谁也不管的空档');
+      expect(doubled, isEmpty,
+          reason: '状态C：同一段内容只许出现一次');
+      expect(projected, contains('continue'), reason: '当前用户消息必须活下来');
+    });
+
+    testWidgets(
+        '7.1 投影里摘要段与原文段交错时，工具轮不会被拆（一个 tool_use 恰好一个 tool_result）',
+        (tester) async {
+      // 这一趟的投影是三段交错的：`[原文 1..40][摘要 41..91][原文 92..130]`（和状态 C 同一套
+      // 几何：库里只有一条不够远的 2 级 [1..40]、没有对应的 1 级）。
+      // 工具轮放在第一段原文里：seq2 是发起调用的 assistant（内容为空、带着 tool_use），
+      // seq3 是这一轮结束时又把同一批 tool_calls 重带一遍的 assistant —— 生产里这两条都真实
+      // 存在（这就是那条去重规则要处理的重复）。它们必须落在**同一段原文**里：拼装一旦把它
+      // 们切开，`_buildApiMessages` 会各自合成一次 tool_result，同一条 tool_use 就被发两遍，
+      // 请求非法。
+      _setupAgentRegistry(maxContextTokens: 20000);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final repo = _FakeSummaryNodeRepository();
+      const dbSessionId = 's1';
+      await repo.materialize(
+        sessionId: dbSessionId,
+        level: 2,
+        startSeq: 1,
+        endSeq: 40,
+        nodeType: 'summary',
+        summaryJson: jsonEncode({
+          'role': 'user',
+          'content': [
+            {'type': 'text', 'text': '层级 2 摘要 seq 1..40'},
+          ],
+        }),
+        tokenCost: 700,
+        summaryPromptVersion: 1,
+        model: 'test-model',
+        coveredMinSeq: 1,
+        coveredMaxSeq: 40,
+      );
+
+      const toolCallId = 'call_read_cfg';
+      final toolCall = {
+        'id': toolCallId,
+        'toolName': 'read_file',
+        'name': 'read_file',
+        'input': {'path': kConfigPath},
+        'result': '// connection timeout\nconst timeout = 120;',
+      };
+      final base = _convLabeled(130, 100);
+      final msgs = <Message>[
+        base[0], // seq1：用户文本，正文带 `m1:` 标签
+        Message(
+          id: 'm_tool',
+          seq: 2,
+          sessionId: 's1',
+          role: 'assistant',
+          content: '', // 内容为空：它的表示就是那个 tool_use 块
+          toolCallsJson: jsonEncode([toolCall]),
+          createdAt: 2,
+        ),
+        Message(
+          id: 'm_tool_final',
+          seq: 3,
+          sessionId: 's1',
+          role: 'assistant',
+          content: base[2].content, // 保留 `m3:` 标签
+          toolCallsJson: jsonEncode([toolCall]), // 重带同一批 tool_calls
+          createdAt: 3,
+        ),
+        ...base.sublist(3),
+      ];
+
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(msgs);
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final summaryProvider = _EchoSummaryProvider();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: summaryProvider,
+        summaryNodeRepo: repo,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      final projected = sidecar.lastMessagesJson ?? '';
+      final decoded = (jsonDecode(projected) as List);
+      var toolUseCount = 0;
+      var toolResultCount = 0;
+      var toolUseAt = -1;
+      var toolResultAt = -1;
+      final roles = <String>[];
+      for (var i = 0; i < decoded.length; i++) {
+        final m = decoded[i] as Map<String, dynamic>;
+        roles.add((m['role'] as String?) ?? '');
+        final content = m['content'];
+        if (content is! List) continue;
+        for (final b in content) {
+          if (b is! Map<String, dynamic>) continue;
+          if (b['type'] == 'tool_use' && b['id'] == toolCallId) {
+            toolUseCount++;
+            toolUseAt = i;
+          }
+          if (b['type'] == 'tool_result' && b['tool_use_id'] == toolCallId) {
+            toolResultCount++;
+            toolResultAt = i;
+          }
+        }
+      }
+      final account = _accountEveryMessage(projected, upToSeq: 130);
+      // ignore: avoid_print
+      print('  [OBS] 7.1 发出去 ${decoded.length} 条消息；摘要段='
+          '${_summarySpansIn(projected).map((s) => '${s.lo}..${s.hi}').join(",")}；'
+          'tool_use=$toolUseCount（第 $toolUseAt 条）'
+          'tool_result=$toolResultCount（第 $toolResultAt 条）；'
+          '角色序列=${roles.join(",")}；'
+          '没有任何表示的 seq=${account.missing}；出现两次的 seq=${account.doubled}');
+
+      expect(projected, contains(kSummaryMarker),
+          reason: '前提：这一趟确实有摘要段，否则"交错"无从谈起');
+      expect(_summarySpansIn(projected), contains((lo: 41, hi: 91)),
+          reason: '前提：摘要段夹在两段原文中间（就是交错的那种排法）');
+      expect(toolUseCount, 1,
+          reason: '同一条工具调用只许发一次 —— 工具轮被切开就会发两遍');
+      expect(toolResultCount, 1,
+          reason: '同一条工具调用的结果也只许一条');
+      expect(toolResultAt, toolUseAt + 1,
+          reason: 'tool_result 必须**紧跟**它的 tool_use（紧邻的下一条消息）');
+      for (var i = 1; i < roles.length; i++) {
+        expect('${roles[i - 1]},${roles[i]}', isNot('user,user'),
+            reason: '相邻两条 role:user 会让请求非法（DeepSeek 没有文档说同角色消息会被合并）');
+      }
+      expect(account.missing, [2],
+          reason: '只允许 seq2（内容为空的工具 assistant）没有文本表示 —— 它的表示就是那个 '
+              'tool_use 块；别的 seq 一条都不许缺');
+      expect(account.doubled, isEmpty,
+          reason: '同一段内容不许出现两种表示');
+    });
+
+    testWidgets('7.2 某段回落成原文时，容量判定按原文算（不是按那条不会发的摘要算）',
+        (tester) async {
+      // 几何：容量 4000 ⇒ 阈值 1000；对话 200 条 × 100 raw（seq 1..200）+ 当前这条用户消息。
+      // 距离按"它后面还有多少原文"算 ⇒ distance(seq s) = 100 × (200 − s) + 6。
+      // 库里预置四条 1 级：
+      //   · [1..60] / [61..130] / [131..190]，各实测 1200 —— 起点距离分别是 19906 / 13906 /
+      //     6906，都超过阈值 ⇒ 够远（1 级的档按它**最旧那条消息**算），这一趟当摘要发，可丢；
+      //   · [191..200]，实测 100 —— 起点距离只有 906 ≤ 1000 ⇒ **还不够远**，这一趟按原文发
+      //     （1000 估算 token），它**不可以**被丢（丢了就是内容凭空消失）。
+      // 两种口径的差别：按原文算 = 3600 + 1000 + 6 = 4606 > 容量 4000 ⇒ 超容量 ⇒ 丢掉最旧的
+      // 那条可丢摘要（丢完 3406，装得下，停手）；按"存下来了、这一趟却不会发"的摘要实测算
+      // = 3600 + 100 + 6 = 3706 ≤ 4000 ⇒ 判定为装得下 ⇒ 什么都不丢。
+      // （那条更粗的摘要这一趟合不出来：假摘要器给它报 5000，不小于它要替换的 1200 ⇒ 被拒，
+      // 所以容量压力不会被"合一条更小的"化解掉，只能看丢弃判定。）
+      _setupAgentRegistry(maxContextTokens: 4000);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final repo = _FakeSummaryNodeRepository();
+      const dbSessionId = 's1';
+      Future<void> put(int lo, int hi, int tokens) => repo.materialize(
+            sessionId: dbSessionId,
+            level: 1,
+            startSeq: lo,
+            endSeq: hi,
+            nodeType: 'summary',
+            summaryJson: jsonEncode({
+              'role': 'user',
+              'content': [
+                {'type': 'text', 'text': '层级 1 摘要 seq $lo..$hi'},
+              ],
+            }),
+            tokenCost: tokens,
+            summaryPromptVersion: 1,
+            model: 'test-model',
+            coveredMinSeq: lo,
+            coveredMaxSeq: hi,
+          );
+      await put(1, 60, 1200); // 够远、当摘要发、可丢（最旧）
+      await put(61, 130, 1200); // 同上
+      await put(131, 190, 1200); // 同上
+      await put(191, 200, 100); // 还不够远 ⇒ 这一趟发原文，不许丢
+
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(_convLabeled(200, 100));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      // 假摘要器报的尺寸有讲究：1 级报 1200（大于阈值 1000 ⇒ 会触发"再合成一条更粗的"），
+      // 2 级报 5000（**不小于**它要替换的那条 ⇒ 合成被拒，容量压力只能靠丢弃解决）——
+      // 这样"按哪种口径算容量"就成了唯一能决定丢不丢的东西。
+      final summaryProvider = _EchoSummaryProvider(l1Tokens: 1200, l2Tokens: 5000);
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: summaryProvider,
+        summaryNodeRepo: repo,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      final projected = sidecar.lastMessagesJson ?? '';
+      final spans = _summarySpansIn(projected);
+      final account = _accountEveryMessage(projected, upToSeq: 200);
+      // ignore: avoid_print
+      print('  [OBS] 7.2 发出去 ${(jsonDecode(projected) as List).length} 条消息；'
+          '摘要段=${spans.map((s) => '${s.lo}..${s.hi}').join(",")}；'
+          '没有任何表示的 seq 共 ${account.missing.length} 个'
+          '（${account.missing.isEmpty ? "-" : '${account.missing.first}..${account.missing.last}'}）；'
+          '出现两次的 seq=${account.doubled}');
+
+      expect(spans, contains((lo: 61, hi: 130)),
+          reason: '前提：够远的摘要照常发（它们是这一趟真正发出去的摘要）');
+      expect(spans, contains((lo: 131, hi: 190)),
+          reason: '同上');
+      expect(spans, isNot(contains((lo: 191, hi: 200))),
+          reason: '那一条"还不够远"的不许以摘要形式出现（它这一趟发原文）');
+      expect(account.missing, [for (var s = 1; s <= 60; s++) s],
+          reason: '按原文算 ⇒ 超容量 ⇒ 最旧那条够远的摘要被丢（这正是"按原文算"的可观测'
+              '结果）；按摘要实测算就会判定为装得下、什么都不丢，那时这条会红');
+      expect(account.doubled, isEmpty, reason: '同一段不许出现两种表示');
+      // 反过来，回落成原文的那一段（191..200）一条都不许少 —— 丢内容是不允许的。
+      for (final seq in [191, 195, 200]) {
+        expect(account.missing.contains(seq), isFalse,
+            reason: '回落成原文的那一段必须完整发出去（seq$seq 不许缺）');
+      }
+      expect(projected, contains('m191:'),
+          reason: '那一段落回成原文后，原文真的出现在发出去的内容里');
+      expect(projected, contains('continue'), reason: '当前用户消息必须活下来');
+    });
+
+    testWidgets('7.4 已经被压过的原文不会再进折卷；库里同等级的摘要跨度互不重叠',
+        (tester) async {
+      // 这一条钉的是"不会重复压缩同一段内容"：
+      //   · 库里预置两条 1 级（覆盖 seq 1..4 与 5..8）；
+      //   · 这一趟的可折尾部必须从 seq 9 开始 —— 交给摘要器的每一批都不许碰到 1..8；
+      //   · 折完之后库里的同等级摘要（1 级与 1 级、2 级与 2 级）跨度都不许重叠。
+      // 判据是"摘要器实际收到的每一批"（真实调用记录），不是从计划里推的。
+      _setupAgentRegistry(maxContextTokens: 4000);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final repo = _FakeSummaryNodeRepository();
+      const dbSessionId = 's1';
+      Future<void> put(int level, int lo, int hi, int tokens) => repo.materialize(
+            sessionId: dbSessionId,
+            level: level,
+            startSeq: lo,
+            endSeq: hi,
+            nodeType: 'summary',
+            summaryJson: jsonEncode({
+              'role': 'user',
+              'content': [
+                {'type': 'text', 'text': '层级 $level 摘要 seq $lo..$hi'},
+              ],
+            }),
+            tokenCost: tokens,
+            summaryPromptVersion: 1,
+            model: 'test-model',
+            coveredMinSeq: lo,
+            coveredMaxSeq: hi,
+          );
+      await put(1, 1, 4, 400);
+      await put(1, 5, 8, 400);
+
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(_convLabeled(19, 100));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final summaryProvider = _RecordingSummaryProvider();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: summaryProvider,
+        summaryNodeRepo: repo,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      // 摘要器实际收到的每一批覆盖了哪些 seq。
+      final foldedSpans = <({int lo, int hi})>[
+        for (final call in summaryProvider.foldedCalls)
+          if (call.isNotEmpty)
+            (lo: call.first.seq ?? 0, hi: call.last.seq ?? 0),
+      ];
+      final nodes = await repo.queryBySession(dbSessionId);
+      final l1Spans = <({int lo, int hi})>[
+        for (final n in nodes.where((n) => n.level == 1))
+          (lo: n.coveredMinSeq, hi: n.coveredMaxSeq),
+      ];
+      final l2Spans = <({int lo, int hi})>[
+        for (final n in nodes.where((n) => n.level == 2))
+          (lo: n.coveredMinSeq, hi: n.coveredMaxSeq),
+      ];
+      ({int lo, int hi})? overlapping(
+          List<({int lo, int hi})> a, List<({int lo, int hi})> b) {
+        for (final x in a) {
+          for (final y in b) {
+            if (!(x.hi < y.lo || y.hi < x.lo)) return (lo: x.lo, hi: x.hi);
+          }
+        }
+        return null;
+      }
+
+      /// 一组跨度里有没有两条互相重叠（只比不同的两条，不拿自己跟自己比）。
+      ({int lo, int hi})? pairOverlap(List<({int lo, int hi})> a) {
+        for (var i = 0; i < a.length; i++) {
+          for (var j = i + 1; j < a.length; j++) {
+            if (!(a[i].hi < a[j].lo || a[j].hi < a[i].lo)) return a[i];
+          }
+        }
+        return null;
+      }
+
+      final presets = <({int lo, int hi})>[(lo: 1, hi: 4), (lo: 5, hi: 8)];
+      final foldHitPreset = overlapping(foldedSpans, presets);
+      // 这一趟**新落的** 1 级（把预置那两条自己排除掉）—— 它们不许碰到预置段落。
+      final newL1 = [
+        for (final s in l1Spans)
+          if (!presets.any((p) => p.lo == s.lo && p.hi == s.hi)) s
+      ];
+      final newL1HitPreset = overlapping(newL1, presets);
+      // ignore: avoid_print
+      print('  [OBS] 7.4 摘要器收到的批次=${foldedSpans.map((s) => '${s.lo}..${s.hi}').join(",")}；'
+          '库里新落的 1 级=${newL1.map((s) => '${s.lo}..${s.hi}').join(",")}'
+          '（另有预置的 1..4、5..8）；库里的 2 级=${l2Spans.map((s) => '${s.lo}..${s.hi}').join(",")}；'
+          '折卷批次碰到预置段落=$foldHitPreset；'
+          '新落的 1 级碰到预置段落=$newL1HitPreset；'
+          '同级 1 级互相重叠=${pairOverlap(l1Spans)}；'
+          '同级 2 级互相重叠=${pairOverlap(l2Spans)}');
+
+      expect(foldedSpans, isNotEmpty,
+          reason: '前提：这一趟确实折了（否则什么都没验证到）');
+      expect(foldHitPreset, isNull,
+          reason: '已经被压过的原文（预置的 1..4 / 5..8）不许再进折卷 —— 尾部必须从 seq 9 起');
+      expect(pairOverlap(foldedSpans), isNull,
+          reason: '同一趟里交给摘要器的各批之间不许重叠');
+      expect(newL1HitPreset, isNull,
+          reason: '库里新落的 1 级不许和已有的 1 级重叠（这就是"同一段被压两次"）');
+      expect(pairOverlap(l1Spans), isNull,
+          reason: '库里同等级的 1 级之间不许重叠');
+      expect(pairOverlap(l2Spans), isNull,
+          reason: '库里同等级的 2 级之间不许重叠');
     });
 
     testWidgets('⑪.3 coarsen: over-budget L1 summaries are rolled into a level-2', (tester) async {
@@ -1140,7 +1919,7 @@ void main() {
 
       final sessions = testSessions(1);
       final sessionRepo = FakeSessionRepository(sessions);
-      final msgRepo = FakeMessageRepository(_convOfRaw(15, 100));
+      final msgRepo = FakeMessageRepository(_convLabeled(15, 100));
       final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
       final summaryProvider = FakeSummaryProvider(text: 'FOLDED SUMMARY');
 
@@ -1175,6 +1954,19 @@ void main() {
           reason: '压出来的更早上下文摘要必须真的进入发给模型的内容');
       expect(projected, contains('continue'),
           reason: '当前用户消息必须活下来');
+      // 这一场没有"每段恰好一种表示"的通用守卫：这条用例用的假摘要器给的是一句固定文本
+      // （没有 `seq a..b` 标签），读不出它盖住了哪一段。退一步查能查的那半 —— 投影里
+      // **逐字发出去的原文**必须正好是尾部那几条（seq 12..15）：远端 1..11 被那条 1 级
+      // 摘要接走，既不许也逐字再发一遍，也不许少发后面几条。
+      final rawSeqs = RegExp(r'm(\d+):')
+          .allMatches(projected)
+          .map((m) => int.parse(m.group(1)!))
+          .toSet();
+      // ignore: avoid_print
+      print('  [OBS] 6.1 逐字发出去的 seq=$rawSeqs（远端 1..11 该由那条 1 级摘要接走）');
+      expect(rawSeqs, {12, 13, 14, 15},
+          reason: '逐字发的必须正好是尾部那四条 —— 少了说明有内容没发出去，'
+              '多了说明被摘要盖住的原文又发了一遍');
     });
 
     testWidgets('6.2 没超容量也合成更粗的摘要：库里两条 L1 实测相加超过阈值',
@@ -1219,9 +2011,9 @@ void main() {
       // 消息 seq 1..10（每条 100 raw）；已冻结范围只到 seq 8，所以 seq 9/10
       // 与当前这条用户消息留在尾部原样发送。整体 raw ≈ 1200，容量 4000。
       final sessionRepo = FakeSessionRepository(testSessions(1));
-      final msgRepo = FakeMessageRepository(_convOfRaw(10, 100));
+      final msgRepo = FakeMessageRepository(_convLabeled(10, 100));
       final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
-      final summaryProvider = _SizedFakeSummaryProvider(l1Tokens: 1, l2Tokens: 300);
+      final summaryProvider = _EchoSummaryProvider(l1Tokens: 1, l2Tokens: 300);
 
       await tester.pumpWidget(_buildApp(
         sessionRepo: sessionRepo,
@@ -1251,8 +2043,17 @@ void main() {
       expect(l2, isNotEmpty,
           reason: '库里 L1 摘要累计 1200 已超过阈值 1000 ⇒ 必须合成出一条 level = 2 '
               '的摘要，哪怕当前投影离模型容量还差得远；改之前一条都不会有');
-      expect(projected, contains(kLevel2SummaryMarker),
-          reason: '合成出来的更粗摘要必须真的进入发给模型的内容');
+      // 投影口径（2026-09-26 的裁定）：这条 2 级盖住的整段（seq 1..8）离末尾还不到一个
+      // 2T ⇒ 这一趟不进投影，那一段照原文发。旧断言写的是"合成出来的更粗摘要必须真的
+      // 进入发给模型的内容"，按新口径改写成"合成照做、但还没轮到它上场"。
+      expect(projected, isNot(contains(kLevel2SummaryMarker)),
+          reason: '这条 2 级盖住的整段还没落到最远档 ⇒ 这一趟不进投影');
+      expect((jsonDecode(projected) as List).length, 11,
+          reason: '这一趟还没轮到 2 级上场 ⇒ seq 1..10 的原文加当前这条用户消息'
+              '共 11 条必须一条不少地照发');
+      // 通用守卫：seq 1..10 每条恰好一种表示（这一趟它们全该以原文出现 —— 库里那两条 1 级
+      // 自己都还不够远，那条刚合出来的 2 级也还不够远）。
+      _expectEveryMessageExactlyOnce(projected, upToSeq: 10);
       expect(projected, contains('continue'),
           reason: '当前用户消息必须活下来');
     });

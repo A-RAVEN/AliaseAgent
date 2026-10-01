@@ -37,7 +37,7 @@ The system SHALL keep the API request's total context within a configurable budg
 - **THEN** its output length is not capped by a compaction-design constant, and the "summary must be measured smaller than the batch it replaced" rule is what rejects a bloated summary
 
 ### Requirement: Recency-gradient hierarchical compaction
-The system SHALL compress the conversation as a hierarchy: recent turns kept verbatim, medium-distance turns replaced by per-segment summaries, and farthest turns by summaries of summaries. The recency gradient SHALL be a deterministic function of history + config, where the set of already-closed segments (delimited boundaries) is a fixed input that is never re-derived or re-shaped (progressive closure — see Segment closure and summary immutability). **The gradient SHALL be driven by the same derived threshold `T` and by token amounts only: the verbatim (recent) span is the bounded newest content whose accumulated raw tokens stay under `T`, and content is folded one level up as soon as the accumulated total exceeds `T` — no count of turns and no count of segments SHALL gate either the fold or the roll-up.**
+The system SHALL compress the conversation as a hierarchy: recent turns kept verbatim, medium-distance turns replaced by per-segment summaries, and farthest turns by summaries of summaries. The recency gradient SHALL be a deterministic function of history + config, where the set of already-closed segments (delimited boundaries) is a fixed input that is never re-derived or re-shaped (progressive closure — see Segment closure and summary immutability). **The gradient SHALL be driven by the same derived threshold `T` and by token amounts only: the verbatim (recent) span is the bounded newest content whose accumulated raw tokens stay under `T`, and content is folded one level up as soon as the accumulated total exceeds `T` — no count of turns and no count of segments SHALL gate either the fold or the roll-up.** **The PROJECTION SHALL be graded by distance from the newest message, and every band boundary SHALL be a multiple of the same derived `T` (no absolute token constant is introduced anywhere). The distance of a segment SHALL be measured at its OLDEST covered message, as the accumulated RAW (estimated) tokens of everything newer than it — never a summary's measured size (this keeps the gradient a pure function of history + config + the closed segmentation): the newest content whose distance stays under `T` is projected verbatim; content at distance `T`–`2T` is projected as its level-1 summaries; content farther back than `2T` is projected as level-2 summaries. A summary SHALL substitute for finer content in the projection only once that content has reached the band that summary belongs to — generating a summary earlier SHALL NOT substitute it earlier. The unit of that choice SHALL be the summary's whole covered span, and every span of history SHALL be projected with EXACTLY ONE representation (a raw message, a level-1 summary, or a level-2 summary) — never two at once, so no span may appear both as level-1 and as level-2 text. A level-2 summary SHALL be projected only once its WHOLE covered span has reached the farthest band (both edges beyond `2T`); until then that span SHALL be represented by its level-1 summaries (finer than the band would require — that cost is accepted so that nothing is sent twice and nothing is substituted earlier than its position allows). When a span has no summary yet (nothing folded for it yet), the FINER representation SHALL be projected instead (raw text, or its level-1 summaries where those exist) rather than an empty span.**
 
 #### Scenario: Recent verbatim
 - **WHEN** the accumulated raw token total exceeds `T`
@@ -46,6 +46,18 @@ The system SHALL compress the conversation as a hierarchy: recent turns kept ver
 #### Scenario: Summary of summaries
 - **WHEN** the level-1 summaries not yet covered by a level-2 have measured tokens whose accumulated total (oldest-first) first exceeds `T`
 - **THEN** those level-1 summaries are folded into a level-2 summary of summaries — the threshold alone authorizes it, with no minimum count of segments
+
+#### Scenario: A level-2 that is not far enough back yet stays out of the projection
+- **WHEN** a level-2 summary exists but part of its covered span is still nearer than `2T` (its span has not wholly reached the farthest band)
+- **THEN** the projection represents that span by its level-1 summaries and does NOT contain the level-2 summary — the same request SHALL NOT contain both the level-1 and the level-2 text of the same span
+
+#### Scenario: Once the whole span is far enough, the level-2 replaces it and the middle band keeps its own level-1s
+- **WHEN** a level-2 summary's whole covered span has reached the farthest band, and separately some level-1 summaries lie in the middle band (`T`–`2T`)
+- **THEN** the projection contains the level-2 summary for that far span AND the middle band's level-1 summaries for their own span — each span exactly once
+
+#### Scenario: A band with no summary yet falls back to the finer representation
+- **WHEN** the middle band contains content that has not been folded into a level-1 summary yet
+- **THEN** that content is projected as raw text (never as an empty span and never as a summary that does not exist yet)
 
 ### Requirement: Non-compressible anchor (guard)
 The system SHALL never collapse user goals, acceptance criteria, or explicit "don't touch X" invariants, regardless of their age. These anchors SHALL be re-injected on every turn and SHALL be sourced from an explicit standing-requirements mechanism (not LLM-extracted from prose). The anchor set SHALL be bounded, deduplicated, and support staleness/revocation.
@@ -204,12 +216,16 @@ The system SHALL decide a level-2 "summary of summaries" roll-up by ONE token th
 - **THEN** the roll-up still happens — reaching the threshold is sufficient, and the roll-up does not wait for the budget
 
 #### Scenario: Level-2 actually reaches the request projection
-- **WHEN** such a roll-up happens
-- **THEN** the request projection actually sent to the model contains the level-2 summary (the level-2 marker), and a `level = 2` row exists in `summary_nodes` whose covered span is the union of the rolled-up level-1 spans
+- **WHEN** such a roll-up happens and its whole covered span has reached the farthest band
+- **THEN** the request projection actually sent to the model contains the level-2 summary (the level-2 marker), and a `level = 2` row exists in `summary_nodes` whose covered span is the union of the rolled-up level-1 spans; the middle band's own level-1 summaries are projected for their own span, each span exactly once
 
 #### Scenario: Rolled-up level-1s are not duplicated
-- **WHEN** a level-2 covers a span
-- **THEN** the level-1 summaries inside that span are not also sent as separate projection entries
+- **WHEN** a level-2 covers a span and is projected
+- **THEN** the level-1 summaries inside that span are not also sent as separate projection entries — every span is projected with exactly one representation
+
+#### Scenario: A roll-up never removes a middle-band level-1 from the projection
+- **WHEN** a roll-up runs while some level-1 summaries still lie in the middle band (distance `T`–`2T`)
+- **THEN** the roll-up proceeds on the token rule as before, and those middle-band level-1 summaries are still projected (their distance, not the level-2's coverage, decides their representation)
 
 #### Scenario: Accumulation spans folds
 - **WHEN** a level-1 summary was persisted by an earlier fold, the accumulated total has not yet exceeded `T`, and a later fold runs
