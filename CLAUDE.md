@@ -25,6 +25,11 @@ Flutter 桌面 AI 对话应用，通过 dart:ffi 调用 C++ Sidecar 动态库（
 
 - **测试规范以 `Docs/TESTING.md` 为权威**（分层决策、怎么写、实现规范、调试读取、可观测性 §3.1、报错处理 §3.2）。新增任何功能（含工具 / 界面 / 错误路径 / 脚本改动）都要配套对应层测试：纯逻辑 → `test/unit`；渲染交互 → `test/widget`；假 sidecar 端到端 → `test/integration`；真实模型端到端 → `integration_test` + `--tags live`；C++ → `sidecar/test`；整套冒烟 → `test/smoke/run_all.sh`。并在 tasks.md 落到可自测的验证任务。
 
+- **不许有"没有测试的新功能"（2026-10-02 用户要求）** — 原文：「以后所有新功能的添加都应该有能反应它的测试用例，可以多个功能共用一个测试，但是不允许没有测试」「添加测试应该是所有 proposal 的硬性要求」。落成三条：
+  1. **每个新功能 / 每个行为改动都必须有一个能反映它的测试用例**（该用例在功能坏掉时会红）。分层按上一条选，便宜的那层够用就不要往贵的那层堆。
+  2. **允许共用**：多个功能可以共用同一个测试文件、甚至同一条用例（例：`integration_test/compact_quality_live_test.dart` 一次真实压缩同时验"摘要质量"与"压缩中的提示"）。**共用时要在用例里写清它覆盖哪几件事**，否则"它到底测了啥"无法核对 = 等同于没有测试。
+  3. **提案层面就是硬性要求**：tasks.md 里必须有点名到测试层路径（`test/unit` / `test/widget` / `test/integration` / `integration_test` / `sidecar/test` / `test/smoke`）的任务；一条都没有的 proposal 不合格，不许进入 apply。守卫：`test/unit/openspec_proposal_test.dart` —— 每个还没归档的 change，其 tasks.md 必须至少有一条任务点名测试层路径，否则红。
+
 - **验证清单（声称"验证通过"之前逐层跑并贴实际输出，缺一层即未验证）**：
   1. `flutter analyze` —— 改动文件不得新增问题。
   2. **先让 DLL 是最新的，再跑全量 VM 测试。** 正规做法走项目自己的入口 `run.bat`（第 [3/5] 步把新构建的 sidecar.dll 刷到仓库根，第 [4/5] 步跑依赖 DLL 的冒烟测试）。只想跑测试：`powershell -NoProfile -File scripts\sync_sidecar_dll.ps1` 然后 `flutter test`。原因：`flutter test` 用**裸名字** `DynamicLibrary.open('sidecar.dll')` 加载**仓库根**那份；绕过第 3 步会拿到 15 个 `Failed to lookup symbol 'browser_available'`，看着像回归，其实是流程绕行。守卫测试 `test/unit/sidecar_dll_freshness_test.dart` 会直接报出该跑哪条命令。

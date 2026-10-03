@@ -1,7 +1,9 @@
 # Chat UI — Spec
 
-## ADDED Requirements
+## Purpose
 
+让用户在应用里和一个能调工具的模型来回对话：消息列表按时间显示用户与助手的往来（含流式输出、思考卡片、工具调用卡片），底部输入框负责发送，左侧会话列表负责切换、新建与删除会话；长对话需要压缩时，对话视图还要让用户看出"正在压缩"这件事。这一屏呈现的是对话本身，模型内部做了什么由「真实上下文」那一屏负责。
+## Requirements
 ### Requirement: Message list display
 The system SHALL display a scrollable message list showing all messages in the current session, with user messages and assistant messages visually differentiated.
 
@@ -190,3 +192,32 @@ The ThinkingCard SHALL NOT auto-expand or auto-collapse: during streaming, a col
 #### Scenario: Turn completion does not change state
 - **WHEN** a turn completes (streaming indicator switches to character count)
 - **THEN** each card keeps the exact collapsed/expanded state it had before
+
+### Requirement: Compaction-in-progress status indicator
+
+The conversation view SHALL show a status indicator while context compaction is running — both when a send compacts the history before its request goes out, and when an idle background compaction runs — and SHALL remove it when compaction ends. The indicator SHALL be driven by the compaction code itself, set at the points where it is about to issue a compaction-related model request; it SHALL NOT be inferred from the in-flight-send flag (`_isStreaming`) or from the streaming indicator, and a send that does not trigger compaction SHALL NOT show it. The indicator SHALL name the current stage (seam selection, level-1 summary generation, or level-2 roll-up) and its progress: when the stage's total is known it SHALL show "segment k of n", and when the total is not yet known it SHALL show the segment in progress without a total (never an invented denominator). While a background compaction runs, the indicator SHALL state that sending a message makes compaction yield. The indicator SHALL disappear when compaction ends for any reason — success, failure, exception, or being preempted by the user's next send — and that removal SHALL repaint the view. When no compaction is running the indicator SHALL render nothing and SHALL NOT occupy layout space. The compaction status SHALL be readable from `ChatScreenState` so tests can assert the idle and in-progress states.
+
+#### Scenario: A send that triggers compaction
+- **WHEN** the user sends a message and this send must produce new summaries before its request goes out
+- **THEN** the conversation view shows the compaction indicator naming the stage and progress, and keeps showing it (updated as segments complete) until compaction ends
+
+#### Scenario: A send that does not trigger compaction
+- **WHEN** the user sends a message and the accumulated history has not crossed the threshold, so no compaction work runs
+- **THEN** the indicator never appears for that send
+
+#### Scenario: Background compaction is visible and announced as yielding
+- **WHEN** a background compaction starts in the idle gap after a turn and is about to issue its first compaction-related model request
+- **THEN** the indicator appears in the conversation view, states that sending a message makes compaction yield, and stays until that background compaction ends
+
+#### Scenario: Indicator clears when compaction ends
+- **WHEN** compaction ends by succeeding, failing, throwing, or being preempted by the user's next send
+- **THEN** the indicator is removed and the view is repainted
+
+#### Scenario: Idle renders nothing
+- **WHEN** no compaction is running
+- **THEN** the indicator renders no content and occupies no layout space, leaving the existing layout unchanged
+
+#### Scenario: Status readable by tests
+- **WHEN** a test drives a send that triggers compaction
+- **THEN** it reads a non-idle compaction status from `ChatScreenState` while compaction runs, and an idle status after compaction ends
+

@@ -7,6 +7,7 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'models/agent_type_config.dart';
 import 'models/app_config.dart';
 import 'models/chat_item.dart';
+import 'models/compaction_status.dart';
 import 'models/message.dart';
 import 'models/session.dart';
 import 'models/tool_call_activity.dart';
@@ -250,6 +251,47 @@ class ChatScreenState extends State<ChatScreen> {
   /// Read-only view of the captured snapshot for the UI and tests. Returns null
   /// only before the first send has captured anything.
   ContextSnapshot? get contextSnapshot => _contextSnapshot;
+
+  /// 压缩进行中的状态（空闲时是 [CompactionStatus.idle]）。
+  ///
+  /// 它**只**说明"压缩这一件事正在做"：置位与清除都发生在真正要发起压缩相关模型
+  /// 请求的地方 —— 挑选分段主题（[_prepareSeamChooser]，冷缓存时它自己要发一次
+  /// 请求）与生成 / 合成摘要（[_resolveSummaries]）。刻意不从"正在发送"
+  /// （`_isStreaming`）推断：没触发压缩的普通发送它也是开的，那样提示就是假的。
+  CompactionStatus _compactionStatus = CompactionStatus.idle;
+
+  /// 压缩进行中的状态，供两个视图与测试读取。
+  CompactionStatus get compactionStatus => _compactionStatus;
+
+  /// 这个状态现在**归谁**：每次置位的人拿一个自己的标记，清除时只清自己那一份。
+  /// 没有这一层时，两条并发的压缩（后台那趟被抢占后收尾 + 你自己的发送前压缩）
+  /// 会互相把对方正在显示的提示清掉 —— 谁先结束谁清。
+  Object? _compactionOwner;
+
+  /// 改压缩状态并重画。[owner] 非空时同时把归属改成它。
+  /// [sessionId] 非空时只有它**就是当前会话**才显示：切走之后，旧会话那趟压缩还会继续
+  /// 跑一阵，它后续的置位不许把提示画到新会话的界面上。
+  /// 压缩期间界面可能已经被销毁（切换会话、关窗口），所以带 `mounted` 判断。
+  void _setCompactionStatus(CompactionStatus status,
+      {Object? owner, String? sessionId}) {
+    if (!mounted) return;
+    if (sessionId != null && sessionId != _currentId) return;
+    if (owner != null) _compactionOwner = owner;
+    setState(() => _compactionStatus = status);
+  }
+
+  /// 把状态清成空闲，但**只在它还是 [owner] 置的那一份时才清**：别人正在显示的
+  /// 提示不许被我清掉（`owner == null` 表示无条件清，只有"整条链收尾"用它）。
+  void _clearCompactionStatus({Object? owner}) {
+    if (!mounted) return;
+    if (owner != null &&
+        _compactionOwner != null &&
+        !identical(_compactionOwner, owner)) {
+      return;
+    }
+    _compactionOwner = null;
+    setState(() => _compactionStatus = CompactionStatus.idle);
+  }
 
   /// Which view the conversation area shows: the original conversation view or
   /// the real context view (task 3.1). Defaults to the conversation view.
@@ -801,6 +843,11 @@ class ChatScreenState extends State<ChatScreen> {
     setState(() {
       _currentId = s.id;
       _chatItems = [];
+      // 压缩状态属于**一个会话**：切走之后旧会话的压缩提示不许挂在新会话界面上。
+      // （被抢占的那趟压缩还会回来清它自己那一份，但它已经不是当前归属，会被忽略；
+      // 它后续的置位也会被 `_setCompactionStatus` 的会话校验挡掉。）
+      _compactionStatus = CompactionStatus.idle;
+      _compactionOwner = null;
     });
     _loadMessages();
   }
@@ -965,27 +1012,55 @@ class ChatScreenState extends State<ChatScreen> {
       // it).
       final loaded = await _loadClosedSegments(sessionId, messages,
           maxContextTokens, agentType.compactionThresholdPercent);
+      // 这一轮要不要**为压缩等待**（用户 2026-10-02 的要求）：只看"不压就发"的那一趟
+      // 投影占模型总上下文多少 —— 超过等待上界才等；不到就不压、一个摘要调用都不发，
+      // 攒过阈值的内容照原文发，压缩留给空闲时的后台折叠。
+      // 判定必须放在**分段选择之前**：生产环境的分段选择器自己要发一次模型请求
+      // （冷缓存时），放在它后面就等于没做到"不等"。
+      final waitPercent = agentType.compactionWaitThresholdPercent;
+      final shareTokens = CompactionEngine.estimatedProjectionTokens(
+          summaryMeasuredTokens: loaded.projected.map((c) => c.tokenCost),
+          rawTail: [
+            for (final m in messages)
+              if ((m.seq ?? 0) > loaded.coveredThrough) m,
+          ]);
+      final waitForCompaction = CompactionEngine.exceedsWaitBound(
+          projectedTokens: shareTokens,
+          maxContextTokens: maxContextTokens,
+          waitPercent: waitPercent);
+      debugPrint('[AliasAgent] 压缩等待门槛：不压就发的投影≈$shareTokens token / '
+          '模型容量 $maxContextTokens（等待上界 '
+          '${CompactionEngine.waitBoundTokens(maxContextTokens, waitPercent)}，'
+          '$waitPercent%）⇒ ${waitForCompaction ? "这一轮等它压完再发" : "不等：照原文发，压缩留给空闲后台"}');
       // 4.3 design D5 option A: when a seam selector is available, prefetch/memoize
       // the LLM L1 topic seams for the current fold BEFORE building the plan, then
       // pass a memo-backed L1SeamChooser. A seam failure degrades gracefully to the
       // arithmetic-safe skeleton (never splits a tool round, never blocks the turn).
-      final seamChooser = await _prepareSeamChooser(
-          messages, loaded.projected, agentType, maxContextTokens,
-          coverageFloorSeq: loaded.coveredThrough);
-      final plan = CompactionEngine.buildTree(
+      // 不等的那一轮连分段选择都不发起（它自己要发一次模型请求）。
+      final seamChooser = waitForCompaction
+          ? await _prepareSeamChooser(
+              messages, loaded.projected, agentType, maxContextTokens,
+              coverageFloorSeq: loaded.coveredThrough, sessionId: sessionId)
+          : null;
+      final planned = CompactionEngine.buildTree(
           history: messages,
           maxContextTokens: maxContextTokens,
           closed: loaded.projected,
           coverageFloorSeq: loaded.coveredThrough,
           seamChooser: seamChooser,
           thresholdPercent: agentType.compactionThresholdPercent);
+      // 不等 ⇒ 把这一趟还没落盘的摘要段降级成原文段：只取已落盘的摘要拼投影。
+      final plan = waitForCompaction
+          ? planned
+          : CompactionEngine.projectionWithoutNewSummaries(planned);
       if (plan.shouldCompact) {
         ({List<ProjectionPiece> timeline, List<SummaryResult> summaries})
             resolved = (timeline: const [], summaries: const []);
         try {
           resolved = await _resolveSummaries(sessionId, plan, agentType,
               maxContextTokens,
-              history: messages);
+              history: messages,
+              generate: waitForCompaction);
         } catch (e) {
           // Summarization failed — never silently replace the folded context with
           // a placeholder. Fall back to sending the conversation verbatim.
@@ -1485,7 +1560,11 @@ class ChatScreenState extends State<ChatScreen> {
   /// tool round, never blocks the turn).
   Future<L1SeamChooser?> _prepareSeamChooser(List<Message> history,
       List<ClosedSummary> closed, AgentTypeConfig agentType,
-      int maxContextTokens, {int? coverageFloorSeq, bool Function()? isAborted}) async {
+      int maxContextTokens,
+      {int? coverageFloorSeq,
+      bool Function()? isAborted,
+      bool background = false,
+      String? sessionId}) async {
     if (_seamSelector == null) return null;
     final seamInputs = CompactionEngine.resolveFoldSeamInputs(
         history: history,
@@ -1493,6 +1572,9 @@ class ChatScreenState extends State<ChatScreen> {
         closed: closed,
         coverageFloorSeq: coverageFloorSeq,
         thresholdPercent: agentType.compactionThresholdPercent);
+    // 这一条同时是界面的闸门：`resolveFoldSeamInputs` 返回空 ⇔ 这次没有远端内容要压
+    // （它和算计划的 `_foldEndFor` 共用同一个判断），所以"没到阈值就返回"的路径上
+    // 界面上不会亮任何东西 —— 后台压缩每次空闲都会试一次，亮在这里会次次闪一下。
     if (seamInputs == null) return null;
     final seamSel = _seamSelector;
     // 2.6 abort gate: the seam ensure makes its own model call (SeamSelector.ensure
@@ -1501,6 +1583,17 @@ class ChatScreenState extends State<ChatScreen> {
     if (isAborted?.call() ?? false) {
       throw const _BackgroundFoldCancelled('background fold aborted before seam selection');
     }
+    // 热缓存时 `ensure` 直接返回、不发请求，所以只有冷缓存才亮提示（否则会闪）。
+    // 提示在这里自己收尾：无论成功、失败还是抛异常，出这个函数前都回到空闲。
+    // 归属标记：这一趟的提示只有这一趟能清（后台那趟被抢占后收尾时不许清掉
+    // 发送前那趟正在显示的提示）。
+    final seamOwner = Object();
+    final coldSeam =
+        seamSel.memoizedSeams(far: seamInputs.far, k: seamInputs.k) == null;
+    if (coldSeam) {
+      _setCompactionStatus(CompactionStatus.seam(background: background),
+          owner: seamOwner, sessionId: sessionId);
+    }
     try {
       await seamSel.ensure(
           far: seamInputs.far, k: seamInputs.k, config: agentType);
@@ -1508,6 +1601,8 @@ class ChatScreenState extends State<ChatScreen> {
     } catch (e) {
       debugPrint('[AliasAgent] seam selection failed, using arithmetic skeleton: $e');
       return null;
+    } finally {
+      if (coldSeam) _clearCompactionStatus(owner: seamOwner);
     }
   }
 
@@ -1566,7 +1661,9 @@ class ChatScreenState extends State<ChatScreen> {
       final seamChooser = await _prepareSeamChooser(
           messages, loaded.projected, agentType, maxContextTokens,
           coverageFloorSeq: loaded.coveredThrough,
-          isAborted: () => _foldGen != myGen);
+          isAborted: () => _foldGen != myGen,
+          background: true,
+          sessionId: sessionId);
       final plan = CompactionEngine.buildTree(
           history: messages,
           maxContextTokens: maxContextTokens,
@@ -1582,7 +1679,8 @@ class ChatScreenState extends State<ChatScreen> {
       }
       final resolved = await _resolveSummaries(
           sessionId, plan, agentType, maxContextTokens,
-          history: messages, isAborted: () => _foldGen != myGen);
+          history: messages, isAborted: () => _foldGen != myGen,
+          background: true);
       debugPrint('[AliasAgent] background fold: folded '
           '${resolved.summaries.length} summary segment(s) for session $sessionId, '
           'top closed seq=$topClosedMax');
@@ -1831,10 +1929,41 @@ class ChatScreenState extends State<ChatScreen> {
     return const [];
   }
 
+  /// 这个函数只做一件事：保证压缩状态**无论成功、失败、异常还是被打断都回到空闲**
+  /// （放在 finally 里，所以不需要每个出口各写一遍）。真正干活的在
+  /// [_resolveSummariesInner]，它按段把状态推进到"正在生成第几段"。
+  /// [background] 为真表示这是空闲时自动跑的那趟压缩，界面据此说明"发消息会让它先让路"。
   Future<({List<ProjectionPiece> timeline, List<SummaryResult> summaries})>
       _resolveSummaries(String sessionId, CompactionPlan plan,
           AgentTypeConfig agentType, int maxContextTokens,
-          {required List<Message> history, bool Function()? isAborted}) async {
+          {required List<Message> history,
+          bool Function()? isAborted,
+          bool background = false,
+          bool generate = true}) async {
+    // 归属标记：这一趟置位的提示只有这一趟能清。反过来，别的压缩流（例如被抢占的
+    // 后台那趟）收尾时也不会把这一趟正在显示的提示清掉。
+    final statusOwner = Object();
+    try {
+      return await _resolveSummariesInner(sessionId, plan, agentType,
+          maxContextTokens,
+          history: history,
+          isAborted: isAborted,
+          background: background,
+          generate: generate,
+          statusOwner: statusOwner);
+    } finally {
+      _clearCompactionStatus(owner: statusOwner);
+    }
+  }
+
+  Future<({List<ProjectionPiece> timeline, List<SummaryResult> summaries})>
+      _resolveSummariesInner(String sessionId, CompactionPlan plan,
+          AgentTypeConfig agentType, int maxContextTokens,
+          {required List<Message> history,
+          bool Function()? isAborted,
+          bool background = false,
+          bool generate = true,
+          Object? statusOwner}) async {
     final dbOpen = _summaryStoreOpen;
     // Dirty-since-seq watermark (D8 lazy recompute): a cached summary may be
     // reused only if its covered span is strictly below the watermark (clean —
@@ -1853,11 +1982,25 @@ class ChatScreenState extends State<ChatScreen> {
     // Phase A — resolve each summary segment to text + MEASURED tokens (⑪.1 real
     // output_tokens), keeping its identity for the measure→adjust loop (⑪.3).
     final entries = <({CompactionSegment seg, String text, int tokens, bool isClosed})>[];
+    // 界面进度：这一步一共要**生成**几条摘要段（已落盘的段是取库、不算进度），
+    // 每开始一条就把状态推进一次。`generate == false`（这一轮不等）时下面不会有
+    // 任何需要生成的段，所以状态不会被点亮。
+    final summarySegTotal = plan.segments
+        .where((s) => s.summary && s.messages.isNotEmpty && s.reuse == null)
+        .length;
+    var summarySegNo = 0;
     for (final seg in plan.segments) {
       if (isAborted?.call() ?? false) {
         throw const _BackgroundFoldCancelled('background fold aborted between segments');
       }
       if (!seg.summary || seg.messages.isEmpty) continue;
+      // 已落盘的段（reuse != null）只取库、不发请求，也不算进度。
+      if (seg.reuse == null) {
+        summarySegNo++;
+        _setCompactionStatus(CompactionStatus.level1(
+            segment: summarySegNo, total: summarySegTotal, background: background),
+            owner: statusOwner, sessionId: sessionId);
+      }
       final minSeq = seg.messages.first.seq;
       final maxSeq = seg.messages.last.seq;
 
@@ -2098,7 +2241,10 @@ class ChatScreenState extends State<ChatScreen> {
     // Identity set: entry records compare structurally, so identity is what tells
     // "this exact entry was already submitted" apart from an equal-looking one.
     final attempted = Set<Object>.identity();
-    while (table.isNotEmpty) {
+    var rollUpNo = 0;
+    // 这一轮不等（generate == false）时**一次合成请求都不发**：库里的摘要只拿来拼投影。
+    // 占比不到等待上界 ⇒ 投影不超容量 ⇒ 也不需要省略，所以跳过整个收拢循环是安全的。
+    while (generate && table.isNotEmpty) {
       if (isAborted?.call() ?? false) {
         throw const _BackgroundFoldCancelled('background fold aborted during coarsen');
       }
@@ -2150,6 +2296,12 @@ class ChatScreenState extends State<ChatScreen> {
         continue;
       }
       final groupSum = candGroup.fold(0, (m, e) => m + e.tokens);
+      // 界面进度：这一趟的第几次合成。总数事先不知道（要看收拢循环怎么走），
+      // 所以只报"正在生成第几段"，不编造分母。
+      rollUpNo++;
+      _setCompactionStatus(CompactionStatus.level2(
+          segment: rollUpNo, background: background),
+          owner: statusOwner, sessionId: sessionId);
       final l2 = await _summaryProvider.summarizeText(
           text: candGroup.map((e) => e.text).join('\n\n'), config: agentType);
       if (l2.tokens >= groupSum) {
@@ -2934,9 +3086,13 @@ class ChatScreenState extends State<ChatScreen> {
                     ? ChatArea(
                         items: _chatItems,
                         isStreaming: _isStreaming,
+                        compactionStatus: _compactionStatus,
                         onSendMessage: _sendMessage,
                       )
-                    : ContextView(snapshot: _contextSnapshot),
+                    : ContextView(
+                        snapshot: _contextSnapshot,
+                        compactionStatus: _compactionStatus,
+                      ),
               ),
             ],
           ),

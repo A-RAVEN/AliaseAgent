@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../models/chat_item.dart';
+import '../models/compaction_status.dart';
+import 'compaction_status_banner.dart';
 import 'message_bubble.dart';
 import 'thinking_card.dart';
 import 'tool_call_card.dart';
@@ -11,10 +13,15 @@ class ChatArea extends StatefulWidget {
   final bool isStreaming;
   final ValueChanged<String> onSendMessage;
 
+  /// 压缩进行中的状态（空闲时是 [CompactionStatus.idle]，那时不显示任何东西）。
+  /// 它只表示"压缩正在做"，与 [isStreaming] 是两件事：没触发压缩的发送不会让它亮。
+  final CompactionStatus compactionStatus;
+
   const ChatArea({
     super.key,
     this.items = const [],
     this.isStreaming = false,
+    this.compactionStatus = CompactionStatus.idle,
     required this.onSendMessage,
   });
 
@@ -122,6 +129,9 @@ class _ChatAreaState extends State<ChatArea> {
                 ),
         ),
         const Divider(height: 1),
+        // 压缩期间在输入框上方显示提示：用户等的地方就是这里（今天从按下发送到
+        // 模型吐出第一个字，这一屏此前毫无变化）。
+        CompactionStatusBanner(status: widget.compactionStatus),
         // Input area
         _InputBar(
           controller: _inputCtrl,

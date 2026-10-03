@@ -3,7 +3,9 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 
 import '../models/chat_item.dart';
+import '../models/compaction_status.dart';
 import '../services/context_snapshot.dart';
+import 'compaction_status_banner.dart';
 import 'message_bubble.dart';
 import 'thinking_card.dart';
 
@@ -24,26 +26,45 @@ enum ContextViewMode { conversation, context }
 class ContextView extends StatelessWidget {
   final ContextSnapshot? snapshot;
 
-  const ContextView({super.key, this.snapshot});
+  /// 压缩进行中的状态（空闲时是 [CompactionStatus.idle]）。
+  ///
+  /// 它在压缩期间**不会**改变这一屏的内容：这一屏按定义只显示真正发出去的那一份，
+  /// 压缩还没结束时下面仍是上一次发出的内容 —— 提示里会把这一点写明。
+  final CompactionStatus compactionStatus;
+
+  const ContextView({
+    super.key,
+    this.snapshot,
+    this.compactionStatus = CompactionStatus.idle,
+  });
 
   @override
   Widget build(BuildContext context) {
     final snap = snapshot;
-    if (snap == null) {
-      return const _NoSnapshot();
-    }
-    final messages = snap.messages;
-    return ListView.builder(
-      padding: const EdgeInsets.all(8),
-      // index 0 = collapsible System Prompt / Tools / raw-JSON sections,
-      // then one item per message.
-      itemCount: messages.length + 1,
-      itemBuilder: (context, index) {
-        if (index == 0) {
-          return _ContextHeader(snapshot: snap);
-        }
-        return _MessageBlock(message: messages[index - 1], index: index - 1);
-      },
+    final body = snap == null
+        ? const _NoSnapshot()
+        : ListView.builder(
+            padding: const EdgeInsets.all(8),
+            // index 0 = collapsible System Prompt / Tools / raw-JSON sections,
+            // then one item per message.
+            itemCount: snap.messages.length + 1,
+            itemBuilder: (context, index) {
+              if (index == 0) {
+                return _ContextHeader(snapshot: snap);
+              }
+              return _MessageBlock(
+                  message: snap.messages[index - 1], index: index - 1);
+            },
+          );
+    return Column(
+      children: [
+        // 固定在本屏顶部（不随内容滚动）：压缩期间下面仍是上一次实际发出的内容。
+        CompactionStatusBanner(
+          status: compactionStatus,
+          forContextView: true,
+        ),
+        Expanded(child: body),
+      ],
     );
   }
 }

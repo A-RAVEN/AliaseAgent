@@ -667,4 +667,53 @@ void main() {
               '这一段继续用它自己的 1 级摘要表示');
     });
   });
+
+  // ── 等待上界：这一轮要不要为压缩等待（用户 2026-10-02 的要求）──────────────
+  // 判据只有一个量：**不压就发**的那一趟投影占模型总上下文的多少。超过等待上界
+  // 才等。上界与其他阈值同构：模型总上下文 × 百分比 ÷ 100，不引入绝对 token 数。
+  group('等待上界（不压就发的投影占比）', () {
+    test('上界按模型总上下文的比例算：容量翻倍 ⇒ 上界翻倍', () {
+      final w20k = CompactionEngine.waitBoundTokens(20000, null);
+      final w40k = CompactionEngine.waitBoundTokens(40000, null);
+      final w40kHalf = CompactionEngine.waitBoundTokens(40000, 50);
+      // ignore: avoid_print
+      print('  [OBS] 容量 20000 ⇒ 上界 $w20k；容量 40000 ⇒ $w40k；'
+          '容量 40000 配 50% ⇒ $w40kHalf；容量 0 ⇒ '
+          '${CompactionEngine.waitBoundTokens(0, null)}');
+      expect(w20k, 15000, reason: '缺省 75%：20000 × 75 ÷ 100 = 15000');
+      expect(w40k, 30000, reason: '容量翻倍，上界必须跟着翻倍（不是写死的数）');
+      expect(w40kHalf, 20000, reason: '换了百分比就按新百分比算');
+      expect(CompactionEngine.waitBoundTokens(0, null), 0,
+          reason: '没配容量 ⇒ 没有上界可言');
+    });
+
+    test('正好等于上界不算超（严格大于才算）', () {
+      final atBound = CompactionEngine.exceedsWaitBound(
+          projectedTokens: 15000, maxContextTokens: 20000);
+      final overBound = CompactionEngine.exceedsWaitBound(
+          projectedTokens: 15001, maxContextTokens: 20000);
+      // ignore: avoid_print
+      print('  [OBS] 15000 对 15000 ⇒ $atBound（不算超）；'
+          '15001 对 15000 ⇒ $overBound（算超）');
+      expect(atBound, isFalse,
+          reason: '正好等于上界不算超 —— 边界口径与规范一致');
+      expect(overBound, isTrue, reason: '超过一个 token 才算超');
+    });
+
+    test('分子口径：会发出去的摘要按它自己的实测 token 计，其余按原文估算', () {
+      final tail = [_msgOfRaw('user', 400, seq: 1), _msgOfRaw('assistant', 400, seq: 2)];
+      final total = CompactionEngine.estimatedProjectionTokens(
+          summaryMeasuredTokens: const [500, 300], rawTail: tail);
+      final smaller = CompactionEngine.estimatedProjectionTokens(
+          summaryMeasuredTokens: const [50], rawTail: tail);
+      // ignore: avoid_print
+      print('  [OBS] 摘要实测 500+300、尾部原文估算 400+400 ⇒ 合计 $total；'
+          '摘要换成一条实测 50 ⇒ 合计 $smaller');
+      expect(total, 500 + 300 + 400 + 400,
+          reason: '摘要按落盘实测值算，原文按估算算，两者相加');
+      expect(smaller, 50 + 400 + 400,
+          reason: '摘要的实测值变了，合计必须跟着变 —— 这证明它不是恒真的常数');
+      expect(smaller, isNot(total));
+    });
+  });
 }

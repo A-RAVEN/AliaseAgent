@@ -185,5 +185,56 @@ void main() {
         }
       });
     });
+
+    // ── 等待阈值百分比（配置键 compaction_wait_threshold_percent）───────────
+    // 用户 2026-10-02 的要求：只有"不压就发的那一趟"占模型总上下文超过一个较大比例
+    // （缺省 75%）时，这一轮才为压缩等待。同样只按"容量 × 百分比"算，缺省 75。
+    // 下面三例覆盖「有值 / 没有这一项 / 值非法」，与上面那组同一套规则。
+    group('compactionWaitThresholdPercent', () {
+      test('reads an explicit compaction_wait_threshold_percent from JSON', () {
+        final config = AgentTypeConfig.fromJson('general', {
+          'provider': 'anthropic',
+          'model': 'claude-sonnet-4-6',
+          'system_prompt': '',
+          'max_context_tokens': 1000000,
+          'compaction_wait_threshold_percent': 60,
+        });
+        // ignore: avoid_print
+        print('  [OBS] explicit wait percent -> '
+            '${config.compactionWaitThresholdPercent}');
+        expect(config.compactionWaitThresholdPercent, 60);
+      });
+
+      test('defaults to 75 when compaction_wait_threshold_percent is absent', () {
+        final config = AgentTypeConfig.fromJson('general', {
+          'provider': 'anthropic',
+          'model': 'claude-sonnet-4-6',
+          'system_prompt': '',
+          'max_context_tokens': 1000000,
+        });
+        // ignore: avoid_print
+        print('  [OBS] absent wait percent -> '
+            '${config.compactionWaitThresholdPercent}');
+        expect(config.compactionWaitThresholdPercent, 75,
+            reason: '配置里不写这一项就按 75% 算');
+      });
+
+      test('falls back to 75 for illegal values (0 / over 100 / not an integer)', () {
+        for (final bad in <Object>['abc', 0, -5, 101, 12.5, true]) {
+          final config = AgentTypeConfig.fromJson('general', {
+            'provider': 'anthropic',
+            'model': 'claude-sonnet-4-6',
+            'system_prompt': '',
+            'max_context_tokens': 1000000,
+            'compaction_wait_threshold_percent': bad,
+          });
+          // ignore: avoid_print
+          print('  [OBS] illegal wait percent $bad -> '
+              '${config.compactionWaitThresholdPercent}');
+          expect(config.compactionWaitThresholdPercent, 75,
+              reason: 'illegal value $bad must fall back to the 75% default');
+        }
+      });
+    });
   });
 }

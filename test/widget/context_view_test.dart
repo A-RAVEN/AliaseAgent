@@ -6,12 +6,14 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:alias_agent/main.dart';
 import 'package:alias_agent/models/agent_type_config.dart';
 import 'package:alias_agent/models/app_config.dart';
+import 'package:alias_agent/models/compaction_status.dart';
 import 'package:alias_agent/models/message.dart';
 import 'package:alias_agent/models/provider_config.dart';
 import 'package:alias_agent/services/compaction/model_summary_provider.dart';
 import 'package:alias_agent/services/compaction/summary_provider.dart';
 import 'package:alias_agent/services/context_snapshot.dart';
 import 'package:alias_agent/services/provider_resolver.dart';
+import 'package:alias_agent/ui/compaction_status_banner.dart';
 import 'package:alias_agent/ui/context_view.dart';
 
 import 'helpers/fakes.dart';
@@ -327,6 +329,75 @@ void main() {
       print('  [OBS] raw snapshot → label: 现场发送版 (un-elided)');
       expect(find.textContaining('现场发送版 (un-elided)'), findsOneWidget,
           reason: 'a raw live-round body must be labeled un-elided');
+    });
+
+    testWidgets('压缩提示：压缩中固定在这一屏顶部，空闲时不占位（组件层）',
+        (tester) async {
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+      final snap = ContextSnapshot(
+        sessionId: 's1',
+        systemPrompt: 'sys',
+        messages: [
+          {
+            'role': 'user',
+            'content': [
+              {'type': 'text', 'text': 'hello'},
+            ],
+          },
+        ],
+        toolsJson: '[]',
+        model: 'm',
+        thinkingMode: 'disabled',
+        thinkingEffort: '',
+        capturedAt: DateTime.now(),
+      );
+      // 固定高度，方便量"提示占了多高"。
+      Widget wrap(Widget child) => MaterialApp(
+          home: Scaffold(body: SizedBox(height: 600, child: child)));
+      final banner = find.byKey(const Key('compaction-status-banner'));
+      final firstMsg = find.text('[0] user');
+
+      // ① 空闲（显式空闲态）：不渲染提示，而且**不占高度**。
+      await tester.pumpWidget(wrap(
+          ContextView(snapshot: snap, compactionStatus: CompactionStatus.idle)));
+      await tester.pump();
+      final idleTop = tester.getTopLeft(firstMsg).dy;
+      // 直接量这个组件自己的高度：它要是留了空白高度，这里立刻不为 0
+      // （变异自检 5.3 就是照这条设计的）。
+      final idleHeight = tester.getSize(find.byType(CompactionStatusBanner)).height;
+      _dumpVisibleTexts(tester, '空闲（显式 CompactionStatus.idle）');
+
+      // ② 不传状态时用的是同一个默认值（空闲），所以位置与①一样。
+      await tester.pumpWidget(wrap(ContextView(snapshot: snap)));
+      await tester.pump();
+      final noParamTop = tester.getTopLeft(firstMsg).dy;
+      // ignore: avoid_print
+      print('  [OBS] 空闲：提示节点数=${banner.evaluate().length} 提示高度=$idleHeight '
+          '首条消息 y=$idleTop；不传状态：y=$noParamTop [expect 0 / 0.0 / 两者相同]');
+      expect(banner, findsNothing, reason: '空闲时不该渲染提示');
+      expect(idleHeight, 0,
+          reason: '空闲态不许占位：这个组件自己的高度必须是 0（留了空白高度就是占了位置）');
+      expect(noParamTop, idleTop,
+          reason: '不传状态时用的就是空闲态（默认值），位置必须与①一样');
+
+      // ③ 压缩中：提示出现、在这一屏顶部（把内容往下推），并写明这是上一次发出的内容。
+      await tester.pumpWidget(wrap(ContextView(
+          snapshot: snap,
+          compactionStatus: CompactionStatus.level1(segment: 3, total: 9))));
+      await tester.pump();
+      final busyTop = tester.getTopLeft(firstMsg).dy;
+      _dumpVisibleTexts(tester, '压缩中（生成第 3 段，共 9 段）');
+      // ignore: avoid_print
+      print('  [OBS] 压缩中：提示节点数=${banner.evaluate().length} '
+          '首条消息 y=$busyTop（空闲时 $idleTop）[expect 1 / 比空闲大]');
+      expect(banner, findsOneWidget, reason: '压缩进行中，这一屏必须有提示');
+      expect(find.textContaining('上一次实际发出'), findsWidgets,
+          reason: '提示要写明这一屏显示的是上一次实际发出的内容');
+      expect(find.textContaining('第 3 段'), findsWidgets,
+          reason: '总数已知时要给出"第 k 段，共 n 段"');
+      expect(busyTop, greaterThan(idleTop),
+          reason: '提示固定在内容之上，会把内容往下推');
     });
   });
 }

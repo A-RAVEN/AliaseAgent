@@ -76,6 +76,7 @@ C:\Users\你的名字\.aliasagent\config.json
       "thinking_effort": "medium",
       "max_context_tokens": 200000,
       "compaction_threshold_percent": 25,
+      "compaction_wait_threshold_percent": 75,
       "standing_requirements": ["不要删我的文件"]
     }
   },
@@ -109,6 +110,7 @@ C:\Users\你的名字\.aliasagent\config.json
 | `thinking_effort` | 每个 agent | 思考强度 | 不传（用服务端默认） |
 | `max_context_tokens` | 每个 agent | 模型能吃下多少 token | 不写就再弹一次欢迎对话框问你要 |
 | `compaction_threshold_percent` | 每个 agent | 压缩阈值百分比，1 到 100 的整数 | 用 25 |
+| `compaction_wait_threshold_percent` | 每个 agent | **等待**阈值百分比，1 到 100 的整数：这一轮要发出去的内容占模型总上下文超过这个比例时，才等压缩做完再发（见 [上下文压缩](context-compaction.md)） | 用 75 |
 | `standing_requirements` | 每个 agent | 你写死的目标，压缩时不许丢掉 | 空清单 |
 | `search` | 顶层 | 搜索服务配置（整块都可以不写） | 不注册任何搜索服务，也就没有 `web_search` 工具 |
 | `zhipuai` / `kimi` / `searxng` | 每个搜索服务 | 三家搜索服务的名字，对应各自的键 | 该服务不启用 |
@@ -127,6 +129,7 @@ C:\Users\你的名字\.aliasagent\config.json
 | 整屏 `Configuration Error`，下面一行 `Unexpected data structure in <路径>: ...` | JSON 合法但结构不对（例如某个供应商少了 `api_key`，或 `agent_types` 里少了 `general`） | 按上面的完整示例补全 |
 | 又弹一次欢迎对话框 | 配置文件不存在，或者 `general` 里没有可用的 `max_context_tokens` | 按对话框填；也可以直接改文件补上这个键 |
 | 日志里多一行 `compaction_threshold_percent=... is absent or not an integer in 1..100 — using the default 25% ...` | 这个键写了小数、`0`、负数、大于 `100`、或者写成了字符串 | 改成 1 到 100 的整数；不改也能用（按 25% 走） |
+| 日志里多一行 `compaction_wait_threshold_percent=... is absent or not an integer in 1..100 — using the default 75% ...` | `compaction_wait_threshold_percent` 写了小数、`0`、负数、大于 `100`、或者写成了字符串 | 改成 1 到 100 的整数；不改也能用（按 75% 走） |
 
 日志在 `%USERPROFILE%\.aliasagent\logs\sidecar.log`。
 

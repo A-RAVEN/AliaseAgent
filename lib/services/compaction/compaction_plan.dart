@@ -148,6 +148,64 @@ class CompactionEngine {
     return (maxContextTokens * p) ~/ 100;
   }
 
+  /// 等待上界：这一轮要不要**为压缩等待**，只看"不压就发"的那一趟投影占模型总上下文
+  /// 的多少；超过这个上界才等（用户 2026-10-02 的要求）。
+  ///
+  /// 与其他阈值同构：`maxContextTokens × percent ÷ 100`，缺省
+  /// [AgentTypeConfig.kDefaultCompactionWaitThresholdPercent]（75%）。这里同样
+  /// 不允许出现绝对 token 数 —— 换一个窗口，上界必须跟着按比例变。
+  static int waitBoundTokens(int maxContextTokens, int? waitPercent) {
+    if (maxContextTokens <= 0) return 0;
+    final p = (waitPercent != null && waitPercent > 0 && waitPercent <= 100)
+        ? waitPercent
+        : AgentTypeConfig.kDefaultCompactionWaitThresholdPercent;
+    return (maxContextTokens * p) ~/ 100;
+  }
+
+  /// 这一趟该不该等：**严格大于**上界才算超 —— 正好等于上界不算（边界口径写死在这里，
+  /// 免得各处自己判）。
+  static bool exceedsWaitBound({
+    required int projectedTokens,
+    required int maxContextTokens,
+    int? waitPercent,
+  }) {
+    if (maxContextTokens <= 0) return false;
+    return projectedTokens > waitBoundTokens(maxContextTokens, waitPercent);
+  }
+
+  /// "不压就发"的那一趟估算总量：会以摘要形式发出去的，按它**落盘时的实测 token**
+  /// 计（[summaryMeasuredTokens]）；其余照原文发的，按原文估算计（[rawTokens]）。
+  ///
+  /// 这两个量必须分开：摘要不许按原文估，原文也不许按摘要的实测值算 —— 判据本身的
+  /// 口径就是这条。
+  static int estimatedProjectionTokens({
+    required Iterable<int> summaryMeasuredTokens,
+    required List<Message> rawTail,
+  }) =>
+      summaryMeasuredTokens.fold(0, (a, b) => a + b) + rawTokens(rawTail);
+
+  /// 占比不到等待上界时用：把"这一趟还没落盘的摘要段"降级成**原文段**，于是这一轮
+  /// 只取已经落盘的摘要拼投影，攒过阈值但还没压过的内容照原文发（用户 2026-10-02
+  /// 的要求：这一轮不等，压缩交给空闲时的后台折叠）。
+  ///
+  /// 只动"要新压的段"（`summary && reuse == null`）：已经落盘的段原样保留，它们的
+  /// 级/区间/文本都从库里取。降级之后这些段 `rollable` 为假，收拢循环也不会再对它们
+  /// 发起合成请求。
+  static CompactionPlan projectionWithoutNewSummaries(CompactionPlan plan) {
+    final segments = <CompactionSegment>[
+      for (final s in plan.segments)
+        if (s.summary && s.reuse == null && s.messages.isNotEmpty)
+          CompactionSegment(messages: s.messages, summary: false)
+        else
+          s,
+    ];
+    return CompactionPlan(
+      segments: segments,
+      projectedTokens: plan.projectedTokens,
+      shouldCompact: segments.any((s) => s.summary),
+    );
+  }
+
   /// 一段内容「离现在多远」：按 [history] 的列表顺序（也就是持久化顺序），每条消息的
   /// 距离 = **比它更新的**所有原文的估算 token 之和。返回的读数与 [history] 下标一一
   /// 对应（按 seq 区间查一段的两端用 [spanIndices]）。

@@ -13,6 +13,7 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:alias_agent/main.dart';
 import 'package:alias_agent/models/agent_type_config.dart';
 import 'package:alias_agent/models/app_config.dart';
+import 'package:alias_agent/models/compaction_status.dart';
 import 'package:alias_agent/models/message.dart';
 import 'package:alias_agent/models/provider_config.dart';
 import 'package:alias_agent/models/summary_node.dart';
@@ -24,6 +25,7 @@ import 'package:alias_agent/services/message_repository.dart';
 import 'package:alias_agent/services/session_repository.dart';
 import 'package:alias_agent/services/summary_node_repository.dart';
 import 'package:alias_agent/ui/chat_area.dart';
+import 'package:alias_agent/ui/compaction_status_banner.dart';
 
 import '../test/integration/helpers/real_context_fixture.dart';
 import 'live_observability.dart';
@@ -31,6 +33,13 @@ import 'live_observability.dart';
 /// A-2 — live real-context compression QUALITY test, in the COMPLIANT window
 /// real-model form (`integration_test/` + `-d windows`), per Docs/TESTING.md
 /// §2.4. It replaces the deleted headless `test/integration/compaction_fidelity_live_test.dart`.
+///
+/// 这条用例现在覆盖**三件事**（共用一条真实压缩，不额外多花一次模型调用）：
+///   ① 摘要质量：真实模型压出来的摘要有没有保住重执行要用的键（③a/③b/③c）；
+///   ② 合成与投影：阈值到了就合成更粗的摘要、以及它在这一趟该不该顶替（④）；
+///   ③ **压缩进行中的提示**：发送前那次（⑤）与空闲时自动那次（⑥）两个视图上都要看得到。
+/// 第二个功能是 change `add-compaction-status-indicator` 加的，按"多个功能可共用一个测试"
+/// 的做法并进这里（该 change 的 tasks 6.6）。
 ///
 /// WHAT IT DOES: pump the REAL app (`AppShell(configLoader: ...)`) against its
 /// OWN temp DB, feeding it the A-1 config-refactor fixture (load-bearing
@@ -270,6 +279,15 @@ void main() {
       // Send a message that forces the assistant to REFERENCE the EARLY decision
       // (P1 behavior continuity — the decision messages are the OLDEST/folded, so
       // the model must draw it from the folded summary, not the near verbatim).
+      //
+      // 顺着这次发送，把"压缩进行中的提示"也取证（⑤）：提示只在压缩那几十秒里
+      // 出现，等这一轮结束再找就晚了 —— 所以在等待期间每一拍顺手看一眼，第一次
+      // 看到就地截图、切到真实上下文再截一张。
+      final banner = find.byKey(CompactionStatusBanner.bannerKey);
+      var caughtConversation = false;
+      var caughtContextView = false;
+      var conversationText = '';
+      var contextText = '';
       try {
         final textField = find.byType(TextField);
         expect(textField, findsOneWidget, reason: 'chat input TextField should exist');
@@ -279,7 +297,32 @@ void main() {
         await tester.tap(sendButton);
         await tester.pump();
 
-        await pumpUntilReplyOrTurnDone(tester, timeoutSec: 300);
+        await pumpUntilReplyOrTurnDone(tester, timeoutSec: 300, onTick: () async {
+          if (caughtConversation || banner.evaluate().isEmpty) return;
+          caughtConversation = true;
+          conversationText = _bannerTexts(tester, banner);
+          debugPrint('[OBS] ⑤ 压缩进行中，对话视图上抓到提示：$conversationText');
+          await captureLiveShot(
+              tester, captureKey, 'compact_quality_status_conversation');
+          final tab = find.text('真实上下文');
+          if (tab.evaluate().isEmpty) return;
+          await tester.tap(tab);
+          await tester.pump(const Duration(milliseconds: 400));
+          if (banner.evaluate().isNotEmpty) {
+            caughtContextView = true;
+            contextText = _bannerTexts(tester, banner);
+            debugPrint('[OBS] ⑤ 同一时刻真实上下文视图上的提示：$contextText');
+          } else {
+            debugPrint('[OBS] ⑤ 同一时刻真实上下文视图上没有找到提示');
+          }
+          await captureLiveShot(
+              tester, captureKey, 'compact_quality_status_real_context');
+          final back = find.text('对话视图');
+          if (back.evaluate().isNotEmpty) {
+            await tester.tap(back);
+            await tester.pump(const Duration(milliseconds: 400));
+          }
+        });
       } on TimeoutException {
         await dumpToolCards(tester, phase: 'compact_quality reply timeout');
         fail('conversation still streaming after 300s — possible pipe deadlock or FFI crash');
@@ -306,6 +349,29 @@ void main() {
       // the model request that actually ran this turn — the live/real-model path of
       // the real-context-view feature (task 4.6). Observability only; never asserts.
       dumpContext(tester, 'compact_quality real context');
+
+      // ------------------------------------------------------------------
+      // ⑤ 压缩进行中的提示（**发送前**那条路径）：这次发送在把请求交给模型之前先压了，
+      // 两个视图上都必须能看到提示，而且真实上下文那一屏要写明"下面是上一次实际发出的
+      // 内容"。提示由 onTick 在等待期间取证，这里只做判定。
+      debugPrint('[OBS] ⑤ 对话视图抓到提示=$caughtConversation（"$conversationText"）；'
+          '真实上下文视图抓到提示=$caughtContextView（"$contextText"）');
+      expect(caughtConversation, isTrue,
+          reason: '⑤ 压缩进行中，对话视图上必须能看到提示 —— 几十秒的压缩窗口没抓到'
+              '就是"未截到"，不算通过');
+      // 提示必须属于**三个已知阶段之一**（不是随便含"正在"两字就算）：
+      // 挑选分段主题 / 生成一级摘要 / 合成二级摘要。
+      final knownStage = conversationText.contains('正在挑选分段主题') ||
+          conversationText.contains('正在压缩较早的对话：') ||
+          conversationText.contains('正在把一级摘要合成二级摘要：');
+      expect(knownStage, isTrue,
+          reason: '⑤ 提示必须写明当前阶段（三个已知阶段之一），实际拿到的是：'
+              '"$conversationText"');
+      expect(caughtContextView, isTrue,
+          reason: '⑤ 同一时刻真实上下文视图上也要有提示');
+      expect(contextText, contains(CompactionStatusBanner.contextViewNote),
+          reason: '⑤ 这一屏的提示必须写明"下面是上一次实际发出的内容"，'
+              '实际拿到的是："$contextText"');
 
       // ------------------------------------------------------------------
       // Read back the REAL summary text from the window live's OWN temp DB. The
@@ -544,6 +610,59 @@ void main() {
       }
 
       // ------------------------------------------------------------------
+      // ⑥ 压缩进行中的提示（**空闲时自动**那条路径）：⑤ 覆盖的是"发送前"那次，这里
+      // 验"你不动它自己压"的那次 —— 两个是不同的入口，提示都该出现，而且这一趟要多一句
+      // "你发消息会让压缩先让路"。
+      // 做法：往库里直接塞一批消息（后台压缩读的是库，不是界面上那串消息，所以塞库有效），
+      // 然后什么都不做，等 2 秒防抖 + 它自己跑起来。
+      final nodesBeforeIdle =
+          (await SummaryNodeRepository().queryBySession(session.id)).length;
+      for (var i = 0; i < 80; i++) {
+        await msgRepo.insert(
+            sessionId: session.id,
+            role: i.isEven ? 'user' : 'assistant',
+            content: '背景压缩填充 ${'B' * 400}');
+      }
+      var idleCaught = false;
+      var idleText = '';
+      var idleBackground = false;
+      final idleDeadline = DateTime.now().add(const Duration(seconds: 180));
+      while (DateTime.now().isBefore(idleDeadline)) {
+        await tester.pump(const Duration(seconds: 1));
+        if (banner.evaluate().isNotEmpty) {
+          idleCaught = true;
+          idleText = _bannerTexts(tester, banner);
+          // 抓到的**当下**读一次状态：这一趟必须标着"后台那趟" —— 提示里那句"让路"
+          // 就是据此显示的，光看文案分不清它是不是别的路径置的。
+          idleBackground = tester
+              .state<ChatScreenState>(find.byType(ChatScreen))
+              .compactionStatus
+              .background;
+          debugPrint('[OBS] ⑥ 空闲自动压缩期间，对话视图上的提示：$idleText'
+              '（状态标着后台那趟=$idleBackground）');
+          await captureLiveShot(
+              tester, captureKey, 'compact_quality_status_background');
+          break;
+        }
+      }
+      final nodesAfterIdle =
+          (await SummaryNodeRepository().queryBySession(session.id)).length;
+      debugPrint('[VERDICT] ⑥ 空闲自动压缩：抓到提示=$idleCaught（"$idleText"）；'
+          '状态标着后台那趟=$idleBackground；'
+          '库里摘要条数 $nodesBeforeIdle → $nodesAfterIdle');
+      expect(idleCaught, isTrue,
+          reason: '⑥ 空闲时自动压缩期间，对话视图上必须能看到提示');
+      expect(idleBackground, isTrue,
+          reason: '⑥ 抓到提示的那一刻，状态必须标着"这是空闲时自动跑的那趟" —— '
+              '提示里那句"让路"就是据此显示的，没有这条对照就分不清是谁置的位');
+      // 文案要完整对上一整句（不是只含"让路"两个字）：这句话由 `CompactionStatus.note`
+      // 给出，这里按同一处实现取值，实现改了文案这条就跟着变（不会漏改）。
+      final waitNote = CompactionStatus.level1(segment: 1, background: true).note!;
+      expect(idleText, contains(waitNote),
+          reason: '⑥ 这一趟是空闲时自动跑的，提示里要写明"$waitNote"；'
+              '实际拿到的是："$idleText"');
+
+      // ------------------------------------------------------------------
       // 切到「真实上下文」视图再截图：这一屏显示的就是**真正发给模型的内容**，
       // 那条"更早上下文(压缩xN,层级2,非用户发言)"会直接出现在画面里 —— 这样
       // 截图验收（TESTING.md §5.9）看到的就是本变更要证明的东西，而不只是一张
@@ -555,7 +674,19 @@ void main() {
     } finally {
       await captureLiveShot(tester, captureKey, 'compact_quality_live');
     }
-  }, timeout: const Timeout(Duration(seconds: 300)));
+  }, timeout: const Timeout(Duration(seconds: 900)));
+}
+
+/// 读出提示里的文字（现场证据用）；提示不在时返回空串。
+String _bannerTexts(WidgetTester tester, Finder banner) {
+  if (banner.evaluate().isEmpty) return '';
+  final parts = <String>[];
+  for (final t in tester.widgetList<Text>(
+      find.descendant(of: banner, matching: find.byType(Text)))) {
+    final d = t.data;
+    if (d != null && d.isNotEmpty) parts.add(d);
+  }
+  return parts.join(' | ');
 }
 
 /// Pump until the conversation resolves:
@@ -566,12 +697,16 @@ void main() {
 ///      exception), OR
 ///  (c) [timeoutSec] elapses while streaming never stopped (genuine hang).
 /// Throws TimeoutException only for (c).
+///
+/// [onTick] 每一拍之后调用一次（用来在等待期间顺手取一次"压缩进行中"的现场：
+/// 提示只在压缩那几十秒里在，等这一轮结束再找就晚了）。它抛异常就照常冒出去。
 Future<void> pumpUntilReplyOrTurnDone(WidgetTester tester,
-    {int timeoutSec = 150}) async {
+    {int timeoutSec = 150, Future<void> Function()? onTick}) async {
   final end = DateTime.now().add(Duration(seconds: timeoutSec));
   var sawStreaming = false;
   while (DateTime.now().isBefore(end)) {
     await tester.pump(const Duration(seconds: 1));
+    if (onTick != null) await onTick();
     final areas = tester.widgetList<ChatArea>(find.byType(ChatArea));
     final stillStreaming = areas.isNotEmpty && areas.last.isStreaming;
     if (stillStreaming) sawStreaming = true;

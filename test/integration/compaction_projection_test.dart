@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -10,19 +11,31 @@ import 'package:alias_agent/models/message.dart';
 import 'package:alias_agent/models/provider_config.dart';
 import 'package:alias_agent/models/summary_node.dart';
 import 'package:alias_agent/services/compaction/model_summary_provider.dart';
+import 'package:alias_agent/services/compaction/seam_selector.dart';
 import 'package:alias_agent/services/compaction/summary_provider.dart';
 import 'package:alias_agent/services/context_estimator.dart';
 import 'package:alias_agent/services/provider_resolver.dart';
 import 'package:alias_agent/services/summary_node_repository.dart';
+import 'package:alias_agent/ui/compaction_status_banner.dart';
 
 import '../widget/helpers/fakes.dart';
 import '../widget/helpers/test_utils.dart';
 import 'helpers/fake_sidecar.dart';
 import 'helpers/real_context_fixture.dart';
 
+/// 注册这个文件用的 general agent。
+///
+/// **[waitPercent] 的缺省值不是生产缺省**：本文件绝大多数用例验的是压缩与投影**规则
+/// 本身**（怎么分批、按距离分档、每段恰好一种表示、阈值到了就合成），它们的前提是
+/// "这一轮会在发送前压"。而生产缺省是 75%（用户 2026-10-02 的要求：不压就发的投影
+/// 占比不到 75% 就不等），本文件那些几何大多只占容量的 30%～40%，用生产缺省就压不起来。
+/// 所以这里把等待门槛缺省调到 1%（等于"永远等"），几何与判据一个字都不用动 ——
+/// 这不是放松判据，而是把"这一轮会压"这个前提显式化。
+/// **要验证"不等"那条路径的用例，必须显式传 `waitPercent: 75`（生产缺省）**。
 void _setupAgentRegistry({
   int maxContextTokens = 200,
   List<String> standingRequirements = const [],
+  int waitPercent = 1,
 }) {
   registry.clear();
   registry.register(AgentTypeConfig(
@@ -31,6 +44,7 @@ void _setupAgentRegistry({
     model: 'test-model',
     systemPrompt: '',
     maxContextTokens: maxContextTokens,
+    compactionWaitThresholdPercent: waitPercent,
     standingRequirements: standingRequirements,
   ));
   resolver = ProviderResolver(const AppConfig(
@@ -47,6 +61,7 @@ Widget _buildApp({
   required FakeSidecar sidecar,
   required SummaryProvider summaryProvider,
   SummaryNodeRepository? summaryNodeRepo,
+  SeamSelector? seamSelector,
 }) {
   return MaterialApp(
     home: Scaffold(
@@ -57,6 +72,7 @@ Widget _buildApp({
         sidecar: sidecar,
         summaryProvider: summaryProvider,
         summaryNodeRepo: summaryNodeRepo,
+        seamSelector: seamSelector,
       ),
     ),
   );
@@ -2057,7 +2073,703 @@ void main() {
       expect(projected, contains('continue'),
           reason: '当前用户消息必须活下来');
     });
+
+    testWidgets('压缩提示 · 发送前这条路径：卡住摘要期间对话视图出现提示，放行后消失',
+        (tester) async {
+      // 容量 4000 ⇒ 阈值 1000；15 条 × 100 raw = 1500 > 1000 ⇒ 这次发送要压。
+      // 摘要生成被卡住 ⇒ 压缩正在进行，这段时间界面上必须能看到提示；而且此时请求
+      // **还没发给模型**（FakeSidecar 什么都没收到）—— 说明用户等的是压缩，不是模型。
+      _setupAgentRegistry(maxContextTokens: 4000);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final banner = find.byKey(CompactionStatusBanner.bannerKey);
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(_convLabeled(15, 100));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final provider = _GatedSummaryProvider()..gate = Completer<SummaryResult>();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: provider,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      // ignore: avoid_print
+      print('  [OBS] 发送前 banner=${banner.evaluate().length} [expect 0]');
+      expect(banner, findsNothing, reason: '还没发送，不该有任何压缩提示');
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      // ignore: avoid_print
+      print('  [OBS] 压缩卡住期间 banner=${banner.evaluate().length} '
+          'summarizeCalls=${provider.summarizeCalls} '
+          '已发给模型=${sidecar.lastMessagesJson != null} '
+          '文案="${_bannerTexts(tester, banner)}" [expect banner=1]');
+      expect(provider.summarizeCalls, greaterThanOrEqualTo(1),
+          reason: '这次发送必须真的走到生成摘要这一步，这条用例才不是空跑');
+      expect(sidecar.lastMessagesJson, isNull,
+          reason: '压缩还没结束，请求不该已经发出去 —— 用户等的是压缩');
+      expect(banner, findsOneWidget, reason: '压缩正在进行，对话视图必须出现提示');
+
+      provider.gate!.complete(SummaryResult(text: 'gated L1', tokens: 1));
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+
+      // ignore: avoid_print
+      print('  [OBS] 放行之后 banner=${banner.evaluate().length} '
+          '已发给模型=${sidecar.lastMessagesJson != null} [expect 0 / true]');
+      expect(banner, findsNothing, reason: '压缩结束后提示必须消失');
+      expect(sidecar.lastMessagesJson, isNotNull,
+          reason: '压缩结束后这次发送必须继续走下去（请求真的发出去）');
+    });
+
+    testWidgets('压缩提示 · 没触发压缩的普通发送：整场都不出现提示', (tester) async {
+      // 容量 4000 ⇒ 阈值 1000；历史只有 4 条 × 100 raw = 400，远低于阈值 ⇒ 不压。
+      // **它的正向对照是同文件的「压缩提示 · 发送前这条路径」与 8.2②**：那两条用同一类
+      // 几何断言"该压的那一轮提示确实出现"。本条只钉"不压 ⇒ 不亮"这一侧，所以单看它
+      // 自己无法区分"提示坏了"与"确实不该亮" —— 判据的可失败性由那两条对照 + 5.1 的
+      // 变异（把提示改成从"正在发送"推断 ⇒ 本条变红）共同保证。
+      _setupAgentRegistry(maxContextTokens: 4000);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final banner = find.byKey(CompactionStatusBanner.bannerKey);
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(_convLabeled(4, 100));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final provider = _EchoSummaryProvider();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: provider,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'hi');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+
+      // ignore: avoid_print
+      print('  [OBS] 未触发压缩的发送：summarizeCalls=${provider.summarizeCalls} '
+          'banner=${banner.evaluate().length} 已发给模型=${sidecar.lastMessagesJson != null} '
+          '[expect 0 / 0 / true]');
+      expect(provider.summarizeCalls, 0,
+          reason: '前提：这一轮低于阈值，没有触发压缩');
+      expect(sidecar.lastMessagesJson, isNotNull,
+          reason: '前提：这一轮真的发出去了（否则"没提示"是空跑）');
+      expect(banner, findsNothing,
+          reason: '没触发压缩的普通发送不许出现压缩提示');
+    });
+
+    testWidgets('压缩提示 · 真实上下文视图：压缩期间这一屏仍是上一次发出的内容',
+        (tester) async {
+      // 发送前这条路径读的是**界面上那串消息**（`_chatItemsToMessages`），不是库里的
+      // 全量历史 —— 所以这里靠两轮长回复把界面上的历史撑过阈值，而不是往库里塞消息
+      // （往库里塞只对后台那条路径有效，background_fold_test 用的是那个办法）。
+      // 容量 4000 ⇒ 阈值 1000。逐轮估算：400（预置 4 条）→ 第 1 轮发出时 ≈406、
+      // 第 2 轮 ≈915（都低于阈值，不压）→ 第 3 轮 ≈1425（超阈值 ⇒ 要压）。
+      _setupAgentRegistry(maxContextTokens: 4000);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final banner = find.byKey(CompactionStatusBanner.bannerKey);
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(_convLabeled(4, 100));
+      // 注意：不要在这里预置事件 —— FakeSidecar 每次 sendMessage 只消费到第一个 done，
+      // 预置的那一份会被第 1 轮吃掉，后面几轮的回复长度就跟预期对不上了（实测踩过）。
+      final sidecar = FakeSidecar();
+      final provider = _GatedSummaryProvider();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: provider,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      Future<void> send(String text, {String reply = 'Reply'}) async {
+        sidecar
+          ..queueChunk(reply)
+          ..queueDone();
+        await tester.enterText(find.byType(TextField), text);
+        await tester.tap(find.byTooltip('Send'));
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+      }
+
+      // 第 1、2 轮：都低于阈值 ⇒ 不压，只把界面上那串历史撑长（每轮一条 2000 字的回复
+      // ≈ 504 raw）。第 2 轮结束后，"上一次实际发出的内容"就是这一份。
+      await send('first', reply: 'R' * 2000);
+      await send('grow', reply: 'R' * 2000);
+      // ignore: avoid_print
+      print('  [OBS] 前两轮之后：summarizeCalls=${provider.summarizeCalls} '
+          '已发给模型=${sidecar.lastMessagesJson != null} '
+          'banner=${banner.evaluate().length} [expect 0 / true / 0]');
+      expect(provider.summarizeCalls, 0,
+          reason: '前提：前两轮都低于阈值，不该触发压缩');
+
+      // 第 3 轮：界面上历史已经超过阈值 ⇒ 发送前要压；卡住摘要让它停在"压缩中"。
+      final histRaw = ContextEstimator.estimateConversation(msgRepo.messages);
+      // ignore: avoid_print
+      print('  [OBS] 第 3 轮之前：库里 ${msgRepo.messages.length} 条、估算 raw=$histRaw '
+          '（阈值 1000，超了才会压）；每条"字符数/估算 raw"='
+          '${msgRepo.messages.map((m) => '${m.content.length}/${ContextEstimator.estimateMessage(m)}').join(' ')}');
+      provider.gate = Completer<SummaryResult>();
+      await send('grow2', reply: 'Reply3');
+
+      // 切到真实上下文视图（压缩还在进行）。
+      await tester.tap(find.text('真实上下文'));
+      await tester.pump();
+      await tester.pump();
+
+      // ignore: avoid_print
+      print('  [OBS] 压缩期间真实上下文视图：banner=${banner.evaluate().length} '
+          'summarizeCalls=${provider.summarizeCalls} '
+          '有"grow2"=${find.textContaining('grow2').evaluate().length} '
+          '有摘要标记=${find.textContaining('更早上下文').evaluate().length} '
+          '文案="${_bannerTexts(tester, banner)}"');
+      expect(provider.summarizeCalls, greaterThanOrEqualTo(1),
+          reason: '这次发送必须真的走到生成摘要这一步');
+      expect(banner, findsOneWidget, reason: '压缩正在进行，这一屏顶部必须有提示');
+      expect(find.textContaining('上一次实际发出'), findsWidgets,
+          reason: '提示要写明这一屏显示的是上一次实际发出的内容');
+      expect(find.textContaining('grow2'), findsNothing,
+          reason: '这次还没发出去，这一屏不许出现还没发出去的内容');
+      expect(find.textContaining('更早上下文'), findsNothing,
+          reason: '压缩还没结束，新压出来的摘要还没发出去，不许出现在这一屏');
+
+      // 放行：压缩结束、这一轮真的发出去 ⇒ 新投影（带摘要标记）才出现在这一屏。
+      provider.gate!.complete(SummaryResult(text: 'gated L1', tokens: 1));
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+
+      // ignore: avoid_print
+      print('  [OBS] 放行之后：banner=${banner.evaluate().length} '
+          '已发给模型=${sidecar.lastMessagesJson != null} '
+          '有摘要标记=${find.textContaining('更早上下文').evaluate().length} '
+          '[expect 0 / true / >=1]');
+      expect(banner, findsNothing, reason: '压缩结束后提示必须消失');
+      expect(sidecar.lastMessagesJson, isNotNull,
+          reason: '放行后这一轮必须真的发出去');
+      expect(find.textContaining('更早上下文'), findsWidgets,
+          reason: '压缩结果要在下一次发送时才出现在这一屏');
+    });
+
+    testWidgets('压缩提示 · 真实上下文视图：还没有任何快照时，提示与占位并存',
+        (tester) async {
+      _setupAgentRegistry(maxContextTokens: 4000);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final banner = find.byKey(CompactionStatusBanner.bannerKey);
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      // 15 条 × 100 raw = 1500 > 阈值 1000 ⇒ 第一条消息的发送就要压。
+      final msgRepo = FakeMessageRepository(_convLabeled(15, 100));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final provider = _GatedSummaryProvider()..gate = Completer<SummaryResult>();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: provider,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'first');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.tap(find.text('真实上下文'));
+      await tester.pump();
+      await tester.pump();
+
+      final placeholder = find.text('尚无捕获的上下文快照');
+      // ignore: avoid_print
+      print('  [OBS] 首次发送压缩期间：banner=${banner.evaluate().length} '
+          '占位=${placeholder.evaluate().length} '
+          'summarizeCalls=${provider.summarizeCalls} [expect 1 / 1]');
+      expect(provider.summarizeCalls, greaterThanOrEqualTo(1),
+          reason: '这次发送必须真的走到生成摘要这一步');
+      expect(banner, findsOneWidget, reason: '压缩进行中，提示必须出现');
+      expect(placeholder, findsOneWidget,
+          reason: '还没有发出过任何请求 ⇒ 占位文字仍在，提示与它并存');
+    });
+
+    testWidgets('压缩提示 · 挑选分段主题：冷缓存时显示这一步，选完换成生成摘要',
+        (tester) async {
+      _setupAgentRegistry(maxContextTokens: 4000);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final banner = find.byKey(CompactionStatusBanner.bannerKey);
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(_convLabeled(15, 100));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      // 分段选择卡住；摘要也卡住 —— 好让"选完换成生成摘要"这一步停住看清楚。
+      final seamSelector = _GatedSeamSelector()..gate = Completer<void>();
+      final provider = _GatedSummaryProvider()..gate = Completer<SummaryResult>();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: provider,
+        seamSelector: seamSelector,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      // ignore: avoid_print
+      print('  [OBS] 分段选择卡住期间：banner=${banner.evaluate().length} '
+          'ensures=${seamSelector.ensures} summarizeCalls=${provider.summarizeCalls} '
+          '文案="${_bannerTexts(tester, banner)}"');
+      expect(banner, findsOneWidget, reason: '压缩正在进行，必须有提示');
+      expect(find.textContaining('挑选分段主题'), findsWidgets,
+          reason: '冷缓存时这一步真的要发一次模型请求，界面必须显示它');
+      expect(provider.summarizeCalls, 0,
+          reason: '分段还没选完，摘要生成不该已经开始');
+
+      // 放行分段选择 ⇒ 状态必须换成"正在生成第 k 段摘要"，不是同一句话。
+      seamSelector.gate!.complete();
+      await tester.pump();
+      await tester.pump();
+      // ignore: avoid_print
+      print('  [OBS] 分段选完之后：banner=${banner.evaluate().length} '
+          'summarizeCalls=${provider.summarizeCalls} 文案="${_bannerTexts(tester, banner)}"');
+      expect(find.textContaining('挑选分段主题'), findsNothing);
+      expect(find.textContaining('正在生成第 1 段摘要'), findsWidgets,
+          reason: '选完分段就进入生成摘要这一步');
+      expect(provider.summarizeCalls, greaterThanOrEqualTo(1));
+
+      // 放行摘要生成 ⇒ 这一趟结束，提示消失。
+      provider.gate!.complete(SummaryResult(text: 'gated L1', tokens: 1));
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+      // ignore: avoid_print
+      print('  [OBS] 全部放行之后：banner=${banner.evaluate().length} [expect 0]');
+      expect(banner, findsNothing);
+    });
+
+    testWidgets('压缩提示 · 挑选分段主题：热缓存时不亮（不闪）', (tester) async {
+      _setupAgentRegistry(maxContextTokens: 4000);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(_convLabeled(15, 100));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final seamSelector = _WarmSeamSelector();
+      final provider = _GatedSummaryProvider()..gate = Completer<SummaryResult>();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: provider,
+        seamSelector: seamSelector,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      final banner = find.byKey(CompactionStatusBanner.bannerKey);
+      // ignore: avoid_print
+      print('  [OBS] 热缓存期间：ensures=${seamSelector.ensures} '
+          '文案="${_bannerTexts(tester, banner)}" [expect 有"生成第 1 段摘要"、没有"挑选分段主题"]');
+      expect(seamSelector.ensures, 1,
+          reason: 'ensure 照常被调用（它自己会因为热缓存直接返回）');
+      expect(find.textContaining('挑选分段主题'), findsNothing,
+          reason: '热缓存不会发请求 ⇒ 这一步不许亮（否则每次发送都闪一下）');
+      expect(find.textContaining('正在生成第 1 段摘要'), findsWidgets,
+          reason: '真正在跑的是生成摘要，提示要显示这个');
+    });
+
+    testWidgets('8.1 攒过阈值但这趟占比不到等待阈值 ⇒ 不等：零摘要调用、那段按原文发、界面无提示',
+        (tester) async {
+      // 容量 4000 ⇒ 压缩阈值 1000（4000 × 25%）、等待上界 3000（4000 × 75%）。
+      // 这一趟"不压就发"的估算总量 = 15 条 × 100 = 1500 ⇒ 占比 37.8%：
+      // 已经超过压缩阈值（按钉死的规则，压缩动作本身照做），但远不到等待上界
+      // ⇒ 这一轮不该为它等待，也不该为此发任何一次摘要调用。
+      _setupAgentRegistry(maxContextTokens: 4000, waitPercent: 75);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final banner = find.byKey(CompactionStatusBanner.bannerKey);
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(_convLabeled(15, 100));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      // 摘要器**挂住**：新规则下这一轮根本不该调用它（所以挂住不影响这一轮），
+      // 旧行为下它会被调用并把这一轮卡在发送前 —— 那样连"请求已发出"这条都会红。
+      final provider = _GatedSummaryProvider()
+        ..gate = Completer<SummaryResult>();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: provider,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+
+      final projected = sidecar.lastMessagesJson ?? '';
+      final rawSeqs = RegExp(r'm(\d+):')
+          .allMatches(projected)
+          .map((m) => int.parse(m.group(1)!))
+          .toSet();
+      final rawBefore = ContextEstimator.estimateConversation(msgRepo.messages);
+      // ignore: avoid_print
+      print('  [OBS] 8.1 不压就发的估算总量≈$rawBefore（容量 4000 ⇒ 压缩阈值 1000、'
+          '等待上界 3000，占比 '
+          '${(rawBefore * 100 / 4000).toStringAsFixed(1)}%）；'
+          '摘要调用次数=${provider.summarizeCalls}；'
+          '逐字出现的 seq=$rawSeqs；界面提示节点数=${banner.evaluate().length}；'
+          '已发给模型=${sidecar.lastMessagesJson != null}');
+      expect(sidecar.lastMessagesJson, isNotEmpty,
+          reason: '前提：这一轮必须真的发出去了，否则"没提示"是空跑');
+      expect(provider.summarizeCalls, 0,
+          reason: '占比约 37.8% 不到等待上界 3000 ⇒ 这一轮一次摘要调用都不许发');
+      expect(rawSeqs, containsAll(<int>[for (var i = 1; i <= 11; i++) i]),
+          reason: '那批已经攒过压缩阈值、但这一轮不等的内容（seq 1..11）要按原文发');
+      expect(banner, findsNothing,
+          reason: '没有在为压缩等待 ⇒ 界面上不该出现压缩提示');
+      // 通用守卫（审查要求的补强）：新路径要重写一份投影拼装，漏发一整段这种
+      // 缺陷光靠上面四条查不出来 —— 这一条钉"每段内容恰好一种表示"。
+      _expectEveryMessageExactlyOnce(projected, upToSeq: 15);
+      // 放行挂住的摘要器，别把未完成的异步链留给下一个用例。
+      provider.gate!.complete(SummaryResult(text: '不该被用到', tokens: 1));
+      await tester.pump();
+    });
+
+    testWidgets('8.2② 这趟占比超过等待上界 ⇒ 照旧等待：真的压、提示在、请求等它压完才发',
+        (tester) async {
+      // 容量 4000 ⇒ 压缩阈值 1000、等待上界 3000；历史 40 条 × 100 = 4000 raw
+      // ⇒ 不压就发的占比 100% > 75% ⇒ 这一轮要等。
+      _setupAgentRegistry(maxContextTokens: 4000, waitPercent: 75);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final banner = find.byKey(CompactionStatusBanner.bannerKey);
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(_convLabeled(40, 100));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final provider = _GatedSummaryProvider()..gate = Completer<SummaryResult>();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: provider,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      // ignore: avoid_print
+      print('  [OBS] 8.2② 占比 100% > 75% ⇒ 该等：摘要调用次数=${provider.summarizeCalls}；'
+          '已发给模型=${sidecar.lastMessagesJson != null}；'
+          '界面提示节点数=${banner.evaluate().length}（压缩中）');
+      expect(provider.summarizeCalls, greaterThanOrEqualTo(1),
+          reason: '占比 100% 超过等待上界 ⇒ 这一轮必须真的压');
+      expect(sidecar.lastMessagesJson, isNull,
+          reason: '压缩还没结束，请求不该已经发出去');
+      expect(banner, findsOneWidget, reason: '这一轮在为压缩等待 ⇒ 提示必须在');
+
+      provider.gate!.complete(SummaryResult(text: 'L1', tokens: 1));
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+      // ignore: avoid_print
+      print('  [OBS] 8.2② 放行之后：已发给模型=${sidecar.lastMessagesJson != null}；'
+          '界面提示节点数=${banner.evaluate().length}');
+      expect(sidecar.lastMessagesJson, isNotNull,
+          reason: '压完这一轮必须真的发出去');
+      expect(banner, findsNothing, reason: '压缩结束提示要消失');
+    });
+
+    testWidgets('8.2③ 占比超过等待上界 ⇒ 等完照发，且一条内容都不许丢', (tester) async {
+      // 容量 4000 ⇒ 阈值 1000、等待上界 3000。历史 40 条 × 100 = 4000 raw（占比 100% ⇒ 该等）。
+      // 摘要实测 200（远端每批约 1100 raw ⇒ 摘要比它小、合法；2 级给 5000 让它被拒）。
+      // 这一条钉的是"等"不等于"丢"：等完之后投影是照既有规则拼的，一条内容都不许少。
+      _setupAgentRegistry(maxContextTokens: 4000, waitPercent: 75);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(_convLabeled(40, 100));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final provider = _EchoSummaryProvider(l1Tokens: 200, l2Tokens: 5000);
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: provider,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+
+      final projected = sidecar.lastMessagesJson ?? '';
+      final spans = _summarySpansIn(projected);
+      final covered = <int>{};
+      for (final s in spans) {
+        for (var i = s.lo; i <= s.hi; i++) {
+          covered.add(i);
+        }
+      }
+      final tailRaw = ContextEstimator.estimateConversation(
+          msgRepo.messages.where((m) => !covered.contains(m.seq ?? 0)).toList());
+      final summaryTokens = spans.isEmpty ? 0 : 200;
+      final projectedTotal = summaryTokens + tailRaw;
+      // ignore: avoid_print
+      print('  [OBS] 8.2③ 摘要调用次数=${provider.summarizeCalls}；摘要覆盖=$spans；'
+          '尾部原文估算=$tailRaw ⇒ 压完投影估算≈$projectedTotal'
+          '（等待上界 3000、容量 4000）；已发给模型=${sidecar.lastMessagesJson != null}');
+      expect(sidecar.lastMessagesJson, isNotEmpty, reason: '这一轮必须真的发出去');
+      expect(provider.summarizeCalls, greaterThanOrEqualTo(1),
+          reason: '前提：占比 100% 超过等待上界，这一轮确实压了');
+      expect(projectedTotal, lessThan(3000),
+          reason: '几何前提：压完降到等待上界 3000 以下 —— 这正是"该等"要达到的效果');
+      // 等不等于丢：这一轮不许有任何一段内容凭空消失。
+      _expectEveryMessageExactlyOnce(projected, upToSeq: 40);
+    });
+
+    testWidgets('8.2④ 压完仍超过容量 ⇒ 按既有规则省略最旧，请求照发（不死等）',
+        (tester) async {
+      // 容量 2000 ⇒ 阈值 500、等待上界 1500。历史 30 条 × 100 = 3000 raw（占比 150%）。
+      // 摘要按 400 实测（比它替换的每批约 1100 raw 小 ⇒ 合法），收拢成一条 2 级按 1900 实测
+      // （比它替换的 6 条 1 级合计小 ⇒ 合法）⇒ 压完投影 ≈ 1900 + 尾部 ≈ 2600 > 容量 2000
+      // ⇒ 必须有内容被留出这一轮投影，但请求必须照发（不许死等）。
+      _setupAgentRegistry(maxContextTokens: 2000, waitPercent: 75);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(_convLabeled(30, 100));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final provider = _EchoSummaryProvider(l1Tokens: 400, l2Tokens: 1900);
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: provider,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+
+      final projected = sidecar.lastMessagesJson ?? '';
+      final rawSeqs = RegExp(r'm(\d+):')
+          .allMatches(projected)
+          .map((m) => int.parse(m.group(1)!))
+          .toSet();
+      final covered = <int>{};
+      for (final s in _summarySpansIn(projected)) {
+        for (var i = s.lo; i <= s.hi; i++) {
+          covered.add(i);
+        }
+      }
+      final represented = <int>{...rawSeqs, ...covered};
+      // ignore: avoid_print
+      print('  [OBS] 8.2④ 逐字出现的 seq=$rawSeqs；摘要覆盖=$covered；'
+          '这一轮有表示的 seq=${represented.length} 个（历史 30 条）；'
+          '已发给模型=${sidecar.lastMessagesJson != null}');
+      expect(sidecar.lastMessagesJson, isNotEmpty,
+          reason: '不许死等：压完仍超容量也要照发');
+      expect(represented.contains(1), isFalse,
+          reason: '超容量 ⇒ 最旧那段被留出这一轮投影（数据仍在磁盘）');
+      expect(represented.length, lessThan(30),
+          reason: '超容量 ⇒ 必须有内容被留出这一轮投影，'
+              '不许把 30 条原文一条不少地全塞进去');
+    });
+
+    testWidgets('8.12 不等的那一轮：连分段选择请求都不发', (tester) async {
+      // 占比 37.8% < 75% ⇒ 这一轮不等。分叉点必须在 `_prepareSeamChooser` **之前**：
+      // 生产环境的分段选择器自己要发一次模型请求（冷缓存时），放在它后面就等于
+      // 没做到"不等" —— 而只看"假摘要器零调用"的用例查不出这件事。
+      _setupAgentRegistry(maxContextTokens: 4000, waitPercent: 75);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final banner = find.byKey(CompactionStatusBanner.bannerKey);
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(_convLabeled(15, 100));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      // 计数用的分段选择器：它自己的 ensure 被调用几次，这里数得出来（热缓存语义
+      // 让它不会挂住，也正好符合"真被调用了才会计数"）。
+      final seamSelector = _WarmSeamSelector();
+      final provider = _EchoSummaryProvider();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: provider,
+        seamSelector: seamSelector,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+
+      // ignore: avoid_print
+      print('  [OBS] 8.12 不等的那一轮：分段选择 ensure 次数=${seamSelector.ensures}；'
+          '摘要调用次数=${provider.summarizeCalls}；'
+          '界面提示节点数=${banner.evaluate().length}；'
+          '已发给模型=${sidecar.lastMessagesJson != null} [expect 0 / 0 / 0 / true]');
+      expect(sidecar.lastMessagesJson, isNotEmpty,
+          reason: '前提：这一轮照发（不等）');
+      expect(seamSelector.ensures, 0,
+          reason: '不等的那一轮连分段选择都不该发起 —— 分叉点必须在它之前');
+      expect(provider.summarizeCalls, 0, reason: '一个摘要调用都不发');
+      expect(banner, findsNothing, reason: '没有在为压缩等待 ⇒ 不该有提示');
+    });
   });
+}
+
+/// 读出提示里的文案（现场证据用）。提示还不存在时返回空串。
+String _bannerTexts(WidgetTester tester, Finder banner) {
+  if (banner.evaluate().isEmpty) return '';
+  return tester
+      .widgetList<Text>(find.descendant(of: banner, matching: find.byType(Text)))
+      .map((t) => t.data)
+      .whereType<String>()
+      .join(' | ');
+}
+
+/// 摘要生成能被卡住的假摘要器：卡住期间压缩仍在进行，用来观察界面提示。
+class _GatedSummaryProvider implements SummaryProvider {
+  Completer<SummaryResult>? gate;
+  int summarizeCalls = 0;
+  int summarizeTextCalls = 0;
+
+  @override
+  Future<SummaryResult> summarize({
+    required List<Message> folded,
+    required AgentTypeConfig config,
+  }) {
+    summarizeCalls++;
+    final g = gate;
+    if (g != null) return g.future;
+    return Future.value(SummaryResult(text: 'GATED L1', tokens: 1));
+  }
+
+  @override
+  Future<SummaryResult> summarizeText({
+    required String text,
+    required AgentTypeConfig config,
+  }) {
+    summarizeTextCalls++;
+    final g = gate;
+    if (g != null) return g.future;
+    return Future.value(SummaryResult(text: 'GATED L2', tokens: 1));
+  }
+}
+
+/// 分段选择能被卡住的假选择器：卡住期间"正在挑选分段主题"这一步应该显示在界面上。
+/// `memoizedSeams` 在 [ensure] 跑完之前返回 null（= 冷缓存，符合接口约定：
+/// "null when ensure has never run for this exact key"）。
+class _GatedSeamSelector implements SeamSelector {
+  Completer<void>? gate;
+  int ensures = 0;
+  bool _done = false;
+
+  @override
+  Future<void> ensure({
+    required List<Message> far,
+    required int k,
+    required AgentTypeConfig config,
+  }) async {
+    ensures++;
+    final g = gate;
+    if (g != null) await g.future;
+    _done = true;
+  }
+
+  @override
+  List<int>? memoizedSeams({required List<Message> far, required int k}) =>
+      _done ? const [] : null;
+
+  @override
+  int get llmCallCount => 0;
+}
+
+/// 已经跑过这个键的假选择器（`memoizedSeams` 返回非空 = 热缓存）：这时
+/// `ensure` 不会发请求，界面不该为这一步亮提示。
+class _WarmSeamSelector implements SeamSelector {
+  int ensures = 0;
+
+  @override
+  Future<void> ensure({
+    required List<Message> far,
+    required int k,
+    required AgentTypeConfig config,
+  }) async {
+    ensures++;
+  }
+
+  @override
+  List<int>? memoizedSeams({required List<Message> far, required int k}) =>
+      const [];
+
+  @override
+  int get llmCallCount => 0;
 }
 
 /// A SummaryProvider that always throws (simulating done!=0 or empty-content

@@ -13,7 +13,9 @@ import 'package:flutter_test/flutter_test.dart';
 ///   ③ 文档里出现的配置键，都能在产品代码的配置解析路径里找到；
 ///   ④ 文档里出现的工具名与工具参数名，都能在 `lib/main.dart` 的工具定义里找到；
 ///   ⑤ 反向：代码里注册的每个工具名、代码里解析的每个配置键，都必须在文档里出现过
-///      （加了工具或配置键却不写文档 ⇒ 红）。
+///      （加了工具或配置键却不写文档 ⇒ 红）；
+///   ⑥ 文档里标成"界面文案"的句子，必须在 `lib/` 下原样找得到（见
+///      [_uiTextMarker]）—— 界面上改了文案而文档没跟着改 ⇒ 红。
 ///
 /// 断言前逐条打印现场：找到几份文档、索引里有几条、每个名字在哪儿找到的。
 
@@ -56,6 +58,9 @@ const _otherCodeNames = <String, String>{
   // 注册。模型不能调用它，它不是工具。
   'browser_available': 'lib/services/sidecar_bridge.dart',
 };
+
+/// 文档里"允许出现的、既不是配置键也不是工具名、但确实是代码里存在的名字"清单。
+const _uiTextMarker = '界面文案：';
 
 void main() {
   group('用户文档与代码的一致性', () {
@@ -222,6 +227,48 @@ void main() {
         expect(hit, isTrue,
             reason: '${entry.key} 声称出现在 ${entry.value}，但那里找不到它');
       }
+    });
+
+    test('文档里标成"界面文案"的句子，在 lib/ 下原样找得到（⑥）', () {
+      // 抽出产品代码的全部 Dart 源码，逐条核对文档里标出来的界面文案。
+      final sources = <String>[];
+      final libDir = Directory('lib');
+      if (libDir.existsSync()) {
+        for (final f in libDir.listSync(recursive: true).whereType<File>()) {
+          if (f.path.endsWith('.dart')) sources.add(f.readAsStringSync());
+        }
+      }
+
+      final rows = <({String doc, String text})>[];
+      for (final f in _docFiles()) {
+        for (final line in f.readAsStringSync().split('\n')) {
+          final at = line.indexOf(_uiTextMarker);
+          if (at < 0) continue;
+          for (final m
+              in RegExp(r'`([^`]+)`').allMatches(line.substring(at))) {
+            rows.add((doc: _name(f), text: m.group(1)!));
+          }
+        }
+      }
+
+      // ignore: avoid_print
+      print('[⑥ 界面文案] 共 ${rows.length} 条：');
+      for (final r in rows) {
+        final hit = sources.any((s) => s.contains(r.text));
+        // ignore: avoid_print
+        print('[⑥ 界面文案]   ${r.doc}：「${r.text}」→ ${hit ? "代码里有" : "代码里没有"}');
+      }
+      expect(rows, isNotEmpty,
+          reason: '一份文档都没标出界面文案（写法：$_uiTextMarker + 反引号里的原句）'
+              '，这条检查会变成空转');
+
+      final missing = [
+        for (final r in rows)
+          if (!sources.any((s) => s.contains(r.text))) '${r.doc}：「${r.text}」',
+      ];
+      expect(missing, isEmpty,
+          reason: '这些标成界面文案的句子在 lib/ 下找不到（界面改了文案、文档没跟着改？）：'
+              '$missing');
     });
   });
 }
