@@ -116,14 +116,18 @@ void main() {
     debugPrint('[OBS] navigate result -> ${jsonEncode(r)}');
     expect(r['ok'], isTrue);
     expect((r['snapshot'] as String).contains('Hello Browser'), isTrue);
-    // The model-visible response (worker stdout) must NOT carry the per-call
-    // counters — they live only in the stderr browser-record channel (the worker
-    // builds this response without them; a leak would land in main.dart's content).
-    for (final k in ['raise_count', 'popup_closed', 'download_denied',
-        'permission_denied', 'tabs']) {
-      expect(r.containsKey(k), isFalse,
-          reason: 'counter "$k" leaked into the model-visible snapshot content');
-    }
+    // The model-visible response (worker stdout) must carry ONLY its documented
+    // keys — every observability counter/flag lives on the stderr browser-record
+    // channel (a leak would land in main.dart's content). This is a WHITELIST, not
+    // the five-name blacklist it used to be: that blacklist could not catch a new
+    // key (e.g. expected_new_tab_unfulfilled), which is exactly the leak this
+    // change introduces. `divergent` / `note` are absent here because a fresh
+    // session that just navigated matches its own expected state; they are not part
+    // of this allow set.
+    const allow = {'ok', 'url', 'title', 'snapshot', 'snapshot_len', 'truncated'};
+    expect(r.keys.toSet(), equals(allow),
+        reason: 'the model-visible response must carry exactly its documented keys — '
+            'any extra key is a leaked counter/flag or an undocumented field');
 
     // type (fill #q)
     r = jsonDecode(await send({'cmd': 'type', 'selector': '#q', 'text': 'hi there'}));
@@ -197,9 +201,18 @@ void main() {
       expect(r['ok'], isTrue);
       expect((r['snapshot'] as String).contains('Results'), isTrue);
 
+      final sw = Stopwatch()..start();
       r = jsonDecode(await send({'cmd': 'click', 'selector': '#r'}));
-      debugPrint('[OBS] click result link -> ${jsonEncode(r)}');
+      sw.stop();
+      debugPrint('[OBS] click result link -> ${jsonEncode(r)} in ${sw.elapsedMilliseconds} ms');
       expect(r['ok'], isTrue);
+      // This page registered WHILE the click was running, so the click was already
+      // spent by the time the call returned: following it must cost no wait at all.
+      // An implementation that waits first and only then looks would sit out the
+      // whole 5s NEW_TAB_WAIT_SEC here — that is the mutation this pins down.
+      expect(sw.elapsedMilliseconds, lessThan(3000),
+          reason: 'a page that registered during the click must be followed without '
+              'paying the wait window (the window is an upper bound, not a delay)');
       // The worker followed the new tab: the snapshot is the LANDING page, not the
       // original "Results" page. (The model-visible response does not carry the
       // counters, so tabs/adopted_tabs are read from the record channel below.)
@@ -229,6 +242,356 @@ void main() {
       await srv.close(force: true);
     }
   });
+
+  test('browser_worker: a target=_blank page opening later than the ordinary wait is still followed',
+      () async {
+    if (unavailable) {
+      markTestSkipped('python/browser_worker.py unavailable');
+      return;
+    }
+    // RED first, then the guard. The ordinary wait window is NEW_PAGE_WAIT_SEC =
+    // 1.0s; the wait for a click that the pre-click check judges as opening a new
+    // page is NEW_TAB_WAIT_SEC = 5.0s. This page opens its tab 1.5s AFTER the
+    // click (preventDefault + setTimeout(window.open)), so it is necessarily
+    // later than the ordinary window and inside the longer one — the red does not
+    // depend on how loaded the machine is.
+    //
+    // A real http server is used (NOT a data: URL href) because Chromium does not
+    // navigate a new tab to a data: URL, and window.open('/landing') needs a real
+    // origin.
+    //
+    // NOTE on the counters below: browser_opened / adopted_tabs / tabs are
+    // per-PROCESS cumulative values (only __init__ zeroes them), and this file
+    // spawns a fresh worker per test, so they start at 0 here. In one process a
+    // second click cannot use the absolute value as "what this click did".
+    const resultsPage = "<html><body><h1>Results</h1>"
+        "<a id='slow' target=_blank href='/landing' "
+        "onclick=\"event.preventDefault();setTimeout(function(){window.open('/landing');},1500);\">"
+        'slow result link</a></body></html>';
+    final srv = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final base = 'http://127.0.0.1:${srv.port}';
+    srv.listen((req) {
+      final body = req.uri.path == '/landing'
+          ? "<html><body><h1>LANDING</h1><p>real result content</p></body></html>"
+          : resultsPage;
+      req.response
+        ..statusCode = 200
+        ..headers.contentType = ContentType.html
+        ..write(body)
+        ..close();
+    });
+    try {
+      var r = jsonDecode(await send({'cmd': 'navigate', 'url': '$base/'}));
+      debugPrint('[OBS] navigate -> ${jsonEncode(r)}');
+      expect(r['ok'], isTrue);
+      expect((r['snapshot'] as String).contains('Results'), isTrue);
+
+      r = jsonDecode(await send({'cmd': 'click', 'selector': '#slow'}));
+      debugPrint('[OBS] click slow link -> ${jsonEncode(r)}');
+      final clickOk = r['ok'];
+      final clickSnap = (r['snapshot'] as String? ?? '');
+
+      // RED ATTRIBUTION — printed, never asserted. Wait until the 1.5s popup must
+      // have happened, then take a second snapshot: its record shows tabs >= 2
+      // (the new page DID open) while the click record shows browser_opened == 0
+      // and adopted_tabs == 0 (this click did not follow it). Printing happens
+      // BEFORE the assertions so a red run still emits the现场.
+      //
+      // adopted_tabs == 0 must NOT become an assertion: it holds only before the
+      // fix. After the fix _adopted_tabs += 1 runs in the click branch and the
+      // same key reads 1, so asserting it would make this case impossible to turn
+      // green — and this case is the guard task 2.2 requires to go red→green.
+      await Future<void>.delayed(const Duration(seconds: 2));
+      final post = jsonDecode(await send({'cmd': 'snapshot'}));
+      debugPrint('[OBS] post-popup snapshot -> ${jsonEncode(post)}');
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      debugPrint('[OBS] browser-record lines received: ${records.length}');
+      for (final rec in records) {
+        debugPrint('[OBS] record -> ${jsonEncode(rec)}');
+      }
+
+      // GREEN side — same口径 as the existing target=_blank case (six assertions
+      // on the click side; the record-exists one is the前提 of the three counts).
+      expect(clickOk, isTrue);
+      expect(clickSnap.contains('LANDING'), isTrue,
+          reason: 'a target=_blank page that opens later than the ordinary wait '
+              'window must still be followed (the response must carry the landing '
+              'page, not the page that was clicked)');
+      final clickRec = records.where((e) => e['tool'] == 'click').firstOrNull;
+      expect(clickRec, isNotNull, reason: 'expected a click browser-record');
+      if (clickRec != null) {
+        expect(clickRec['browser_opened'] as int, greaterThan(0),
+            reason: 'the browser must have recorded the opened tab');
+        expect(clickRec['adopted_tabs'] as int, greaterThan(0),
+            reason: 'the click must have FOLLOWED the opened tab');
+        expect(clickRec['tabs'] as int, greaterThanOrEqualTo(2));
+      }
+    } finally {
+      await srv.close(force: true);
+    }
+  });
+
+  test('browser_worker: a missing selector still fails as the selector timeout (the pre-check never replaces it)',
+      () async {
+    if (unavailable) {
+      markTestSkipped('python/browser_worker.py unavailable');
+      return;
+    }
+    // The pre-click check (reading the element's target) must be bounded and
+    // non-waiting: if it waited like a normal Playwright read it would inherit the
+    // 30s default, and pre-check 30s + click 30s = 60s hits the sidecar's
+    // BROWSER_RESPONSE_TIMEOUT_MS kill limit while this file's own 45s read budget
+    // returns "worker response timeout" first. Two assertions pin it down:
+    //   ① the error is STILL the worker's selector timeout (not a pre-check
+    //      exception, and not the 45s "worker response timeout" string), and
+    //   ② the command's wall-clock time stays under 45s (asserted, not just
+    //      printed — a print cannot fail).
+    final r0 = jsonDecode(await send({'cmd': 'navigate', 'url': 'data:text/html,<h1>Pre</h1>'}));
+    debugPrint('[OBS] navigate -> ${jsonEncode(r0)}');
+    expect(r0['ok'], isTrue);
+
+    final sw = Stopwatch()..start();
+    final r = jsonDecode(await send({'cmd': 'click', 'selector': '#nope'}));
+    sw.stop();
+    debugPrint('[OBS] missing-selector click -> ${jsonEncode(r)} '
+        'in ${sw.elapsedMilliseconds} ms');
+    expect(r['ok'], isFalse);
+    expect(r['error'] as String, contains('timed out waiting for'),
+        reason: 'the click must still fail as the worker\'s own selector timeout — '
+            'a pre-check exception or the 45s "worker response timeout" means the '
+            'pre-check changed the failure mode');
+    expect(sw.elapsedMilliseconds, lessThan(45000),
+        reason: 'the click pre-check must not add a second full wait: the command '
+            'has to stay inside the 45s test-side read budget');
+    // A missing selector makes page.click wait its own 30s OP_TIMEOUT_SEC before
+    // failing, so this test needs a longer budget than the 30s default (the 45s
+    // assertion above is about the COMMAND, not about this test's own limit).
+  }, timeout: const Timeout(Duration(seconds: 120)));
+
+  test('browser_worker: an ordinary in-place click pays no extra wait', () async {
+    if (unavailable) {
+      markTestSkipped('python/browser_worker.py unavailable');
+      return;
+    }
+    // The element carries no new-window target, so the pre-click check judges it
+    // in-place and this click keeps the ordinary NEW_PAGE_WAIT_SEC = 1s bound. The
+    // assertion is the wall clock of the whole command: raising the ordinary bound
+    // to 5s must make this fail (mutation), which is what keeps the higher cost off
+    // the highest-frequency operation.
+    final srv = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final base = 'http://127.0.0.1:${srv.port}';
+    srv.listen((req) {
+      final body = req.uri.path == '/next'
+          ? '<html><body><h1>NEXT</h1></body></html>'
+          : "<html><body><h1>HOME</h1><a id='p' href='/next'>in-place link</a></body></html>";
+      req.response
+        ..statusCode = 200
+        ..headers.contentType = ContentType.html
+        ..write(body)
+        ..close();
+    });
+    try {
+      final r0 = jsonDecode(await send({'cmd': 'navigate', 'url': '$base/'}));
+      debugPrint('[OBS] navigate -> ${jsonEncode(r0)}');
+      expect(r0['ok'], isTrue);
+
+      final sw = Stopwatch()..start();
+      final r = jsonDecode(await send({'cmd': 'click', 'selector': '#p'}));
+      sw.stop();
+      debugPrint('[OBS] in-place click -> ${jsonEncode(r)} in ${sw.elapsedMilliseconds} ms');
+      expect(r['ok'], isTrue);
+      expect((r['snapshot'] as String).contains('NEXT'), isTrue,
+          reason: 'the in-place click must still navigate and snapshot the new page');
+      expect(sw.elapsedMilliseconds, lessThan(3000),
+          reason: 'an in-place click must keep today\'s ordinary 1s window '
+              '(mutation: raising NEW_PAGE_WAIT_SEC to 5 makes this fail)');
+    } finally {
+      await srv.close(force: true);
+    }
+  });
+
+  test('browser_worker: a named-target link also gets the longer bound and is followed', () async {
+    if (unavailable) {
+      markTestSkipped('python/browser_worker.py unavailable');
+      return;
+    }
+    // target="_blank" is not the only new-window target: a NAMED target opens (or
+    // reuses) another page. The pre-click check must judge it as opening a new page
+    // rather than falling back to the ordinary bound.
+    final srv = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final base = 'http://127.0.0.1:${srv.port}';
+    srv.listen((req) {
+      final body = req.uri.path == '/landing'
+          ? "<html><body><h1>LANDING</h1><p>named target content</p></body></html>"
+          : "<html><body><h1>Results</h1>"
+              "<a id='n' target='landing' href='/landing'>named target link</a>"
+              '</body></html>';
+      req.response
+        ..statusCode = 200
+        ..headers.contentType = ContentType.html
+        ..write(body)
+        ..close();
+    });
+    try {
+      final r0 = jsonDecode(await send({'cmd': 'navigate', 'url': '$base/'}));
+      debugPrint('[OBS] navigate -> ${jsonEncode(r0)}');
+      expect(r0['ok'], isTrue);
+
+      final r = jsonDecode(await send({'cmd': 'click', 'selector': '#n'}));
+      debugPrint('[OBS] named-target click -> ${jsonEncode(r)}');
+      expect(r['ok'], isTrue);
+      expect((r['snapshot'] as String? ?? '').contains('LANDING'), isTrue,
+          reason: 'a named-target click opens a new page and must be followed');
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      for (final rec in records) {
+        debugPrint('[OBS] record -> ${jsonEncode(rec)}');
+      }
+      final clickRec = records.where((e) => e['tool'] == 'click').firstOrNull;
+      expect(clickRec, isNotNull, reason: 'expected a click browser-record');
+      if (clickRec != null) {
+        expect(clickRec['adopted_tabs'] as int, greaterThan(0),
+            reason: 'the named-target click must have FOLLOWED the opened page');
+      }
+    } finally {
+      await srv.close(force: true);
+    }
+  });
+
+  test('browser_worker: a judged new-tab click that opens nothing is recorded, not failed, and the flag never sticks',
+      () async {
+    if (unavailable) {
+      markTestSkipped('python/browser_worker.py unavailable');
+      return;
+    }
+    // The element DECLARES a new-window target but its handler cancels the default
+    // action and opens nothing: the pre-click check expects a page, this click's
+    // bound expires, and the click must still succeed. Three things are pinned:
+    //   ① the response is a success (an unfulfilled expectation is NOT a failure),
+    //   ② the flag is on the stderr record and NOT in the model-visible response,
+    //   ③ it does not stick: the next click in the SAME worker process must report
+    //      false. Without ③ a single unfulfilled click would leave `true` on every
+    //      later record of this long-lived process.
+    final srv = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final base = 'http://127.0.0.1:${srv.port}';
+    srv.listen((req) {
+      final path = req.uri.path;
+      final body = path == '/next'
+          ? '<html><body><h1>NEXT</h1></body></html>'
+          : path == '/landing'
+              ? '<html><body><h1>LANDING</h1></body></html>'
+              : "<html><body><h1>Quiet</h1>"
+                  "<a id='q' target=_blank href='/landing' "
+                  "onclick=\"event.preventDefault();\">no popup</a>"
+                  "<a id='p' href='/next'>plain link</a></body></html>";
+      req.response
+        ..statusCode = 200
+        ..headers.contentType = ContentType.html
+        ..write(body)
+        ..close();
+    });
+    try {
+      final r0 = jsonDecode(await send({'cmd': 'navigate', 'url': '$base/'}));
+      debugPrint('[OBS] navigate -> ${jsonEncode(r0)}');
+      expect(r0['ok'], isTrue);
+
+      final sw = Stopwatch()..start();
+      final r = jsonDecode(await send({'cmd': 'click', 'selector': '#q'}));
+      sw.stop();
+      debugPrint('[OBS] judged-new-tab click that opens nothing -> ${jsonEncode(r)} '
+          'in ${sw.elapsedMilliseconds} ms');
+      // ① still a success, and the model-visible response carries no such key.
+      expect(r['ok'], isTrue,
+          reason: 'a new tab that never appears must not turn the click into a failure');
+      expect(r.containsKey('expected_new_tab_unfulfilled'), isFalse,
+          reason: 'the flag is an observability value: it must never reach the '
+              'model-visible response');
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      for (final rec in records) {
+        debugPrint('[OBS] record -> ${jsonEncode(rec)}');
+      }
+      final firstClick = records.where((e) => e['tool'] == 'click').firstOrNull;
+      expect(firstClick, isNotNull, reason: 'expected a click browser-record');
+      if (firstClick != null) {
+        // ② recorded on the observability channel only.
+        expect(firstClick['expected_new_tab_unfulfilled'], isTrue,
+            reason: 'a judged new-tab click whose page never registered must be '
+                'recorded as expected-but-not-observed');
+      }
+
+      // ③ same process, next call: the flag must be back to false.
+      final r2 = jsonDecode(await send({'cmd': 'click', 'selector': '#p'}));
+      debugPrint('[OBS] following in-place click -> ${jsonEncode(r2)}');
+      expect(r2['ok'], isTrue);
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      final clicks = records.where((e) => e['tool'] == 'click').toList();
+      debugPrint('[OBS] click records so far: ${clicks.length}');
+      for (final rec in clicks) {
+        debugPrint('[OBS] click record -> ${jsonEncode(rec)}');
+      }
+      expect(clicks.length, greaterThanOrEqualTo(2));
+      expect(clicks.last['expected_new_tab_unfulfilled'], isFalse,
+          reason: 'the flag must be decided per call — if the worker forgets to '
+              'reset it, every later record in this process keeps reporting true');
+    } finally {
+      await srv.close(force: true);
+    }
+  });
+
+  test('browser_worker: a page opening 3s after the click is still inside the bound and followed',
+      () async {
+    if (unavailable) {
+      markTestSkipped('python/browser_worker.py unavailable');
+      return;
+    }
+    // Task 5.1 — the measured lower edge for NEW_TAB_WAIT_SEC = 5.0s. Same page as
+    // the 1.5s case, with the popup 3s after the click: still inside the bound, so
+    // the click must follow it. This is the evidence Open Question 1 asks for
+    // ("how much headroom does 5s actually have?"), instead of an unmeasured claim.
+    const resultsPage = "<html><body><h1>Results</h1>"
+        "<a id='slow3' target=_blank href='/landing' "
+        "onclick=\"event.preventDefault();setTimeout(function(){window.open('/landing');},3000);\">"
+        'slow-3s result link</a></body></html>';
+    final srv = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final base = 'http://127.0.0.1:${srv.port}';
+    srv.listen((req) {
+      final body = req.uri.path == '/landing'
+          ? "<html><body><h1>LANDING</h1><p>3s landing content</p></body></html>"
+          : resultsPage;
+      req.response
+        ..statusCode = 200
+        ..headers.contentType = ContentType.html
+        ..write(body)
+        ..close();
+    });
+    try {
+      final r0 = jsonDecode(await send({'cmd': 'navigate', 'url': '$base/'}));
+      debugPrint('[OBS] navigate -> ${jsonEncode(r0)}');
+      expect(r0['ok'], isTrue);
+
+      final sw = Stopwatch()..start();
+      final r = jsonDecode(await send({'cmd': 'click', 'selector': '#slow3'}));
+      sw.stop();
+      debugPrint('[OBS] 3s-late new tab -> ${jsonEncode(r)} in ${sw.elapsedMilliseconds} ms');
+      expect(r['ok'], isTrue);
+      expect((r['snapshot'] as String? ?? '').contains('LANDING'), isTrue,
+          reason: 'a new page 3s after the click is still inside the 5s bound and '
+              'must be followed');
+      // Also record how much of the bound was actually used — the number that gives
+      // the 5s choice its measured lower edge.
+      expect(sw.elapsedMilliseconds, lessThan(5000),
+          reason: 'following must happen as soon as the page appears, not by '
+              'waiting the bound out');
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      final clickRec = records.where((e) => e['tool'] == 'click').firstOrNull;
+      expect(clickRec, isNotNull, reason: 'expected a click browser-record');
+      if (clickRec != null) {
+        expect(clickRec['adopted_tabs'] as int, greaterThan(0));
+        debugPrint('[OBS] 3s-case record -> ${jsonEncode(clickRec)}');
+      }
+    } finally {
+      await srv.close(force: true);
+    }
+  }, timeout: const Timeout(Duration(seconds: 60)));
 
   test('browser_worker: download is denied (no file persists)', () async {
     if (unavailable) {

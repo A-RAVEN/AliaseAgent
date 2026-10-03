@@ -81,9 +81,19 @@ PROBE_ATTEMPTS = 2
 # event registers in ~0.16-0.36s (the event precedes the target's content load —
 # that load is handled separately by _wait_for_page_ready). We wait 1.0s — a ~2-6x
 # margin over the worst measured case — so a real popup is never missed, while an
-# in-place click pays only 1s wait instead of a longer stall. (expect_page blocks
-# for exactly this whole window when NO popup opens; a well-known tradeoff.)
+# in-place click pays only 1s wait instead of a longer stall.
+#
+# The wait is an UPPER bound counted from AFTER the click returns, and a page that
+# registered DURING the click costs no wait at all (the page handler already
+# recorded it — see _handle_click and _take_opened_page).
 NEW_PAGE_WAIT_SEC = 1.0
+# The longer bound for a click whose element declares a new-window target
+# (target=_blank / a named target), decided BEFORE the click by _click_opens_new_page.
+# Only those clicks pay it, so the higher cost lands on the operation that actually
+# opens a page instead of on every click. A full-suite run showed the ordinary 1.0s
+# bound being missed under load; the 1.5s case is the deterministic reproduction,
+# and task 5.1 probes a 3s case to give this bound a measured lower edge.
+NEW_TAB_WAIT_SEC = 5.0
 
 # --- Window placement (tasks 12.13 / 12.15 / 12.17) --------------------------
 # The headed browser must stay user-visible (spec: "user-visible browser") but it
@@ -642,6 +652,17 @@ class BrowserSession:
         # how many of those the worker then FOLLOWED after a click.
         self._browser_opened = 0
         self._adopted_tabs = 0
+        # Pages the browser opened WHILE a click was in flight, in the order the
+        # page handler saw them. Collected only between `_collect_opened_pages =
+        # True` (set for the duration of one click) and cleared at the start of
+        # each click, so a page opened by a relaunch or by the user's own clicking
+        # in the visible window is never mistaken for this click's popup.
+        self._opened_pages = []
+        self._collect_opened_pages = False
+        # Per-call observability: set when a click was judged to open a new page but
+        # no page registered within that click's bound. Reset before every command
+        # (see the dispatch loop) so it never describes more than the current call.
+        self._expected_new_tab_unfulfilled = False
         # Best-effort permission states read per step (observability only).
         self._last_permissions = {}
         # After returning a "dead" error once, the next command is allowed to
@@ -907,16 +928,25 @@ class BrowserSession:
         def on_page(page) -> None:
             # Design 甲 (follow new tab): the worker does NOT close browser-opened
             # pages (a target=_blank result / window.open popup) — the AI reads the
-            # real landing page a click produced. We only COUNT them here as an
-            # observable (browser_opened). The FOLLOW itself is done in the click
-            # handler by diffing the context's page set before/after the click
-            # (robust against rel=noopener pages whose opener() is None). NEVER
-            # count the main page; only pages with a real opener (window.open /
-            # target=_blank) are browser popups — a programmatic context.new_page()
-            # (initial OR a recreated main page) has a null opener (verified:
-            # programmatic new_page() opener is None, popup opener is non-None).
+            # real landing page a click produced. Two separate jobs live around this
+            # handler:
+            #   • RECORD (here): while a click is in flight, put the page on the
+            #     session's _opened_pages list. That list is how _handle_click finds
+            #     a page that registered DURING the click: its event is already
+            #     flushed by the time page.click() returns, so a waiter attached
+            #     afterwards would never see it (and would sit out the whole window).
+            #   • FOLLOW (in _handle_click): take that page, make it the active page,
+            #     wait for it to load and snapshot it; _adopted_tabs counts those.
+            # The COUNT below (_browser_opened) is observability only, and counts
+            # only pages with a real opener (window.open / target=_blank): a
+            # programmatic context.new_page() — the initial page OR a recreated main
+            # page — has a null opener (verified). The RECORD above must NOT reuse
+            # that filter: a rel=noopener popup has a null opener too, and it is
+            # still a browser-opened page the AI must be able to read.
             if self._page is not None and page is self._page:
                 return
+            if self._collect_opened_pages:
+                self._opened_pages.append(page)
             try:
                 if page.opener() is None:
                     return
@@ -926,6 +956,17 @@ class BrowserSession:
                 pass
 
         self._context.on("page", on_page)
+
+    def _take_opened_page(self):
+        """First still-open page the browser opened during the current click."""
+        while self._opened_pages:
+            candidate = self._opened_pages.pop(0)
+            try:
+                if not candidate.is_closed():
+                    return candidate
+            except Exception:
+                continue
+        return None
 
     # Stay-hidden guarantee: this worker NEVER calls bring_to_front (there is no
     # raise path at all), so _raise_count is legitimately 0. The regression guard
@@ -1118,6 +1159,36 @@ class BrowserSession:
         except Exception:
             pass
 
+    def _click_opens_new_page(self, page, selector: str) -> bool:
+        """Does the clicked element declare a new-window target? (design D1)
+
+        BOUNDED AND NON-WAITING ON PURPOSE. This worker never sets Playwright's
+        default timeout, so a waiting read (page.get_attribute) would inherit the
+        30s default; pre-check 30s + click 30s = 60s, which is exactly the
+        sidecar's BROWSER_RESPONSE_TIMEOUT_MS kill limit (a timeout there kills
+        the worker), and the test-side 45s read budget would return "worker
+        response timeout" first. page.evaluate takes no timeout and does NOT wait
+        for the element (a missing selector yields null immediately).
+
+        ANY failure — evaluate error, page gone, unexpected value — is treated as
+        "does not open a new page", so the pre-check can never fail the click.
+        `_self` / `_top` / `_parent` are in-place targets; `_blank`, `_new` and a
+        named window target open (or reuse) another page and get the longer wait.
+        """
+        try:
+            target = page.evaluate(
+                "sel => { const el = document.querySelector(sel);"
+                " return el ? (el.getAttribute('target') || '') : null; }",
+                selector,
+            )
+        except Exception as e:
+            _log(f"click pre-check failed ({e.__class__.__name__}: {e})"
+                 " -> treating this click as in-place")
+            return False
+        if not isinstance(target, str) or not target.strip():
+            return False
+        return target.strip().lower() not in ("_self", "_top", "_parent")
+
     def _handle_click(self, req: dict) -> dict:
         page = self._launch_for_op()
         if isinstance(page, dict):
@@ -1125,39 +1196,58 @@ class BrowserSession:
         selector = req.get("selector", "")
         if not selector:
             return {"ok": False, "error": "click: selector is required"}
+        expects_new_page = self._click_opens_new_page(page, selector)
+        wait_sec = NEW_TAB_WAIT_SEC if expects_new_page else NEW_PAGE_WAIT_SEC
+        _log(f"click pre-check: selector={selector!r} opens_new_page={expects_new_page} "
+             f"wait={wait_sec}s")
         # Design 甲 (follow new tab): a click on a target=_blank result / window.open
-        # popup opens a NEW page. context.expect_page() reliably awaits that popup
-        # (polling context.pages does NOT see it mid-loop — the popup event only
-        # flushes on a Playwright API pump). We bound the wait to NEW_PAGE_WAIT_SEC:
-        # if a page opens we FOLLOW it (make it active, wait for load) so the AI
-        # reads the REAL landing page; if none opens in the window the click
-        # navigated in-place and we keep the current page. This replaces the
-        # single-tab close (which was dropping the landing page).
+        # popup opens a NEW page, and we FOLLOW it (make it active, wait for load) so
+        # the AI reads the REAL landing page; an in-place click keeps the current
+        # page. This replaces the single-tab close (which dropped the landing page).
         #
-        # expect_page's context-manager RAISES PWTimeout on block exit when no page
-        # opened (the common in-place click), and pinfo.value is set once a popup
-        # fires. So we (a) run the click inside, capturing its OWN error into
-        # click_err (never swallowed silently), and (b) treat the exit-timeout as a
-        # normal "no popup → in-place navigation", NOT a click failure. A click error
-        # is still surfaced (we check click_err after the block).
+        # TAKING THE PAGE IS THREE STEPS, and all three are needed:
+        #   ① the session's page handler (see _install_page_handler) records every
+        #      page the browser opens while a click is in flight. Checking that list
+        #      FIRST is an ordering guard: Playwright attaches event listeners when
+        #      you ask for them, so IF a page's event were dispatched before
+        #      page.click() returned, a waiter attached afterwards would never see
+        #      it and would sit out the whole window (and, for a judged new-tab
+        #      click, be recorded as "expected but not observed"). Measured locally
+        #      (task 2.2): the synchronous target=_blank page event arrives AFTER
+        #      click() returns, so this guard is not the common path here — it is
+        #      kept because it costs almost nothing and covers the other order.
+        #   ② only when that list is empty do we wait, bounded, for a page event —
+        #      that is the page which registers AFTER the click returned (the
+        #      1.5s/3s cases).
+        #   ③ after the wait expires the list is checked once more, so a page that
+        #      did register inside the window is never reported as unfulfilled.
+        # The wait is counted from AFTER the click returns: the old code wrapped the
+        # click in context.expect_page(), whose window started before the click, so
+        # a slow click ate the popup budget.
+        self._opened_pages.clear()
+        self._collect_opened_pages = True
         click_err = None
         new_page = None
         try:
-            with self._context.expect_page(timeout=NEW_PAGE_WAIT_SEC * 1000) as pinfo:
-                try:
-                    page.click(selector, timeout=OP_TIMEOUT_SEC * 1000)
-                except PWTimeout as e:
-                    click_err = {"ok": False, "error": f"click: timed out waiting for {selector}: {e}"}
-                except Exception as e:
-                    click_err = {"ok": False, "error": f"click: {e}"}
-                if click_err is None and pinfo.value is not None:
-                    new_page = pinfo.value
-        except PWTimeout:
-            # expect_page found no page on exit: the click navigated in-place OR the
-            # selector was missing. If the click itself succeeded (click_err is None),
-            # this is the in-place case — proceed without a follow. If the click
-            # errored, click_err below wins.
-            pass
+            try:
+                page.click(selector, timeout=OP_TIMEOUT_SEC * 1000)
+            except PWTimeout as e:
+                click_err = {"ok": False, "error": f"click: timed out waiting for {selector}: {e}"}
+            except Exception as e:
+                click_err = {"ok": False, "error": f"click: {e}"}
+            if click_err is None:
+                new_page = self._take_opened_page()
+                if new_page is None:
+                    try:
+                        self._context.wait_for_event("page", timeout=wait_sec * 1000)
+                    except PWTimeout:
+                        # No page event inside the window: either the click navigated
+                        # in-place, or the page is still on its way and registers too
+                        # late. Not a click failure either way.
+                        pass
+                    new_page = self._take_opened_page()
+        finally:
+            self._collect_opened_pages = False
         if click_err is not None:
             return click_err
         if new_page is not None and not new_page.is_closed():
@@ -1166,6 +1256,16 @@ class BrowserSession:
             self._wait_for_page_ready(new_page)
             page = new_page
             _log(f"followed new tab (adopted={self._adopted_tabs})")
+        elif expects_new_page:
+            # The pre-click check judged this click as opening a page and none
+            # registered within its bound. NOT a failure (the user may have blocked
+            # the popup, or the page cancelled the default action) and never
+            # model-visible — it is recorded on the observability channel only, so a
+            # later reader can tell "this click waited and found nothing" apart from
+            # "this click was never expected to open a page".
+            self._expected_new_tab_unfulfilled = True
+            _log("expected a new tab but none registered within "
+                 f"{wait_sec}s (recorded, not a failure)")
         # A click may itself navigate the page; that is the AI's own action, so
         # the resulting URL + content hash become the new expected state.
         # Task 12.33: navigation-class op -> re-check the real window rect.
@@ -1235,6 +1335,7 @@ def _emit_record(cmd: str, input_obj: dict, result: dict, session: BrowserSessio
             "download_denied": session._download_denied,
             "permission_denied": session._permission_denied,
             "permissions": session._last_permissions,
+            "expected_new_tab_unfulfilled": session._expected_new_tab_unfulfilled,
             "tabs": len(session._context.pages) if session._context else 0,
             "divergent": result.get("divergent", False),
             "error": result.get("error", ""),
@@ -1305,6 +1406,11 @@ def main() -> None:
             return
 
         try:
+            # The per-call record must describe THIS call only: reset the
+            # "expected a new tab but did not observe one" flag before every
+            # command, so a click that did not wait out its bound cannot leave the
+            # flag true on the records of later calls in this long-lived process.
+            session._expected_new_tab_unfulfilled = False
             if cmd == "open":
                 result = session._handle_open(req)
             elif cmd == "relaunch":
