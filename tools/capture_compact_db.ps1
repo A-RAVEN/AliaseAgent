@@ -33,11 +33,23 @@ while ((Get-Date) -lt $deadline) {
     if ($dir) {
         $db = Join-Path $dir.FullName 'aliasagent.db'
         if (Test-Path $db) {
-            # Copy the whole temp dir: sqflite may leave -wal / -shm siblings that are
-            # part of the committed state.
+            # Copy the DB and its SQLite side files by NAME, one at a time, tolerating
+            # each one's disappearance. Do NOT glob the directory: a live writer creates
+            # and deletes `aliasagent.db-journal` between two frames, so a wildcard copy
+            # expands to an entry that is already gone and the whole capture dies with
+            # "Could not find file ...aliasagent.db-journal" (measured twice on
+            # 2026-10-03, exit code 1, nothing captured).
             Remove-Item $OutDir -Recurse -Force -ErrorAction SilentlyContinue
             New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-            Copy-Item (Join-Path $dir.FullName '*') $OutDir -Recurse -Force -ErrorAction SilentlyContinue
+            foreach ($name in @('aliasagent.db', 'aliasagent.db-wal', 'aliasagent.db-shm', 'aliasagent.db-journal')) {
+                $src = Join-Path $dir.FullName $name
+                try {
+                    if (Test-Path $src) { Copy-Item $src $OutDir -Force -ErrorAction Stop }
+                } catch {
+                    # A transient side file vanished mid-copy: skip it, the next tick
+                    # re-reads the directory and picks up the committed state.
+                }
+            }
             $copies++
             $lastSrc = $dir.FullName
         }

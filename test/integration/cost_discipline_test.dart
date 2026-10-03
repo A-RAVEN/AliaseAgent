@@ -7,6 +7,7 @@ import 'package:alias_agent/models/app_config.dart';
 import 'package:alias_agent/models/message.dart';
 import 'package:alias_agent/models/provider_config.dart';
 import 'package:alias_agent/services/compaction/summary_provider.dart';
+import 'package:alias_agent/services/compaction/summary_reference.dart';
 import 'package:alias_agent/services/context_estimator.dart';
 import 'package:alias_agent/services/provider_resolver.dart';
 
@@ -148,6 +149,7 @@ class _AccumulatingSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarize({
     required List<Message> folded,
     required AgentTypeConfig config,
+    List<SummaryReference> reference = const [],
   }) async {
     totalFoldedRaw += ContextEstimator.estimateConversation(folded);
     final tokens = ContextEstimator.estimateTokens(text);

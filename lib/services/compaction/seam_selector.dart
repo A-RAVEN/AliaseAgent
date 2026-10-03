@@ -131,7 +131,7 @@ class ModelSeamSelector implements SeamSelector {
             '你是 AliasAgent 的对话分缝器。给定一段消息区间和一组安全边界下标，请挑选话题分缝。',
         messagesJson: messagesJson,
         toolsJson: '[]',
-        thinkingMode: 'summary', // summary profile: thinking disabled, max_tokens 1024
+        thinkingMode: 'summary', // summary profile: thinking disabled, no max_tokens sent
         thinkingEffort: '',
         onChunk: (t) => text.write(t),
         onToolCall: (_) {},

@@ -11,6 +11,7 @@ import 'package:alias_agent/models/provider_config.dart';
 import 'package:alias_agent/models/session.dart';
 import 'package:alias_agent/services/compaction/model_summary_provider.dart';
 import 'package:alias_agent/services/compaction/summary_provider.dart';
+import 'package:alias_agent/services/compaction/summary_reference.dart';
 import 'package:alias_agent/services/provider_resolver.dart';
 
 import '../widget/helpers/fakes.dart';
@@ -46,6 +47,7 @@ class _GatedSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarize({
     required List<Message> folded,
     required AgentTypeConfig config,
+    List<SummaryReference> reference = const [],
   }) async {
     summarizeCalls++;
     final g = gate;
@@ -620,6 +622,7 @@ class _PerCallGatedSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarize({
     required List<Message> folded,
     required AgentTypeConfig config,
+    List<SummaryReference> reference = const [],
   }) {
     calls++;
     if (!_gated()) return Future.value(SummaryResult(text: 'L1', tokens: 1));

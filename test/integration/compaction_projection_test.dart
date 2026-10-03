@@ -13,6 +13,7 @@ import 'package:alias_agent/models/summary_node.dart';
 import 'package:alias_agent/services/compaction/model_summary_provider.dart';
 import 'package:alias_agent/services/compaction/seam_selector.dart';
 import 'package:alias_agent/services/compaction/summary_provider.dart';
+import 'package:alias_agent/services/compaction/summary_reference.dart';
 import 'package:alias_agent/services/context_estimator.dart';
 import 'package:alias_agent/services/provider_resolver.dart';
 import 'package:alias_agent/services/summary_node_repository.dart';
@@ -208,6 +209,7 @@ class _SizedFakeSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarize({
     required List<Message> folded,
     required AgentTypeConfig config,
+    List<SummaryReference> reference = const [],
   }) async {
     summarizeCalls++;
     return SummaryResult(
@@ -254,12 +256,18 @@ class _EchoSummaryProvider implements SummaryProvider {
   int summarizeCalls = 0;
   int summarizeTextCalls = 0;
 
+  /// 每一次 summarize 收到的参考上下文（按调用顺序）—— 本变更的接线判据靠它：
+  /// 只测挑选函数是测不到"main.dart 真的把参考传下来了"。
+  final List<List<SummaryReference>> referencesPerCall = [];
+
   @override
   Future<SummaryResult> summarize({
     required List<Message> folded,
     required AgentTypeConfig config,
+    List<SummaryReference> reference = const [],
   }) async {
     summarizeCalls++;
+    referencesPerCall.add(List.of(reference));
     final lo = folded.isEmpty ? 0 : (folded.first.seq ?? 0);
     final hi = folded.isEmpty ? 0 : (folded.last.seq ?? 0);
     return SummaryResult(text: '层级 1 摘要 seq $lo..$hi', tokens: l1Tokens);
@@ -286,6 +294,7 @@ class _RecordingSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarize({
     required List<Message> folded,
     required AgentTypeConfig config,
+    List<SummaryReference> reference = const [],
   }) async {
     foldedCalls.add(List.of(folded));
     return SummaryResult(
@@ -2074,6 +2083,73 @@ void main() {
           reason: '当前用户消息必须活下来');
     });
 
+    testWidgets('参考上下文 · 折叠真的把上一条摘要传给了摘要模型（接线判据）',
+        (tester) async {
+      // 接线判据：挑选函数写对、但 main.dart 一处都不接线（一律传空）时，这条必红。
+      // 几何：容量 2000 ⇒ 阈值 500；seq 1..10 各 100 raw；库里预置一条覆盖 seq 1..4 的
+      // 上一轮一级摘要（已冻结、已落盘）⇒ 这一趟要折的是尾部（累加首次超过 500 的那一段），
+      // 它的参考只可能是那条 1..4 的摘要。
+      _setupAgentRegistry(maxContextTokens: 2000);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final repo = _FakeSummaryNodeRepository();
+      const dbSessionId = 's1';
+      const presetText = '上一轮压出来的 L1 摘要 seq 1..4';
+      await repo.materialize(
+        sessionId: dbSessionId,
+        level: 1,
+        startSeq: 1,
+        endSeq: 4,
+        nodeType: 'summary',
+        summaryJson: jsonEncode({
+          'role': 'user',
+          'content': [
+            {'type': 'text', 'text': presetText},
+          ],
+        }),
+        tokenCost: 60,
+        summaryPromptVersion: 1,
+        model: 'test-model',
+        coveredMinSeq: 1,
+        coveredMaxSeq: 4,
+      );
+
+      final sessionRepo = FakeSessionRepository(testSessions(1));
+      final msgRepo = FakeMessageRepository(_convLabeled(10, 100));
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      final summaryProvider = _EchoSummaryProvider(l1Tokens: 1, l2Tokens: 300);
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+        summaryProvider: summaryProvider,
+        summaryNodeRepo: repo,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'continue');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      final calls = summaryProvider.referencesPerCall;
+      // ignore: avoid_print
+      print('  [OBS] 参考上下文 · 折叠调用 ${calls.length} 次，每次参考='
+          '${calls.map((r) => r.isEmpty ? '（空）' : r.map((x) => 'lvl${x.level}[${x.coveredMinSeq},${x.coveredMaxSeq}]').join('+')).join(' / ')}');
+      final withReference = calls.where((r) => r.isNotEmpty).toList();
+      expect(withReference, isNotEmpty,
+          reason: '这一趟折的是尾部（seq 1..4 已经压过并落盘）⇒ 摘要请求必须带参考；'
+              '一次都没带说明 main.dart 没把参考接线到 provider');
+      expect(withReference.first.map((r) => r.text), contains(presetText),
+          reason: '参考必须是库里那条覆盖 seq 1..4 的上一轮摘要的正文');
+      expect(withReference.first.length, 1,
+          reason: '只有一个候选 ⇒ "最近的一条一级"与"层级最高那条"是同一条，'
+              '按覆盖范围去重后只该留一条');
+    });
+
     testWidgets('压缩提示 · 发送前这条路径：卡住摘要期间对话视图出现提示，放行后消失',
         (tester) async {
       // 容量 4000 ⇒ 阈值 1000；15 条 × 100 raw = 1500 > 1000 ⇒ 这次发送要压。
@@ -2703,6 +2779,7 @@ class _GatedSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarize({
     required List<Message> folded,
     required AgentTypeConfig config,
+    List<SummaryReference> reference = const [],
   }) {
     summarizeCalls++;
     final g = gate;
@@ -2780,6 +2857,7 @@ class _ThrowingSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarize({
     required List<Message> folded,
     required AgentTypeConfig config,
+    List<SummaryReference> reference = const [],
   }) async {
     throw StateError('summarization failed (simulated done!=0/empty)');
   }

@@ -1,11 +1,14 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
+
 import '../context_estimator.dart';
 import '../provider_resolver.dart';
 import '../sidecar_bridge.dart';
 import '../../models/agent_type_config.dart';
 import '../../models/message.dart';
 import 'summary_provider.dart';
+import 'summary_reference.dart';
 
 /// Summary instruction appended as the final user message of a summarization
 /// request. Ask for a structured, lossless-enough summary: keep the decision
@@ -21,9 +24,39 @@ const String kSummarizeInstruction =
     '请用与对话正文相同的语言输出摘要（对话主要是中文就用中文，主要是英文就用英文）。'
     '只输出纯文本：不要 thinking 块、不要 tool_use 块、不要 tool_result 块。精简但完整。';
 
+/// 参考上下文的抬头：这一段只用来解析指代与判断"什么已经说过了"，不许被总结。
+const String kReferenceContextHeader = '【参考上下文 · 不要总结】';
+
+/// 待压缩原文的抬头（只在这次带了参考上下文时才出现）。
+const String kSummarizeTextHeader = '【待压缩原文 · 只总结这一段】';
+
+/// 没有参考上下文时用的 system —— **与过去逐字相同**。
+const String kSummarySystemPrompt =
+    '你是 AliasAgent 的对话摘要器。请忠实、精简地用纯文本总结此前的对话。'
+    '请用与对话正文相同的语言输出摘要。';
+
+/// 带了参考上下文时追加到 system 后面的禁令句（追加，不替换 —— 上面那两句必须留着）。
+const String kReferenceOnlyProhibition =
+    '用户消息里会给你一段【参考上下文】和一段【待压缩原文】：参考上下文只用来解析指代、'
+    '判断什么已经说过了，严禁把它的内容写进摘要；摘要只写【待压缩原文】里的信息。';
+
+/// 摘要正文偶尔会把渲染用的角色前缀抄进开头（2026-10-03 实测：5 条一级摘要里 3 条以
+/// `ASSISTANT` / `ASSISTANT:` 开头）。这里只削掉这一种形态，不动正文本身：
+///   `ASSISTANT: 用户目标…` → `用户目标…`；`ASSISTANT本次…` → `本次…`
+/// 两种会被保留的情形：英文正文以 `ASSISTANT ` 开头（后面是空格 + 英文，属于正常措辞）、
+/// 以及标签出现在正文中间（只削开头）。
+String stripLeadingRoleLabel(String text) {
+  final withColon = RegExp(r'^\s*(?:USER|ASSISTANT|SYSTEM)\s*[:：]\s*').firstMatch(text);
+  if (withColon != null) return text.substring(withColon.end);
+  final glued = RegExp(r'^\s*(?:USER|ASSISTANT|SYSTEM)(?=[\u4e00-\u9fff])').firstMatch(text);
+  if (glued != null) return text.substring(glued.end);
+  return text;
+}
+
 /// The production [SummaryProvider]: routes a summarization request through the
-/// model gateway on the summary profile (thinking disabled, max_tokens 1024 —
-/// the "summary" mode handled in model_gateway.cpp), collecting the output text.
+/// model gateway on the summary profile (thinking disabled; the request carries NO
+/// max_tokens — the output length is the model/endpoint default; see the "summary"
+/// mode in model_gateway.cpp), collecting the output text.
 class ModelSummaryProvider implements SummaryProvider {
   final ISidecar _sidecar;
   final ProviderResolver _resolver;
@@ -38,6 +71,7 @@ class ModelSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarize({
     required List<Message> folded,
     required AgentTypeConfig config,
+    List<SummaryReference> reference = const [],
   }) async {
     final provider = _resolver.resolve(config.provider);
     if (provider == null) {
@@ -55,13 +89,31 @@ class ModelSummaryProvider implements SummaryProvider {
     // plain role-qualified transcript + the summarize instruction. Tool rounds
     // are represented inline (assistant tool_use + derived user tool_result) so
     // the model sees a coherent alternation and the re-execution keys.
+    //
+    // With a reference context (design D2) the request gets TWO extra pieces, and
+    // both are load-bearing: the reference travels as its own message with its own
+    // header (so the model can tell "background" from "what to summarize"), and the
+    // text-to-summarize gets a header too. Without a reference the request is
+    // exactly what it always was — same system, same messages, no headers.
     final summaryMessages = <Map<String, dynamic>>[];
-    for (final m in folded) {
-      summaryMessages.add({'role': m.role, 'content': _messageText(m)});
-      if (m.role == 'assistant' && m.toolCallsJson != null && m.toolCallsJson!.isNotEmpty) {
-        // Synthetic user(tool_result) round, inlined: tool name + input + result.
-        summaryMessages.add({'role': 'user', 'content': _toolRoundText(m)});
+    if (reference.isEmpty) {
+      for (final m in folded) {
+        summaryMessages.add({'role': m.role, 'content': _messageText(m)});
+        if (m.role == 'assistant' && m.toolCallsJson != null && m.toolCallsJson!.isNotEmpty) {
+          // Synthetic user(tool_result) round, inlined: tool name + input + result.
+          summaryMessages.add({'role': 'user', 'content': _toolRoundText(m)});
+        }
       }
+    } else {
+      summaryMessages.add({'role': 'user', 'content': _referenceBlock(reference)});
+      final buf = StringBuffer()..writeln(kSummarizeTextHeader);
+      for (final m in folded) {
+        buf.writeln(_messageText(m));
+        if (m.role == 'assistant' && m.toolCallsJson != null && m.toolCallsJson!.isNotEmpty) {
+          buf.writeln(_toolRoundText(m));
+        }
+      }
+      summaryMessages.add({'role': 'user', 'content': buf.toString().trimRight()});
     }
     summaryMessages.add({'role': 'user', 'content': kSummarizeInstruction});
 
@@ -70,18 +122,21 @@ class ModelSummaryProvider implements SummaryProvider {
     String doneErr = '';
     // Real measured usage from the summary call (Anthropic-format /v1/messages
     // input_tokens/output_tokens). The summary's SIZE is the provider's actual
-    // output_tokens — NOT an estimate (no compression-ratio assumption, D3/D4).
+    // output_tokens — NOT an estimate (no compression-ratio assumption, D3/D4);
+    // the INPUT count is observation only (what this call cost to send), never a
+    // validity criterion.
     int outTokens = 0;
+    int inTokens = 0;
     await _sidecar.sendMessage(
       apiKey: apiKey,
       baseUrl: baseUrl,
       model: config.model,
-      systemPrompt:
-          '你是 AliasAgent 的对话摘要器。请忠实、精简地用纯文本总结此前的对话。'
-          '请用与对话正文相同的语言输出摘要。',
+      systemPrompt: reference.isEmpty
+          ? kSummarySystemPrompt
+          : kSummarySystemPrompt + kReferenceOnlyProhibition,
       messagesJson: jsonEncode(summaryMessages),
       toolsJson: '[]',
-      thinkingMode: 'summary', // summary profile: thinking disabled, max_tokens 1024
+      thinkingMode: 'summary', // summary profile: thinking disabled, no max_tokens sent
       thinkingEffort: '',
       onChunk: (t) => text.write(t),
       onToolCall: (_) {}, // never expected on a summary profile
@@ -89,8 +144,13 @@ class ModelSummaryProvider implements SummaryProvider {
         doneCode = code;
         doneErr = err ?? '';
         outTokens = outTok ?? 0;
+        inTokens = inTok ?? 0;
       },
     );
+    // Per-call observability (never model-visible): what this summarization call
+    // cost to SEND, next to what it produced. Printed even when the call failed,
+    // so a failing call's spend stays attributable.
+    debugPrint('[OBS] summary in=$inTokens/out=$outTokens (level-1 fold)');
 
     // A failed summarization must NOT silently replace the folded context with a
     // placeholder. Surface the failure so the caller falls back to sending the
@@ -98,7 +158,7 @@ class ModelSummaryProvider implements SummaryProvider {
     if (doneCode != 0) {
       throw StateError('Summarization failed (code=$doneCode): ${doneErr.isEmpty ? 'unknown' : doneErr}');
     }
-    final content = text.toString().trim();
+    final content = stripLeadingRoleLabel(text.toString().trim());
     if (content.isEmpty) {
       // R1-5: a SUCCESSFUL (code==0) but EMPTY summary must NOT silently become the
       // "(empty summary)" placeholder — that would replace the folded context with
@@ -112,6 +172,7 @@ class ModelSummaryProvider implements SummaryProvider {
       // Real measured size; if the provider didn't report usage (0), fall back to
       // a deterministic tokenizer estimate so the budget check still has a size.
       tokens: outTokens > 0 ? outTokens : ContextEstimator.estimateTokens(content),
+      inputTokens: inTokens,
     );
   }
 
@@ -128,7 +189,7 @@ class ModelSummaryProvider implements SummaryProvider {
 
     // 2-pass "summary of summaries": the input is the joined level-1 summary
     // texts. Send it as a single user message + the summarize instruction on the
-    // summary profile (thinking disabled, max_tokens 1024).
+    // summary profile (thinking disabled; no max_tokens sent).
     final summaryMessages = <Map<String, dynamic>>[
       {'role': 'user', 'content': '$text\n\n$kSummarizeInstruction'},
     ];
@@ -137,6 +198,7 @@ class ModelSummaryProvider implements SummaryProvider {
     int doneCode = 0;
     String doneErr = '';
     int outTokens = 0;
+    int inTokens = 0;
     await _sidecar.sendMessage(
       apiKey: provider.apiKey,
       baseUrl: provider.baseUrl,
@@ -154,13 +216,15 @@ class ModelSummaryProvider implements SummaryProvider {
         doneCode = code;
         doneErr = err ?? '';
         outTokens = outTok ?? 0;
+        inTokens = inTok ?? 0;
       },
     );
+    debugPrint('[OBS] summary in=$inTokens/out=$outTokens (level-2 roll-up)');
     if (doneCode != 0) {
       throw StateError(
           'level-2 summarization failed (code=$doneCode): ${doneErr.isEmpty ? 'unknown' : doneErr}');
     }
-    final content = out.toString().trim();
+    final content = stripLeadingRoleLabel(out.toString().trim());
     if (content.isEmpty) {
       // R1-5: never a silent "(empty summary)" placeholder (see summarize).
       throw StateError('level-2 summarization returned empty content (code=0, no text)');
@@ -169,7 +233,20 @@ class ModelSummaryProvider implements SummaryProvider {
       text: content,
       // Real measured size (no compression-ratio estimate).
       tokens: outTokens > 0 ? outTokens : ContextEstimator.estimateTokens(content),
+      inputTokens: inTokens,
     );
+  }
+
+  /// Render the reference context as its own message body: header + one block per
+  /// carried summary, each block labelled with the sequence range it covers (so the
+  /// model can judge whether that reference is really "before" the batch).
+  static String _referenceBlock(List<SummaryReference> reference) {
+    final buf = StringBuffer()..writeln(kReferenceContextHeader);
+    for (final r in reference) {
+      buf.writeln('[第 ${r.coveredMinSeq}..${r.coveredMaxSeq} 段摘要（层级 ${r.level}）]');
+      buf.writeln(r.text);
+    }
+    return buf.toString().trimRight();
   }
 
   /// Render a message's content for the summarizer (plain text transcript).
@@ -210,6 +287,14 @@ class FakeSummaryProvider implements SummaryProvider {
   /// Records the folded span passed in (for assertions).
   List<Message>? lastFolded;
 
+  /// 记录**每一次** summarize 收到的参考上下文（按调用顺序），用来断言"参考真的
+  /// 从 main.dart 一路传到了 provider"—— 只测挑选函数是测不到接线的。
+  final List<List<SummaryReference>> referencesPerCall = [];
+
+  /// 最近一次 summarize 收到的参考。
+  List<SummaryReference> get lastReference =>
+      referencesPerCall.isEmpty ? const [] : referencesPerCall.last;
+
   /// Records the joined level-1 texts passed into the 2-pass summarizeText.
   String? lastSummarizeText;
 
@@ -222,8 +307,10 @@ class FakeSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarize({
     required List<Message> folded,
     required AgentTypeConfig config,
+    List<SummaryReference> reference = const [],
   }) async {
     lastFolded = List.of(folded);
+    referencesPerCall.add(List.of(reference));
     return SummaryResult(text: text, tokens: ContextEstimator.estimateTokens(text));
   }
 

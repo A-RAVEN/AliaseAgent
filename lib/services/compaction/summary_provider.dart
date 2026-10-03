@@ -1,5 +1,6 @@
 import '../../models/agent_type_config.dart';
 import '../../models/message.dart';
+import 'summary_reference.dart';
 
 /// Result of a summarization request.
 class SummaryResult {
@@ -12,22 +13,35 @@ class SummaryResult {
   /// Proxy token cost the provider reports (for budget accounting).
   final int tokens;
 
-  const SummaryResult({required this.text, required this.tokens});
+  /// The summarization call's measured INPUT token count (from the same
+  /// `/v1/messages` usage block that supplies [tokens]). Observation only: it
+  /// never decides whether a summary is valid — that is still [tokens] (the
+  /// measured output size).
+  final int inputTokens;
+
+  const SummaryResult({required this.text, required this.tokens, this.inputTokens = 0});
 }
 
 /// The execution side of the decision/execution split: buildTree decides WHICH
 /// messages fold; a SummaryProvider fills the content of the chosen leaf.
 ///
 /// The real implementation ([ModelSummaryProvider]) routes through the model
-/// gateway on the summary profile (thinking disabled, max_tokens 512-1024).
+/// gateway on the summary profile (thinking disabled; the request carries NO
+/// max_tokens, so the output length is the model/endpoint default).
 /// Tests inject a [FakeSummaryProvider] so the fold plan (which is already
 /// deterministic) can be asserted without a live model.
 abstract class SummaryProvider {
   /// Produce a summary over [folded] (oldest → newest). The summary is plain
   /// role:user text; the caller prepends the "earlier context" marker.
+  ///
+  /// [reference] is the optional reference context (at most two already-persisted
+  /// summaries that end before this batch). When it is empty the request is exactly
+  /// what it has always been; when it is non-empty the reference and the text to be
+  /// summarized travel as separate messages with their own headers.
   Future<SummaryResult> summarize({
     required List<Message> folded,
     required AgentTypeConfig config,
+    List<SummaryReference> reference = const [],
   });
 
   /// Produce a 2-pass "summary of summaries": summarize the already-produced

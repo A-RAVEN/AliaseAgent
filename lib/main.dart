@@ -17,6 +17,7 @@ import 'services/compaction/guard_anchors.dart';
 import 'services/compaction/model_summary_provider.dart';
 import 'services/compaction/seam_selector.dart';
 import 'services/compaction/summary_provider.dart';
+import 'services/compaction/summary_reference.dart';
 import 'services/config_service.dart';
 import 'services/context_snapshot.dart';
 import 'services/database_service.dart';
@@ -1891,7 +1892,8 @@ class ChatScreenState extends State<ChatScreen> {
   /// disk, D9), never sent as a summary larger than the content it replaced.
   Future<List<({CompactionSegment seg, String text, int tokens, bool isClosed})>>
       _resolveOpenLevel1(List<Message> msgs, AgentTypeConfig agentType,
-          {bool Function()? isAborted, void Function(int minSeq, int maxSeq)? onOmit}) async {
+          {bool Function()? isAborted, void Function(int minSeq, int maxSeq)? onOmit,
+          List<SummaryReference> reference = const []}) async {
     // 2.6 abort gate (split-if-invalid recursion makes its own model calls): a
     // preempted background fold must stop at the next model call rather than
     // enqueueing an un-cancelled summarize onto the single-slot _chain ahead of the
@@ -1901,7 +1903,8 @@ class ChatScreenState extends State<ChatScreen> {
     }
     if (msgs.isEmpty) return const [];
     final raw = CompactionEngine.rawTokens(msgs);
-    final summary = await _summaryProvider.summarize(folded: msgs, config: agentType);
+    final summary = await _summaryProvider.summarize(
+        folded: msgs, config: agentType, reference: reference);
     if (summary.tokens < raw) {
       return [
         (seg: CompactionSegment(messages: msgs, summary: true, level: 1),
@@ -1913,9 +1916,9 @@ class ChatScreenState extends State<ChatScreen> {
       final mid = msgs.length ~/ 2;
       return [
         ...await _resolveOpenLevel1(msgs.sublist(0, mid), agentType,
-            isAborted: isAborted, onOmit: onOmit),
+            isAborted: isAborted, onOmit: onOmit, reference: reference),
         ...await _resolveOpenLevel1(msgs.sublist(mid), agentType,
-            isAborted: isAborted, onOmit: onOmit),
+            isAborted: isAborted, onOmit: onOmit, reference: reference),
       ];
     }
     // Atomic batch that cannot compress — omit (never send a bloated summary).
@@ -1989,6 +1992,10 @@ class ChatScreenState extends State<ChatScreen> {
         .where((s) => s.summary && s.messages.isNotEmpty && s.reuse == null)
         .length;
     var summarySegNo = 0;
+    // 参考上下文的候选：这一趟开始前从库里读**一次**快照（本变更第一条决定）。
+    // 库没打开或读不到 ⇒ 空 ⇒ 整条参考路径退化成今天的行为。快照只读一次，
+    // 所以同一趟里前面几段刚压出来的摘要不会跑进后面几段的参考里。
+    final referenceCandidates = await _loadReferenceCandidates(sessionId, dbOpen);
     for (final seg in plan.segments) {
       if (isAborted?.call() ?? false) {
         throw const _BackgroundFoldCancelled('background fold aborted between segments');
@@ -2108,6 +2115,10 @@ class ChatScreenState extends State<ChatScreen> {
       // is OMITTED from the projection (data kept on disk, D9) — never send a
       // bloat- > batch summary.
       final leafEntries = await _resolveOpenLevel1(seg.messages, agentType,
+          // 参考上下文：最多两条、只取覆盖范围严格早于这一批的（挑选规则见
+          // selectSummaryReferences）。折半重压时两半用同一份参考、同一个界。
+          reference: selectSummaryReferences(
+              persisted: referenceCandidates, batchOldestSeq: minSeq ?? 0),
           isAborted: isAborted,
           // R8-c: if a STALE (dirty-reaching) span is omitted (un-compressible → not
           // re-summarized/persisted), do NOT consume the dirty watermark — else the
@@ -2469,6 +2480,31 @@ class ChatScreenState extends State<ChatScreen> {
   }
 
   /// Extract the summary text from a stored summary_json block document.
+  /// 把库里已落盘的摘要节点读成"参考上下文候选"（纯数据，本变更新增）。库没打开
+  /// 或读失败 ⇒ 空列表 ⇒ 这条路径退化成今天的行为（请求里不加参考）。读的是**快照**：
+  /// 同一趟里后面才压出来的摘要不会进前面几段的参考。
+  Future<List<SummaryReference>> _loadReferenceCandidates(
+      String sessionId, bool dbOpen) async {
+    if (!dbOpen) return const [];
+    try {
+      final nodes = await _summaryNodeRepo.queryBySession(sessionId);
+      return [
+        for (final n in nodes)
+          if (n.summaryJson != null && n.summaryJson!.isNotEmpty)
+            SummaryReference(
+              level: n.level,
+              coveredMinSeq: n.coveredMinSeq,
+              coveredMaxSeq: n.coveredMaxSeq,
+              text: _summaryTextFromJson(n.summaryJson!),
+            ),
+      ];
+    } catch (e) {
+      // 参考只是"读得懂前文"的辅助手段，读不到就按今天的方式压（绝不因此中断折叠）。
+      debugPrint('[AliasAgent] reference candidates unavailable: $e');
+      return const [];
+    }
+  }
+
   static String _summaryTextFromJson(String summaryJson) {
     try {
       final doc = jsonDecode(summaryJson) as Map<String, dynamic>;
