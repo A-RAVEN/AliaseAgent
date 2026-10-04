@@ -5,7 +5,7 @@ Give a reader who has not read the code a way to use every feature the applicati
 ## Requirements
 ### Requirement: User-facing documentation exists for every user-facing feature
 
-The repository SHALL provide, for every feature a user of the application can reach (the conversation UI, the real-context view, context compaction, the file tools, the web tools, the browser tools, configuration, and common trouble symptoms), a usage document under `Docs/user-guide/<feature>.md` written in Chinese for someone who has not read the code. Each such document SHALL cover: what the feature is, where it is used, how to operate it, the parameters or configuration it takes, what the user sees when it fails, and its known limits. No usage document SHALL describe behaviour the code does not have.
+The repository SHALL provide, for every feature a user of the application can reach (the conversation UI, the real-context view, context compaction, the file tools, the web tools, the browser tools, the command tool, configuration, and common trouble symptoms), a usage document under `Docs/user-guide/<feature>.md` written in Chinese for someone who has not read the code. Each such document SHALL cover: what the feature is, where it is used, how to operate it, the parameters or configuration it takes, what the user sees when it fails, and its known limits. No usage document SHALL describe behaviour the code does not have.
 
 #### Scenario: Every user-facing feature has a usage document
 
@@ -14,13 +14,18 @@ The repository SHALL provide, for every feature a user of the application can re
 
 #### Scenario: Tools are documented as model-invoked, not user-clicked
 
-- **WHEN** a usage document describes a tool the model calls (`read_file`, `write_file`, `edit_file`, `list_dir`, `glob_file`, `grep_file`, `get_current_time`, `web_search`, `web_fetch`, `browser_navigate`, `browser_click`, `browser_type`, `browser_snapshot`)
+- **WHEN** a usage document describes a tool the model calls (`read_file`, `write_file`, `edit_file`, `list_dir`, `glob_file`, `grep_file`, `get_current_time`, `web_search`, `web_fetch`, `browser_navigate`, `browser_click`, `browser_type`, `browser_snapshot`, `run_command`)
 - **THEN** the document SHALL state, before describing the tool, that the model invokes it on the user's behalf and the user does not call it directly
 
 #### Scenario: The file tools' workspace boundary is stated
 
 - **WHEN** a usage document describes a file tool
 - **THEN** it SHALL state that paths are resolved inside the workspace, that the workspace is the user's home directory, and that a path outside it is refused with an error rather than silently accepted
+
+#### Scenario: The command tool's real effects are stated
+
+- **WHEN** a usage document describes `run_command`
+- **THEN** it SHALL state that the command really runs on this machine with the user's own permissions, that it can modify files under the workspace, that it is not sandboxed, and that a running command cannot be approved or undone after the fact
 
 ### Requirement: The README indexes the usage documents
 
@@ -37,7 +42,7 @@ Configuration keys and tool names that appear in the usage documents SHALL be ve
 
 #### Scenario: Configuration keys exist in the parsing path
 
-- **WHEN** a usage document mentions a key of `~/.aliasagent/config.json` (for example `api_key`, `base_url`, `provider`, `model`, `system_prompt`, `tools`, `max_context_tokens`, `thinking_effort`, `standing_requirements`, `compaction_threshold_percent`)
+- **WHEN** a usage document mentions a key of `~/.aliasagent/config.json` (for example `api_key`, `base_url`, `provider`, `model`, `system_prompt`, `tools`, `max_context_tokens`, `thinking_effort`, `standing_requirements`, `compaction_threshold_percent`, `command_timeout_ms`, `command_max_timeout_ms`, `command_max_output_chars`, `command_output_full_chars`)
 - **THEN** that key SHALL be found in the product code's configuration parsing path (`AgentTypeConfig` / `ProviderConfig` / `ConfigService`), and a key that cannot be found there SHALL be a failure
 
 #### Scenario: Tool names exist in the registered tool list

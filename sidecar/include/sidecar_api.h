@@ -126,6 +126,17 @@ SIDECAR_API const char* browser_click(const char* request_json);
 SIDECAR_API const char* browser_type(const char* request_json);
 SIDECAR_API const char* browser_snapshot(const char* request_json);
 
+/// Run one PowerShell command and return its exit code, stdout and stderr.
+/// 命令字符串作为 `-Command` 的单个参数交出去，外层不再套第二层解析；
+/// 输出只保留尾部，被截断时完整内容写在系统临时目录并把路径带回来。
+/// @param request_json  {"command":"...","workdir":"...","timeout_ms":N,
+///                       "max_timeout_ms":N,"max_output_chars":N,"full_output_chars":N}
+/// Returns JSON: {"ok":true,"exit_code":N,"stdout":"...","stderr":"...",
+///                "timed_out":bool,"duration_ms":N,
+///                "truncated":{"stdout":bool,"stderr":bool}, ...}
+///           or {"ok":false,"error":"..."}
+SIDECAR_API const char* run_command(const char* request_json);
+
 #ifdef __cplusplus
 }
 #endif

@@ -50,6 +50,7 @@ set(SOURCES
   src/searxng_search.cpp
   src/kimi_search.cpp
   src/browser.cpp
+  src/command_tool.cpp
 )
 
 # Shared library
@@ -97,6 +98,7 @@ add_executable(sidecar_tests
   src/searxng_search.cpp
   src/kimi_search.cpp
   src/browser.cpp
+  src/command_tool.cpp
   test/sse_parser_test.cpp
   test/tool_execution_test.cpp
   test/subprocess_test.cpp
@@ -105,6 +107,7 @@ add_executable(sidecar_tests
   test/ffi_tracing_test.cpp
   test/search_provider_test.cpp
   test/browser_test.cpp
+  test/command_tool_test.cpp
 )
 target_include_directories(sidecar_tests PRIVATE include src test "${JSON_INCLUDE_DIR}")
 target_compile_definitions(sidecar_tests PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN NOMINMAX

@@ -64,6 +64,7 @@ typedef BrowserNavigateDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef BrowserClickDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef BrowserTypeDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef BrowserSnapshotDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
+typedef RunCommandDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef WriteFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef EditFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef GlobFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
@@ -131,6 +132,11 @@ abstract class ISidecar {
   Future<String> browserClick(String requestJson);
   Future<String> browserType(String requestJson);
   Future<String> browserSnapshot(String requestJson);
+
+  // Command tool (add-command-tool) — runs a real command on this machine.
+  // 走 worker isolate（与上面的 web/browser 同一通道），所以一条跑几分钟的命令
+  // 不会把界面冻住；超时的判定仍在 sidecar 里。
+  Future<String> runCommand(String requestJson);
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +684,29 @@ class SidecarBridge implements ISidecar {
   @override
   Future<String> browserSnapshot(String requestJson) async => _browserOp(requestJson, 'browser_snapshot');
 
+  // -- command tool (add-command-tool) --
+
+  @override
+  Future<String> runCommand(String requestJson) async {
+    final receivePort = ReceivePort();
+    await Isolate.spawn(_webWorkerMain, {
+      'sendPort': receivePort.sendPort,
+      'requestJson': requestJson,
+      'workerType': 'run_command',
+    });
+    // 这里的等待时长只是"别把 isolate 永远挂着"的兜底：真正的超时判定在 sidecar
+    // 里（由它杀掉整棵进程树并返回 timed_out）。所以给得比命令自己的上限宽一截 ——
+    // 缺省上限是 10 分钟，这里留到 11 分钟，好让超时的结果由 sidecar 报出来，
+    // 而不是被这一层抢先掐断（掐断的话模型看到的是"没结果"而不是"超时了"）。
+    final result = await receivePort.first.timeout(
+      const Duration(minutes: 11),
+      onTimeout: () =>
+          '{"ok":false,"error":"命令等待超时：这一层没能等到命令结束（sidecar 侧的超时应当先到）。"}',
+    ) as String;
+    receivePort.close();
+    return result;
+  }
+
   Future<String> _browserOp(String requestJson, String workerType) async {
     final receivePort = ReceivePort();
     await Isolate.spawn(_webWorkerMain, {
@@ -694,8 +723,7 @@ class SidecarBridge implements ISidecar {
   }
 
   /// Worker isolate entry point for web_search / web_fetch (tasks 8.5, 8.8)
-  static void _webWorkerMain(Map<String, dynamic> args) {
-    final sendPort = args['sendPort'] as SendPort;
+  static void _webWorkerMain(Map<String, dynamic> args) {    final sendPort = args['sendPort'] as SendPort;
     final requestJson = args['requestJson'] as String;
     final workerType = args['workerType'] as String;
 
@@ -735,6 +763,12 @@ class SidecarBridge implements ISidecar {
             case 'browser_snapshot':
               final fn = lib.lookupFunction<SetWorkspaceNative, BrowserSnapshotDart>(
                   'browser_snapshot');
+              resultPtr = fn(ptr!);
+              break;
+            case 'run_command':
+              // 命令工具（change add-command-tool）：与上面几个一样跑在 worker
+              // isolate 里，所以界面不会被一条跑几分钟的命令冻住。
+              final fn = lib.lookupFunction<SetWorkspaceNative, RunCommandDart>('run_command');
               resultPtr = fn(ptr!);
               break;
             default:

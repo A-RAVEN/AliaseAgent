@@ -57,6 +57,10 @@ const _otherCodeNames = <String, String>{
   // 可用性探测：启动时问一次"本机浏览器能不能用"，用来决定四个浏览器工具要不要
   // 注册。模型不能调用它，它不是工具。
   'browser_available': 'lib/services/sidecar_bridge.dart',
+  // PowerShell 的换目录命令名。命令工具的说明文字里写着"pass workdir instead of
+  // using cd"（告诉模型别用 cd），用户文档讲"要不要 cd"时也会把这两个字母括起来，
+  // 所以文档一致性检查会在产品代码里逐一核到这个记号。
+  'cd': 'lib/main.dart',
 };
 
 /// 文档里"允许出现的、既不是配置键也不是工具名、但确实是代码里存在的名字"清单。

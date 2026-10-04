@@ -25,6 +25,10 @@ class FakeSidecar implements ISidecar {
   String _browserTypeResult = '{"ok":false,"error":"browser unavailable"}';
   String _browserSnapshotResult = '{"ok":false,"error":"browser unavailable"}';
 
+  // Command tool stub (add-command-tool). Default: 一条成功的空输出，用例可以覆盖。
+  String _runCommandResult = '{"ok":true,"exit_code":0,"stdout":"","stderr":"",'
+      '"timed_out":false,"duration_ms":1,"truncated":{"stdout":false,"stderr":false}}';
+
   // File edit stubs
   String _writeFileResult = '{"ok":true,"bytes_written":0,"created":true}';
   String _editFileResult = '{"ok":true,"replacements":1}';
@@ -40,6 +44,7 @@ class FakeSidecar implements ISidecar {
   void stubBrowserClick(String json) { _browserClickResult = json; }
   void stubBrowserType(String json) { _browserTypeResult = json; }
   void stubBrowserSnapshot(String json) { _browserSnapshotResult = json; }
+  void stubRunCommand(String json) { _runCommandResult = json; }
   void stubWriteFile(String json) { _writeFileResult = json; }
   void stubEditFile(String json) { _editFileResult = json; }
   void stubGlobFile(String json) { _globFileResult = json; }
@@ -223,6 +228,15 @@ class FakeSidecar implements ISidecar {
 
   @override
   Future<String> browserSnapshot(String requestJson) async => _browserSnapshotResult;
+
+  /// 命令工具：返回用例设定的结果，并把最后一次请求记下来（用例可以核对
+  /// "组装进请求的四个配置值"到底传了什么）。
+  String? lastRunCommandRequest;
+  @override
+  Future<String> runCommand(String requestJson) async {
+    lastRunCommandRequest = requestJson;
+    return _runCommandResult;
+  }
 
   @override
   String writeFile(String requestJson) => _writeFileResult;

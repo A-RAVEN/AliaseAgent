@@ -562,6 +562,44 @@ class ChatScreenState extends State<ChatScreen> {
           'required': ['pattern'],
         },
       },
+      // Command tool (add-command-tool): 无条件可用（与 read_file / grep_file 一样，
+      // 不挂在搜索服务或浏览器栈的可用性判断下）。命令**真的在本机执行** —— 用
+      // 用户自己的权限跑，能改动工作区里的文件，没有沙箱；说明文字里必须写明这一点。
+      'run_command': const {
+        'name': 'run_command',
+        'description': 'Run one PowerShell command on this machine and get its '
+            'exit code, stdout and stderr. The command really runs with the '
+            "user's own permissions and can modify files under the workspace; "
+            'there is no sandbox and it cannot be approved or undone after the '
+            'fact. Dialect is PowerShell: use native paths (C:\\...) and read '
+            'environment variables with \$env:NAME. Each call is a fresh '
+            'process — pass workdir instead of using cd. A non-zero exit code '
+            'is NOT a tool failure: it is reported in the result so you can read '
+            'it. Long output is truncated to its tail and the full output is '
+            'written to a temp file whose path is reported.',
+        'input_schema': {
+          'type': 'object',
+          'properties': {
+            'command': {
+              'type': 'string',
+              'description': 'The PowerShell command to run.',
+            },
+            'workdir': {
+              'type': 'string',
+              'description': 'Working directory for this command. Defaults to the '
+                  'workspace; a relative path is resolved against it. A path '
+                  'outside the workspace is refused.',
+            },
+            'timeout_ms': {
+              'type': 'integer',
+              'minimum': 1,
+              'description': 'Timeout in milliseconds for this command. Defaults '
+                  'to 120000 (2 minutes) and is capped at 600000 (10 minutes).',
+            },
+          },
+          'required': ['command'],
+        },
+      },
     };
 
     // Assign the base tool set SYNCHRONOUSLY before the browser-availability await
@@ -2775,6 +2813,23 @@ class ChatScreenState extends State<ChatScreen> {
         }));
       case 'browser_snapshot':
         resultJson = await _sidecar.browserSnapshot(jsonEncode({}));
+      case 'run_command':
+        // 命令工具（add-command-tool）：四个配置值随每次调用一起传到执行侧，
+        // 执行侧不读配置文件（design 决策 7）。缺省值在这里补一份，与 C++ 侧一致。
+        final cmdCfg = registry.lookup('general');
+        final request = <String, dynamic>{
+          'command': input['command'] ?? '',
+        };
+        if (input['workdir'] is String &&
+            (input['workdir'] as String).isNotEmpty) {
+          request['workdir'] = input['workdir'];
+        }
+        request['timeout_ms'] =
+            (input['timeout_ms'] as int?) ?? cmdCfg?.commandTimeoutMs ?? 120000;
+        request['max_timeout_ms'] = cmdCfg?.commandMaxTimeoutMs ?? 600000;
+        request['max_output_chars'] = cmdCfg?.commandMaxOutputChars ?? 8000;
+        request['full_output_chars'] = cmdCfg?.commandOutputFullChars ?? 2000000;
+        resultJson = await _sidecar.runCommand(jsonEncode(request));
       case 'get_current_time':
         final now = DateTime.now();
         final dt = now.toIso8601String();
@@ -2819,6 +2874,37 @@ class ChatScreenState extends State<ChatScreen> {
         parsed['content'] = sb.toString().trim().isEmpty
             ? '(no page text captured)'
             : sb.toString().trim();
+      } else if (name == 'run_command') {
+        // 模型看到的是"正文 + 可选的 stderr + 状态标记"，不是原始 JSON。
+        // 顺序有讲究：截断说明与全文路径必须留在结果里（它们可能紧跟在被截断的
+        // 尾部之后），而整段结果要落在 kToolResultElisionThreshold 之内 —— 工具
+        // 侧的上限取 8000 就是为了这件事，见 agent_type_config.dart 的注释。
+        final sb = StringBuffer();
+        final outText = (parsed['stdout'] as String?) ?? '';
+        final errText = (parsed['stderr'] as String?) ?? '';
+        if (outText.trim().isEmpty && errText.trim().isEmpty) {
+          sb.writeln('(no output)');
+        } else {
+          if (outText.isNotEmpty) sb.write(outText.endsWith('\n') ? outText : '$outText\n');
+          if (errText.isNotEmpty) {
+            sb.writeln('[stderr]');
+            sb.write(errText.endsWith('\n') ? errText : '$errText\n');
+          }
+        }
+        final paths = parsed['full_output_paths'];
+        if (paths is Map) {
+          for (final entry in paths.entries) {
+            sb.writeln('[output truncated; full output: ${entry.value}]');
+          }
+        }
+        if (parsed['timed_out'] == true) {
+          sb.writeln('[timed out after ${(parsed['duration_ms'] ?? 0)}ms]');
+        }
+        final exitCode = parsed['exit_code'];
+        if (exitCode is int && exitCode != 0) {
+          sb.writeln('[exit code: $exitCode]');
+        }
+        parsed['content'] = sb.toString().trimRight();
       } else if (name == 'write_file') {
         final bytes = parsed['bytes_written'] as int? ?? 0;
         final created = parsed['created'] as bool? ?? false;
