@@ -17,11 +17,20 @@ class ChatArea extends StatefulWidget {
   /// 它只表示"压缩正在做"，与 [isStreaming] 是两件事：没触发压缩的发送不会让它亮。
   final CompactionStatus compactionStatus;
 
+  /// 工具清单是否已经装好（含按可用性动态加入的 `web_search` / `web_fetch` / 浏览器
+  /// 四件套 / `run_command`）。**缺省 true**，保证既有用例与既有调用点的行为不变。
+  ///
+  /// 为什么需要它：界面启动后有一小段"动态工具仍在探测"的窗口，那期间发出的请求里
+  /// 工具清单是**残缺的**（本地那 8 个在 await 之前就装好了，缺的是动态那批），模型
+  /// 因此没有搜索工具可用 —— 真机实测过一整轮空转。未就绪时这里禁用发送并给出文案。
+  final bool toolsReady;
+
   const ChatArea({
     super.key,
     this.items = const [],
     this.isStreaming = false,
     this.compactionStatus = CompactionStatus.idle,
+    this.toolsReady = true,
     required this.onSendMessage,
   });
 
@@ -64,6 +73,8 @@ class _ChatAreaState extends State<ChatArea> {
   }
 
   void _submit() {
+    // 工具清单没装好就不发：那一轮请求会带着残缺的工具清单出去，模型白白空转一轮。
+    if (!widget.toolsReady) return;
     final text = _inputCtrl.text;
     if (text.trim().isEmpty) return;
     widget.onSendMessage(text);
@@ -136,6 +147,7 @@ class _ChatAreaState extends State<ChatArea> {
         _InputBar(
           controller: _inputCtrl,
           onSubmit: _submit,
+          toolsReady: widget.toolsReady,
         ),
       ],
     );
@@ -146,9 +158,13 @@ class _InputBar extends StatefulWidget {
   final TextEditingController controller;
   final VoidCallback onSubmit;
 
+  /// 工具清单是否已就绪（见 [ChatArea.toolsReady]）。未就绪时发送按钮禁用。
+  final bool toolsReady;
+
   const _InputBar({
     required this.controller,
     required this.onSubmit,
+    this.toolsReady = true,
   });
 
   @override
@@ -206,9 +222,10 @@ class _InputBarState extends State<_InputBar> {
           ),
           const SizedBox(width: 6),
           IconButton.filled(
-            onPressed: widget.onSubmit,
+            // 未就绪时禁用并给出可见原因（不是静默排队 —— 排队在用户看来还是"发出去了"）。
+            onPressed: widget.toolsReady ? widget.onSubmit : null,
             icon: const Icon(Icons.send, size: 20),
-            tooltip: 'Send',
+            tooltip: widget.toolsReady ? 'Send' : '正在准备工具…',
           ),
         ],
       ),

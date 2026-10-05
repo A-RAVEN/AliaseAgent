@@ -841,8 +841,12 @@ TEST_CASE("read_file: truncation notice for 2000+ line file", "[read_file]") {
     REQUIRE(j["truncated"] == true);
     REQUIRE(j.contains("notice"));
     std::string notice = j["notice"];
-    REQUIRE(notice.find("2050") != std::string::npos);
+    // fix-silent-truncation 8.2：续读说明要给成"能直接照抄"的 —— 总行数、本次区间、
+    // 以及下一段该用的 offset。只写"Use offset/limit to read more."不够。
+    REQUIRE(notice.find("2050") != std::string::npos);              // 总行数
+    REQUIRE(notice.find("1-2000") != std::string::npos);            // 本次区间
     REQUIRE(notice.find("offset") != std::string::npos);
+    REQUIRE(notice.find("2001") != std::string::npos);              // 可照抄的下一段起点
 
     // Read remaining lines with offset
     std::string result2 = tools::read_file("{\"path\":\"big.txt\",\"offset\":2001,\"limit\":100}");

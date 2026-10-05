@@ -2,6 +2,7 @@
 #include "zhipuai_search.h"
 #include "searxng_search.h"
 #include "kimi_search.h"
+#include "deepseek_search.h"
 #include "logger.h"
 #include "tools.h"
 #include <nlohmann/json.hpp>
@@ -47,6 +48,102 @@ public:
     return {{}, {"Provider not configured", false}};
   }
 };
+
+// ============================================================================
+// DeepSeek 后端的凭据闸门（tasks.md 3.2，设计决策 D2）
+//
+// 这是本变更的安全边界：**绝不把非 DeepSeek 的密钥发出去**。
+//   ① `search.deepseek.api_key` / `.base_url`：写了就用写的；
+//   ② 仅当"会话模型当前 provider 的地址"确实指向 DeepSeek（含 api.deepseek.com）
+//      **且** `search.deepseek` 段存在（`g_deepseek_section_seen`）时，才允许回落
+//      复用它那把密钥与地址；
+//   ③ 地址不是 DeepSeek 时该后端直接不可用 —— 不回落、**不发任何请求**；
+//   ④ `search` 段里没有 `deepseek` 项且不能回落时不出现。
+//
+// 传给 `ensure_search_infra` 的配置 JSON 里，这两处来源的字段名是：
+//   `search.deepseek.{api_key,base_url,model}`  —— 用户自己写的
+//   `session_model.{base_url,api_key}`          —— Dart 侧把会话模型当前 provider
+//                                                  的地址与密钥一起交下来
+// 没有 `session_model` 这一项时按"没有可回落的来源"处理（老配置、单测都走这条）。
+// ============================================================================
+
+/// `search.deepseek` 段是否出现过、`session_model` 有没有交出可回落的地址与密钥。
+static bool g_deepseek_section_seen = false;
+static bool g_session_model_present = false;
+
+/// 判定某个 provider 该不该出现在可用清单里。**抽成函数就是为了能被单测直接调**
+/// （4.3 的安全边界用例断言"非 DeepSeek 地址 → 不可用"）。
+bool deepseek_provider_is_available(bool section_seen,
+                                    bool session_model_present,
+                                    const std::string& own_api_key,
+                                    const std::string& session_api_key,
+                                    const std::string& own_base_url,
+                                    const std::string& endpoint) {
+  (void)session_model_present;  // 回落只在 session_api_key 里已经体现
+  // ① 自己**同时写了**密钥与地址：用这一份，不碰会话模型的任何东西，因此不存在
+  //    "把别家密钥发出去"的问题；地址写错要让用户看得见（规范要求失败说明带实际
+  //    地址），所以这一条要在地址判定**之前**。
+  if (!own_api_key.empty() && !own_base_url.empty()) return true;
+  if (!deepseek_address_is_deepseek(endpoint)) {
+    // ③ 到这里说明要动用的要么是会话模型那把密钥、要么是它的地址 —— 地址不是
+    //    DeepSeek 就绝不能碰：不回落、不发请求。
+    return false;
+  }
+  if (!own_api_key.empty()) return true;   // ① 自己写了密钥，地址来自会话模型
+  if (!section_seen) return false;         // ④ 没写这段就没有回落的依据
+  return !session_api_key.empty();         // ② 地址确实是 DeepSeek 才允许回落
+}
+
+/// 取出"会话模型当前 provider 的地址与密钥"（Dart 侧组装，字段名
+/// `session_model.{base_url,api_key}`）。**这个函数刻意留在读配置那个函数之外**：
+/// `test/unit/user_docs_test.dart` 会从读配置那一段的源码里抽配置键名，并要求每个
+/// 键都出现在用户文档里；`session_model` 是界面自己塞进去的内部字段，不该让用户
+/// 去写，所以不放进那个扫描范围。（连带一条纪律：这一带任何注释里都不要写出那个
+/// 函数的**连续函数名**，否则扫描起点会被顶到注释上，把这里重新圈进去。）
+static void read_session_model_credentials(const json& cfg,
+                                           std::string& session_key,
+                                           std::string& session_base) {
+  if (cfg.contains("session_model") && cfg["session_model"].is_object()) {
+    const auto& sm = cfg["session_model"];
+    if (sm.contains("api_key") && sm["api_key"].is_string()) {
+      session_key = sm["api_key"].get<std::string>();
+    }
+    if (sm.contains("base_url") && sm["base_url"].is_string()) {
+      session_base = sm["base_url"].get<std::string>();
+    }
+    g_session_model_present = (!session_key.empty() || !session_base.empty());
+  }
+}
+
+/// 按闸门判定配置好 DeepSeek provider 实例，并按需清掉不该留着的凭据。
+static void apply_deepseek_gate(const std::string& own_key,
+                                const std::string& own_base,
+                                const std::string& session_key,
+                                const std::string& session_base) {
+  // 地址：自己写了用自己的，否则（写了这一段才）回落会话模型的地址
+  std::string base = own_base;
+  if (base.empty() && g_deepseek_section_seen) base = session_base;
+
+  auto provider = get_deepseek_provider();
+  provider->set_section_present(g_deepseek_section_seen);
+  provider->set_base_url(base);
+  provider->set_api_key(own_key.empty() ? (g_deepseek_section_seen ? session_key : std::string())
+                                        : own_key);
+
+  const bool available = deepseek_provider_is_available(
+    g_deepseek_section_seen, g_session_model_present, own_key, session_key,
+    own_base, base);
+  provider->set_gate_passed(available);
+  LOG_INFO(std::string("DeepSeek 搜索后端：") + (available ? "可用" : "不可用") +
+           "（search.deepseek 段" + (g_deepseek_section_seen ? "有" : "无") +
+           "、会话模型凭据" + (g_session_model_present ? "有" : "无") +
+           "、地址" + (base.empty() ? "未配置" : base) + "）");
+  // 不可用时清掉实例上的凭据：即便将来某条路径绕过 is_configured()，也没有密钥可发。
+  // 注意只清"密钥"：自己写的地址要留着，失败说明里要报出来（规范要求）。
+  if (!available) {
+    provider->set_api_key(std::string());
+  }
+}
 
 // ============================================================================
 // Provider registry (task 1.4)
@@ -134,6 +231,35 @@ std::string ensure_search_infra_impl(const std::string& search_config_json) {
       auto searxng = get_searxng_provider();
       searxng->set_base_url(g_searxng_base_url);
 
+      // DeepSeek 后端（tasks.md 3.1 / 3.2）：带凭据闸门。
+      //
+      // 键名逐处写成字面量（`cfg.contains("deepseek")` / `cfg["deepseek"]`），不用
+      // 局部引用 —— `test/unit/user_docs_test.dart` 就是从这里抽配置键名的，只有
+      // 字面写出来，"代码解析了这个键 → 用户文档里必须写到它"这条反向检查才认。
+      std::string deepseek_own_key;
+      std::string deepseek_own_base;
+      if (cfg.contains("deepseek") && cfg["deepseek"].is_object()) {
+        g_deepseek_section_seen = true;
+        if (cfg["deepseek"].contains("api_key") &&
+            cfg["deepseek"]["api_key"].is_string()) {
+          deepseek_own_key = cfg["deepseek"]["api_key"].get<std::string>();
+        }
+        if (cfg["deepseek"].contains("base_url") &&
+            cfg["deepseek"]["base_url"].is_string()) {
+          deepseek_own_base = cfg["deepseek"]["base_url"].get<std::string>();
+        }
+        if (cfg["deepseek"].contains("model") &&
+            cfg["deepseek"]["model"].is_string()) {
+          const std::string model = cfg["deepseek"]["model"].get<std::string>();
+          if (!model.empty()) get_deepseek_provider()->set_model(model);
+        }
+      }
+      std::string deepseek_session_key;
+      std::string deepseek_session_base;
+      read_session_model_credentials(cfg, deepseek_session_key, deepseek_session_base);
+      apply_deepseek_gate(deepseek_own_key, deepseek_own_base,
+                          deepseek_session_key, deepseek_session_base);
+
       // One-time SearXNG TCP liveness check (2s timeout)
       // Skip the check for now — it blocks the main thread.
       // SearXNG will be marked unavailable until a background check completes.
@@ -208,6 +334,16 @@ std::vector<std::shared_ptr<ISearchProvider>> get_configured_providers() {
     auto kimi = get_kimi_provider();
     if (kimi->is_configured()) {
       result.push_back(kimi);
+    }
+  }
+
+  // DeepSeek（add-deepseek-web-search）—— 凭据闸门已在 register_deepseek_from_config
+  // 里判定过：地址不指向 DeepSeek 时实例上的密钥与地址都已被清空，这里只会拿到
+  // is_configured() 为假，不会把任何密钥发出去。
+  {
+    auto deepseek = get_deepseek_provider();
+    if (deepseek->is_configured()) {
+      result.push_back(deepseek);
     }
   }
 

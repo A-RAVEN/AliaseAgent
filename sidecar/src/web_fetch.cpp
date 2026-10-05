@@ -45,6 +45,27 @@ static const long FETCH_CONNECT_TIMEOUT_SEC = 15L;
 // Max redirect hops
 static const long MAX_REDIRECTS = 5L;
 
+/// 响应体的上限（与 `CURLOPT_MAXFILESIZE` 用的是同一个数）。它是**内存保护**，不是
+/// 内容预算：越界时按 `fix-silent-truncation` 的规矩要写明"上限多少、服务端声明多大、
+/// 正文没被读取、抓的是哪个网址"。
+static const long long kMaxResponseBytes = 10LL * 1024 * 1024;
+
+long long web_fetch_max_response_bytes() { return kMaxResponseBytes; }
+
+std::string describe_fetch_size_rejection(int curl_result, long long declared_bytes,
+                                          const std::string& url) {
+  if (curl_result == CURLE_TOO_MANY_REDIRECTS) {
+    return "Fetch failed: 跳转次数超过上限（" + std::to_string(MAX_REDIRECTS) +
+           " 次），本次抓取的是 " + url;
+  }
+  if (curl_result != CURLE_FILESIZE_EXCEEDED) return std::string();
+  return "Fetch failed: 响应体超过上限 " + std::to_string(kMaxResponseBytes) +
+         " 字节，服务端声明 " +
+         (declared_bytes >= 0 ? std::to_string(declared_bytes) + " 字节"
+                              : std::string("未知大小")) +
+         "，正文未被读取；本次抓取的是 " + url;
+}
+
 // Subprocess timeout (30s for crawl4ai — browser startup + render)
 static const long SUBPROCESS_TIMEOUT_SEC = 30L;
 
@@ -690,7 +711,7 @@ std::string web_fetch_impl(const std::string& request_json) {
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-    curl_easy_setopt(curl, CURLOPT_MAXFILESIZE, 10L * 1024 * 1024);  // 10MB — reject oversized responses pre-transfer
+    curl_easy_setopt(curl, CURLOPT_MAXFILESIZE, kMaxResponseBytes);  // 越界时给出写明上限与网址的专门说明（见下面 CURLE_FILESIZE_EXCEEDED 那一支）
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "AliasAgent/1.0 WebFetcher");
     curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, opensocket_callback);
@@ -703,6 +724,17 @@ std::string web_fetch_impl(const std::string& request_json) {
     // Check for errors (task 3.6)
     if (res != CURLE_OK) {
       std::string curl_err = curl_easy_strerror(res);
+      // 体积被拒 / 跳转过多：由抽出来的函数拼说明（见 web_fetch.h 的声明）。
+      // 以前这一支落到末尾那句通用的 `Fetch failed: <libcurl 英文原文>` —— 既没有上限
+      // 数字、也没有网址，用户与模型都没法判断是"这个页面太大"还是"网络坏了"。
+      if (res == CURLE_FILESIZE_EXCEEDED || res == CURLE_TOO_MANY_REDIRECTS) {
+        long long declared = -1;
+        curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &declared);
+        curl_easy_cleanup(curl);
+        const std::string msg = describe_fetch_size_rejection(res, declared, url);
+        LOG_WARN(msg);
+        return std::string("{\"ok\":false,\"error\":\"") + tools::json_escape(msg) + "\"}";
+      }
       curl_easy_cleanup(curl);
 
       // Determine error type

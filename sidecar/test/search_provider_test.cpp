@@ -402,6 +402,36 @@ TEST_CASE("web_fetch: whitespace compression", "[web_fetch]") {
 }
 
 // ============================================================================
+// fix-silent-truncation 5.4 — 体积被拒时的说明要指名上限与网址
+// ============================================================================
+
+TEST_CASE("web_fetch: 体积被拒时说明含上限、声明体积与网址", "[web_fetch][size]") {
+  const std::string url = "https://example.com/huge";
+  const std::string msg =
+      describe_fetch_size_rejection(CURLE_FILESIZE_EXCEEDED, 50LL * 1024 * 1024, url);
+
+  INFO("说明 = " << msg);
+  REQUIRE_FALSE(msg.empty());
+  REQUIRE(msg.find(std::to_string(web_fetch_max_response_bytes())) != std::string::npos);
+  REQUIRE(msg.find(std::to_string(50LL * 1024 * 1024)) != std::string::npos);
+  REQUIRE(msg.find(url) != std::string::npos);
+  REQUIRE(msg.find("未被读取") != std::string::npos);
+}
+
+TEST_CASE("web_fetch: 读不到声明体积时写未知，不许编数字", "[web_fetch][size]") {
+  const std::string msg =
+      describe_fetch_size_rejection(CURLE_FILESIZE_EXCEEDED, -1, "https://example.com/x");
+  INFO("说明 = " << msg);
+  REQUIRE(msg.find("未知大小") != std::string::npos);
+  REQUIRE(msg.find("example.com/x") != std::string::npos);
+}
+
+TEST_CASE("web_fetch: 其它错误不归这一支（由调用方走通用分支）", "[web_fetch][size]") {
+  REQUIRE(describe_fetch_size_rejection(CURLE_OPERATION_TIMEDOUT, 1024, "https://e.com").empty());
+  REQUIRE(describe_fetch_size_rejection(CURLE_OK, 1024, "https://e.com").empty());
+}
+
+// ============================================================================
 // 9.5a — Content-Type mime type extraction + charset handling
 // ============================================================================
 

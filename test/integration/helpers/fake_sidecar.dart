@@ -39,6 +39,21 @@ class FakeSidecar implements ISidecar {
   void stubWebSearch(String json) { _webSearchResult = json; }
   void stubWebFetch(String json) { _webFetchResult = json; }
   void stubEnsureSearchInfra(String json) { _ensureSearchInfraResult = json; }
+
+  /// 最近一次 `ensureSearchInfra` 收到的配置原文（add-deepseek-web-search 任务 3.4）：
+  /// 用来断言"会话模型的地址与密钥真的被一起交下去了"。
+  String? lastEnsureSearchInfraConfig;
+
+  /// 非空时 `ensureSearchInfra()` 会等它完成才返回 —— 用它把"动态工具还没装好"的
+  /// 窗口摆出来（fix-silent-truncation 6.4）。这个窗口比 `browserAvailableGate` 更靠前：
+  /// `_initSearchAndTools()` 先把 8 个本地工具同步装好，然后 await 搜索初始化，
+  /// 那时 `_toolDefs` **恰好**就是"只有本地工具"的状态。
+  Completer<void>? ensureSearchInfraGate;
+
+  /// 非空时 `browserAvailable()` 会等它完成才返回 —— 用来在窗口用例里制造
+  /// "动态工具还没探完"的那段窗口（fix-silent-truncation 6.3）。用例自己
+  /// `complete()` 之后记得清空。
+  Completer<void>? browserAvailableGate;
   void stubBrowserAvailable(String json) { _browserAvailableResult = json; }
   void stubBrowserNavigate(String json) { _browserNavigateResult = json; }
   void stubBrowserClick(String json) { _browserClickResult = json; }
@@ -203,7 +218,10 @@ class FakeSidecar implements ISidecar {
       _listDirResult ?? '{"ok":true,"content":"[]"}';
 
   @override
-  String ensureSearchInfra(String configJson) => _ensureSearchInfraResult;
+  String ensureSearchInfra(String configJson) {
+    lastEnsureSearchInfraConfig = configJson;
+    return _ensureSearchInfraResult;
+  }
 
   @override
   String getSearchProviders() => _searchProvidersResult;
@@ -215,7 +233,12 @@ class FakeSidecar implements ISidecar {
   Future<String> webFetch(String requestJson) async => _webFetchResult;
 
   @override
-  Future<String> browserAvailable() async => _browserAvailableResult;
+  Future<String> browserAvailable() async {
+    // 需要"探测还没回来"这个窗口时，用例先设一个 Completer（fix-silent-truncation 6.3）。
+    final gate = browserAvailableGate;
+    if (gate != null) await gate.future;
+    return _browserAvailableResult;
+  }
 
   @override
   Future<String> browserNavigate(String requestJson) async => _browserNavigateResult;

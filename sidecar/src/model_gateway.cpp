@@ -18,6 +18,50 @@
 using json = nlohmann::json;
 
 // ---------------------------------------------------------------------------
+// API 报错原因（fix-silent-truncation 8.6）
+// ---------------------------------------------------------------------------
+
+std::string describe_api_error_reason(const std::string& raw_body) {
+  if (raw_body.empty()) return std::string();
+  bool parsed_as_json = false;
+  try {
+    const auto j = json::parse(raw_body);
+    parsed_as_json = true;
+    if (j.is_object()) {
+      if (j.contains("error") && j["error"].is_object() &&
+          j["error"].contains("message") && j["error"]["message"].is_string()) {
+        return j["error"]["message"].get<std::string>();
+      }
+      if (j.contains("error") && j["error"].is_string()) {
+        return j["error"].get<std::string>();
+      }
+      if (j.contains("message") && j["message"].is_string()) {
+        return j["message"].get<std::string>();
+      }
+    }
+  } catch (...) {
+    // 不是 JSON：走下面的"原样带一段"
+  }
+  // 能解析成 JSON 但结构里没有原因 ⇒ **返回空**：那种正文（例如 `{"error":{}}`）
+  // 当成"原因"带出去只会让人误以为服务端说了什么。由调用方写成"没有更多信息"。
+  if (parsed_as_json) return std::string();
+  // 不是 JSON：把正文前面一段原样带出去（去掉换行，免得把日志与界面撑成多行）。
+  // 上限 2048 字节，与原来写日志时的取法一致。
+  std::string preview = raw_body.size() > 2048 ? raw_body.substr(0, 2048) + "..." : raw_body;
+  std::string flat;
+  flat.reserve(preview.size());
+  for (char c : preview) {
+    if (c == '\n' || c == '\r' || c == '\t') {
+      if (!flat.empty() && flat.back() != ' ') flat += ' ';
+    } else {
+      flat += c;
+    }
+  }
+  while (!flat.empty() && flat.back() == ' ') flat.pop_back();
+  return flat;
+}
+
+// ---------------------------------------------------------------------------
 // FFI ring buffer — records recent C→Dart callback invocations
 // ---------------------------------------------------------------------------
 
@@ -749,27 +793,29 @@ int ModelGateway::execute(
     }
   } else if (http_code == 401) {
     LOG_ERR("Authentication failed (HTTP 401)");
-    if (!impl_->raw_body.empty()) {
-      std::string preview = impl_->raw_body.size() > 2048
-          ? impl_->raw_body.substr(0, 2048) + "..."
-          : impl_->raw_body;
-      LOG_ERR("API error body: " + preview);
-    }
+    const std::string reason = describe_api_error_reason(impl_->raw_body);
+    // 服务端给的原因要**交给模型与用户**，不能只写日志（fix-silent-truncation 8.6）：
+    // 401 可能是"key 不对"，也可能是"余额不足"之类，只看一句固定话术判断不了。
+    const std::string err = reason.empty()
+        ? std::string("Authentication failed — invalid API key（服务端没有给出更多信息）")
+        : "Authentication failed — invalid API key（服务端说：" + reason + "）";
+    LOG_ERR("API error reason: " + (reason.empty() ? std::string("(none)") : reason));
     // Unconditional error done — never masked by a stream's message_stop
     // (stream done is suppressed when http_status_ok() is false).
     if (!impl_->done_dispatched) {
       impl_->done_dispatched = true;
-      dispatch_done(impl_, -1, "Authentication failed — invalid API key", "");
+      dispatch_done(impl_, -1, err, "");
     }
   } else if (http_code >= 400) {
     std::string err = "API returned HTTP " + std::to_string(http_code);
     LOG_ERR(err);
-    if (!impl_->raw_body.empty()) {
-      std::string preview = impl_->raw_body.size() > 2048
-          ? impl_->raw_body.substr(0, 2048) + "..."
-          : impl_->raw_body;
-      LOG_ERR("API error body: " + preview);
+    const std::string reason = describe_api_error_reason(impl_->raw_body);
+    if (!reason.empty()) {
+      err += " — " + reason;
+    } else if (!impl_->raw_body.empty()) {
+      err += "（服务端没有给出可读原因）";
     }
+    LOG_ERR("API error reason: " + (reason.empty() ? std::string("(none)") : reason));
     // Same suppression as 401: HTTP errors always surface as errors.
     if (!impl_->done_dispatched) {
       impl_->done_dispatched = true;

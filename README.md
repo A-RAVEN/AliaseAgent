@@ -64,7 +64,7 @@ Windows 上还有仓库根的 `run.bat`：一键 `flutter build windows --debug`
 | [真实上下文视图](Docs/user-guide/real-context-view.md) | 看模型这一步**实际**收到了什么（系统提示词、工具、每条消息） |
 | [上下文压缩](Docs/user-guide/context-compaction.md) | 对话变长后什么时候压、怎么认出来、阈值怎么调 |
 | [文件工具](Docs/user-guide/tools-file.md) | 读写/编辑/查找文件这六个工具、工作区边界、各类拒绝 |
-| [联网工具](Docs/user-guide/tools-web.md) | 搜索、抓网页、当前时间；搜索要付费服务的 key |
+| [联网工具](Docs/user-guide/tools-web.md) | 搜索、抓网页、当前时间；搜索可以走 DeepSeek 自己的（不用另买 key），也可以配付费服务 |
 | [浏览器工具](Docs/user-guide/tools-browser.md) | 开真实浏览器窗口操作网页；下载与权限请求会被拦 |
 | [命令行工具](Docs/user-guide/tools-command.md) | 在你自己的电脑上真的执行 PowerShell 命令；没有沙箱、不能事后撤销 |
 | [常见现象与排查](Docs/user-guide/troubleshooting.md) | 看到某个报错是什么意思、下一步做什么、日志在哪 |

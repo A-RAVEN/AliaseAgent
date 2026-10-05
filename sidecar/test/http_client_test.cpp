@@ -282,6 +282,77 @@ TEST_CASE("HTTP: 400 error body captured and logged", "[http_client]") {
 }
 
 // ============================================================================
+// fix-silent-truncation 8.7 — 4xx 的错误文本要带上服务端给的原因
+// ============================================================================
+TEST_CASE("HTTP: 400 的错误文本带上服务端原因", "[http_client][api_error]") {
+    MockServer server;
+    // 正文里带 error.message —— 服务端明明说了原因
+    server.set_response_body("{\"error\":{\"message\":\"insufficient balance\"}}");
+    server.start(fixture("text_delta.txt"), 400);
+    server.wait_ready();
+
+    ModelGateway gw;
+    gw.set_timeout(5);
+
+    s_done_called = false;
+    s_done_code = 0;
+    s_done_err = "";
+
+    int rid = gw.execute(
+        "sk-key", server.base_url().c_str(), "claude-sonnet-4-6",
+        "", VALID_MSG, "",
+        "", "", nullptr, nullptr, nullptr, s_done_capture
+    );
+    server.join();
+
+    INFO("交给上层的错误文本 = " << s_done_err);
+    REQUIRE(s_done_called);
+    REQUIRE(s_done_code == -1);
+    REQUIRE(s_done_err.find("HTTP 400") != std::string::npos);            // 状态码还在
+    REQUIRE(s_done_err.find("insufficient balance") != std::string::npos); // 原因也带上了
+    REQUIRE(rid > 0);
+}
+
+TEST_CASE("HTTP: 401 的错误文本也带服务端原因", "[http_client][api_error]") {
+    MockServer server;
+    server.set_response_body("{\"error\":{\"message\":\"Invalid API key provided\"}}");
+    server.start(fixture("text_delta.txt"), 401);
+    server.wait_ready();
+
+    ModelGateway gw;
+    gw.set_timeout(5);
+
+    s_done_called = false;
+    s_done_code = 0;
+    s_done_err = "";
+
+    gw.execute(
+        "sk-key", server.base_url().c_str(), "claude-sonnet-4-6",
+        "", VALID_MSG, "",
+        "", "", nullptr, nullptr, nullptr, s_done_capture
+    );
+    server.join();
+
+    INFO("交给上层的错误文本 = " << s_done_err);
+    REQUIRE(s_done_called);
+    REQUIRE(s_done_code == -1);
+    REQUIRE(s_done_err.find("Authentication failed") != std::string::npos);
+    REQUIRE(s_done_err.find("Invalid API key provided") != std::string::npos);
+}
+
+TEST_CASE("api_error: 读不出原因时不编（纯函数）", "[http_client][api_error]") {
+    REQUIRE(describe_api_error_reason("").empty());
+    REQUIRE(describe_api_error_reason("{\"error\":{}}").empty());
+    // 不是 JSON：把正文原样带出去（压成一行），不编一个原因
+    const std::string plain = describe_api_error_reason("Bad\nGateway\tTimeout");
+    INFO("非 JSON 正文的读法 = " << plain);
+    REQUIRE(plain.find("Bad Gateway Timeout") != std::string::npos);
+    // 结构化的原因优先
+    REQUIRE(describe_api_error_reason("{\"error\":{\"message\":\"boom\"}}") == "boom");
+    REQUIRE(describe_api_error_reason("{\"message\":\"flat boom\"}") == "flat boom");
+}
+
+// ============================================================================
 // Additional: nullptr system + nullptr tools
 // ============================================================================
 TEST_CASE("HTTP: nullptr system and tools omitted", "[http_client]") {

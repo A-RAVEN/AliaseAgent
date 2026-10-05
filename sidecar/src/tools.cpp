@@ -387,8 +387,12 @@ std::string read_file(const std::string& request_json) {
   if (truncated) {
     resp["truncated"] = true;
     std::ostringstream notice;
-    notice << "File has " << total_lines << " lines, showing 1-2000. "
-           << "Use offset/limit to read more.";
+    // 续读参数要给成**能直接照抄**的（fix-silent-truncation 8.1）：原来只写
+    // "Use offset/limit to read more."，调用方还得自己算下一段从哪行开始。
+    const int next_offset = end + 1;
+    notice << "File has " << total_lines << " lines, showing " << offset << "-" << end
+           << ". To continue reading, call read_file with {\"path\": \"<same path>\", \"offset\": "
+           << next_offset << ", \"limit\": " << limit << "}.";
     resp["notice"] = notice.str();
   }
 

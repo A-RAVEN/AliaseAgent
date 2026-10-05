@@ -58,4 +58,21 @@ struct FetchWriteCtx {
 /// Write callback for web_fetch — appends received data to body.
 size_t fetch_write_callback(char* ptr, size_t size, size_t nmemb, void* userdata);
 
+// ============================================================================
+// 体积被拒时的说明（fix-silent-truncation 5.3 / 5.4，抽出来为了能被单测直接调）
+// ============================================================================
+
+/// 响应体上限（与 `CURLOPT_MAXFILESIZE` 用同一个数）。这是**内存保护**，不是内容预算。
+long long web_fetch_max_response_bytes();
+
+/// 当 libcurl 因为体积上限（或跳转次数）中止时，拼一条给用户与模型看的说明。
+/// 说明里必须含：上限多少、服务端声明多大（读不到就写"未知大小"）、正文没被读取、
+/// 以及本次抓取的网址 —— 好让"这个页面太大"和"网络坏了"能分清。
+/// @param curl_result       libcurl 的返回码
+/// @param declared_bytes    服务端声明的体积；<0 表示读不到
+/// @param url               本次抓取的网址
+/// @return 说明字符串；不是这两种错误时返回空串（由调用方走原来的通用分支）
+std::string describe_fetch_size_rejection(int curl_result, long long declared_bytes,
+                                          const std::string& url);
+
 #endif // WEB_FETCH_H

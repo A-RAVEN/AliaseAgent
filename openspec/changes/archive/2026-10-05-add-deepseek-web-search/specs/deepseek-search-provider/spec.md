@@ -6,27 +6,49 @@
 
 ## ADDED Requirements
 
-### Requirement: 搜索后端与凭据来源
+### Requirement: 搜索后端与凭据来源（绝不把非 DeepSeek 的密钥发出去）
 
 系统 SHALL 提供一个名为 `deepseek` 的搜索后端，与既有的 `zhipuai`、`kimi` 并列，实现同一个搜索后端接口（输入：查询、深度、条数上限；输出：一组 `{标题, 网址, 正文}` 与一条错误）。
 
-它的凭据 SHALL 按下面的顺序解析：① `search.deepseek.api_key` / `search.deepseek.base_url`（若写了）；② 否则复用**会话模型当前 provider** 的密钥与地址。两处都拿不到密钥时，该后端 SHALL 报告自己不可用（不出现在可用后端清单里），SHALL NOT 报错、SHALL NOT 让搜索初始化失败。
+**凭据只允许来自两处，其它一律不用**：
 
-`search.deepseek.model` SHALL 决定那次调用用的模型，缺省为一个固定的轻量模型；写了就用写的。搜索用的地址 SHALL 独立于会话模型的地址（可以相同，但配置上是两个来源），SHALL NOT 因为会话模型换了地址就静默改用另一个不兼容的端点。
+① `search.deepseek.api_key` / `search.deepseek.base_url`（写了就用写的）；
+② **仅当**会话模型当前 provider 的地址**确实指向 DeepSeek**（地址中含 `api.deepseek.com`）**且** `search.deepseek` 段存在时，才允许回落复用它那一把密钥与地址。
 
-#### Scenario: 只有 DeepSeek 模型配置时后端可用
+**硬规矩**：只要这一份配置里要动用的**是**会话模型那把密钥**或**它的地址（也就是自己没把密钥与地址两样都写全），地址不是 DeepSeek 时该后端 SHALL 直接报告不可用，SHALL NOT 回落复用那把密钥、SHALL NOT 向该地址发出任何请求（不是"发出去再失败"，是根本不发）。`search` 段里没有 `deepseek` 这一项时，该后端 SHALL NOT 出现在可用清单里（除非它按第 ② 条回落成功）。
 
-- **WHEN** 配置里 `agent_types.general` 指向一个 Anthropic 兼容的 DeepSeek 端点与密钥，`search` 段里没有任何搜索密钥
-- **THEN** `deepseek` 后端 SHALL 报告可用，并出现在可用后端清单里
+自己**同时写了** `api_key` 与 `base_url` 时，用的是这两份、没碰会话模型的任何东西，因此地址可以不指向 DeepSeek；这时该后端 SHALL 报告可用，并让地址写错这件事在失败说明里看得见（见下面"条数截断与错误说明"那条要求）。
 
-#### Scenario: 单独配了搜索密钥时用它
+`search.deepseek.model` SHALL 决定那次调用用的模型，缺省为一个固定的轻量模型；写了就用写的。搜索用的地址 SHALL 与会话模型的地址在配置上分开，SHALL NOT 因为会话模型换了地址就静默改用另一个端点。
 
-- **WHEN** `search.deepseek.api_key` 写了另一把密钥
-- **THEN** 该后端 SHALL 用这一把，而不是会话模型那把
+#### Scenario: 自己写了密钥时用它
 
-#### Scenario: 两处都没有密钥时不出现
+- **WHEN** `search.deepseek` 里写了 `api_key` 与 `base_url`
+- **THEN** 该后端 SHALL 用这一份，SHALL NOT 去碰会话模型那把密钥
 
-- **WHEN** 会话模型的 provider 没有密钥，`search` 段里也没写
+#### Scenario: 模型配的也是 DeepSeek 且写了 deepseek 段时回落
+
+- **WHEN** 会话模型的 provider 地址是 `https://api.deepseek.com/anthropic`，`search.deepseek` 段存在但没写 `api_key`
+- **THEN** 该后端 SHALL 复用它那把密钥与地址并报告可用
+
+#### Scenario: 模型配的不是 DeepSeek 时绝不碰那把密钥
+
+- **WHEN** 会话模型的 provider 地址不是 DeepSeek（例如某个自建网关），而 `search.deepseek` 里没写 `api_key`
+- **THEN** 该后端 SHALL 报告不可用，且 SHALL NOT 向那个地址发出任何请求（测试要断言"没有请求发出"，而不是"请求失败了"）
+
+#### Scenario: 自己把密钥与地址都写全时用它，地址可以不指向 DeepSeek
+
+- **WHEN** `search.deepseek` 里同时写了 `api_key` 与 `base_url`，而那个地址不是 DeepSeek（例如用户自己的网关）
+- **THEN** 该后端 SHALL 用这一份并报告可用（没有动用会话模型的任何东西），该次搜索失败时错误说明里 SHALL 带这个地址
+
+#### Scenario: 只写了密钥、地址仍来自会话模型时受地址闸门管
+
+- **WHEN** `search.deepseek` 里只写了 `api_key`，会话模型的地址不是 DeepSeek
+- **THEN** 该后端 SHALL 报告不可用，且 SHALL NOT 发出任何请求
+
+#### Scenario: 什么都没写时不出现
+
+- **WHEN** `search` 段里没有 `deepseek` 这一项，会话模型的地址也不是 DeepSeek
 - **THEN** 该后端 SHALL 报告不可用、不出现于清单；搜索初始化 SHALL 仍然成功
 
 ### Requirement: 请求按固定形状发出

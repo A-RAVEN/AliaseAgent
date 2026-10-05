@@ -81,6 +81,11 @@ C:\Users\你的名字\.aliasagent\config.json
     }
   },
   "search": {
+    "deepseek": {
+      "api_key": "不写就用 providers 里那把（前提：地址指向 DeepSeek）",
+      "base_url": "https://api.deepseek.com/anthropic",
+      "model": "deepseek-v4-flash"
+    },
     "zhipuai": {
       "api_key": "搜索服务的 key",
       "search_engine": "search_std"
@@ -114,10 +119,14 @@ C:\Users\你的名字\.aliasagent\config.json
 | `standing_requirements` | 每个 agent | 你写死的目标，压缩时不许丢掉 | 空清单 |
 | `search` | 顶层 | 搜索服务配置（整块都可以不写） | 不注册任何搜索服务，也就没有 `web_search` 工具 |
 | `zhipuai` / `kimi` / `searxng` | 每个搜索服务 | 三家搜索服务的名字，对应各自的键 | 该服务不启用 |
+| `deepseek` | `search` 下 | DeepSeek 自己的搜索：**不用另外买搜索 key**，复用你在 `providers` 里已经填的那把（前提是那个地址指向 `api.deepseek.com`） | 该服务不启用（写一个空的 `{}` 就算启用） |
 | `search_engine` | `zhipuai` | 用哪个搜索引擎档位 | 由服务端默认决定 |
+| `api_key` / `base_url` / `model` | `deepseek` 下 | 单独给搜索指定密钥、地址、模型（都可选） | 用 `providers` 里那把密钥与地址；模型用 `deepseek-v4-flash` |
 | `base_url`（`searxng` 下） | `searxng` | 自建搜索服务地址 | `http://localhost:8888` |
 
-> 关于搜索：**`web_search` 工具只有在至少配了一家搜索服务时才会出现**。目前这一版里 `searxng` 在启动时被直接标记为不可用，所以实际能生效的是 `zhipuai` 和 `kimi` 两家（都要付费 key）。详见 [联网工具](tools-web.md)。
+> 关于搜索：**`web_search` 工具只有在至少配了一家搜索服务时才会出现**。目前这一版里 `searxng` 在启动时被直接标记为不可用，所以实际能生效的是 `deepseek`、`zhipuai` 和 `kimi` 三家（前一家不用另外买 key，后两家要付费 key）。详见 [联网工具](tools-web.md)。
+
+> 关于 `deepseek` 的一条安全规矩：**只有地址确实指向 DeepSeek（含 `api.deepseek.com`）时才会复用 `providers` 里那把密钥**；地址指向别处时这个后端直接不可用、一个请求都不发（那把密钥可能是别家的，不能发到别的地址上）。
 
 ## 出错时会看到什么
 

@@ -23,6 +23,7 @@ import 'services/context_snapshot.dart';
 import 'services/database_service.dart';
 import 'services/message_repository.dart';
 import 'services/provider_resolver.dart';
+import 'services/search_text_assembly.dart';
 import 'services/session_repository.dart';
 import 'services/sidecar_bridge.dart';
 import 'services/summary_node_repository.dart';
@@ -327,6 +328,21 @@ class ChatScreenState extends State<ChatScreen> {
   // a sendMessage that reads it while the probe is still pending never hits a
   // LateInitializationError (browser/prober gates resolve later and mutate it).
   Map<String, Map<String, dynamic>> _toolDefs = {};
+
+  /// 工具清单是否已经装好（含动态那批）。`_initSearchAndTools()` 完成时置真；
+  /// 在此之前 `ChatArea` 会挡住发送 —— 否则那一轮请求里的工具清单是残缺的（缺
+  /// `web_search` / `web_fetch` / 浏览器四件套），模型会白白空转一轮（真机实测过）。
+  bool _toolsReady = false;
+
+  /// 当前工具清单里的工具名（**只读出口，给测试用**）。
+  ///
+  /// 为什么要有它：`tasks.md` 6.4 要断言"启动就绪那一刻清单里只有本地那 8 个、还没有
+  /// `web_search`"，而 `_toolDefs` 是私有的、窗口用例从外面读不到。加这一个只读方法就
+  /// 让那句话变成**能失败的断言**，而不是靠源码顺序去推。它不改变任何行为。
+  List<String> currentToolNames() => _toolDefs.keys.toList(growable: false);
+
+  /// 工具清单是否已就绪（只读出口，给测试断言用）。
+  bool get toolsReady => _toolsReady;
 
   @override
   void initState() {
@@ -686,9 +702,26 @@ class ChatScreenState extends State<ChatScreen> {
     // Initialize search infra from config (task 8.2)
     try {
       final searchConfig = widget.config.search;
-      final searchJson = searchConfig != null && searchConfig.isNotEmpty
-          ? jsonEncode(searchConfig)
-          : '{}';
+      // 把**会话模型当前 provider 的地址与密钥**一起交下去（add-deepseek-web-search
+      // 任务 3.4）。C++ 侧只在"地址确实指向 DeepSeek 且 search.deepseek 段存在"
+      // 时才允许回落到它，`search.deepseek` 里自己写了的以自己写的为准；地址不是
+      // DeepSeek 时那一侧直接报告不可用、不发任何请求（安全边界，见 design 决策 D2）。
+      // 字段名：`session_model.{base_url,api_key}`。
+      final mergedSearch = <String, dynamic>{
+        if (searchConfig != null) ...searchConfig,
+      };
+      final activeAgent = registry.lookup('general');
+      final sessionProvider =
+          activeAgent == null ? null : resolver?.resolve(activeAgent.provider);
+      if (sessionProvider != null) {
+        mergedSearch['session_model'] = <String, dynamic>{
+          'base_url': sessionProvider.baseUrl.isNotEmpty
+              ? sessionProvider.baseUrl
+              : 'https://api.anthropic.com',
+          'api_key': sessionProvider.apiKey,
+        };
+      }
+      final searchJson = mergedSearch.isEmpty ? '{}' : jsonEncode(mergedSearch);
       _sidecar.ensureSearchInfra(searchJson);
     } catch (e) {
       debugPrint('[AliasAgent] Search infra init failed: $e');
@@ -769,6 +802,14 @@ class ChatScreenState extends State<ChatScreen> {
     }
 
     _toolDefs = base;
+    // 到这里动态那批（web_search / web_fetch / 浏览器四件套）也定了 —— 发送入口可以放行。
+    // 在此之前 `_toolDefs` 只有本地那 8 个（`base` 在 await 之前就装好了），那一轮请求
+    // 会缺搜索工具，所以 `ChatArea` 用 `toolsReady` 挡住发送（fix-silent-truncation 6.1）。
+    if (mounted && !_toolsReady) {
+      setState(() => _toolsReady = true);
+    } else {
+      _toolsReady = true;
+    }
   }
 
   Future<void> _loadSessions() async {
@@ -2689,7 +2730,16 @@ class ChatScreenState extends State<ChatScreen> {
             final rawBody = (tc['result'] ?? tc['resultPreview'] ?? '').toString();
             final tcInput = (tc['input'] as Map<String, dynamic>?) ?? const {};
             final toolName = (tc['toolName'] ?? tc['name'] ?? '').toString();
+            // 再取入口按**可用输入**拼（fix-silent-truncation 的 5.1）：
+            //   ① 有 `path` 用 `path`（读文件类工具走这条）；
+            //   ② 否则有 `url` 用 `url`（`web_fetch` 只有 url —— 以前这里给了个空的
+            //      refetch，模型知道中间没了却拿不回来）；
+            //   ③ 两者都没有就明说取不回，不留空。
             final refetchPath = (tcInput['path'] as String?) ?? '';
+            final refetchUrl = (tcInput['url'] as String?) ?? '';
+            final refetchArg = refetchPath.isNotEmpty
+                ? refetchPath
+                : (refetchUrl.isNotEmpty ? refetchUrl : '');
             toolResults.add({
               'type': 'tool_result',
               'tool_use_id': tc['id'] ?? '',
@@ -2700,7 +2750,7 @@ class ChatScreenState extends State<ChatScreen> {
               // placement, and the round structure. Never folds/splits the round;
               // full body stays on disk and is recoverable via the tool+path.
               'content': _elideOversizedToolResult(
-                name: toolName, path: refetchPath, body: rawBody),
+                name: toolName, path: refetchArg, body: rawBody),
             });
           }
           apiMessages.add({
@@ -2720,13 +2770,18 @@ class ChatScreenState extends State<ChatScreen> {
   /// thousand chars; beyond ~8K chars the model gains little from the full body
   /// and the body dominates the request, so it is elided to a head/tail preview +
   /// marker + refetch record (D10 "近端超大 tool_result 正文…截断标记+再取记录").
-  static const int kToolResultElisionThreshold = 8000;
+  ///
+  /// 定义在 `search_text_assembly.dart`（本文件只 re-export 这个名字给内部用）。
+  static const int kToolResultElisionThreshold = searchTextElisionThreshold;
 
   /// Elide an oversized tool_result BODY (near-zone elision). Keeps a head/tail
   /// preview (~the threshold total) + a truncation marker recording the original
   /// byte length + the refetch path, so the round stays a valid tool_use/
   /// tool_result pair and the full body is recoverable via the tool + path
   /// (never deleted, D9). Under the threshold the body is passed through intact.
+  ///
+  /// 阈值常量住在 `lib/services/search_text_assembly.dart`（`kToolResultElisionThreshold`）：
+  /// 搜索结果那段拼装也用它当预算，两处**只留一份定义**，结构上不会漂移。
   static String _elideOversizedToolResult({
     required String name,
     required String path,
@@ -2736,7 +2791,11 @@ class ChatScreenState extends State<ChatScreen> {
     final half = kToolResultElisionThreshold ~/ 2;
     final head = body.substring(0, half);
     final tail = body.substring(body.length - half);
-    final refetch = path.isNotEmpty ? '; refetch via $name "$path"' : '';
+    // 再取记录：有可用的入参就给一条**能照抄**的动作；一个都没有就明说取不回，
+    // 不许留空（留空等于告诉模型"中间没了"却不给它办法）。
+    final refetch = path.isNotEmpty
+        ? '; refetch via $name "$path"'
+        : '; 本篇无法自动再取，请重新给出地址后再试';
     return '$head\n...[truncated middle of ${body.length - 2 * half} chars]...\n$tail'
         '\n[tool_result body elided: ${body.length} chars > threshold '
         '$kToolResultElisionThreshold$refetch]';
@@ -2924,13 +2983,18 @@ class ChatScreenState extends State<ChatScreen> {
         // smaller hard cap would silently drop results without a marker.
         final maxResults = (input['max_results'] as int?) ?? 200;
         final paths = parsed['paths'] as List? ?? [];
-        final count = parsed['count'] as int? ?? paths.length;
         final truncated = parsed['truncated'] == true;
         final sb = StringBuffer();
         for (final p in paths.take(maxResults)) {
           sb.writeln(p);
         }
-        if (truncated) sb.writeln('... (truncated, showing ${paths.length} of $count)');
+        if (truncated) {
+          // 截断要**可恢复**（fix-silent-truncation 8.3）：说清本次给了几条，并给一个能
+          // 直接照抄的取回写法。**不写"of <count>"** —— C++ 侧收满 max_results 就掐断了
+          // rg，`count` 因此等于本次条数、**不是**总条数，写成"showing N of N"等于编一个总数。
+          sb.writeln('... (truncated: only the first $maxResults entries are shown; '
+              'to get more, call glob_file again with max_results=${maxResults * 2})');
+        }
         parsed['content'] = sb.toString().trim().isEmpty
             ? '(no files matched)'
             : sb.toString().trim();
@@ -2940,7 +3004,6 @@ class ChatScreenState extends State<ChatScreen> {
         // leading indentation (which is meaningful in code lines).
         final maxResults = (input['max_results'] as int?) ?? 100;
         final matches = parsed['matches'] as List? ?? [];
-        final count = parsed['count'] as int? ?? matches.length;
         final truncated = parsed['truncated'] == true;
         final sb = StringBuffer();
         for (final m in matches.take(maxResults)) {
@@ -2950,7 +3013,12 @@ class ChatScreenState extends State<ChatScreen> {
           final t = (mm['text'] ?? '').toString().trimRight();
           sb.writeln('$p:${l ?? '?'}: $t');
         }
-        if (truncated) sb.writeln('... (truncated, showing ${matches.length} of $count)');
+        if (truncated) {
+          // 同 glob_file：说清本次给了几条 + 可照抄的取回写法；同样不声称总条数。
+          sb.writeln('... (truncated: only the first $maxResults matches are shown; '
+              'to get more, call grep_file again with max_results=${maxResults * 2}, '
+              'or narrow the pattern/glob)');
+        }
         parsed['content'] = sb.toString().trim().isEmpty
             ? '(no matches)'
             : sb.toString().trim();
@@ -2963,6 +3031,9 @@ class ChatScreenState extends State<ChatScreen> {
   }
 
   /// Format search/fetch results into a human-readable string for tool card display (task 8.9).
+  ///
+  /// `web_search` 的正文由 [assembleSearchText] 拼（单独一个文件，便于单测传小预算
+  /// 逼出"预览被省略"那一支）；这里只负责把它接上。
   String _formatSearchResultForDisplay(String toolName, Map<String, dynamic> result) {
     if (result['ok'] != true) {
       // Error — use the error message directly
@@ -2973,71 +3044,7 @@ class ChatScreenState extends State<ChatScreen> {
     final buf = StringBuffer();
 
     if (toolName == 'web_search') {
-      final results = result['results'] as Map<String, dynamic>?;
-      if (results == null || results.isEmpty) {
-        return 'No results found.';
-      }
-
-      var totalLen = 0;
-      const maxLen = 2000;
-      var nsCount = 0;
-      var resultsBeyond = 0;
-
-      for (final ns in results.keys) {
-        nsCount++;
-        if (totalLen >= maxLen) { resultsBeyond++; continue; }
-
-        final nsData = results[ns] as Map<String, dynamic>?;
-        if (nsData == null) continue;
-
-        if (nsData.containsKey('error')) {
-          final err = (nsData['error'] as String?) ?? 'Unknown error';
-          final line = '$ns: ERROR — ${err.length > 200 ? '${err.substring(0, 200)}...' : err}\n';
-          if (totalLen + line.length > maxLen) { resultsBeyond++; continue; }
-          buf.write(line);
-          totalLen += line.length;
-        } else {
-          final items = nsData['results'] as List<dynamic>?;
-          final count = items?.length ?? 0;
-          final line = '$ns: $count results\n';
-          if (totalLen + line.length > maxLen) { resultsBeyond++; continue; }
-          buf.write(line);
-          totalLen += line.length;
-
-          // First result preview
-          if (items != null && items.isNotEmpty) {
-            final first = items[0] as Map<String, dynamic>?;
-            if (first != null) {
-              final title = (first['title'] as String?) ?? '';
-              final url = (first['url'] as String?) ?? '';
-              final content = (first['content'] as String?) ?? '';
-              var preview = '';
-              if (title.isNotEmpty) preview += title;
-              if (url.isNotEmpty) {
-                if (preview.isNotEmpty) preview += ' — ';
-                preview += url;
-              }
-              if (content.isNotEmpty) {
-                if (preview.isNotEmpty) preview += '\n';
-                preview += content.length > 200
-                    ? '${content.substring(0, 200)}...'
-                    : content;
-              }
-              if (preview.isNotEmpty) {
-                if (totalLen + preview.length + 2 > maxLen) {
-                  preview = '${preview.substring(0, maxLen - totalLen - 5)}...';
-                }
-                buf.write('$preview\n');
-                totalLen += preview.length + 1;
-              }
-            }
-          }
-        }
-      }
-
-      if (resultsBeyond > 0) {
-        buf.write('... ($resultsBeyond more providers not shown)');
-      }
+      return assembleSearchText(result, budget: kToolResultElisionThreshold);
     } else if (toolName == 'web_fetch') {
       final content = (result['content'] as String?) ?? '';
       if (content.isEmpty) {
@@ -3209,6 +3216,7 @@ class ChatScreenState extends State<ChatScreen> {
                         items: _chatItems,
                         isStreaming: _isStreaming,
                         compactionStatus: _compactionStatus,
+                        toolsReady: _toolsReady,
                         onSendMessage: _sendMessage,
                       )
                     : ContextView(
