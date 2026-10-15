@@ -1961,22 +1961,26 @@ class ChatScreenState extends State<ChatScreen> {
     return s.text;
   }
 
-  /// Summarize an OPEN level-1 batch with SPLIT-IF-INVALID (design D3/D4).
+  /// 把一批还没闭合的原文解析成它**这一级**的内容（design D2/D3）。
   ///
-  /// A compression is valid ONLY if the produced summary's MEASURED token count
-  /// (real `output_tokens`, ⑪.1) is LESS than the batch it replaced. If invalid,
-  /// split the batch in half and recurse (deterministic — always terminates: the
-  /// batch halves). If a single (atomic) batch still cannot compress, RETURN an
-  /// empty list — the atomic batch is OMITTED from the projection (DATA KEPT on
-  /// disk, D9), never sent as a summary larger than the content it replaced.
+  /// 规则（用户 2026-10-05，两级同一条）：压缩前、压缩后比 token，**取小的那一侧**。
+  /// 压缩后的实测 token 真的更小就采用它；否则**这一级的内容就是这批原文本身** ——
+  /// 返回一个 [CompactionSegment.verbatimAtLevel] 为真的条目：它照样在这一级上占位
+  /// （能进合成更粗的一级、参与阈值累积），但渲染永远走原文路径，一个块不少。
+  ///
+  /// 原来那条"折半重试、切到原子批就 `return const []` 把它丢掉"的路径已经删掉 ——
+  /// 压不短不再是一个失败态，所以不存在"因为压不短而丢内容"。
+  ///
+  /// [onNotResummarized]：这一批这一趟**没有重新生成摘要**时回调（压缩前赢那一支）。
+  /// 调用方据此不消费脏水位（R8-c）—— 否则下一趟会复用一条陈旧的缓存摘要。
   Future<List<({CompactionSegment seg, String text, int tokens, bool isClosed})>>
       _resolveOpenLevel1(List<Message> msgs, AgentTypeConfig agentType,
-          {bool Function()? isAborted, void Function(int minSeq, int maxSeq)? onOmit,
+          {bool Function()? isAborted,
+          void Function(int minSeq, int maxSeq)? onNotResummarized,
           List<SummaryReference> reference = const []}) async {
-    // 2.6 abort gate (split-if-invalid recursion makes its own model calls): a
-    // preempted background fold must stop at the next model call rather than
-    // enqueueing an un-cancelled summarize onto the single-slot _chain ahead of the
-    // user's request. Checked at each recursion entry. Inline callers pass null.
+    // 2.6 abort gate: a preempted background fold must stop at the next model call
+    // rather than enqueueing an un-cancelled summarize onto the single-slot _chain
+    // ahead of the user's request. Inline callers pass null.
     if (isAborted?.call() ?? false) {
       throw const _BackgroundFoldCancelled('background fold aborted during open-batch resolve');
     }
@@ -1984,31 +1988,31 @@ class ChatScreenState extends State<ChatScreen> {
     final raw = CompactionEngine.rawTokens(msgs);
     final summary = await _summaryProvider.summarize(
         folded: msgs, config: agentType, reference: reference);
-    if (summary.tokens < raw) {
+    if (CompactionEngine.summarySideWins(raw, summary.tokens)) {
       return [
         (seg: CompactionSegment(messages: msgs, summary: true, level: 1),
             text: summary.text, tokens: summary.tokens, isClosed: false),
       ];
     }
-    // Invalid (summary ≥ batch raw): split the batch in half and recurse.
-    if (msgs.length > 1) {
-      final mid = msgs.length ~/ 2;
-      return [
-        ...await _resolveOpenLevel1(msgs.sublist(0, mid), agentType,
-            isAborted: isAborted, onOmit: onOmit, reference: reference),
-        ...await _resolveOpenLevel1(msgs.sublist(mid), agentType,
-            isAborted: isAborted, onOmit: onOmit, reference: reference),
-      ];
+    // 压缩后不比压缩前小 ⇒ 取压缩前那一侧：这一级的内容就是这批原文本身。
+    // 它没有被重新摘要，所以照旧要把"没重生成摘要"这件事告诉调用方（脏水位规则）。
+    if (onNotResummarized != null && msgs.isNotEmpty) {
+      onNotResummarized(msgs.first.seq ?? 0, msgs.last.seq ?? 0);
     }
-    // Atomic batch that cannot compress — omit (never send a bloated summary).
-    // DATA KEPT on disk (D9). But a stale span omitted here is NEITHER re-summarized
-    // NOR re-persisted, so the caller must NOT consume the dirty watermark (R8-c) —
-    // surface the omission so clearDirty is skipped (else next round reuses a stale
-    // cached summary, R2-2 reuse-gate failure).
-    if (onOmit != null && msgs.isNotEmpty) {
-      onOmit(msgs.first.seq ?? 0, msgs.last.seq ?? 0);
-    }
-    return const [];
+    return [
+      (
+        seg: CompactionSegment(
+            messages: msgs, summary: true, level: 1, verbatimAtLevel: true),
+        // text 只给"合成更粗一级"当输入用；真正发出去时走的是 seg.messages 的
+        // 原文渲染路径（见 Phase C）。
+        text: msgs
+            .map((m) => m.content)
+            .where((c) => c.isNotEmpty)
+            .join('\n\n'),
+        tokens: raw,
+        isClosed: false,
+      ),
+    ];
   }
 
   /// 这个函数只做一件事：保证压缩状态**无论成功、失败、异常还是被打断都回到空闲**
@@ -2188,27 +2192,28 @@ class ChatScreenState extends State<ChatScreen> {
         continue;
       }
 
-      // OPEN level-1 batch: resolve with split-if-invalid (D3/D4). A summary is
-      // valid ONLY if its MEASURED token count is less than the batch it replaced
-      // (else split in half + recurse); an atomic batch that still cannot compress
-      // is OMITTED from the projection (data kept on disk, D9) — never send a
-      // bloat- > batch summary.
+      // OPEN level-1 batch：按"取小者"解析它这一级的内容。压缩后的实测 token 真的更小
+      // 就用摘要；否则这一级的内容就是这批原文本身（`verbatimAtLevel`），渲染走原文
+      // 路径、一个块不少。压不短不再丢任何东西。
       final leafEntries = await _resolveOpenLevel1(seg.messages, agentType,
           // 参考上下文：最多两条、只取覆盖范围严格早于这一批的（挑选规则见
-          // selectSummaryReferences）。折半重压时两半用同一份参考、同一个界。
+          // selectSummaryReferences）。
           reference: selectSummaryReferences(
               persisted: referenceCandidates, batchOldestSeq: minSeq ?? 0),
           isAborted: isAborted,
-          // R8-c: if a STALE (dirty-reaching) span is omitted (un-compressible → not
-          // re-summarized/persisted), do NOT consume the dirty watermark — else the
-          // next fold reuses a stale cached summary. Mark persistFailed so the
-          // clearDirty gate (below) is skipped.
-          onOmit: (minSeq, maxSeq) {
+          // R8-c: 这一批这一趟**没有重新生成摘要**（走了"压缩前赢"那一支）时，不许消费
+          // 脏水位 —— 否则下一趟会复用一条陈旧的缓存摘要。置 persistFailed 让下面那道
+          // clearDirty 的门跳过。
+          onNotResummarized: (minSeq, maxSeq) {
             if (dirtySince > 0 && maxSeq >= dirtySince) persistFailed = true;
           });
       for (final leaf in leafEntries) {
-        // Hermetic tests (no DB open) never persist the derived index.
-        if (dbOpen && leaf.seg.messages.isNotEmpty &&
+        // Hermetic tests (no DB open) never persist the derived index. 这一级的内容是
+        // 它自己的原文时（verbatimAtLevel）也不落盘：写进去的话下一趟会被当成一条普通
+        // 一级摘要加载，就有可能被文本化渲染 —— 那正是要避免的事。
+        if (dbOpen &&
+            !leaf.seg.verbatimAtLevel &&
+            leaf.seg.messages.isNotEmpty &&
             leaf.seg.messages.first.seq != null &&
             leaf.seg.messages.last.seq != null) {
           final lo = leaf.seg.messages.first.seq!;
@@ -2320,14 +2325,14 @@ class ChatScreenState extends State<ChatScreen> {
 
     var table = List.of(entries);
     var total = projectedTotal(table);
-    // May this entry be left out of THIS request? Only one that is actually being
-    // sent as a summary: a level-1 summary may be omitted (it is projection-only —
-    // the data stays on disk, and it can be rebuilt later), so may anything this
-    // pass just produced; a level-2 summary persisted by an earlier round may not.
-    // An entry that is being sent as RAW text is NOT omittable: leaving it out
-    // would not shrink the projection at all, it would just drop the content.
-    bool omittable(({CompactionSegment seg, String text, int tokens, bool isClosed}) e) =>
-        (e.seg.level == 1 || !e.isClosed) && sentAsSummary(e);
+    // 因为容量不够而把一条内容从这次请求里拿掉时，**只有二级及以上、且这一趟确实按
+    // 摘要发出去的**条目允许被拿掉（用户 2026-10-05：允许静默丢弃的只有超过上下文上限
+    // 的 L2 级摘要，不应该有其它东西允许静默丢弃）。一级摘要与原文一条都不许拿 ——
+    // 拿掉一条按原文发的条目等于直接丢内容，不是换一种更粗的表示。
+    bool omittable(
+            ({CompactionSegment seg, String text, int tokens, bool isClosed}) e) =>
+        CompactionEngine.mayBeLeftOut(
+            level: e.seg.level, sentAsSummary: sentAsSummary(e));
     // Identity set: entry records compare structurally, so identity is what tells
     // "this exact entry was already submitted" apart from an equal-looking one.
     final attempted = Set<Object>.identity();
@@ -2394,39 +2399,34 @@ class ChatScreenState extends State<ChatScreen> {
           owner: statusOwner, sessionId: sessionId);
       final l2 = await _summaryProvider.summarizeText(
           text: candGroup.map((e) => e.text).join('\n\n'), config: agentType);
-      if (l2.tokens >= groupSum) {
-        // INVALID coarsen: the level-2 is NOT smaller than the L1 summaries it
-        // would replace — the same "valid only if measured < replaced" criterion
-        // split-if-invalid enforces for L1. A bloated L2 would INFLATE total.
-        for (final e in candGroup) {
-          attempted.add(e);
-        }
-        if (!overCapacity) {
-          // Not over capacity ⇒ do NOT retry this merge and do NOT drop the
-          // still-valid L1s. The next iteration finds no fresh candidate and ends.
-          continue;
-        }
-        // Over capacity ⇒ DRAIN (omit) the group's entries one-at-a-time,
-        // re-measuring total, preserving the still-valid L1s (each omit is
-        // projection-only; data kept on disk).
-        var drain = candCount;
-        while (drain > 0 && table.isNotEmpty && total > maxContextTokens) {
-          table.removeAt(candStart);
-          drain--;
-          total = projectedTotal(table);
-        }
-        continue;
-      }
+      // 取小者（用户 2026-10-05，两级同一条）：压缩后的实测 token 真的更小，就用模型
+      // 给的那条；否则**这一级的正文就是那几条一级的文本拼接**（压缩前那一侧）。
+      //
+      // 原来那条"二级不比那几条一级短就拒绝、装不下就把那组一级逐条丢掉"的路径已经
+      // 删掉 —— 取小者之后不存在"拒绝"这个态，也就不存在"因为压不短而丢内容"。
+      final l2Wins = CompactionEngine.summarySideWins(groupSum, l2.tokens);
+      // 只要输入里有一条的内容是**它自己的原文**（verbatimAtLevel），这一级也标成
+      // verbatimAtLevel：渲染仍走原文路径，工具块与思考块一个不少。不这么传的话，
+      // 一条"内容是原文"的一级被合成进二级之后，就会被当成一段纯文本发出去。
+      final l2IsVerbatim = candGroup.any((e) => e.seg.verbatimAtLevel);
+      final l2Text =
+          l2Wins ? l2.text : candGroup.map((e) => e.text).join('\n\n');
+      final l2Tokens = l2Wins ? l2.tokens : groupSum;
       final mergedMsgs = candGroup.expand((e) => e.seg.messages).toList();
       final l2seg = CompactionSegment(
           messages: mergedMsgs,
           summary: true,
           level: 2,
+          verbatimAtLevel: l2IsVerbatim,
           l2SubSpans:
               candGroup.map((e) => CompactionEngine.segmentSpan(e.seg)).toList());
       final l2Entry =
-          (seg: l2seg, text: l2.text, tokens: l2.tokens, isClosed: false);
-      if (dbOpen && mergedMsgs.isNotEmpty &&
+          (seg: l2seg, text: l2Text, tokens: l2Tokens, isClosed: false);
+      // 这一级的内容是它自己的原文（verbatimAtLevel）时不落盘，理由与 level-1 那一侧
+      // 相同：写进去的话下一趟会被当成一条普通二级摘要加载，就有可能被文本化渲染。
+      if (dbOpen &&
+          !l2IsVerbatim &&
+          mergedMsgs.isNotEmpty &&
           mergedMsgs.first.seq != null && mergedMsgs.last.seq != null) {
         final lo = mergedMsgs.first.seq!;
         final hi = mergedMsgs.last.seq!;
@@ -2440,10 +2440,10 @@ class ChatScreenState extends State<ChatScreen> {
             summaryJson: jsonEncode({
               'role': 'user',
               'content': [
-                {'type': 'text', 'text': l2.text},
+                {'type': 'text', 'text': l2Text},
               ],
             }),
-            tokenCost: l2.tokens,
+            tokenCost: l2Tokens,
             summaryPromptVersion: 1,
             model: agentType.model,
             coveredMinSeq: lo,
@@ -2487,7 +2487,12 @@ class ChatScreenState extends State<ChatScreen> {
     // Phase C —— 按时间顺序拼出这条投影的时间线，一段内容只用一种表示：
     //  - 表里剩下的条目：够远的发摘要；还不够远的（它自己那一档还没轮到）发原文；
     //  - 计划里还没被任何摘要盖住的原文段（含尾部）：原样发；
-    //  - 其余的摘要段：这一趟什么都不发（要么已经被更粗的那条顶替，要么按容量省略）。
+    //  - 其余的摘要段：这一趟什么都不发（已经被更粗的那条顶替，或者因为容量被拿掉）。
+    //    按容量拿掉的**只可能是二级摘要**（判据见 `CompactionEngine.mayBeLeftOut`）——
+    //    一级摘要与原文一条都不许拿；把所有二级都拿光还是装不下时，投影直接超预算
+    //    发出去，那句 `compaction projection still over budget by …` 就是这时候打印的
+    //    （它的条件是 `total > maxContextTokens`，与"这一趟有没有丢过东西"无关；
+    //    `generate == false` 时整个收拢循环不跑，也不会打印）。
     final pieces = <({int at, ProjectionPiece piece})>[];
     final finalSummaries = <SummaryResult>[];
     // 位置按消息在历史里的下标算：seq 允许为空（合成测试的历史就没有 seq），位置永远在。
@@ -2501,7 +2506,10 @@ class ChatScreenState extends State<ChatScreen> {
     for (final e in table) {
       if (e.seg.messages.isEmpty) continue;
       final at = startPos(e.seg.messages);
-      if (sentAsSummary(e)) {
+      // `verbatimAtLevel` 的条目**永远按原文发**：这一级的内容本来就是它自己的原文
+      // （压缩后不比压缩前短，"取小者"取中了压缩前那一侧），不许因为"够远了"就改发一段
+      // 文本 —— 那会把那段里的 tool_use / tool_result / thinking 块换成文字。
+      if (!e.seg.verbatimAtLevel && sentAsSummary(e)) {
         final summary = SummaryResult(text: e.text, tokens: e.tokens);
         finalSummaries.add(summary);
         pieces.add((

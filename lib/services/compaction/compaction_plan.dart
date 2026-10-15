@@ -37,12 +37,22 @@ class CompactionSegment {
   final ClosedSummary? reuse; // non-null → this (closed) segment reuses a cached summary
   final List<List<int>>? l2SubSpans; // level-2 only: each [startSeq, endSeq] of a
                                      // level-1 sub-span, for 2-pass "summary of summaries".
+
+  /// 这一级的内容是**它自己的原文**（压缩后不比压缩前短，"取小者"取中了压缩前那一侧）。
+  ///
+  /// 它照样按 [level] 参与层级（能进合成更粗的一级、参与阈值累积），但**渲染永远走
+  /// 原文**（`_buildApiMessages`），不许把它拼成一段文本当摘要发 —— `context-compaction`
+  /// 的「Compressed output is plain text」明令摘要不带 tool_use / tool_result / thinking
+  /// 块，文本化等于把它们换成一段文字。
+  final bool verbatimAtLevel;
+
   const CompactionSegment({
     required this.messages,
     required this.summary,
     this.level = 1,
     this.reuse,
     this.l2SubSpans,
+    this.verbatimAtLevel = false,
   });
 
   bool get isClosed => reuse != null;
@@ -161,6 +171,40 @@ class CompactionEngine {
         : AgentTypeConfig.kDefaultCompactionWaitThresholdPercent;
     return (maxContextTokens * p) ~/ 100;
   }
+
+  /// 压缩取值：**取小者**（用户 2026-10-05 钉死的规则）。
+  ///
+  /// 原文⇒一级与一级⇒二级用**同一条**规则：把「压缩前」和「压缩后」的 token 数比一下，
+  /// 取较小的那一侧作为**下一级**的内容。没有特殊情况。
+  ///
+  /// 判据写成**严格小于**：压缩后的实测值必须真的比压缩前小，才采用它。两边相等时取
+  /// 压缩前那一侧 —— 压缩一点没变小，就没有理由引入一条摘要。
+  ///
+  /// 这条规则让"压不短"不再是一个失败态：既没有"折半重试"，也没有"压不短就把内容
+  /// 丢掉"这条路（原来那三条丢弃路径随本变更一起删掉）。
+  ///
+  /// [beforeTokens] 压缩前那一侧的 token 数（原文⇒一级用 [rawTokens] 的估算值；
+  /// 一级⇒二级用那几条一级摘要的实测值之和）；[afterTokens] 压缩后的 token 数
+  /// （模型回的 `output_tokens` 实测值）。
+  static bool summarySideWins(int beforeTokens, int afterTokens) =>
+      afterTokens < beforeTokens;
+
+  /// 因为容量不够而从这次请求里拿掉一条内容时，允许被拿掉的是哪一种。
+  ///
+  /// 用户 2026-10-05 的话：「我允许静默丢弃的应该只有超过上下文上限的L2级摘要，
+  /// 不应该有其它东西允许静默丢弃」，以及「最旧的二级摘要 …… 丢弃的意思是不再发给
+  /// 模型，不是说从数据库历史中丢弃」。
+  ///
+  /// 所以只有**二级及以上、且这一趟确实以摘要形式发出去的**条目可以因为容量被拿掉；
+  /// 一级摘要与原文一条都不许拿（它们不是最粗的那一层）。判据收窄之前是
+  /// `(level == 1 || !isClosed) && sentAsSummary`，它把一级摘要与这一趟新产出的段
+  /// 也放行了。
+  ///
+  /// [level] 这一段的摘要层级（`CompactionSegment.level`）；[sentAsSummary] 这一趟
+  /// 是不是真的以摘要形式发它（`false` 表示按原文发，那就不该拿 —— 拿掉它等于直接
+  /// 丢内容，而不是换一种更粗的表示）。
+  static bool mayBeLeftOut({required int level, required bool sentAsSummary}) =>
+      level >= 2 && sentAsSummary;
 
   /// 这一趟该不该等：**严格大于**上界才算超 —— 正好等于上界不算（边界口径写死在这里，
   /// 免得各处自己判）。

@@ -812,14 +812,15 @@ void main() {
           reason: '当前用户消息必须活下来');
     });
 
-    testWidgets('合成被拒后不再重试：这一趟正常结束，那一组只试一次',
+    testWidgets('合成只试一次：二级不比那几条一级短 ⇒ 用压缩前那一侧，这一趟正常结束',
         timeout: const Timeout(Duration(seconds: 20)), (tester) async {
       // 容量 4000 ⇒ 阈值 = 1000。15 条 × 100 raw = 1500 已过阈值 ⇒ 远端 11 条
       // （1100 raw）压成一条 L1。假摘要器给这条 L1 报 1050（< 1100，是有效压缩），
-      // 给"合成出来的更粗那条"报 1200（不小于它要替换的 1050）⇒ 合成被拒。
-      // 此时投影 = 1050 + 剩下的 400 原文 = 1450，离容量 4000 还差得远 —— 正是
-      // "因为超过阈值进来、但并没有超容量"的情形。规则：被拒即不再重试，这一趟
-      // 到此结束（否则同一组会被反复送进模型，既不终止也不是"只调一次"）。
+      // 给"合成出来的更粗那条"报 1200（不小于它要替换的 1050）。
+      // **旧规则**：这条二级"被拒"，靠"被拒即不再重试"结束这一趟。
+      // **新规则**：不存在"被拒"这个态 —— 取小者取中了压缩前那一侧（1050 < 1200），
+      // 二级的正文 = 那条一级的文本，这一趟照样结束（一组只试一次）。
+      // 那条二级此刻还不够远（距离 400 < 2T = 2000）⇒ 这一趟先不顶替那条一级。
       _setupAgentRegistry(maxContextTokens: 4000);
       tester.view.physicalSize = const Size(1280, 720);
       tester.view.devicePixelRatio = 1.0;
@@ -854,8 +855,12 @@ void main() {
       expect(summaryProvider.summarizeCalls, 1,
           reason: '前提：远端只切出一批 L1（否则下面那条"只试一次"不成立）');
       expect(summaryProvider.summarizeTextCalls, 1,
-          reason: '被拒的那一组只许试一次：改之前（没有"被拒即不再试"这条规则时）'
-              '同一组会被反复送进模型，这个数会一直涨、这趟压缩不结束');
+          reason: '同一组只许试一次合成（旧规则靠"被拒即不再重试"，新规则下根本不存在'
+              '"被拒"这个态 —— 取小者总会产出一条二级；这个数涨上去说明这一趟不终止）');
+      expect(projected, contains(kSummaryMarker),
+          reason: '那条二级还不够远（距离 400 < 2T）⇒ 这一趟仍然由那条有效的一级代表');
+      expect(projected, isNot(contains(kLevel2SummaryMarker)),
+          reason: '二级还不够远时不许顶替一级（同一段同时出现两种表示就是缺陷）');
       expect(projected, contains('continue'),
           reason: '这趟压缩必须正常结束并把请求发出去');
       // 「每一段恰好一种表示」这条不变量在这一场也要成立：15 条消息里 1..11 该由那条 1 级
@@ -1785,13 +1790,14 @@ void main() {
           reason: 'the current user message must survive coarsening');
     });
 
-    testWidgets('⑪.3 reject-bloated-L2: a non-compressing level-2 is rejected, valid L1s kept', (tester) async {
-      // l1Tokens=20 (< every batch's raw → each L1 is a VALID compression, so
-      // split-if-invalid never fires) but l2Tokens=150 (>= the L1s it would roll
-      // up → the L2 is INVALID, "measured < replaced" fails). ⑪.3 must NOT accept
-      // a bloated L2; it rejects the coarsen and omits the oldest L1 instead, so
-      // the projection keeps the (valid) L1 summaries and drops one, never sending
-      // a summary larger than the content it replaced.
+    testWidgets('⑪.3 二级不比那几条一级短 ⇒ 取压缩前那一侧（拼起来当正文，不采用模型那条）', (tester) async {
+      // l1Tokens=20（< 每一批的 raw ⇒ 每条一级都是**有效**压缩，压不短那一支不参与）
+      // 而 l2Tokens=150（>= 它要替换的那几条一级之和）。
+      // **旧规则**：这条二级"无效" ⇒ 拒绝它，并把最旧的一条一级从投影里省略掉。
+      // **新规则（用户 2026-10-05：取小者、没有特殊情况）**：压缩前那一侧赢 ⇒ 二级的
+      // 正文就是那几条一级文本按原顺序拼接，照常落盘；模型给的那条正文一个字都不用。
+      // 断言不许放松：仍然要断言"模型那条更长的正文没进投影"，并且**新增**断言
+      // "那条二级确实以拼接后的正文进了投影"（旧写法只断言了前者，后者正是新行为）。
       _setupAgentRegistry(maxContextTokens: 200);
       tester.view.physicalSize = const Size(1280, 720);
       tester.view.devicePixelRatio = 1.0;
@@ -1829,19 +1835,23 @@ void main() {
       expect(summaryProvider.summarizeTextCalls, greaterThanOrEqualTo(1),
           reason: 'coarsening must be attempted before the invalid L2 is rejected');
       expect(projected, isNot(contains('L2 rolled up')),
-          reason: 'a level-2 that is not smaller than the L1s it replaces must be rejected, never sent');
+          reason: '取小者取中了压缩前那一侧 ⇒ 模型给的那条更长的二级正文一个字都不许进投影');
+      expect(projected, contains(kLevel2SummaryMarker),
+          reason: '新行为：那条二级照样进投影，只是正文换成了压缩前那一侧的拼接');
+      expect(projected, contains('L1 summary ('),
+          reason: '二级的正文就是那几条一级文本按原顺序拼接（一级只在这里出现，不再单独发）');
       expect(projected, contains('## 更早上下文'),
-          reason: 'the valid L1 summaries are still kept (rejected L2 does not drop them)');
+          reason: '有效的一级/二级摘要都还在投影里');
       expect(projected, contains('continue'),
           reason: 'the current user message must survive');
     });
 
-    testWidgets('⑪.3 split-if-invalid: an un-compressible batch is split down to atomics and omitted', (tester) async {
-      // l1Tokens=150 (>= every batch's raw) so a batch's summary is NEVER smaller
-      // than the batch it replaced — invalid. _resolveOpenLevel1 splits it in half,
-      // recurses, and omits each atomic batch (data kept, D9) rather than send a
-      // bloated summary. The projection must therefore be verbatim-only (no marker)
-      // and summarize must have been called MORE than once per batch (split ran).
+    testWidgets('⑪.3 压不短 ⇒ 那一段按原文发出去（不再折半、不再省略）', (tester) async {
+      // l1Tokens=150（>= 每一批的 raw）⇒ 每一批的摘要都不比它替换的内容短。
+      // **旧规则**：`_resolveOpenLevel1` 折半递归、把每个原子批 OMIT 掉（数据留在盘上），
+      // 于是投影里那一整段内容一条表示都没有。
+      // **新规则（用户 2026-10-05：取小者、没有特殊情况）**：压缩前那一侧赢 ⇒ 那一级的
+      // 内容就是这批原文本身，按原文渲染路径发出去，工具块与思考块都保留。没有折半。
       _setupAgentRegistry(maxContextTokens: 200);
       tester.view.physicalSize = const Size(1280, 720);
       tester.view.devicePixelRatio = 1.0;
@@ -1873,12 +1883,16 @@ void main() {
           'projectedChars=${projected.length} '
           'hasMarker=${projected.contains('## 更早上下文')} '
           'hasContinue=${projected.contains('continue')}');
-      // More summarize calls than line-batches → the split recursion ran, and each
-      // atomic un-compressible batch was omitted (no bloated summary was sent).
-      expect(summaryProvider.summarizeCalls, greaterThan(6),
-          reason: 'an un-compressible batch must be split down several times before omission');
+      // **改后（依据用户 2026-10-05「取小者，没有特殊情况」）**：那段原文必须真的发出去。
+      expect(projected, contains('A' * 100),
+          reason: '压不短 ⇒ 取压缩前那一侧：那段原文必须按原文发出去，一条都不许丢'
+              '（旧规则下这一整段被省略，投影里一条都没有）');
       expect(projected, isNot(contains('## 更早上下文')),
-          reason: 'un-compressible far content is omitted (never sent as a bloated summary)');
+          reason: '这一趟没有真的压出摘要（每一批都压不短）⇒ 投影里不该出现摘要标记');
+      // 折半递归已经删掉：一次调用至少覆盖一条消息，所以调用数不可能超过消息条数。
+      // 旧规则下折半会把这个数顶到 36（12 批 × 3 次），这里 <= 24 才说明折半确实没了。
+      expect(summaryProvider.summarizeCalls, lessThanOrEqualTo(24),
+          reason: '不许再有折半递归：调用次数不能超过消息条数（一条一次是上界）');
       expect(projected, contains('continue'),
           reason: 'the current user message must survive the split-omit');
     });
