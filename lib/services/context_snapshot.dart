@@ -1,3 +1,5 @@
+import 'package:alias_agent/models/context_breakdown.dart';
+
 /// A frozen, deep-copied snapshot of the exact context handed to the model
 /// gateway on one main-conversation request.
 ///
@@ -19,6 +21,13 @@ class ContextSnapshot {
   final String thinkingEffort;
   final DateTime capturedAt;
 
+  /// 这一份请求的占用拆分（二级摘要 / 一级摘要 / 原文 + 固定开销）。
+  ///
+  /// 与快照在**同一次** `setState` 里写入，所以它和上面那几个字段描述的是同一份请求；
+  /// 为 `null` 时环不渲染（没有拆分就没有环）。**它不是请求的一部分**，因此
+  /// [toRawJson] 里没有它 —— 「真实上下文」那一屏的原始 JSON 保持原样。
+  final ContextBreakdown? breakdown;
+
   const ContextSnapshot({
     required this.sessionId,
     required this.systemPrompt,
@@ -28,6 +37,7 @@ class ContextSnapshot {
     required this.thinkingMode,
     required this.thinkingEffort,
     required this.capturedAt,
+    this.breakdown,
   });
 
   /// Header label shown in the context view so the user can tell which session

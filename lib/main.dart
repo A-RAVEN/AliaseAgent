@@ -8,6 +8,7 @@ import 'models/agent_type_config.dart';
 import 'models/app_config.dart';
 import 'models/chat_item.dart';
 import 'models/compaction_status.dart';
+import 'models/context_breakdown.dart';
 import 'models/message.dart';
 import 'models/session.dart';
 import 'models/tool_call_activity.dart';
@@ -19,6 +20,7 @@ import 'services/compaction/seam_selector.dart';
 import 'services/compaction/summary_provider.dart';
 import 'services/compaction/summary_reference.dart';
 import 'services/config_service.dart';
+import 'services/context_estimator.dart';
 import 'services/context_snapshot.dart';
 import 'services/database_service.dart';
 import 'services/message_repository.dart';
@@ -28,6 +30,7 @@ import 'services/session_repository.dart';
 import 'services/sidecar_bridge.dart';
 import 'services/summary_node_repository.dart';
 import 'ui/chat_area.dart';
+import 'ui/context_ring.dart';
 import 'ui/context_view.dart';
 import 'ui/session_sidebar.dart';
 import 'ui/setup_dialog.dart';
@@ -44,15 +47,6 @@ class _BackgroundFoldCancelled implements Exception {
   const _BackgroundFoldCancelled(this.reason);
   @override
   String toString() => reason;
-}
-
-/// 投影时间线上的一段：要么发摘要（[summary] 非空，标记由 [segment] 的层级决定），
-/// 要么把 [segment] 里的原文原样发出去（[summary] 为空）。两种段在时间里交错排列：
-/// 离现在还不够远的那一段即使已经被压成摘要，这一趟也仍然发原文。
-class ProjectionPiece {
-  final CompactionSegment segment;
-  final SummaryResult? summary;
-  const ProjectionPiece({required this.segment, this.summary});
 }
 
 void main() {
@@ -1083,6 +1077,10 @@ class ChatScreenState extends State<ChatScreen> {
     // (non-compressible invariants) are injected into the system prompt.
     final maxContextTokens = agentType.maxContextTokens ?? 0;
     final List<Map<String, dynamic>> apiMessages;
+    // 3.1（环）：这条投影的时间线。声明在分支外，好让「发送前捕获拆分」那一处
+    // （在工具循环里、每次发送都走到）也能拿到它。退化路径（不走压缩 / 投影为空）
+    // 留空列表，那一处据此造一条整段按原文发的退化时间线。
+    List<ProjectionPiece> projectionTimeline = const [];
     if (maxContextTokens > 0) {
       // NOTE (2026-09-20): a per-session cap on how much a session may compress
       // used to sit here and skip ALL on-demand compaction once the session had
@@ -1161,6 +1159,7 @@ class ChatScreenState extends State<ChatScreen> {
           // timeline 是这条投影的时间线：发摘要的段与发原文的段按时间排好；某一趟把
           // 远端几乎全省略时摘要会为空，那时投影里只剩原文（更早的内容留在磁盘上，D9）。
           apiMessages = _buildCompactionProjection(resolved.timeline);
+          projectionTimeline = resolved.timeline;
         }
       } else {
         apiMessages = _buildApiMessages(messages);
@@ -1172,6 +1171,11 @@ class ChatScreenState extends State<ChatScreen> {
 
     // Track all tool calls across turns for final assistant message
     final allTurnToolCalls = <Map<String, dynamic>>[];
+
+    // 3.1（环）：投影定下来那一刻的消息条数。工具轮里往 apiMessages 追加的那些
+    // （`add` 出来的助手 tool_use 与工具结果）没有投影段，稍后按原文补进拆分里 ——
+    // 不补的话，最后一轮的快照与拆分描述的不是同一份请求。
+    final projectionMessageCount = apiMessages.length;
 
     int turn = 0;
     while (true) {
@@ -1218,6 +1222,30 @@ class ChatScreenState extends State<ChatScreen> {
       // here are systemPrompt / thinkingMode / thinkingEffort / toolsJson all in
       // scope. The last send of a multi-round turn wins (the grown version).
       if (mounted) {
+        // 3.1/3.2（环）：占用拆分必须与快照在**同一次** setState 里写入 —— 分两次
+        // 会出现一帧「快照换了、拆分还是上一次的」，那时点开面板就是错的。固定开销用
+        // 仓库既有的估算器算（不是写死的数）。工具轮里这一轮比投影多出来的消息按原文
+        // 补进去，两者才描述同一份请求。
+        final fixedOverheadTokens =
+            ContextEstimator.estimateTokens(systemPrompt) +
+                ContextEstimator.estimateTokens(toolsJson);
+        final trailingRawMessages =
+            apiMessages.sublist(projectionMessageCount);
+        final breakdown = maxContextTokens <= 0
+            ? null
+            : projectionTimeline.isEmpty
+                ? ContextBreakdown.verbatim(
+                    messages: messages,
+                    windowTokens: maxContextTokens,
+                    fixedOverheadTokens: fixedOverheadTokens,
+                    trailingRawMessages: trailingRawMessages,
+                  )
+                : ContextBreakdown.fromTimeline(
+                    timeline: projectionTimeline,
+                    windowTokens: maxContextTokens,
+                    fixedOverheadTokens: fixedOverheadTokens,
+                    trailingRawMessages: trailingRawMessages,
+                  );
         setState(() {
           _contextSnapshot = ContextSnapshot(
             sessionId: sessionId,
@@ -1229,6 +1257,7 @@ class ChatScreenState extends State<ChatScreen> {
             thinkingMode: thinkingMode,
             thinkingEffort: thinkingEffort,
             capturedAt: DateTime.now(),
+            breakdown: breakdown,
           );
         });
       }
@@ -3194,28 +3223,38 @@ class ChatScreenState extends State<ChatScreen> {
           // (task 3.2 / design D6). The default remains the conversation view.
           child: Column(
             children: [
-              Align(
-                alignment: Alignment.centerLeft,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 12, vertical: 6),
-                  child: SegmentedButton<ContextViewMode>(
-                    segments: const [
-                      ButtonSegment(
-                        value: ContextViewMode.conversation,
-                        label: Text('对话视图'),
-                      ),
-                      ButtonSegment(
-                        value: ContextViewMode.context,
-                        label: Text('真实上下文'),
-                      ),
-                    ],
-                    selected: {_viewMode},
-                    onSelectionChanged: (selection) {
-                      setState(() => _viewMode = selection.first);
-                    },
-                    showSelectedIcon: false,
-                  ),
+              Padding(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 12, vertical: 6),
+                child: Row(
+                  children: [
+                    SegmentedButton<ContextViewMode>(
+                      segments: const [
+                        ButtonSegment(
+                          value: ContextViewMode.conversation,
+                          label: Text('对话视图'),
+                        ),
+                        ButtonSegment(
+                          value: ContextViewMode.context,
+                          label: Text('真实上下文'),
+                        ),
+                      ],
+                      selected: {_viewMode},
+                      onSelectionChanged: (selection) {
+                        setState(() => _viewMode = selection.first);
+                      },
+                      showSelectedIcon: false,
+                    ),
+                    const Spacer(),
+                    // 5.3（环）：占用环放在这一行最右侧。切换视图换的是下面那块
+                    // Expanded，工具栏不动，所以两屏下环都在。没有拆分时它渲染成
+                    // 不占高度的空盒子（SizedBox.shrink），这一行的高度不受影响。
+                    // 9.2（环旁的数字）：环**和它左边那个百分比**一起放这一行最右。
+                    // 数字是 `ContextRing` 的兄弟节点 —— 放进控件内部会把它的 14×14 尺寸顶掉。
+                    ContextRingLabeled(
+                      breakdown: _contextSnapshot?.breakdown,
+                    ),
+                  ],
                 ),
               ),
               Expanded(
