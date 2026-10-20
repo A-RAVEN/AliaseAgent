@@ -58,13 +58,24 @@ class ContextBreakdown {
   /// 三段在环上的排布：顺时针、起点 12 点，顺序固定为 二级 → 一级 → 原文。
   ///
   /// 每段 `sweep = tokens / windowTokens * 2π`；[windowTokens] <= 0（窗口未知）时返回空列表。
+  ///
+  /// **2026-10-18 加的限制：整圈不许被画过**。三段之和可以大于窗口（历史总量本来就可能
+  /// 比窗口大 —— 压缩就是为了让它塞进窗口），那时按比例算出来的弧度会超过 2π、绕回去，
+  /// 画出来的环会自我覆盖。所以按顺序累加、到整圈为止，超出的部分**不画**；
+  /// 真实的 token 数仍原样留在 `tokens` 里（数字与面板都读它，不读弧度）。
   List<RingSegment> get ringSegments {
     if (windowTokens <= 0) return const [];
-    RingSegment seg(int tokens) => (
-          tokens: tokens,
-          sweepRadians: tokens / windowTokens * 2 * math.pi,
-        );
-    return [seg(level2Tokens), seg(level1Tokens), seg(rawTokens)];
+    const full = 2 * math.pi;
+    var used = 0.0;
+    final out = <RingSegment>[];
+    for (final tokens in [level2Tokens, level1Tokens, rawTokens]) {
+      var sweep = tokens / windowTokens * full;
+      if (used + sweep > full) sweep = full - used;
+      if (sweep < 0) sweep = 0;
+      out.add((tokens: tokens, sweepRadians: sweep));
+      used += sweep;
+    }
+    return out;
   }
 
   /// 按 design D1 把一条投影时间线分成三段。
@@ -102,6 +113,121 @@ class ContextBreakdown {
       rawTokens: raw,
       fixedOverheadTokens: fixedOverheadTokens,
       windowTokens: windowTokens,
+    );
+  }
+
+  /// 按**层级**直接构造（2026-10-18 新口径，tasks 12.2）。
+  ///
+  /// 与 [fromTimeline] 的区别是"量的是什么"：
+  /// * [fromTimeline] 量的是**上一次实际发出去那份请求**的构成 —— 只有当二级摘要真进了这次
+  ///   投影时，二级那一段才非零。而按 `CompactionEngine.substitutesSpan` 的判据（2 级要求
+  ///   最旧端与最新端都超过 `2T`），二级在实际对话里几乎永远不进投影。
+  /// * 这个工厂量的是**这段对话按层级划分的构成**：调用方按"每条消息取盖住它的最高层级"
+  ///   把三层 token 累加好再传进来（见 `lib/main.dart` 里那处调用），三段之和＝这段对话的
+  ///   token 总量，同一条消息不会被算两次。
+  ///
+  /// 用户原话（2026-10-18）：「我的要求是有原文，一级，二级摘要 3 瓣条的占用量」。
+  static ContextBreakdown fromTiers({
+    required int level2Tokens,
+    required int level1Tokens,
+    required int rawTokens,
+    required int windowTokens,
+    required int fixedOverheadTokens,
+  }) {
+    return ContextBreakdown(
+      level2Tokens: level2Tokens,
+      level1Tokens: level1Tokens,
+      rawTokens: rawTokens,
+      fixedOverheadTokens: fixedOverheadTokens,
+      windowTokens: windowTokens,
+    );
+  }
+
+  /// 按**层级**从整段历史算（2026-10-18 新口径，tasks 12.3）。
+  ///
+  /// 规则：对每条消息取**盖住它的最高层级**（[covers] 里 `minSeq..maxSeq` 命中的、`level`
+  /// 最大的那条）；被二级盖的算二级、只被一级盖的算一级、都没盖的算原文。三段之和
+  /// 就是这段对话的 token 总量 —— 同一条消息只进一个桶，不会重复计入。
+  ///
+  /// [extraRawTokens]：投影定下来之后才追加进这一轮请求的那些消息（工具轮），一律算原文。
+  ///
+  /// 提成纯函数是为了能单测：调用点在 `_sendMessage` 里、拿不到它的私有状态。
+  static ContextBreakdown fromHistory({
+    required List<Message> messages,
+    required List<({int level, int minSeq, int maxSeq})> covers,
+    required int windowTokens,
+    required int fixedOverheadTokens,
+    int extraRawTokens = 0,
+  }) {
+    var level2 = 0;
+    var level1 = 0;
+    var raw = 0;
+    for (final m in messages) {
+      final seq = m.seq ?? 0;
+      var coveredBy = 0;
+      for (final c in covers) {
+        if (seq >= c.minSeq && seq <= c.maxSeq && c.level > coveredBy) {
+          coveredBy = c.level;
+        }
+      }
+      final t = ContextEstimator.estimateMessage(m);
+      if (coveredBy >= 2) {
+        level2 += t;
+      } else if (coveredBy == 1) {
+        level1 += t;
+      } else {
+        raw += t;
+      }
+    }
+    return fromTiers(
+      level2Tokens: level2,
+      level1Tokens: level1,
+      rawTokens: raw + extraRawTokens,
+      windowTokens: windowTokens,
+      fixedOverheadTokens: fixedOverheadTokens,
+    );
+  }
+
+  /// 按**层级**从"各层表示自己的大小"算（2026-10-18 用户要求三瓣，tasks 12.3 的第二版）。
+  ///
+  /// **为什么不用"取最高层级"那版**：那一版在真机上跑出来 `level2=10859 level1=0`
+  /// （一条大二级把所有折叠内容都盖住了 ⇒ 一级桶恒 0），而且总量可以大于窗口、环画过整圈。
+  ///
+  /// 这一版的口径是"每一层的表示各占多少"：
+  /// * 二级 = 库里所有 `level == 2` 摘要的 `tokenCost` 之和；
+  /// * 一级 = 库里所有 `level == 1` 摘要的 `tokenCost` 之和；
+  /// * 原文 = **没有被任何摘要覆盖**的那些消息的估算之和（含 [extraRawTokens]）。
+  ///
+  /// 注意三段之和**不等于**上下文大小（二级盖住的一级仍各自计一次）—— 环显示的是
+  /// "各层表示的成本"，这一点写在 spec 里。
+  static ContextBreakdown fromSummaries({
+    required List<Message> messages,
+    required List<({int level, int minSeq, int maxSeq, int tokenCost})> summaries,
+    required int windowTokens,
+    required int fixedOverheadTokens,
+    int extraRawTokens = 0,
+  }) {
+    var level2 = 0;
+    var level1 = 0;
+    for (final s in summaries) {
+      if (s.level >= 2) {
+        level2 += s.tokenCost;
+      } else if (s.level == 1) {
+        level1 += s.tokenCost;
+      }
+    }
+    var raw = extraRawTokens;
+    for (final m in messages) {
+      final seq = m.seq ?? 0;
+      final covered = summaries.any((s) => seq >= s.minSeq && seq <= s.maxSeq);
+      if (!covered) raw += ContextEstimator.estimateMessage(m);
+    }
+    return fromTiers(
+      level2Tokens: level2,
+      level1Tokens: level1,
+      rawTokens: raw,
+      windowTokens: windowTokens,
+      fixedOverheadTokens: fixedOverheadTokens,
     );
   }
 

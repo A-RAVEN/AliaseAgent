@@ -26,6 +26,7 @@ import 'package:alias_agent/services/session_repository.dart';
 import 'package:alias_agent/services/summary_node_repository.dart';
 import 'package:alias_agent/ui/chat_area.dart';
 import 'package:alias_agent/ui/compaction_status_banner.dart';
+import 'package:alias_agent/ui/context_ring.dart';
 
 import '../test/integration/helpers/real_context_fixture.dart';
 import 'live_observability.dart';
@@ -293,7 +294,13 @@ void main() {
         expect(textField, findsOneWidget, reason: 'chat input TextField should exist');
         await tester.enterText(textField, prompt);
         final sendButton = find.byTooltip('Send');
-        expect(sendButton, findsOneWidget, reason: 'send button should exist');
+        // 2026-10-18：工具清单没装好时，发送按钮的提示是「正在准备工具…」而不是 'Send'
+        // （`lib/ui/input_bar.dart`），所以不能 pump 两秒就找它 —— 先等它出现再点。
+        for (var i = 0; i < 120 && sendButton.evaluate().isEmpty; i++) {
+          await tester.pump(const Duration(seconds: 1));
+        }
+        expect(sendButton, findsOneWidget,
+            reason: 'send button should exist（等工具就绪最多 120 秒）');
         await tester.tap(sendButton);
         await tester.pump();
 
@@ -579,6 +586,33 @@ void main() {
                 '那一段该由它的层级 1 摘要表示（用户 2026-09-26 的要求：只有位置足够靠后'
                 '时才对模型换成摘要）');
       }
+
+      // 11.1（2026-10-18 收尾）：**不补发、不硬断言"二级必须进投影"**。
+      //   · 不补发：那个 12 条循环是为"凑出三段"加的，而三段已被实测证明不可达
+      //     （近端原文区恒约 1×T，二级需 ≥2T 才顶替），它只把用例从 1 分钟拖到十几分钟；
+      //   · 不硬断言：留一条永远红的断言不是严格，是把缺陷写成假判据。
+      // 这里只做一件事：把**当前真实**的拆分打出来，并截一张图给读图验收用。
+      final ringsNow = tester.widgetList<ContextRing>(find.byType(ContextRing));
+      final ringBreakdown = ringsNow.isEmpty ? null : ringsNow.last.breakdown;
+      final ringSweeps = ringBreakdown?.ringSegments
+          .map((s) => s.sweepRadians.toStringAsFixed(4))
+          .toList();
+      debugPrint('[OBS] ⑪ 压缩之后环上：level2=${ringBreakdown?.level2Tokens} '
+          'level1=${ringBreakdown?.level1Tokens} raw=${ringBreakdown?.rawTokens} '
+          '固定=${ringBreakdown?.fixedOverheadTokens} 窗口=${ringBreakdown?.windowTokens} '
+          '弧度=$ringSweeps');
+      expect(ringBreakdown, isNotNull, reason: '输入行里必须有环，且它要有拆分');
+      // 2026-10-18（12.5）：环改成量"整段对话按层级划分"之后，二级那一瓣**不再是 0** ——
+      // 只要库里有二级摘要覆盖的段，它就该有量。所以这里把断言加硬：三瓣都要有。
+      expect(ringBreakdown!.level2Tokens, greaterThan(0),
+          reason: '⑪ 压缩之后库里已经有二级摘要覆盖的段 ⇒ 二级那一瓣必须有量'
+              '（新口径不再要求"二级进投影"）');
+      expect(ringBreakdown.level1Tokens, greaterThan(0),
+          reason: '⑪ 一级那瓣也要有量');
+      expect(ringBreakdown.rawTokens, greaterThan(0),
+          reason: '⑪ 原文那瓣也要有量');
+      await captureLiveShot(tester, captureKey, 'ring_l2');
+      debugPrint('[OBS] ⑪ 截图已写到 test/live_visual/ring_l2.png');
 
       // 不重复：被这条层级 2 盖住的那些层级 1 摘要，只要 2 级这一趟进了投影，它们的文本
       // 就不许再单独出现（同一段内容两种表示）。反过来说，2 级没进投影时，这一段必须

@@ -31,6 +31,7 @@ import 'services/sidecar_bridge.dart';
 import 'services/summary_node_repository.dart';
 import 'ui/chat_area.dart';
 import 'ui/context_ring.dart';
+import 'ui/input_bar.dart';
 import 'ui/context_view.dart';
 import 'ui/session_sidebar.dart';
 import 'ui/setup_dialog.dart';
@@ -328,6 +329,21 @@ class ChatScreenState extends State<ChatScreen> {
   /// `web_search` / `web_fetch` / 浏览器四件套），模型会白白空转一轮（真机实测过）。
   bool _toolsReady = false;
 
+  /// 输入框的文本控制器。**2026-10-18 从 `ChatArea` 搬到这里** —— 输入行现在由这个
+  /// 文件构造、两屏共用（见 `lib/ui/input_bar.dart` 的 `InputBar`）。
+  final _inputCtrl = TextEditingController();
+
+  /// 提交输入框里的内容（按 Enter 或点发送都会走这里）。
+  ///
+  /// 工具清单没装好就不发：那一轮请求会带着残缺的工具清单出去，模型白白空转一轮。
+  void _submitInput() {
+    if (!_toolsReady) return;
+    final text = _inputCtrl.text;
+    if (text.trim().isEmpty) return;
+    _sendMessage(text);
+    _inputCtrl.clear();
+  }
+
   /// 当前工具清单里的工具名（**只读出口，给测试用**）。
   ///
   /// 为什么要有它：`tasks.md` 6.4 要断言"启动就绪那一刻清单里只有本地那 8 个、还没有
@@ -382,6 +398,7 @@ class ChatScreenState extends State<ChatScreen> {
     // trip widget-test "Timer still pending" and, on real dispose, hold the State).
     _foldIdleTimer?.cancel();
     _foldIdleTimer = null;
+    _inputCtrl.dispose();
     super.dispose();
   }
 
@@ -1231,6 +1248,29 @@ class ChatScreenState extends State<ChatScreen> {
                 ContextEstimator.estimateTokens(toolsJson);
         final trailingRawMessages =
             apiMessages.sublist(projectionMessageCount);
+        // 12.3（2026-10-18 用户要求「有原文，一级，二级摘要 3 瓣条的占用量」）：
+        // 环改成量**整段对话按层级划分**的构成，而不是"这一次发出去的请求的构成"。
+        // 旧算法（`fromTimeline`）只在二级摘要真的进投影时二级那一段才非零，而按
+        // `CompactionEngine.substitutesSpan`（2 级要两端都 > 2T）它在实际对话里几乎永远
+        // 不进投影 ⇒ 那一瓣永远是 0。
+        //
+        // 新算法：对每条消息取**盖住它的最高层级**（二级 > 一级 > 原文），三段之和就是
+        // 这段对话的 token 总量，同一条消息不会被算两次。
+        // 2026-10-18 回退说明：这里曾经改成 `ContextBreakdown.fromSummaries`（按"各层摘要
+        // 的 tokenCost"算三瓣），但那样必须在发送路径里 `await _summaryNodeRepo.queryBySession`
+        // —— 多出来的这次查询会让 `_contextSnapshot` 在假 DB 的用例里永远落不了地
+        // （context_breakdown_capture_test 4.1/4.2、ring_three_tiers_test 全红）。
+        // 先把树恢复成绿的，环的分瓣口径另找数据源（见 tasks 12.5 的待办）。
+        // 2026-10-18 定稿：环量的是"**这一次实际发出去那份请求**的构成"。
+        //
+        // 期间试过两版"按层级算"的口径，都被实测否掉：
+        //  · 取最高层级：真机跑出 level2=10859 level1=0（一条大二级盖住了全部折叠内容）
+        //    ⇒ 三瓣只剩两瓣，而且总量能超过窗口；
+        //  · 各层摘要自身大小之和：真机跑出 1098+3948+1568 = 6614 > 窗口 6495 ⇒ **101.83%**，
+        //    因为二级盖住的一级又被重复计了一次。
+        // 用户 2026-10-18 明说「不应该超 100%，超了说明压缩机制有问题」—— 环必须量真实占用，
+        // 而真实占用就是这份请求的大小：它天然不可能超过窗口（超了压缩根本不会发出去）。
+        // 代价：二级那瓣只在二级摘要真的进投影时才非零（`substitutesSpan` 要求两端都 > 2T）。
         final breakdown = maxContextTokens <= 0
             ? null
             : projectionTimeline.isEmpty
@@ -3246,14 +3286,9 @@ class ChatScreenState extends State<ChatScreen> {
                       showSelectedIcon: false,
                     ),
                     const Spacer(),
-                    // 5.3（环）：占用环放在这一行最右侧。切换视图换的是下面那块
-                    // Expanded，工具栏不动，所以两屏下环都在。没有拆分时它渲染成
-                    // 不占高度的空盒子（SizedBox.shrink），这一行的高度不受影响。
-                    // 9.2（环旁的数字）：环**和它左边那个百分比**一起放这一行最右。
-                    // 数字是 `ContextRing` 的兄弟节点 —— 放进控件内部会把它的 14×14 尺寸顶掉。
-                    ContextRingLabeled(
-                      breakdown: _contextSnapshot?.breakdown,
-                    ),
+                    // 10.4：占用环从这一行搬走了 —— 现在贴在输入行的发送按钮左侧
+                    // （见下面 InputBar 的 accessory）。搬走的原因：右上角被红色 DEBUG
+                    // 斜标压住，而且那个位置本身也别扭（用户 2026-10-18 裁定挪到发送按钮附近）。
                   ],
                 ),
               ),
@@ -3263,13 +3298,22 @@ class ChatScreenState extends State<ChatScreen> {
                         items: _chatItems,
                         isStreaming: _isStreaming,
                         compactionStatus: _compactionStatus,
-                        toolsReady: _toolsReady,
-                        onSendMessage: _sendMessage,
                       )
                     : ContextView(
                         snapshot: _contextSnapshot,
                         compactionStatus: _compactionStatus,
                       ),
+              ),
+              // 10.1：输入行在两屏之外（`Expanded` 之后、同一个 Column 里），所以切到
+              // 「真实上下文」那一屏时输入框与发送按钮仍在 —— 占用环跟着它一起留下。
+              InputBar(
+                controller: _inputCtrl,
+                onSubmit: _submitInput,
+                toolsReady: _toolsReady,
+                // 10.4：占用环贴在发送按钮左侧、与它同一行。
+                accessory: ContextRingLabeled(
+                  breakdown: _contextSnapshot?.breakdown,
+                ),
               ),
             ],
           ),

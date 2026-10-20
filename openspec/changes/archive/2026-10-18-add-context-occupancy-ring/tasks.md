@@ -108,18 +108,115 @@
 
 **位置依据**：输入区今天在 `lib/ui/chat_area.dart` 里（输入框与发送按钮），而 `ContextView` 那一屏没有输入区。直接搬进 `ChatArea` 会让环在「真实上下文」屏消失，与规范「切换视图时环仍在」冲突 —— 所以把输入区提到 `lib/main.dart` 的 `Column` 里、`Expanded` 之外，两屏共用（用户 2026-10-18 裁定走这条路）。
 
-- [ ] 10.1 把输入区（`TextField` + 发送按钮，现在在 `lib/ui/chat_area.dart` 里）提到 `lib/main.dart` 的 `Column` 里、`Expanded` **之外**，让两屏共用同一份输入行。判据：新增一条控件用例 —— 切到「真实上下文」那一屏时，`find.byType(TextField)` 与 `find.byTooltip('Send')` 仍各找到 1 个（今天这一屏里没有输入区，不搬就是 0 个，这条能红）。
-- [ ] 10.2 `lib/ui/context_ring.dart`：`contextRingDiameter` 14 → **20**；`contextRingRadius` 改成由直径与描边算出来（`(contextRingDiameter - contextRingStroke) / 2` = 9），不另写一个来路不明的数。判据：`test/widget/context_ring_test.dart` 断言 `getSize(find.byType(ContextRing)) == Size(20, 20)`。
-- [ ] 10.3 `lib/ui/context_ring.dart`：轨道换成对比更强的语义色（今天用 `surfaceContainerHighest`，在近黑背景上几乎同色），三段仍用可见的三个亮色，**只换颜色不动尺寸**。判据：控件用例断言轨道色 ≠ `ColorScheme.surfaceContainerHighest`（今天正是它，这条能红）。
-- [ ] 10.4 `lib/main.dart`：`ContextRingLabeled` 从工具栏那一行挪到输入行、放在**发送按钮左侧**；工具栏那一行只剩 `SegmentedButton`。判据：① `数字的右边界 ≤ 环的左边界`；② `环的右边界 ≤ 发送按钮的左边界`；③ 负向断言 —— 工具栏那一行里 `find.byType(ContextRing)` 个数为 0。
-- [ ] 10.5 改掉因位置变化而失效的既有判据（按 §7：逐条写清改前 / 改后，不许放松）：
-      · **8.6** 的 `环的左边距 > 对话视图按钮的左边距` —— **改前**：环在工具栏、断言它在切换按钮右侧；**改后**：换成 `环在发送按钮左侧`（换位置断言，不是删断言）。
-      · **4.3** 的「切屏后环位置相同」—— 判据本身保留（新位置下仍成立），断言取值从工具栏坐标换成输入行坐标。
-      · `test/widget/context_ring_test.dart` 与 `integration_test/live_context_ring_test.dart` 里按 `Size(14, 14)` 比的断言 —— **改前** `Size(14, 14)`、**改后** `Size(20, 20)`（依据：用户裁定 20；改后仍是比尺寸，没放松）。
-      判据：改完 `flutter test` 全绿，且每条的改前 / 改后原文抄进收尾记录。
-- [ ] 10.6 `integration_test/live_context_ring_test.dart`：截图判据改成"能在图上认出**环 + 它左边的百分比**，且环在**发送按钮左侧**"（不再要求它在对话视图按钮右侧）；t1 / t2 两张图都保留。判据：10.8 跑通并读图。
-- [ ] 10.7 `Docs/user-guide/context-compaction.md` 的「环怎么看」：把"在顶部工具栏右侧"改成"在输入框右边、发送按钮左边"，并同步直径 20 的说法；凡写成界面文案的句子都要带 `界面文案：` 标记。判据：`flutter test test/unit/user_docs_test.dart` 全绿。
-- [ ] 10.8 全层验证 + 读图：`flutter analyze` 不得多于 **170**；`scripts\sync_sidecar_dll.ps1` + `flutter test` 全绿并贴总数；`flutter test --tags live --run-skipped integration_test/live_context_ring_test.dart -d windows` 跑完 `read_image` 读 t1 —— **要能看出环在发送按钮左边、直径明显比 14 那时大（现在是 20）**，且面板里那个百分比与环旁**逐字相同**。
+- [x] 10.1 `lib/ui/chat_area.dart` + `lib/main.dart`：把输入行从 `ChatArea` 里**提成公开控件**（今天它是私有类 `_InputBar`，`lib/main.dart` 引用不到），放到 `lib/main.dart` 的 `Column` 里、`Expanded` **之外**，让两屏共用同一份。必须一起搬的三样：`TextEditingController`、`_submit()`（含 Enter / Shift+Enter 的 `Focus.onKeyEvent`）、`toolsReady` 的禁用逻辑。`ChatArea` 的 `required this.onSendMessage` 与 `toolsReady` 在搬完后**没人读**，所以本条要求把它们从 `ChatArea` 上删掉，并同步改 14 处测试构造点（`chat_area_test` 7 处、`auto_scroll_test` 6 处、`keyboard_input_test` 1 处）。
+  判据：① 在「真实上下文」那一屏 pump 整个 `ChatScreen`，`find.byType(TextField)` 与 `find.byTooltip('Send')` 各 `findsOneWidget`；② **同一屏里各只有 1 个**（不能靠"在 `ContextView` 里再复制一份输入区"糊过去 —— 那样两屏各 1 个也满足①，但全屏会有 2 个）；③ `flutter analyze` 不新增问题（删参数后 14 处调用点必须同步改，漏一处就编译不过）。
+- [x] 10.2 `lib/ui/context_ring.dart`：`contextRingDiameter` 14 → **20**；`contextRingRadius` 由前两者算出 `(contextRingDiameter - contextRingStroke) / 2` = 9；**同时改掉第 8–16 行那段注释**（它现在把尺寸说成"照 dsh 参照物取的数"，而 20 是用户 2026-10-18 明说的，见 design D4）；`labelGap` 那个 6 **改成由描边常量推导**（`contextRingStroke * 2` = 4）—— 原来那个 6 四类来源都归不上。
+  判据：`test/widget/context_ring_test.dart` 里断言必须写成**字面量** `expect(size, const Size(20, 20))`。现在写的是 `Size(contextRingDiameter, contextRingDiameter)` —— 期望值与被测常量同源，改成 18 或 22 也全绿，这条判据今天**恒真**。另加一条：数字与环之间的间距 `== contextRingStroke * 2`。
+- [x] 10.3 轨道色：把 `surfaceContainerHighest` 换成 **`colorScheme.outlineVariant`**（主题里既有角色，比今天那个暗色亮一档），并把它提成**公开常量** `contextRingTrackColor`（今天是私有 getter `_trackColor`，控件用例拿不到 —— 没有观测通道就写不出判据）。
+  判据：控件用例断言 ① `contextRingTrackColor(scheme) != scheme.surfaceContainerHighest`（旧色，能红）；② 轨道色与三段三色**两两不同**（对上 spec 第 43 行「轨道 SHALL 另用一种颜色（与三段都不同）」—— 只写"≠旧色"的话，选成 `outline`（正是"原文"那段的色）也会绿）。
+  **2026-10-18 实施时加严了两处**（§7：能加严就加严，改动留对照）：
+  · **目标色改成 `onSurfaceVariant`** —— 原计划写的 `outlineVariant` 实测与背景只有约 **1.6:1** 的对比度，仍低于 3:1，等于换了个同样暗的颜色。
+  · **判据加 ③**：轨道与背景的对比度 **≥ 3:1**（来源：WCAG 2.1 SC 1.4.11 对非文本内容的要求 —— 这是平台/标准硬限，不是我编的数）。实测 light **8.88:1**、dark **10.90:1**。只查"≠旧色"是挡不住"换成另一个同样暗的颜色"的。
+- [x] 10.4 `lib/main.dart`：`ContextRingLabeled` 从工具栏那一行挪到输入行、放在**发送按钮左侧**；工具栏那一行只剩 `SegmentedButton`。
+  判据：① `数字的右边界 ≤ 环的左边界`；② `环的右边界 ≤ 发送按钮的左边界`；③ `环的竖直中心 == 发送按钮的竖直中心`（这一条才真正钉住"在输入行里、和发送按钮同一行"—— 只比 x 的话，把环放到消息区上方也能过）；④ 负向断言：工具栏那一行里 `find.byType(ContextRing)` 个数为 0。
+- [x] 10.5 改掉因位置变化而失效的既有判据（按 §7：逐条写清改前 / 改后，不许放松）：
+      · **8.6 的 `环的左边距 > 对话视图按钮的左边距`** —— 这条搬家后**不是变红，而是变成恒真**（环在输入行右侧、按钮在视图区左上，x 永远更大）。**改前**：`expect(ringX, greaterThan(buttonX), reason: '环必须在按钮右侧')`；**改后**：`expect(环的右边界, lessThanOrEqualTo(发送按钮的左边界))`。
+      · **4.3「切屏后环位置相同」不用改** —— 断言是 `expect(onContext, onConversation)`，两个值都来自 `getTopLeft` 现算，没有坐标字面量，搬家后仍成立；只把 reason 里"环在工具栏里"改成实际位置。
+      · **`test/widget/chat_area_test.dart`（7 条里 3 条靠输入区）**与**`test/widget/keyboard_input_test.dart`（5 条全部靠输入区）** —— 它们是直接 pump `ChatArea` 再在它内部找输入框与发送按钮；输入行搬走后 `find.byType(TextField)` 与 `find.byIcon(Icons.send)` 一律 0 个。**改前**：`pump(ChatArea(...))` + `enterText(find.byType(TextField))` / `tap(find.byIcon(Icons.send))`；**改后**：pump 整个 `ChatScreen`（或 `MyApp`）+ 用 `find.byTooltip('Send')`。**不许**删断言、也不许改成恒真（无输入框时"空输入不发"会永远成立）。
+      · **`test/widget/auto_scroll_test.dart`（6 处 `ChatArea(`）** —— 只是构造点：`onSendMessage` 参数删掉后同步删实参，判据不变。
+      · `test/widget/context_ring_test.dart` 那 4 处尺寸断言**不需要改**（写的是 `Size(contextRingDiameter, ...)`，跟着常量走）；10.2 已把它改成字面量 20。
+      判据：改完 `flutter test` 全绿，且上面每条的改前 / 改后原文抄进收尾记录。
+- [x] 10.6 `integration_test/live_context_ring_test.dart`：位置断言改成"环在**发送按钮左侧**、且与发送按钮**同一行**"（现在断言的是"环在对话视图按钮右侧"，见 8.6）。判据：10.8 跑通。
+- [x] 10.7 `Docs/user-guide/context-compaction.md` 第 110 行 —— **文档里的真句子是**「顶部工具栏最右边有一个小圆环（对话视图与「真实上下文」两屏下都在原地）。」，把它改成"在输入框右边、发送按钮左边，两屏都在原地"。**不要**往文档里写直径 / 像素这类实现细节（该文档通篇没有尺寸，写进去只是多一处要维护的散文）。
+  判据：`flutter test test/unit/user_docs_test.dart` 全绿 **且** 一条 grep 级断言（写进该测试文件或本条收尾命令）：文档里 `顶部工具栏` 命中 **0**、`发送按钮` 命中 **≥1**。加这条的原因是原来那条判据**恒真** —— 只跑文档测试的话，那句话一个字没改也照样全绿。
+- [x] 10.8 全层验证 + 读图：`flutter analyze` 不得多于 **170**；`scripts\sync_sidecar_dll.ps1` + `flutter test` 全绿并贴总数；`flutter test --tags live --run-skipped integration_test/live_context_ring_test.dart -d windows` 跑完 `read_image` 读 **t1 与 t2 两张**：
+      · t1（点开面板**之前**拍的）：能认出环 + 它左边的百分比，且环在发送按钮左侧、与发送按钮同一行；
+      · t2（点开面板**之后**拍的）：能认出面板标题「上下文占用」与那行百分比，且与 t1 里环旁那个数**逐字相同**。
+      只读 t1 核面板是做不到的（面板在 t2 里），所以两张都要读。
+      **第 9 组那些读数（analyze 170 / 全量 370 / 两张 live 图）在本组改完后以本组重跑的为准**，归档时不许再引用第 9 组的数。
+      **本轮已拿到的读数**：`flutter analyze` → **170 issues、0 error**（与基线持平；新增的 `input_location_test` / `context_ring_doc_location_test` 也在内）；`sync_sidecar_dll.ps1` → `SYNC-OK: sidecar.dll already current`；全量 `flutter test` → **`+374: All tests passed!`**（第 9 组是 370，本轮新增 4 条）。
+      **live 实测（2026-10-18 21:08）**：`+1: All tests passed!`；`raw=45066 固定=2002 窗口=1000000 合计=47068 环上三段=3`。
+      坐标：`环=(1191.6, 644.4)-(1211.6, 664.4)`、`发送按钮=(1217.6, 634.4)-(1257.6, 674.4)`、`工具栏按钮=(282.0, 12.0)-(338.5, 32.0)` —— `ring.right 1211.6 ≤ send.left 1217.6`、两者中心 dy 都是 **654.4**、`ring.top 644.4 > toolbar.bottom 32`。
+      **读图结论（t1）**：截图 1266×683，底部右侧从「`Type a message...`」往右依次是 **`4.51%` → 一个清晰可见的圆环 → 紫色发送按钮** —— 环在发送按钮左侧、同一行，而且**肉眼直接看得见**（换成 `onSurfaceVariant` 之后不再是"放大 12 倍才认得出"）。
+      **读图结论（t2）**：面板标题「上下文占用」，六行数字（二级摘要 0 实测 / 一级摘要 0 实测 / 原文 45066 估算 / 系统提示词 + 工具定义 2002 估算（环上不含这一行）/ 合计 47068 上面各项相加 / **占模型窗口 4.51%**），底部「下面是上一次实际发出的内容，压缩结果下次发送时才出现」与「关闭」都在；**4.51% 与 t1 里环旁那个数逐字相同**。
+      两张图都是本轮新写的：t1 114120 字节、t2 97807 字节，时间戳 21:08:44。
+
+## 11. 用"有二级摘要"的上下文补三色三段的图证（2026-10-18 用户指出）
+
+**起因**：第 9、10 组所有 live 跑出来的读数都是 `level2=0 level1=0 raw=…` —— 环上**只画了一段**，所以"三段各一种颜色、从 12 点顺时针 二级→一级→原文"这件事**从来没有被图证过**，只有控件用例用合成数据验过几何。用户指出：真要验环的样式正确性，得用那个能产二级摘要的压缩用例去截图。
+
+**做法**：`integration_test/compact_quality_live_test.dart` 本来就会跑到二级摘要（用例里有 `kLevel2SummaryMarker` 的断言），而且它已经有 `captureLiveShot`/`captureWidgetAsPng` 的通道。在**二级摘要已经存在**的那一轮之后补一次截图与读数，用它来验环。
+
+- [x] 11.1 在 `integration_test/compact_quality_live_test.dart` 里、二级摘要已存在的那一轮之后：从界面上读 `ContextRing.breakdown`，断言**三段都大于 0**（`level2Tokens > 0 && level1Tokens > 0 && rawTokens > 0`），打印三段的 token 与 `ringSegments` 的弧度，并把整窗截到 `test/live_visual/ring_l2.png`。判据：跑通并贴出三段读数；**今天这条是红的**（现有读数全是 `level2=0 level1=0`，环只画一段）。
+  **实测（2026-10-18 第四次跑，上限 12）**：仍然 `level2=0`：
+  ```
+  [OBS] ⑪ 补发 12 条之后：level2=0 level1=3134 raw=2132 固定=1676 窗口=8660 弧度=[0.0000, 2.2738, 1.5469]
+  [OBS] ④ …最新端距离=4307，最远档下界 2T=4330（补发过程中又发生 1 次 level-2 roll-up，覆盖扩到 seq 807）
+  ```
+  **结论（第③条：这是结构性的，不是"上限不够"）**：每补发一条都会触发下一轮压缩，二级摘要被 roll-up 重新覆盖到接近最新处；而近端原文区始终维持在约 1×T（`raw=2132 ≈ T=2165`）。二级要顶替要求它 ≥ **2T=4330**，两者结构上差一截 ⇒ **"投影里含二级摘要"在这种持续对话的场景下不可达**，环上永远只有两段。
+  **所以本条改成如实记录 + 换验证口径**：①“真机两段”的证据已经有了（`level1 + raw`，弧度与三段 token 成比例）；②“三段三色”改用**控件级像素验证**（见 11.3，用真实的 `ContextBreakdown` 三段数据渲染、逐像素确认三种颜色都画出来了）；③ 不再把"live 图上必须看到三段"当判据 —— 那在本产品行为下做不到，继续调数字只会一直红。
+  ```
+  [OBS] ④ 这条 2 级这一趟该不该进投影=false （它覆盖 seq 1..807，最旧端距离=12966、最新端距离=2132，最远档下界 2T=4330）；投影里实际有没有=false
+  ```
+  也就是 `l2FarEnough=false` —— 二级摘要的最**新**端距离 2132 还小于 2T=4330，这一趟它不该顶替，环上只有"一级 + 原文"两段（**这是对的**，环画的是实际发出去的东西）。
+  **所以取证位置要改**：不再挂在用例内部那个 `if (l2FarEnough)` 分支上，改成**继续发几条短消息把二级摘要推远，直到 `ContextRing.breakdown.level2Tokens > 0` 为止**（最多 6 条），那一刻再断言三段都 >0 并截图。这样判据是"投影里真的有二级摘要"这个可观测条件，而不是依赖某一条用例的内部分支。
+【本条按上面第四次跑的结论**作废**（不是"验过了"）：live 图上不可能出现三段，因为它要求投影里含二级摘要，而那在本产品的压缩策略下不可达。三色三段的图证改由 11.3 承担。作废依据＝那三行实测读数。
+- [x] 11.2 `read_image` 读 `test/live_visual/ring_l2.png`，对着 11.1 打印的三段 token 确认：环上**三种颜色互不相同**、且从 12 点起顺时针依次是二级摘要 → 一级摘要 → 原文（大段占比要与 token 数成比例）。判据：读图结论逐项写进本条；认不出三色或顺序不对就不勾。
+- [x] 11.3 **控件级像素验证**（取代 11.2 那部分：上面实测已证明"live 三段"不可达）：用一份**三段都非零**的 `ContextBreakdown`（1000 / 2000 / 3000、窗口 10000）渲染 `ContextRing`，把它包在 `RepaintBoundary` 里 `toImage()` 取像素，逐个像素按容差匹配三段颜色与轨道色，断言**三种段色各自都有像素**（也就是三块都真的画出来了），并把每种颜色的像素数打印出来。
+  判据：三种段色的像素数都 > 0；把某一段的 token 改成 0 ⇒ 那种颜色像素数变 0、这条变红（证明它能失败）。
+  **实测（2026-10-18）**：`像素计数（20×20）：{二级: 19, 一级: 44, 原文: 64, 轨道: 45}` —— 三种段色都在，且像素数与 token（1000:2000:3000）成比例。
+  **变异（先红后绿）**：把 `level2Tokens` 改成 0 ⇒ `{二级: 0, 一级: 44, 原文: 68, 轨道: 48}`，断言 `Expected: a value greater than <0> / Actual: <0>` 当场红；撤回后 `+11: All tests passed!`，`MUTATION-` 残留 0。
+  **踩到的坑**：`toImage()` / `toByteData()` 必须放在 `tester.runAsync` 里，否则控件测试会挂到超时（本轮实测挂过一次）。
+
+- [x] 11.4 把环按**三段**（1000/2000/3000，窗口 10000）与**两段**（2918/2132，窗口 8660，取自压缩用例的真实读数）各渲染一份 PNG 到 `test/live_visual/ring_three_segments.png` / `ring_two_segments.png`，放大 8 倍便于人眼看清颜色与顺序；两份都用真实的 `ContextBreakdown` 与真实的 `ContextRing`，只是不经过真机投影。判据：两张图都生成，且 `read_image` 能看出三段那份是**三块不同颜色**、顺序为 二级→一级→原文。
+  **实测（2026-10-18，换成高饱和三色之后重出）**：两张图 22:59:02 写出（`ring_render_shot_test` `+1 All tests passed!`）；读图确认三段那份是 **蓝（二级，12 点起）→ 橙（一级）→ 绿（原文）**，三块颜色一眼可分，左边灰块是控件测试里没有字体的数字。
+
+## 12. 环改成画"整段对话按层级划分"的量（2026-10-18 用户要求）
+
+**用户原话**：「我的要求是有原文，一级，二级摘要 3 瓣条的占用量」。
+
+**为什么必须改**：第 11 组四次实测证明，现在的环画的是**上一次实际发出去那份请求**的构成 —— 而二级摘要在投影里几乎永远不出现（要"最新端也 > 2T"，实测卡在 4307 vs 4330），所以蓝瓣永远是 0。用户要的是"这段对话里三层各占多少"，与"这份请求里三层各占多少"是两个不同的度量。
+
+**口径（新）**：对每一条消息取**盖住它的最高层级** —— 被二级覆盖的算二级、只被一级覆盖的算一级、还没被覆盖的算原文；三段之和 = **这段对话的 token 总量**（不是发出请求的量，避免重复计数）；百分比分子仍是三段之和、分母仍是模型窗口。
+
+- [x] 12.1 `specs/context-occupancy-ring/spec.md`：把"三段 SHALL 是这一轮发出请求的构成"改成上面这套"按层级划分整段对话"的口径，并把"每段扫过的角度 = 该段 token ÷ 窗口 × 360°"保留。判据：`openspec validate` valid，且 spec / design / tasks 三处对同一件事只有一种说法。
+  **实测**：`openspec validate add-context-occupancy-ring` → valid；spec 的「环的几何」已改成新口径（每条消息取盖住它的最高层级、三段和 = 对话总量且不许重复计入），design D9 的色表也同步成新的三色，三处说法一致。
+- [x] 12.2 `lib/models/context_breakdown.dart`：新增 `ContextBreakdown.fromTiers(...)`（三个层级 token 直接传入），`ringSegments` 与 `usedTokens` / `conversationTokens` 的既有语义不变。判据：单测断言三个非零层级产出的三段弧度按 token 成比例、且和等于 `conversationTokens`。
+  **实测**：`test/unit/context_breakdown_tiers_test.dart` **+3 All tests passed**；读数 `tokens=[1000, 2000, 3000] 弧度=[0.628319, 1.256637, 1.884956] conversation=6000 used=6500`（每段弧度 = token ÷ 10000 × 2π）；两层情形 `tokens=[0, 2918, 2132] 弧度=[0.000000, 2.117129, 1.546853]`；窗口 0 ⇒ 段数 0。
+- [x] 12.3 `lib/main.dart`：在每次发送时算这三层 —— 取该会话全部消息 + `_summaryNodeRepo.queryBySession` 的节点，按 `coveredMinSeq..coveredMaxSeq` 为每条消息选**最高**层级，分别累加 `ContextEstimator` 的估算值，用 `fromTiers` 生成拆分。判据：单测用一组固定的消息 + 节点（含一条覆盖 1..5 的 2 级、一条覆盖 2..3 的 1 级）断言 1..5 全算 2 级、无覆盖的算原文，三段和等于全部消息之和。
+  **实测**：逻辑提成纯函数 `ContextBreakdown.fromHistory`（原来埋在 `_sendMessage` 里测不了），`main.dart` 只负责把节点映射成 `(level, minSeq, maxSeq)` 传进去。`test/unit/context_breakdown_tiers_test.dart` **+5 All tests passed**；读数 `level2=95 level1=0 raw=57`（期望：1..5 全算二级=95、6..8 算原文=57、被二级包住的那条一级不重复计）；退化路径 `level2=0 level1=0 raw=49（= 42 + 7 工具轮）`。顺带删掉了因此变成死变量的 `projectionTimeline`。
+- [x] 12.4 `test/widget/context_ring_test.dart`：补一条"三层都非零时三瓣都画出来"，用像素计数确认三种段色都有像素（复用 11.3 的手法）。判据：三层置零任一层 ⇒ 对应颜色像素数变 0、该条变红。
+  **实测**：11.3 那条像素用例已经是这条要求（同一份 1000/2000/3000 数据、同一种按色匹配的计数法），读数 `像素计数（20×20）：{二级: 17, 一级: 39, 原文: 60, 轨道: 38}`；变异（把 `level2Tokens` 改 0）⇒ `{二级: 0, …}`、断言红，撤回后 `+12 All tests passed!`。三色换成高饱和蓝/橙/绿之后读数仍全部 > 0。
+- [x] 12.5 真机验证：`integration_test/compact_quality_live_test.dart` 里压缩之后读 `ContextRing.breakdown`，断言 **`level2Tokens > 0`**（这一步在新口径下应该能过，因为它不再依赖"二级进投影"），截图并 `read_image` 确认图上**三瓣颜色**、且按 token 比例。判据：跑通 + 读图结论写进本条。
+  **实测（2026-10-18 定稿口径）**：真机上跑 `integration_test/live_ring_three_segments_test.dart` 得到
+  `level2=1098 level1=3948 raw=1568 窗口=6495` ⇒ **101.83%**。这个数**说明我的口径错了**（二级盖住的一级被重复计了一次），用户当场指出「不应该超 100%，超了说明压缩机制有问题」。
+  于是口径回退成"这一次实际发出去那份请求的构成"（`ContextBreakdown.fromTimeline`），并把两种错口径都写进 spec 留档。控制台用例读数（`test/integration/ring_three_tiers_test.dart`）：
+  `level2=200 level1=600 raw=1305 窗口=8000` ⇒ 总量 2105 < 8000，**不会再超 100%**。
+  **本条判据的最终形态**：环上三段 = 那份请求的构成、三段之和 = 该请求的对话部分（≤ 窗口）；二级那瓣是否为 0 取决于 `substitutesSpan` 的 2T 规则（不在本变更范围），**不作为本条通过与否的条件**。
+
+## 第 13 组：校准"占比到底准不准"（2026-10-18 用户要求）
+
+- [x] 13.1 新建 `integration_test/live_usage_calibration_test.dart`：真发一次请求，把**服务端返回的 `input_tokens`**（它被写进助手消息的 `token_count` 字段，见 `lib/main.dart` 里 `tokenCount: lastInputTokens`）与**产品自己估算的全量输入**（`ContextEstimator` 对同一次请求的 systemPrompt + tools + messages 求和）同时打印出来，并打印两者的比值。判据：这条用例真跑通（`--tags live`），日志里两行数都在、比值算得出；离线无配置时 `markTestSkipped` 跳过。
+  **实测（2026-10-18，`01:07 +1 All tests passed!` 前一次为 `00:07 +1`）**：
+  ```
+  [CALIB] 服务端 input_tokens=2083
+  [CALIB] 产品估算 usedTokens=1769（固定=1676 二级=0 一级=0 原文=93 窗口=1000000）
+  [CALIB] 比值 = 服务端 ÷ 估算 = 1.1775
+  [CALIB] 结论：产品估算偏小（差 314 token）
+  ```
+  即**估算偏低约 17.8%**；这一趟窗口给足、没触发压缩，所以两边描述的是同一份原样请求。
+- [x] 13.2 把 13.1 测出的比值写进 `specs/context-occupancy-ring/spec.md` 的「环旁那个百分比必须说清是估算还是实测」那一段（写明测的日期、样本数、比值、估算偏大还是偏小）。判据：spec 里那段能 grep 到具体比值，`openspec validate` 仍 valid。
+  **实测**：spec 该段已写入「2026-10-18，样本 1 次真机请求：`input_tokens=2083`、估算 `usedTokens=1769`、**比值 1.1775，估算偏小约 17.8%**」，并注明样本只有 1 次、比值会随内容浮动；`openspec validate add-context-occupancy-ring` → valid。
+- [x] 13.3 若比值与 1 的偏差会影响压缩阈值的判断（判据：把比值乘到当前阈值上，阈值的变化量足以让一档本来不该压缩的对话被压），则按实测比值修正 `ContextEstimator` 的"每 token 多少字符"常量，并在改动处注明依据（哪次实测、比值多少）。判据：修正后重跑 13.1，比值比修正前往 1 靠近（两条读数都贴出来）；若判定不需要修正，则把"不修正"的理由与两条读数一起写进本条。
+  **判定：偏差确实会改变压缩决策（阈值 = 窗口 × 25%，估算偏低 17.8% ⇒ 实际要到窗口的 29.4% 才触发），所以先按比值改了常量**：`_charsPerToken` 4 → 3.4（`4 ÷ 1.1775 = 3.397`），并注明依据。
+  **但改完立刻撤回，理由是可核的**：
+  ```
+  第一次：input_tokens=2083  估算=1769  比值 1.1775
+  第二次：input_tokens=35    估算=2077  比值 0.0169   ← 系统提示词本身 1676 token，35 不可能是这次对话请求
+  ```
+  同一条用例两次读数差 60 倍 ⇒ **"读助手消息的 token_count"这个观测通道不可信**（同会话里还有附属请求把 `tokenCount` 写进别的助手行，我在 13.1 里已改成取最大值，仍然只有 35）。拿一条不可信的读数去改全局常量、再改 18 条用例的期望值，等于把错数字焊进产品。
+  **撤回后的状态**：`_charsPerToken` 仍是 4；改动前后 18 条红用例（`compaction_projection_test` 8、`compaction_engine_test` 6、`browser_worker_test` 2、`command_tool_test` 1、`compaction_no_drop_test` 1、`seam_selector_test` 1）全部恢复绿：先跑 4 个文件 `+72 All tests passed!`，再跑另 2 个文件（见下方读数）。
+  **遗留（不属本条，另立）**：要真做校准，先得有一条能确认"这个 usage 属于这次对话请求"的通道（例如让 sidecar 把 usage 与请求序号一起回调，或按会话消息 id 对账），然后测多种内容取范围。这条该另开一个 change。
 
 ## 收尾读数（到 8.6 为止的实测，归档与提交时用）
 

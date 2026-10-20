@@ -50,7 +50,6 @@ void main() {
 
       await _pumpChat(tester, ChatArea(
         items: [ChatMessageItem(msg1)],
-        onSendMessage: (_) {},
       ));
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 200));
@@ -63,7 +62,6 @@ void main() {
       final msg2 = _longMsg('m2', 'user', 18);
       await _pumpChat(tester, ChatArea(
         items: [ChatMessageItem(msg1), ChatMessageItem(msg2)],
-        onSendMessage: (_) {},
       ));
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 200));
@@ -80,7 +78,6 @@ void main() {
       // Start with one message and short streaming text
       await _pumpChat(tester, ChatArea(
         items: [ChatMessageItem(msg1), const ChatStreamingItem('Thinking...')],
-        onSendMessage: (_) {},
       ));
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 200));
@@ -98,7 +95,6 @@ void main() {
           List.generate(20, (i) => 'Stream chunk $i').join('\n');
       await _pumpChat(tester, ChatArea(
         items: [ChatMessageItem(msg1), ChatStreamingItem(longStreaming)],
-        onSendMessage: (_) {},
       ));
       await tester.pump();
 
@@ -118,7 +114,6 @@ void main() {
       // Start streaming (1 msg + 1 streaming bubble = 2 items)
       await _pumpChat(tester, ChatArea(
         items: [ChatMessageItem(msg1), const ChatStreamingItem('Generating...')],
-        onSendMessage: (_) {},
       ));
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 200));
@@ -131,7 +126,6 @@ void main() {
       final msg2 = testMessage(id: 'm2', role: 'assistant', content: assistantContent);
       await _pumpChat(tester, ChatArea(
         items: [ChatMessageItem(msg1), ChatMessageItem(msg2), const ChatStreamingItem('Finalizing...')],
-        onSendMessage: (_) {},
       ));
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 200));

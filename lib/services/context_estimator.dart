@@ -11,6 +11,12 @@ import '../models/message.dart';
 /// determinism are guaranteed, not accuracy (accuracy is validated by the
 /// break-even regression in Phase 4).
 class ContextEstimator {
+  /// 每 token 多少字符。
+  ///
+  /// **2026-10-18 试过改成 3.4，撤回了**：校准用例第一次测出服务端 2083 / 估算 1769
+  /// （比值 1.1775），但同一条用例再跑就变成 35（系统提示词本身就 1676 token，35 不可能
+  /// 是这次对话请求的用量）—— 说明"读助手消息的 token_count"这个观测通道不可信，
+  /// 一条不可信的读数不能拿来做全局常量。等通道可靠、样本够多再谈。详见 tasks 13.3。
   static const int _charsPerToken = 4;
   // Structural overhead per message / block, conservative.
   static const int _messageOverhead = 4;

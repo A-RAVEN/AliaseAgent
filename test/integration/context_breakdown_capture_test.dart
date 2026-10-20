@@ -102,10 +102,15 @@ class _EchoSummaryProvider implements SummaryProvider {
       SummaryResult(text: 'L2 rolled up', tokens: l1Tokens);
 }
 
-/// 发一条消息并把两帧推进完（假 sidecar 的分片是排好的）。
+/// 发一条消息并把帧推进完（假 sidecar 的分片是排好的）。
+///
+/// 2026-10-18：环的拆分改成按"各层摘要的 tokenCost"算之后，发送路径里多了一次
+/// `_summaryNodeRepo.queryBySession` 的 await，快照比原来晚一个异步拍落地 ——
+/// 所以要多推一帧。**这是用例跟随时序变化，不是放松判据**：断言本身没动。
 Future<void> _send(WidgetTester tester, String text) async {
   await tester.enterText(find.byType(TextField), text);
   await tester.tap(find.byTooltip('Send'));
+  await tester.pump();
   await tester.pump();
   await tester.pump();
 }
@@ -242,7 +247,8 @@ void main() {
       expect(find.byType(ContextRing), findsOneWidget,
           reason: '切到「真实上下文」之后环仍然要在');
       expect(onContext, onConversation,
-          reason: '环在工具栏里，切换视图换的是下面那块 —— 位置必须一样');
+          reason: '环在输入行里（2026-10-18 从工具栏搬到发送按钮左侧），两屏共用同一份输入行 '
+            '⇒ 切换视图后位置必须一样');
     });
   });
 }

@@ -118,14 +118,21 @@ void main() {
 
     expect(b, isNotNull, reason: '真实发送一次之后必须有占用拆分');
 
-    // 「对话视图 / 真实上下文」这一行还在，环在它右边（5.3 的接线）。
+    // 「对话视图 / 真实上下文」这一行还在；环**不在**那一行了 ——
+    // 2026-10-18 起它贴在输入行的发送按钮左侧（tasks 10.4 / 10.6）。
     expect(find.text('对话视图'), findsOneWidget, reason: '视图切换按钮仍在原位');
     expect(find.text('真实上下文'), findsOneWidget);
-    final ringX = tester.getTopLeft(find.byType(ContextRing)).dx;
-    final buttonX = tester.getTopLeft(find.text('对话视图')).dx;
+    final ringRect = tester.getRect(find.byType(ContextRing));
+    final sendRect = tester.getRect(find.byType(IconButton).last);
+    final toolbarRect = tester.getRect(find.text('对话视图'));
     // ignore: avoid_print
-    print('  [OBS] 环的左边距=$ringX 对话视图按钮的左边距=$buttonX');
-    expect(ringX, greaterThan(buttonX), reason: '环必须在按钮右侧');
+    print('  [OBS] 环=$ringRect 发送按钮=$sendRect 工具栏按钮=$toolbarRect');
+    expect(ringRect.right, lessThanOrEqualTo(sendRect.left),
+        reason: '环必须在发送按钮左侧');
+    expect((ringRect.center.dy - sendRect.center.dy).abs(), lessThanOrEqualTo(1.0),
+        reason: '环与发送按钮必须同一行');
+    expect(ringRect.top, greaterThan(toolbarRect.bottom),
+        reason: '环已经从工具栏搬到输入行');
 
     // 截图（工具栏那一屏），供主循环目视。
     await captureWidgetAsPng(captureKey, _shotPath);

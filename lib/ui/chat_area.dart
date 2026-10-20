@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../models/chat_item.dart';
 import '../models/compaction_status.dart';
@@ -11,27 +10,20 @@ import 'tool_call_card.dart';
 class ChatArea extends StatefulWidget {
   final List<ChatItem> items;
   final bool isStreaming;
-  final ValueChanged<String> onSendMessage;
 
   /// 压缩进行中的状态（空闲时是 [CompactionStatus.idle]，那时不显示任何东西）。
   /// 它只表示"压缩正在做"，与 [isStreaming] 是两件事：没触发压缩的发送不会让它亮。
   final CompactionStatus compactionStatus;
 
-  /// 工具清单是否已经装好（含按可用性动态加入的 `web_search` / `web_fetch` / 浏览器
-  /// 四件套 / `run_command`）。**缺省 true**，保证既有用例与既有调用点的行为不变。
-  ///
-  /// 为什么需要它：界面启动后有一小段"动态工具仍在探测"的窗口，那期间发出的请求里
-  /// 工具清单是**残缺的**（本地那 8 个在 await 之前就装好了，缺的是动态那批），模型
-  /// 因此没有搜索工具可用 —— 真机实测过一整轮空转。未就绪时这里禁用发送并给出文案。
-  final bool toolsReady;
-
+  /// **2026-10-18 起 `ChatArea` 只管消息列表与压缩提示**：输入行（输入框 + 发送按钮）
+  /// 搬到了 `lib/ui/input_bar.dart` 的公开控件 `InputBar`，由 `lib/main.dart` 在两屏之间
+  /// 共用 —— 这样上下文占用环在「对话视图」与「真实上下文」两屏都能贴着发送按钮显示。
+  /// 原来的 `onSendMessage` / `toolsReady` 两个参数随之删除（搬完就没人读了）。
   const ChatArea({
     super.key,
     this.items = const [],
     this.isStreaming = false,
     this.compactionStatus = CompactionStatus.idle,
-    this.toolsReady = true,
-    required this.onSendMessage,
   });
 
   @override
@@ -39,7 +31,6 @@ class ChatArea extends StatefulWidget {
 }
 
 class _ChatAreaState extends State<ChatArea> {
-  final _inputCtrl = TextEditingController();
   final _scrollCtrl = ScrollController();
 
   @override
@@ -72,18 +63,8 @@ class _ChatAreaState extends State<ChatArea> {
     }
   }
 
-  void _submit() {
-    // 工具清单没装好就不发：那一轮请求会带着残缺的工具清单出去，模型白白空转一轮。
-    if (!widget.toolsReady) return;
-    final text = _inputCtrl.text;
-    if (text.trim().isEmpty) return;
-    widget.onSendMessage(text);
-    _inputCtrl.clear();
-  }
-
   @override
   void dispose() {
-    _inputCtrl.dispose();
     _scrollCtrl.dispose();
     super.dispose();
   }
@@ -143,92 +124,10 @@ class _ChatAreaState extends State<ChatArea> {
         // 压缩期间在输入框上方显示提示：用户等的地方就是这里（今天从按下发送到
         // 模型吐出第一个字，这一屏此前毫无变化）。
         CompactionStatusBanner(status: widget.compactionStatus),
-        // Input area
-        _InputBar(
-          controller: _inputCtrl,
-          onSubmit: _submit,
-          toolsReady: widget.toolsReady,
-        ),
+        // 输入行已经搬到 `lib/main.dart`（与「真实上下文」那一屏共用），这里不再放。
       ],
     );
   }
 }
 
-class _InputBar extends StatefulWidget {
-  final TextEditingController controller;
-  final VoidCallback onSubmit;
 
-  /// 工具清单是否已就绪（见 [ChatArea.toolsReady]）。未就绪时发送按钮禁用。
-  final bool toolsReady;
-
-  const _InputBar({
-    required this.controller,
-    required this.onSubmit,
-    this.toolsReady = true,
-  });
-
-  @override
-  State<_InputBar> createState() => _InputBarState();
-}
-
-class _InputBarState extends State<_InputBar> {
-  final _focusNode = FocusNode();
-
-  @override
-  void dispose() {
-    _focusNode.dispose();
-    super.dispose();
-  }
-
-  KeyEventResult _onKey(FocusNode node, KeyEvent event) {
-    if (event is KeyDownEvent &&
-        event.logicalKey == LogicalKeyboardKey.enter) {
-      if (HardwareKeyboard.instance.isShiftPressed) {
-        return KeyEventResult.ignored; // let TextField handle newline
-      }
-      widget.onSubmit();
-      return KeyEventResult.handled;
-    }
-    return KeyEventResult.ignored;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Container(
-      color: theme.colorScheme.surface,
-      padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          Expanded(
-            child: Focus(
-              onKeyEvent: _onKey,
-              child: TextField(
-                controller: widget.controller,
-                focusNode: _focusNode,
-                maxLines: 5,
-                minLines: 1,
-                textInputAction: TextInputAction.newline,
-                decoration: const InputDecoration(
-                  hintText: 'Type a message...',
-                  border: OutlineInputBorder(),
-                  contentPadding:
-                      EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                  isDense: true,
-                ),
-              ),
-            ),
-          ),
-          const SizedBox(width: 6),
-          IconButton.filled(
-            // 未就绪时禁用并给出可见原因（不是静默排队 —— 排队在用户看来还是"发出去了"）。
-            onPressed: widget.toolsReady ? widget.onSubmit : null,
-            icon: const Icon(Icons.send, size: 20),
-            tooltip: widget.toolsReady ? 'Send' : '正在准备工具…',
-          ),
-        ],
-      ),
-    );
-  }
-}
