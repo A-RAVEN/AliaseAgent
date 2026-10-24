@@ -133,4 +133,38 @@ void main() {
     expect(parsed['error'], 'old_text not found in file');
     expect(parsed.containsKey('diagnosis'), isTrue);
   });
+
+  // =========================================================================
+  // 7.1 真实 DLL：hunks 与"文件被外部改过"的守卫
+  // =========================================================================
+  test('edit_file 返回 hunks；文件被外部改过后再改报 stale', () {
+    const path = '_test_guard.txt';
+    try {
+      File(path).deleteSync();
+    } catch (_) {}
+
+    bridge.writeFile('{"path":"$path","content":"alpha\\nbeta\\ngamma\\n"}');
+    expect(jsonDecode(bridge.readFile('{"path":"$path"}'))['ok'], isTrue);
+
+    final edited = jsonDecode(bridge.editFile(
+        '{"path":"$path","edits":[{"old_text":"beta","new_text":"BETA"}]}'));
+    expect(edited['ok'], isTrue);
+    expect(edited['hunks'], isA<List<dynamic>>());
+    final hunks = edited['hunks'] as List<dynamic>;
+    expect(hunks.length, 1);
+    expect(hunks[0]['start_line'], 2);
+    expect(hunks[0]['old_text'], 'beta');
+    expect(hunks[0]['new_text'], 'BETA');
+    expect(File(path).readAsStringSync(), 'alpha\nBETA\ngamma\n');
+
+    // 外部改动（内容与大小都变）之后，再改必须报 stale 且不动文件
+    File(path).writeAsStringSync('completely different content\n');
+    final stale = jsonDecode(bridge.editFile(
+        '{"path":"$path","edits":[{"old_text":"alpha","new_text":"ALPHA"}]}'));
+    expect(stale['ok'], isFalse);
+    expect(stale['code'], 'stale');
+    expect(File(path).readAsStringSync(), 'completely different content\n');
+
+    File(path).deleteSync();
+  });
 }

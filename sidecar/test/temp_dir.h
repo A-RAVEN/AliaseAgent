@@ -160,6 +160,9 @@ class WorkspaceGuard {
 public:
     explicit WorkspaceGuard(const std::string& path) {
         tools::set_workspace(path);
+        // Start every case with an empty observation table: a read in an earlier
+        // case must not authorize an edit in this one.
+        tools::reset_observation_state_for_tests();
     }
     ~WorkspaceGuard() {
         tools::set_workspace("");

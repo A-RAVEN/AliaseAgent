@@ -6,6 +6,32 @@ import 'package:alias_agent/services/compaction/compaction_plan.dart';
 import 'package:alias_agent/services/compaction/summary_provider.dart';
 import 'package:alias_agent/services/context_estimator.dart';
 
+/// 去掉 `hunks` / `hunksOmitted` 再估算：它们只给界面画 diff，从不进入任何请求体，
+/// 算进原文段等于把"没发出去的东西"计入占用率。
+String _withoutEditHunks(String encoded) {
+  if (!encoded.contains('"hunks')) return encoded;
+  try {
+    return jsonEncode(_stripEditHunks(jsonDecode(encoded)));
+  } catch (_) {
+    // 解不动就按原样估算：宁可多算一点，也不把真实的原文漏掉。
+    return encoded;
+  }
+}
+
+Object? _stripEditHunks(Object? node) {
+  if (node is List) return node.map(_stripEditHunks).toList();
+  if (node is Map) {
+    final copy = <String, dynamic>{};
+    for (final entry in node.entries) {
+      final key = entry.key.toString();
+      if (key == 'hunks' || key == 'hunksOmitted') continue;
+      copy[key] = _stripEditHunks(entry.value);
+    }
+    return copy;
+  }
+  return node;
+}
+
 /// 投影时间线上的一段：要么发摘要（[summary] 非空，标记由 [segment] 的层级决定），
 /// 要么把 [segment] 里的原文原样发出去（[summary] 为空）。两种段在时间里交错排列：
 /// 离现在还不够远的那一段即使已经被压成摘要，这一趟也仍然发原文。
@@ -105,7 +131,8 @@ class ContextBreakdown {
       }
     }
     if (trailingRawMessages.isNotEmpty) {
-      raw += ContextEstimator.estimateTokens(jsonEncode(trailingRawMessages));
+      raw += ContextEstimator.estimateTokens(
+          _withoutEditHunks(jsonEncode(trailingRawMessages)));
     }
     return ContextBreakdown(
       level2Tokens: level2,

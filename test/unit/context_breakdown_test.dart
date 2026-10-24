@@ -198,5 +198,57 @@ void main() {
           reason: '投影之后才追加进请求的消息没有投影段，必须按原文补进 rawTokens'
               '（用同一个估算器、按序列化后的长度算）');
     });
+
+    // hunks 只给界面画 diff，从不进入请求体；它若被算进原文段，
+    // 一次大编辑就会凭空抬高占用率。
+    test('追加原文里的 hunks 不计入 rawTokens', () {
+      final rawMsgs = _conv(2, 100);
+      final withHunks = <Map<String, dynamic>>[
+        {
+          'role': 'assistant',
+          'content': [
+            {
+              'type': 'tool_use',
+              'id': 't1',
+              'name': 'edit_file',
+              'input': {'path': '/x'},
+              'hunks': [
+                {'start_line': 1, 'old_text': 'a', 'new_text': 'b'},
+                {'start_line': 9, 'old_text': 'ccc', 'new_text': 'ddd'},
+              ],
+            },
+          ],
+        },
+      ];
+      final withoutHunks = <Map<String, dynamic>>[
+        {
+          'role': 'assistant',
+          'content': [
+            {
+              'type': 'tool_use',
+              'id': 't1',
+              'name': 'edit_file',
+              'input': {'path': '/x'},
+            },
+          ],
+        },
+      ];
+      ContextBreakdown build(List<Map<String, dynamic>> trailing) =>
+          ContextBreakdown.fromTimeline(
+            timeline: [
+              ProjectionPiece(
+                  segment: CompactionSegment(messages: rawMsgs, summary: false)),
+            ],
+            windowTokens: 100000,
+            fixedOverheadTokens: 0,
+            trailingRawMessages: trailing,
+          );
+      final a = build(withHunks);
+      final b = build(withoutHunks);
+      // ignore: avoid_print
+      print('  [OBS] 带 hunks 的原文段=${a.rawTokens} 不带=${b.rawTokens}');
+      expect(a.rawTokens, b.rawTokens,
+          reason: 'hunks 不进请求体，不能计入原文段的 token');
+    });
   });
 }

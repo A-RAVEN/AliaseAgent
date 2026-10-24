@@ -269,8 +269,9 @@ void main() {
       await tester.enterText(
         textField,
         'In the workspace, find every TODO comment using grep_file and '
-        'replace it with DONE using edit_file. When done, report which '
-        'files you edited.',
+        'replace it with DONE using edit_file. Read each file with read_file '
+        'before editing it (edit_file refuses a file that has not been read). '
+        'When done, report which files you edited.',
       );
       final sendButton = find.byTooltip('Send');
       expect(sendButton, findsOneWidget, reason: 'Send button');
@@ -369,7 +370,9 @@ void main() {
       await tester.enterText(
         textField,
         'Use grep_file to find all TODO comments. Replace each TODO comment '
-        'with "DONE": change "// TODO: ..." to "// DONE". For src/tasks.dart, '
+        'with "DONE": change "// TODO: ..." to "// DONE". Read each file with '
+        'read_file before editing it (edit_file refuses a file that has not '
+        'been read). For src/tasks.dart, '
         'use a SINGLE edit_file call with all three replacements in one edits '
         'array (do not use replace_all). Handle src/notes.dart separately. '
         'When done, report which files you edited.',
@@ -486,7 +489,8 @@ void main() {
         'countB MUST stay unchanged. Note: the two function bodies are '
         'identical text, so an old_text of just the comment or return line '
         'matches both and will be rejected unless you include the function '
-        'signature. Do NOT rewrite the whole file — use edit_file to change '
+        'signature. Do NOT rewrite the whole file — read it with read_file '
+        'first, then use edit_file to change '
         'just the comment in countA. Report when done.',
       );
       final sendButton = find.byTooltip('Send');

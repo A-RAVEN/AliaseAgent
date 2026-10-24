@@ -1,7 +1,9 @@
 #include <catch2/catch_all.hpp>
 #include "temp_dir.h"
 #include "tools.h"
+#include "command_tool.h"
 #include <string>
+#include <vector>
 #include <fstream>
 #include <nlohmann/json.hpp>
 
@@ -434,6 +436,7 @@ TEST_CASE("edit_file: exact match succeeds", "[edit_file]") {
     tmp.write("test.txt", "line 1\nline 2\nline 3\n");
     WorkspaceGuard ws(tmp.path());
 
+    tools::read_file("{\"path\":\"test.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file("{\"path\":\"test.txt\",\"edits\":[{\"old_text\":\"line 2\",\"new_text\":\"line two\"}]}");
     auto j = parse_result(result);
     REQUIRE(j["ok"] == true);
@@ -450,6 +453,7 @@ TEST_CASE("edit_file: replace_all replaces all occurrences", "[edit_file]") {
     tmp.write("test.txt", "foo bar foo baz foo\n");
     WorkspaceGuard ws(tmp.path());
 
+    tools::read_file("{\"path\":\"test.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"test.txt\",\"edits\":[{\"old_text\":\"foo\",\"new_text\":\"qux\",\"replace_all\":true}]}");
     auto j = parse_result(result);
@@ -466,6 +470,7 @@ TEST_CASE("edit_file: multiple exact matches rejected with line numbers", "[edit
     tmp.write("test.txt", "TODO: fix bug\nsome code\nTODO: more work\n");
     WorkspaceGuard ws(tmp.path());
 
+    tools::read_file("{\"path\":\"test.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"test.txt\",\"edits\":[{\"old_text\":\"TODO:\",\"new_text\":\"DONE:\"}]}");
     auto j = parse_result(result);
@@ -502,6 +507,7 @@ TEST_CASE("edit_file: CRLF vs LF mismatch auto-corrected", "[edit_file][normaliz
 
     // old_text "line2" is found literally in the file content (it contains no line endings),
     // so exact match succeeds without needing normalization.
+    tools::read_file("{\"path\":\"crlf.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"crlf.txt\",\"edits\":[{\"old_text\":\"line2\",\"new_text\":\"line TWO\"}]}");
     auto j = parse_result(result);
@@ -585,6 +591,7 @@ TEST_CASE("edit_file: no match returns diagnostic info", "[edit_file]") {
     tmp.write("code.dart", "  final count = 0;\n  print(count);\n");
     WorkspaceGuard ws(tmp.path());
 
+    tools::read_file("{\"path\":\"code.dart\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"code.dart\",\"edits\":[{\"old_text\":\"final count = 1\",\"new_text\":\"final count = 99\"}]}");
     auto j = parse_result(result);
@@ -704,6 +711,7 @@ TEST_CASE("edit_file: indentation mismatch falls through to diagnostic", "[edit_
     // We deliberately avoid substring matches (e.g. "  void bar()" would
     // accidentally match at offset 2 inside "    void bar()" since both
     // share "  void bar()" as a common substring).
+    tools::read_file("{\"path\":\"test.dart\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"test.dart\",\"edits\":[{\"old_text\":\"  void bar(int x)\",\"new_text\":\"  void baz()\"}]}");
     auto j = parse_result(result);
@@ -724,6 +732,7 @@ TEST_CASE("edit_file: diagnostic lists indentation differences", "[edit_file]") 
     WorkspaceGuard ws(tmp.path());
 
     // old_text uses 2-space indentation + different code (avoid accidental substring match)
+    tools::read_file("{\"path\":\"test.dart\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"test.dart\",\"edits\":[{\"old_text\":\"  final count = 1;\",\"new_text\":\"  final count = 99;\"}]}");
     auto j = parse_result(result);
@@ -749,6 +758,7 @@ TEST_CASE("edit_file: replace_all with normalization preserves CRLF", "[edit_fil
     }
     WorkspaceGuard ws(tmp.path());
 
+    tools::read_file("{\"path\":\"crlf.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"crlf.txt\",\"edits\":[{\"old_text\":\"hello\\nworld\",\"new_text\":\"REPLACED\",\"replace_all\":true}]}");
     auto j = parse_result(result);
@@ -775,6 +785,7 @@ TEST_CASE("edit_file: normalized match preserves non-matching content", "[edit_f
     WorkspaceGuard ws(tmp.path());
 
     // old_text with tab (file has 4-space indent, tab→4 spaces via normalization)
+    tools::read_file("{\"path\":\"code.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"code.txt\",\"edits\":[{\"old_text\":\"\\tint y = 2;\",\"new_text\":\"\\tint z = 3;\"}]}");
     auto j = parse_result(result);
@@ -805,6 +816,7 @@ TEST_CASE("edit_file: multi-line old_text with CRLF normalization", "[edit_file]
     WorkspaceGuard ws(tmp.path());
 
     // old_text uses LF — should normalize to match the CRLF block
+    tools::read_file("{\"path\":\"ml.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"ml.txt\",\"edits\":[{\"old_text\":\"block line 1\\nblock line 2\",\"new_text\":\"REPLACED\"}]}");
     auto j = parse_result(result);
@@ -864,6 +876,7 @@ TEST_CASE("edit_file: replace_all exact match replaces all occurrences", "[edit_
     tmp.write("reps.txt", "AAA BBB AAA CCC AAA DDD\n");
     WorkspaceGuard ws(tmp.path());
 
+    tools::read_file("{\"path\":\"reps.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"reps.txt\",\"edits\":[{\"old_text\":\"AAA\",\"new_text\":\"ZZZ\",\"replace_all\":true}]}");
     auto j = parse_result(result);
@@ -911,6 +924,7 @@ TEST_CASE("edit_file: normalized multi-match rejected with line numbers", "[edit
     }
     WorkspaceGuard ws(tmp.path());
 
+    tools::read_file("{\"path\":\"rep.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"rep.txt\",\"edits\":[{\"old_text\":\"AA\\nBB\",\"new_text\":\"XX\",\"replace_all\":false}]}");
     auto j = parse_result(result);
@@ -928,6 +942,7 @@ TEST_CASE("edit_file: tab old_text matches space-indented file", "[edit_file][no
     tmp.write("indent.txt", "first\n    indented line\nlast\n");
     WorkspaceGuard ws(tmp.path());
 
+    tools::read_file("{\"path\":\"indent.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"indent.txt\",\"edits\":[{\"old_text\":\"\\tindented line\",\"new_text\":\"\\treplaced\"}]}");
     auto j = parse_result(result);
@@ -944,6 +959,7 @@ TEST_CASE("edit_file: diagnostic includes your_text for mismatch", "[edit_file]"
     tmp.write("diag.txt", "    final x = 1;\n    print(x);\n");
     WorkspaceGuard ws(tmp.path());
 
+    tools::read_file("{\"path\":\"diag.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"diag.txt\",\"edits\":[{\"old_text\":\"  final x = 2;\",\"new_text\":\"  final x = 99;\"}]}");
     auto j = parse_result(result);
@@ -993,6 +1009,7 @@ TEST_CASE("edit_file: old_text equals new_text is no-op", "[edit_file]") {
     tmp.write("same.txt", "hello world\nfoo bar\n");
     WorkspaceGuard ws(tmp.path());
 
+    tools::read_file("{\"path\":\"same.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"same.txt\",\"edits\":[{\"old_text\":\"foo bar\",\"new_text\":\"foo bar\"}]}");
     auto j = parse_result(result);
@@ -1012,6 +1029,7 @@ TEST_CASE("edit_file: replace_all substring overlap no infinite loop", "[edit_fi
     tmp.write("sub.txt", "a a a\n");
     WorkspaceGuard ws(tmp.path());
 
+    tools::read_file("{\"path\":\"sub.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"sub.txt\",\"edits\":[{\"old_text\":\"a\",\"new_text\":\"aa\",\"replace_all\":true}]}");
     auto j = parse_result(result);
@@ -1032,6 +1050,7 @@ TEST_CASE("edit_file: multiple replacements in one call", "[edit_file][batch]") 
     tmp.write("multi.txt", "alpha\nbeta\ngamma\n");
     WorkspaceGuard ws(tmp.path());
 
+    tools::read_file("{\"path\":\"multi.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"multi.txt\",\"edits\":["
         "{\"old_text\":\"alpha\",\"new_text\":\"ALPHA\"},"
@@ -1053,6 +1072,7 @@ TEST_CASE("edit_file: any failed match aborts all", "[edit_file][batch]") {
     WorkspaceGuard ws(tmp.path());
 
     // Second pair's old_text does not exist — whole request fails, zero changes
+    tools::read_file("{\"path\":\"abort.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"abort.txt\",\"edits\":["
         "{\"old_text\":\"aaa\",\"new_text\":\"AAA\"},"
@@ -1075,6 +1095,7 @@ TEST_CASE("edit_file: batch pair non-unique match rejected with pair index", "[e
     tmp.write("dup.txt", "x\nTODO\ny\nTODO\nz\n");
     WorkspaceGuard ws(tmp.path());
 
+    tools::read_file("{\"path\":\"dup.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"dup.txt\",\"edits\":["
         "{\"old_text\":\"TODO\",\"new_text\":\"DONE\"}"
@@ -1092,6 +1113,7 @@ TEST_CASE("edit_file: overlapping edits rejected", "[edit_file][batch]") {
     WorkspaceGuard ws(tmp.path());
 
     // Ranges [0,5) "hello" and [4,9) "o wor" overlap
+    tools::read_file("{\"path\":\"overlap.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"overlap.txt\",\"edits\":["
         "{\"old_text\":\"hello\",\"new_text\":\"X\"},"
@@ -1113,6 +1135,7 @@ TEST_CASE("edit_file: per-pair replace_all semantics", "[edit_file][batch]") {
     WorkspaceGuard ws(tmp.path());
 
     // Pair 0 replace_all replaces all 3 'a'; pair 1 (single, unique) replaces 'b'
+    tools::read_file("{\"path\":\"per.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"per.txt\",\"edits\":["
         "{\"old_text\":\"a\",\"new_text\":\"A\",\"replace_all\":true},"
@@ -1173,6 +1196,7 @@ TEST_CASE("edit_file: array order differs from position order", "[edit_file][bat
     WorkspaceGuard ws(tmp.path());
 
     // Pairs given in REVERSE position order — apply must still be correct
+    tools::read_file("{\"path\":\"order.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"order.txt\",\"edits\":["
         "{\"old_text\":\"three\",\"new_text\":\"3\"},"
@@ -1199,6 +1223,7 @@ TEST_CASE("edit_file: replace_all pair with hit after another pair's range (per-
     // that applies [0,1) before [2,8) would shift pair 1's target by +1 and
     // corrupt it. Per-hit global reverse applies [9,10) → [2,8) → [0,1),
     // keeping every target position valid.
+    tools::read_file("{\"path\":\"cross.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"cross.txt\",\"edits\":["
         "{\"old_text\":\"X\",\"new_text\":\"YY\",\"replace_all\":true},"
@@ -1239,6 +1264,7 @@ TEST_CASE("edit_file: batch with normalized pair and matched_with", "[edit_file]
     WorkspaceGuard ws(tmp.path());
 
     // Pair 0 exact, pair 1 uses LF old_text against a CRLF file → normalized
+    tools::read_file("{\"path\":\"bn.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"bn.txt\",\"edits\":["
         "{\"old_text\":\"A\",\"new_text\":\"AAA\"},"
@@ -1267,6 +1293,7 @@ TEST_CASE("edit_file: bare CR line boundary with trailing whitespace (8.4 regres
     }
     WorkspaceGuard ws(tmp.path());
 
+    tools::read_file("{\"path\":\"barecr.txt\"}");  // 先观测一次，再过守卫
     std::string result = tools::edit_file(
         "{\"path\":\"barecr.txt\",\"edits\":[{\"old_text\":\"x\\r\",\"new_text\":\"z\"}]}");
     auto j = parse_result(result);
@@ -1276,4 +1303,504 @@ TEST_CASE("edit_file: bare CR line boundary with trailing whitespace (8.4 regres
     std::ifstream f(tmp.path() + "/barecr.txt", std::ios::binary);
     std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     REQUIRE(content == "zY");
+}
+
+// ============================================================================
+// Atomic publication — staging file + rename (harden-edit-tool-and-diff-card 1.2)
+// ============================================================================
+
+// Directory entries (files only) whose name starts with `prefix`.
+static std::vector<std::string> entries_with_prefix(const std::string& dir,
+                                                    const std::string& prefix) {
+    std::vector<std::string> out;
+#ifdef _WIN32
+    std::string search = dir + "/*";
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(search.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return out;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        std::string name(fd.cFileName);
+        if (name.rfind(prefix, 0) == 0) out.push_back(name);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR* d = opendir(dir.c_str());
+    if (!d) return out;
+    struct dirent* entry;
+    while ((entry = readdir(d)) != nullptr) {
+        std::string name(entry->d_name);
+        if (name.rfind(prefix, 0) == 0) out.push_back(name);
+    }
+    closedir(d);
+#endif
+    return out;
+}
+
+static std::string read_all(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(f)),
+                       std::istreambuf_iterator<char>());
+}
+
+#ifdef _WIN32
+// Restores normal attributes even when a REQUIRE throws, so TempDir can clean up.
+struct ReadOnlyFile {
+    std::string path;
+    explicit ReadOnlyFile(const std::string& p) : path(p) {
+        SetFileAttributesA(path.c_str(), FILE_ATTRIBUTE_READONLY);
+    }
+    ~ReadOnlyFile() { SetFileAttributesA(path.c_str(), FILE_ATTRIBUTE_NORMAL); }
+};
+
+TEST_CASE("edit_file: read-only target reports Cannot replace file and keeps bytes intact",
+          "[edit_file][atomic]") {
+    TempDir tmp;
+    tmp.write("ro.txt", "line 1\nline 2\n");
+    WorkspaceGuard ws(tmp.path());
+    const std::string full = tmp.path() + "/ro.txt";
+
+    // Observe first, so the read-before-edit guard (2.3) is not the one answering.
+    tools::read_file("{\"path\":\"ro.txt\"}");
+    const std::string before = read_all(full);
+
+    ReadOnlyFile read_only(full);
+    std::string result = tools::edit_file(
+        "{\"path\":\"ro.txt\",\"edits\":[{\"old_text\":\"line 2\",\"new_text\":\"LINE 2\"}]}");
+    auto j = parse_result(result);
+    REQUIRE(j["ok"] == false);
+    const std::string msg = j["error"].get<std::string>();
+    // Direct ofstream overwrite answers "Cannot write file: …"; only the staged
+    // publication reaches the rename and reports it.
+    REQUIRE(msg.rfind("Cannot replace file:", 0) == 0);
+    REQUIRE(read_all(full) == before);
+    REQUIRE(entries_with_prefix(tmp.path(), "ro.txt.tmp-").empty());
+}
+#endif
+
+TEST_CASE("edit_file: successful write leaves no staging file behind", "[edit_file][atomic]") {
+    TempDir tmp;
+    tmp.write("ok.txt", "a\nb\n");
+    WorkspaceGuard ws(tmp.path());
+    tools::read_file("{\"path\":\"ok.txt\"}");
+
+    auto j = parse_result(tools::edit_file(
+        "{\"path\":\"ok.txt\",\"edits\":[{\"old_text\":\"b\",\"new_text\":\"B\"}]}"));
+    REQUIRE(j["ok"] == true);
+    REQUIRE(read_all(tmp.path() + "/ok.txt") == "a\nB\n");
+    REQUIRE(entries_with_prefix(tmp.path(), "ok.txt.tmp-").empty());
+}
+
+TEST_CASE("write_file: stale staging leftovers are cleaned before publishing",
+          "[write_file][atomic]") {
+    TempDir tmp;
+    tmp.write("st.txt", "old");
+    WorkspaceGuard ws(tmp.path());
+    {
+        std::ofstream f(tmp.path() + "/st.txt.tmp-999999-1", std::ios::binary);
+        f << "junk";
+    }
+    REQUIRE(entries_with_prefix(tmp.path(), "st.txt.tmp-").size() == 1);
+
+    auto j = parse_result(tools::write_file("{\"path\":\"st.txt\",\"content\":\"new\"}"));
+    REQUIRE(j["ok"] == true);
+    REQUIRE(read_all(tmp.path() + "/st.txt") == "new");
+    REQUIRE(entries_with_prefix(tmp.path(), "st.txt.tmp-").empty());
+}
+
+TEST_CASE("write_file and edit_file round-trip a non-ASCII path", "[write_file][edit_file][atomic]") {
+    // "中文目录" as UTF-8 bytes: the name is chosen so the staging path, the
+    // rename and the A-suffixed path APIs all see the same byte sequence.
+    const std::string dir = "\xe4\xb8\xad\xe6\x96\x87\xe7\x9b\xae\xe5\xbd\x95";
+    const std::string file = dir + "/note.txt";
+
+    TempDir tmp;
+    WorkspaceGuard ws(tmp.path());
+    tmp.mkdir(dir);
+
+    auto w = parse_result(tools::write_file(
+        "{\"path\":\"" + file + "\",\"content\":\"first\\nsecond\\n\"}"));
+    REQUIRE(w["ok"] == true);
+    REQUIRE(read_all(tmp.path() + "/" + file) == "first\nsecond\n");
+
+    tools::read_file("{\"path\":\"" + file + "\"}");
+    auto e = parse_result(tools::edit_file(
+        "{\"path\":\"" + file + "\",\"edits\":[{\"old_text\":\"second\",\"new_text\":\"SECOND\"}]}"));
+    REQUIRE(e["ok"] == true);
+    REQUIRE(read_all(tmp.path() + "/" + file) == "first\nSECOND\n");
+}
+
+// ============================================================================
+// Read-before-edit / freshness guard (harden-edit-tool-and-diff-card 2.1–2.5)
+// ============================================================================
+
+// ---- 2.2: the test hook really clears the table ----
+TEST_CASE("guard: reset_observation_state_for_tests clears prior observations", "[guard]") {
+    TempDir tmp;
+    tmp.write("r.txt", "alpha\n");
+    WorkspaceGuard ws(tmp.path());
+
+    REQUIRE(parse_result(tools::read_file("{\"path\":\"r.txt\"}"))["ok"] == true);
+    tools::reset_observation_state_for_tests();
+    auto refused = parse_result(tools::edit_file(
+        "{\"path\":\"r.txt\",\"edits\":[{\"old_text\":\"alpha\",\"new_text\":\"beta\"}]}"));
+    REQUIRE(refused["ok"] == false);
+    REQUIRE(refused["code"] == "not_observed");
+
+    // Control: the same edit succeeds once the file is observed again, so the
+    // refusal above came from the reset and not from something else.
+    REQUIRE(parse_result(tools::read_file("{\"path\":\"r.txt\"}"))["ok"] == true);
+    auto allowed = parse_result(tools::edit_file(
+        "{\"path\":\"r.txt\",\"edits\":[{\"old_text\":\"alpha\",\"new_text\":\"beta\"}]}"));
+    REQUIRE(allowed["ok"] == true);
+}
+
+// ---- 2.1 negatives: listing/searching/running a command observes nothing ----
+TEST_CASE("guard: list_dir does not observe a file", "[guard]") {
+    TempDir tmp;
+    tmp.write("d.txt", "x\n");
+    WorkspaceGuard ws(tmp.path());
+
+    tools::list_dir(".");
+    auto j = parse_result(tools::edit_file(
+        "{\"path\":\"d.txt\",\"edits\":[{\"old_text\":\"x\",\"new_text\":\"y\"}]}"));
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["code"] == "not_observed");
+}
+
+TEST_CASE("guard: glob_file and grep_file do not observe a file", "[guard]") {
+    TempDir tmp;
+    tmp.write("g.txt", "needle\n");
+    WorkspaceGuard ws(tmp.path());
+
+    tools::glob_file("{\"pattern\":\"*.txt\",\"max_results\":10}");
+    auto after_glob = parse_result(tools::edit_file(
+        "{\"path\":\"g.txt\",\"edits\":[{\"old_text\":\"needle\",\"new_text\":\"hay\"}]}"));
+    REQUIRE(after_glob["code"] == "not_observed");
+
+    tools::grep_file("{\"pattern\":\"needle\",\"glob\":\"\",\"ignore_case\":false,\"max_results\":10}");
+    auto after_grep = parse_result(tools::edit_file(
+        "{\"path\":\"g.txt\",\"edits\":[{\"old_text\":\"needle\",\"new_text\":\"hay\"}]}"));
+    REQUIRE(after_grep["code"] == "not_observed");
+}
+
+TEST_CASE("guard: run_command does not observe a file", "[guard]") {
+    TempDir tmp;
+    tmp.write("c.txt", "z\n");
+    WorkspaceGuard ws(tmp.path());
+
+    command_tool::run_command("{\"command\":\"echo hello\"}");
+    auto j = parse_result(tools::edit_file(
+        "{\"path\":\"c.txt\",\"edits\":[{\"old_text\":\"z\",\"new_text\":\"w\"}]}"));
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["code"] == "not_observed");
+}
+
+// ---- 2.5 ①: never read → refused, file untouched ----
+TEST_CASE("guard: editing an unobserved file is refused and changes nothing", "[guard]") {
+    TempDir tmp;
+    tmp.write("n.txt", "keep me\n");
+    WorkspaceGuard ws(tmp.path());
+
+    auto j = parse_result(tools::edit_file(
+        "{\"path\":\"n.txt\",\"edits\":[{\"old_text\":\"keep\",\"new_text\":\"lose\"}]}"));
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["code"] == "not_observed");
+    REQUIRE(j["error"].get<std::string>().find("read the file first") != std::string::npos);
+    REQUIRE(read_all(tmp.path() + "/n.txt") == "keep me\n");
+}
+
+// ---- 2.5 ②③: read first, or write first ----
+TEST_CASE("guard: reading first authorizes the edit", "[guard]") {
+    TempDir tmp;
+    tmp.write("a.txt", "one\n");
+    WorkspaceGuard ws(tmp.path());
+
+    tools::read_file("{\"path\":\"a.txt\"}");
+    auto j = parse_result(tools::edit_file(
+        "{\"path\":\"a.txt\",\"edits\":[{\"old_text\":\"one\",\"new_text\":\"two\"}]}"));
+    REQUIRE(j["ok"] == true);
+    REQUIRE(read_all(tmp.path() + "/a.txt") == "two\n");
+}
+
+TEST_CASE("guard: write_file authorizes an immediate edit", "[guard]") {
+    TempDir tmp;
+    WorkspaceGuard ws(tmp.path());
+
+    REQUIRE(parse_result(tools::write_file("{\"path\":\"new.txt\",\"content\":\"draft\\n\"}"))["ok"] == true);
+    auto j = parse_result(tools::edit_file(
+        "{\"path\":\"new.txt\",\"edits\":[{\"old_text\":\"draft\",\"new_text\":\"final\"}]}"));
+    REQUIRE(j["ok"] == true);
+    REQUIRE(read_all(tmp.path() + "/new.txt") == "final\n");
+}
+
+// ---- 2.5 ④⑤: external change → stale (not "not found"), re-read recovers ----
+TEST_CASE("guard: an externally changed file reports stale, and re-reading recovers", "[guard]") {
+    TempDir tmp;
+    tmp.write("s.txt", "old text\n");
+    WorkspaceGuard ws(tmp.path());
+    const std::string full = tmp.path() + "/s.txt";
+
+    tools::read_file("{\"path\":\"s.txt\"}");
+
+    // Change both content and size behind the tool's back; old_text is gone.
+    {
+        std::ofstream f(full, std::ios::binary | std::ios::trunc);
+        f << "completely different\n";
+    }
+
+    auto stale = parse_result(tools::edit_file(
+        "{\"path\":\"s.txt\",\"edits\":[{\"old_text\":\"old text\",\"new_text\":\"new text\"}]}"));
+    REQUIRE(stale["ok"] == false);
+    REQUIRE(stale["code"] == "stale");
+    REQUIRE(stale["error"].get<std::string>().find("read it again") != std::string::npos);
+    REQUIRE(stale.find("diagnosis") == stale.end());  // not the match-failure path
+    REQUIRE(read_all(full) == "completely different\n");
+
+    tools::read_file("{\"path\":\"s.txt\"}");
+    auto recovered = parse_result(tools::edit_file(
+        "{\"path\":\"s.txt\",\"edits\":[{\"old_text\":\"completely\",\"new_text\":\"COMPLETELY\"}]}"));
+    REQUIRE(recovered["ok"] == true);
+    REQUIRE(read_all(full) == "COMPLETELY different\n");
+}
+
+// ---- 2.5 ⑥: different spelling of the same path is the same observation ----
+TEST_CASE("guard: a path reached by another spelling is still observed", "[guard]") {
+    TempDir tmp;
+    tmp.mkdir("dir");
+    tmp.write("dir/a.txt", "alpha\n");
+    WorkspaceGuard ws(tmp.path());
+
+    tools::read_file("{\"path\":\"dir/a.txt\"}");
+    auto j = parse_result(tools::edit_file(
+        "{\"path\":\"dir/../dir/a.txt\",\"edits\":[{\"old_text\":\"alpha\",\"new_text\":\"beta\"}]}"));
+    REQUIRE(j["ok"] == true);
+    REQUIRE(read_all(tmp.path() + "/dir/a.txt") == "beta\n");
+}
+
+// ---- 2.5 ⑦: reading an empty file still counts ----
+TEST_CASE("guard: reading an empty file counts as observing it", "[guard]") {
+    TempDir tmp;
+    tmp.write("empty.txt", "");
+    WorkspaceGuard ws(tmp.path());
+
+    REQUIRE(parse_result(tools::read_file("{\"path\":\"empty.txt\"}"))["ok"] == true);
+    auto j = parse_result(tools::edit_file(
+        "{\"path\":\"empty.txt\",\"edits\":[{\"old_text\":\"x\",\"new_text\":\"y\"}]}"));
+    REQUIRE(j["ok"] == false);
+    REQUIRE(!j.contains("code"));  // reached matching, not the guard
+}
+
+// ---- 2.5 ⑧: unreadable targets keep their original errors ----
+TEST_CASE("guard: binary, oversized and directory targets keep their own errors", "[guard]") {
+    TempDir tmp;
+    WorkspaceGuard ws(tmp.path());
+
+    write_binary_file(tmp.path() + "/bin.dat");
+    auto bin = parse_result(tools::edit_file(
+        "{\"path\":\"bin.dat\",\"edits\":[{\"old_text\":\"x\",\"new_text\":\"y\"}]}"));
+    REQUIRE(bin["error"] == "Cannot edit binary or non-text file");
+    REQUIRE(!bin.contains("code"));
+
+    {
+        std::ofstream f(tmp.path() + "/big.txt", std::ios::binary);
+        f << "x";
+        f.seekp(1024 * 1024 + 1);
+        f << "y";
+    }
+    auto big = parse_result(tools::edit_file(
+        "{\"path\":\"big.txt\",\"edits\":[{\"old_text\":\"x\",\"new_text\":\"y\"}]}"));
+    REQUIRE(big["error"] == "File too large for edit_file (>1MB)");
+    REQUIRE(!big.contains("code"));
+
+    tmp.mkdir("subdir");
+    auto dir = parse_result(tools::edit_file(
+        "{\"path\":\"subdir\",\"edits\":[{\"old_text\":\"x\",\"new_text\":\"y\"}]}"));
+    REQUIRE(dir["error"] == "Path is a directory, not a file: subdir");
+    REQUIRE(!dir.contains("code"));
+}
+
+// ---- 2.5 ⑨: a successful edit itself records the new version ----
+TEST_CASE("guard: a successful edit re-observes the file it just wrote", "[guard]") {
+    TempDir tmp;
+    tmp.write("e.txt", "aaa\n");
+    WorkspaceGuard ws(tmp.path());
+
+    tools::read_file("{\"path\":\"e.txt\"}");
+    // Unequal length, so the size changes too and the version cannot "collide".
+    REQUIRE(parse_result(tools::edit_file(
+        "{\"path\":\"e.txt\",\"edits\":[{\"old_text\":\"aaa\",\"new_text\":\"bbbb\"}]}"))["ok"] == true);
+
+    auto second = parse_result(tools::edit_file(
+        "{\"path\":\"e.txt\",\"edits\":[{\"old_text\":\"bbbb\",\"new_text\":\"ccc\"}]}"));
+    REQUIRE(second["ok"] == true);
+    REQUIRE(read_all(tmp.path() + "/e.txt") == "ccc\n");
+}
+
+// ---- 2.5 ⑩: an offset-past-the-end read still counts ----
+TEST_CASE("guard: a read past the end still counts as observing", "[guard]") {
+    TempDir tmp;
+    tmp.write("o.txt", "line\n");
+    WorkspaceGuard ws(tmp.path());
+
+    auto read = parse_result(tools::read_file("{\"path\":\"o.txt\",\"offset\":50,\"limit\":10}"));
+    REQUIRE(read["ok"] == true);
+    REQUIRE(read.contains("notice"));
+
+    auto j = parse_result(tools::edit_file(
+        "{\"path\":\"o.txt\",\"edits\":[{\"old_text\":\"line\",\"new_text\":\"LINE\"}]}"));
+    REQUIRE(j["ok"] == true);
+}
+
+// ============================================================================
+// hunks in the edit_file result (harden-edit-tool-and-diff-card 3.1/3.2)
+// ============================================================================
+
+// ---- 3.2 ①: line number and the exact bytes that left the file ----
+TEST_CASE("hunks: a single replacement reports its line and exact bytes", "[hunks]") {
+    TempDir tmp;
+    tmp.write("h1.txt", "line 1\nline 2\nline 3\n");
+    WorkspaceGuard ws(tmp.path());
+    tools::read_file("{\"path\":\"h1.txt\"}");
+
+    auto j = parse_result(tools::edit_file(
+        "{\"path\":\"h1.txt\",\"edits\":[{\"old_text\":\"line 3\",\"new_text\":\"LINE 3\"}]}"));
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["hunks"].size() == 1);
+    REQUIRE(j["hunks"][0]["start_line"] == 3);
+    REQUIRE(j["hunks"][0]["old_text"] == "line 3");
+    REQUIRE(j["hunks"][0]["new_text"] == "LINE 3");
+    REQUIRE(read_all(tmp.path() + "/h1.txt") == "line 1\nline 2\nLINE 3\n");
+}
+
+// ---- 3.2 ②: one element per applied hit, in file order ----
+TEST_CASE("hunks: replace_all reports one element per hit in file order", "[hunks]") {
+    TempDir tmp;
+    // foo on lines 2, 7 and 9
+    tmp.write("h2.txt", "x\nfoo\na\nb\nc\nd\nfoo\ne\nfoo\n");
+    WorkspaceGuard ws(tmp.path());
+    tools::read_file("{\"path\":\"h2.txt\"}");
+
+    auto j = parse_result(tools::edit_file(
+        "{\"path\":\"h2.txt\",\"edits\":[{\"old_text\":\"foo\",\"new_text\":\"BAR\",\"replace_all\":true}]}"));
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["replacements"] == 3);
+    REQUIRE(j["hunks"].size() == 3);
+    REQUIRE(j["hunks"][0]["start_line"] == 2);
+    REQUIRE(j["hunks"][1]["start_line"] == 7);
+    REQUIRE(j["hunks"][2]["start_line"] == 9);
+}
+
+// ---- 3.2 ③: a normalized hit reports the bytes the disk had, not the caller's ----
+TEST_CASE("hunks: a normalized hit reports the file's own bytes", "[hunks]") {
+    TempDir tmp;
+    // Disk holds four spaces; the caller sends a tab. Normalization maps the tab
+    // to the detected indent width, so the hit is real but old_text must still be
+    // what actually left the file.
+    tmp.write("h3.txt", "first\n    indented line\nlast\n");
+    WorkspaceGuard ws(tmp.path());
+    tools::read_file("{\"path\":\"h3.txt\"}");
+
+    auto j = parse_result(tools::edit_file(
+        "{\"path\":\"h3.txt\",\"edits\":[{\"old_text\":\"\\tindented line\",\"new_text\":\"\\treplaced\"}]}"));
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["matched_with"] == "whitespace normalization");
+    REQUIRE(j["hunks"].size() == 1);
+    const std::string replaced = j["hunks"][0]["old_text"].get<std::string>();
+    REQUIRE(replaced == "    indented line");          // disk bytes: spaces
+    REQUIRE(replaced.find('\t') == std::string::npos);  // not the caller's tab
+}
+
+TEST_CASE("hunks: an exact tab match keeps the tab", "[hunks]") {
+    TempDir tmp;
+    tmp.write("h3b.txt", "a\tb\n");
+    WorkspaceGuard ws(tmp.path());
+    tools::read_file("{\"path\":\"h3b.txt\"}");
+
+    auto j = parse_result(tools::edit_file(
+        "{\"path\":\"h3b.txt\",\"edits\":[{\"old_text\":\"a\\tb\",\"new_text\":\"a\\tB\"}]}"));
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["hunks"][0]["old_text"] == "a\tb");
+}
+
+// ---- 3.2 ④: a multi-line replacement reports its starting line ----
+TEST_CASE("hunks: a multi-line replacement reports its starting line", "[hunks]") {
+    TempDir tmp;
+    tmp.write("h4.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\nAAA\nBBB\nCCC\n");
+    WorkspaceGuard ws(tmp.path());
+    tools::read_file("{\"path\":\"h4.txt\"}");
+
+    auto j = parse_result(tools::edit_file(
+        "{\"path\":\"h4.txt\",\"edits\":[{\"old_text\":\"AAA\\nBBB\\nCCC\",\"new_text\":\"ZZZ\"}]}"));
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["hunks"].size() == 1);
+    REQUIRE(j["hunks"][0]["start_line"] == 10);
+    REQUIRE(j["hunks"][0]["old_text"] == "AAA\nBBB\nCCC");
+}
+
+// ---- 3.2 ⑤: every failure path carries no hunks ----
+TEST_CASE("hunks: failures never carry a hunks array", "[hunks]") {
+    TempDir tmp;
+    tmp.write("h5.txt", "dup\ndup\n");
+    WorkspaceGuard ws(tmp.path());
+    tools::read_file("{\"path\":\"h5.txt\"}");
+
+    auto ambiguous = parse_result(tools::edit_file(
+        "{\"path\":\"h5.txt\",\"edits\":[{\"old_text\":\"dup\",\"new_text\":\"x\"}]}"));
+    REQUIRE(ambiguous["ok"] == false);
+    REQUIRE(!ambiguous.contains("hunks"));
+
+    auto empty_old = parse_result(tools::edit_file(
+        "{\"path\":\"h5.txt\",\"edits\":[{\"old_text\":\"\",\"new_text\":\"x\"}]}"));
+    REQUIRE(empty_old["ok"] == false);
+    REQUIRE(!empty_old.contains("hunks"));
+
+    auto not_found = parse_result(tools::edit_file(
+        "{\"path\":\"h5.txt\",\"edits\":[{\"old_text\":\"absent\",\"new_text\":\"x\"}]}"));
+    REQUIRE(not_found["ok"] == false);
+    REQUIRE(!not_found.contains("hunks"));
+}
+
+// ---- 3.2 ⑥: oversized hunks are omitted, and the omission is stated ----
+TEST_CASE("hunks: an oversized diff is omitted with a stated reason", "[hunks]") {
+    TempDir tmp;
+    const std::string big_old(600 * 1024, 'A');
+    const std::string big_new(600 * 1024, 'B');
+    tmp.write("h6.txt", big_old + "\n");
+    WorkspaceGuard ws(tmp.path());
+    REQUIRE(parse_result(tools::read_file("{\"path\":\"h6.txt\"}"))["ok"] == true);
+
+    auto j = parse_result(tools::edit_file(
+        "{\"path\":\"h6.txt\",\"edits\":[{\"old_text\":\"" + big_old + "\",\"new_text\":\"" + big_new + "\"}]}"));
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["replacements"] == 1);
+    REQUIRE(!j.contains("hunks"));
+    REQUIRE(j["hunks_omitted"] == "too large");
+    REQUIRE(read_all(tmp.path() + "/h6.txt") == big_new + "\n");
+}
+
+// ============================================================================
+// read_file 的截断标记：只要没读到末尾就要标（9.1）
+// ============================================================================
+
+TEST_CASE("read_file: a caller-supplied limit still reports truncation", "[read_file][truncation]") {
+    TempDir tmp;
+    std::string content;
+    for (int i = 1; i <= 8000; ++i) {
+        content += "line " + std::to_string(i) + "\n";
+    }
+    tmp.write("long.txt", content);
+    WorkspaceGuard ws(tmp.path());
+
+    auto j = parse_result(tools::read_file("{\"path\":\"long.txt\",\"limit\":5000}"));
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["truncated"] == true);
+    const std::string notice = j["notice"].get<std::string>();
+    REQUIRE(notice.find("\"offset\": 5001") != std::string::npos);
+
+    // 读到末尾那一次不应再报截断
+    auto tail = parse_result(
+        tools::read_file("{\"path\":\"long.txt\",\"offset\":5001,\"limit\":5000}"));
+    REQUIRE(tail["ok"] == true);
+    REQUIRE(!tail.contains("truncated"));
 }

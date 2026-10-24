@@ -70,5 +70,45 @@ void main() {
       expect(ContextEstimator.estimateMessage(tool),
           greaterThan(ContextEstimator.estimateMessage(plain)));
     });
+
+    // hunks 只给界面画 diff，从不进入请求体；算进预算会让一次大编辑
+    // 凭空抬高占用率、提前触发压缩。
+    test('stored edit hunks do not change the estimate', () {
+      final hunks = List.generate(
+        200,
+        (i) => '{"start_line":${i + 1},"old_text":"old line $i","new_text":"new line $i"}',
+      ).join(',');
+      final without = Message(
+          id: '1',
+          sessionId: 's',
+          role: 'assistant',
+          content: '',
+          toolCallsJson:
+              '[{"id":"tc1","toolName":"edit_file","input":{"path":"/x"},"result":"Edited /x (1 replacement)"}]',
+          createdAt: 1);
+      final withHunks = Message(
+          id: '2',
+          sessionId: 's',
+          role: 'assistant',
+          content: '',
+          toolCallsJson:
+              '[{"id":"tc1","toolName":"edit_file","input":{"path":"/x"},"result":"Edited /x (1 replacement)","hunks":[$hunks]}]',
+          createdAt: 2);
+      expect(ContextEstimator.estimateMessage(withHunks),
+          ContextEstimator.estimateMessage(without));
+    });
+
+    test('the omission marker does not change the estimate either', () {
+      final base =
+          '[{"id":"tc1","toolName":"edit_file","input":{"path":"/x"},"result":"Edited /x (3 replacements)"}]';
+      final omitted =
+          '[{"id":"tc1","toolName":"edit_file","input":{"path":"/x"},"result":"Edited /x (3 replacements)","hunksOmitted":"too large"}]';
+      expect(
+        ContextEstimator.estimateMessage(
+            Message(id: '1', sessionId: 's', role: 'assistant', content: '', toolCallsJson: omitted, createdAt: 1)),
+        ContextEstimator.estimateMessage(
+            Message(id: '2', sessionId: 's', role: 'assistant', content: '', toolCallsJson: base, createdAt: 2)),
+      );
+    });
   });
 }

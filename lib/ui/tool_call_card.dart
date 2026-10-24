@@ -15,6 +15,9 @@ class ToolCallCard extends StatefulWidget {
 class _ToolCallCardState extends State<ToolCallCard> {
   bool _expanded = false;
 
+  /// diff 展开态里是否已经点开"还有 N 行未显示"。
+  bool _showAllDiff = false;
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -44,6 +47,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
     }
 
     final inputPreview = a.input.entries.map((e) => '${e.key}=${e.value}').join(', ');
+    final title = _cardTitle(a, inputPreview);
     final hasResultArea = a.status != ToolCallStatus.executing;
     final hasStructured = a.resultSections != null;
 
@@ -68,7 +72,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                   const SizedBox(width: 6),
                   Expanded(
                     child: Text(
-                      '${a.toolName}($inputPreview)',
+                      title,
                       style: TextStyle(
                         fontSize: 13,
                         fontFamily: 'monospace',
@@ -136,8 +140,122 @@ class _ToolCallCardState extends State<ToolCallCard> {
     );
   }
 
+  /// edit_file / write_file 只显示路径；其余工具沿用整行参数预览。
+  String _cardTitle(ToolCallActivity a, String inputPreview) {
+    if (a.toolName == 'edit_file' || a.toolName == 'write_file') {
+      final path = (a.input['path'] as String?) ?? '';
+      final stat = _diffStat(a);
+      return stat == null
+          ? '${a.toolName}($path)'
+          : '${a.toolName}($path) $stat';
+    }
+    return '${a.toolName}($inputPreview)';
+  }
+
+  /// `+N/−M`：所有 hunk 的新增/删除行数；没有 hunks 时给 null。
+  String? _diffStat(ToolCallActivity a) {
+    final hunks = a.hunks;
+    if (hunks == null || hunks.isEmpty) return null;
+    var added = 0;
+    var removed = 0;
+    for (final hunk in hunks) {
+      added += _splitLines(hunk.newText).length;
+      removed += _splitLines(hunk.oldText).length;
+    }
+    return '+$added/−$removed';
+  }
+
+  /// 省略时的那句话：说清"为什么没有 diff"和这次改了几处。
+  String _omissionLabel(ToolCallActivity a) {
+    final match = RegExp(r'\((\d+) replacement').firstMatch(a.result ?? '');
+    final count = match?.group(1);
+    return count == null
+        ? 'diff 未显示：改动过大'
+        : 'diff 未显示：改动过大（$count 处改动）';
+  }
+
+  static List<String> _splitLines(String text) {
+    if (text.isEmpty) return const <String>[];
+    final trimmed =
+        text.endsWith('\n') ? text.substring(0, text.length - 1) : text;
+    return trimmed.split('\n');
+  }
+
+  /// 展开态里的差异区块：每处先给行号，再按行给 `-`/`+`。
+  /// 默认最多 12 行内容（行号行不计），超出折叠成"还有 N 行未显示"。
+  Widget _buildDiffBody(ThemeData theme, ToolCallActivity a) {
+    const defaultBudget = 12;
+    final children = <Widget>[];
+    var shown = 0;
+    var hidden = 0;
+    for (final hunk in a.hunks!) {
+      children.add(Padding(
+        padding: const EdgeInsets.only(top: 4),
+        child: Text('第 ${hunk.startLine} 行',
+            style: TextStyle(
+                fontSize: 11, color: theme.colorScheme.onSurfaceVariant)),
+      ));
+      for (final line in _splitLines(hunk.oldText)) {
+        if (!_showAllDiff && shown >= defaultBudget) {
+          hidden++;
+          continue;
+        }
+        shown++;
+        children.add(_diffLine('-', line, theme.colorScheme.error));
+      }
+      for (final line in _splitLines(hunk.newText)) {
+        if (!_showAllDiff && shown >= defaultBudget) {
+          hidden++;
+          continue;
+        }
+        shown++;
+        children.add(_diffLine('+', line, Colors.green.shade700));
+      }
+    }
+    if (hidden > 0) {
+      children.add(GestureDetector(
+        onTap: () => setState(() => _showAllDiff = true),
+        child: Padding(
+          padding: const EdgeInsets.only(top: 4),
+          child: Text('还有 $hidden 行未显示，点击展开',
+              style: TextStyle(fontSize: 12, color: theme.colorScheme.primary)),
+        ),
+      ));
+    }
+    return _resultBox(
+      theme,
+      ConstrainedBox(
+        constraints: const BoxConstraints(maxHeight: 400),
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: children,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _diffLine(String prefix, String text, Color color) {
+    return Text('$prefix $text',
+        style: TextStyle(
+            fontSize: 12, fontFamily: 'monospace', color: color));
+  }
+
   Widget _buildResultBody(BuildContext context, ToolCallActivity a, bool expanded) {
     final theme = Theme.of(context);
+
+    // 省略必须看得见：hunks 因过大被 sidecar 丢了时，卡片要说清为什么没有 diff。
+    if (a.hunksOmitted != null) {
+      return _resultBox(theme, Text(_omissionLabel(a),
+          style: TextStyle(fontSize: 12, fontFamily: 'monospace',
+              color: theme.colorScheme.onSurfaceVariant)));
+    }
+
+    // edit_file 的差异只在展开的结果区里渲染；折叠态仍是一句话结果。
+    if (expanded && a.hunks != null && a.hunks!.isNotEmpty) {
+      return _buildDiffBody(theme, a);
+    }
 
     // Structured results (web_search, web_fetch)
     if (a.resultSections != null) {

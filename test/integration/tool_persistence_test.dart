@@ -7,6 +7,7 @@ import 'package:alias_agent/main.dart';
 import 'package:alias_agent/models/agent_type_config.dart';
 import 'package:alias_agent/models/app_config.dart';
 import 'package:alias_agent/models/provider_config.dart';
+import 'package:alias_agent/models/tool_call_activity.dart';
 import 'package:alias_agent/ui/message_bubble.dart';
 import 'package:alias_agent/ui/tool_call_card.dart';
 
@@ -187,6 +188,74 @@ void main() {
       expect(find.textContaining('read_file'), findsOneWidget);
       // Assistant message content is visible
       expect(find.text('Let me read that for you.'), findsOneWidget);
+    });
+
+    // 4.4 — edit 的 hunks 存进消息再读回来，卡片仍能画出差异
+    testWidgets('edit hunks survive persistence and re-render', (tester) async {
+      _setupAgentRegistry();
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      // 先构造活动对象、走 toJson 落库——这样"序列化分支丢了"会直接让本用例红。
+      const original = ToolCallActivity(
+        id: 'tc1',
+        toolName: 'edit_file',
+        input: {'path': '/a.txt'},
+        status: ToolCallStatus.done,
+        result: 'Edited /a.txt (2 replacements) — 第 12、40 行',
+        resultPreview: 'Edited /a.txt (2 replacements) — 第 12、40 行',
+        hunks: [
+          EditHunk(startLine: 12, oldText: 'old twelve', newText: 'new twelve'),
+          EditHunk(startLine: 40, oldText: 'old forty', newText: 'new forty'),
+        ],
+      );
+      final msgWithTools = testMessageWithToolCalls(
+        id: 'm1',
+        sessionId: 's1',
+        role: 'assistant',
+        content: '改好了。',
+        toolCallsJson: jsonEncode([original.toJson()]),
+      );
+      final userMsg = testMessage(
+        id: 'm0',
+        sessionId: 's1',
+        role: 'user',
+        content: '编辑一下',
+      );
+      final sessions = testSessions(1);
+      final sessionRepo = FakeSessionRepository(sessions);
+      final msgRepo = FakeMessageRepository([userMsg, msgWithTools]);
+      final sidecar = FakeSidecar();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo,
+        msgRepo: msgRepo,
+        sidecar: sidecar,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      // 存进去的 JSON 先过一遍 fromJson：字段一个不丢
+      final stored = await msgRepo.queryBySession('s1');
+      final withTools = stored.where(
+          (m) => m.role == 'assistant' && m.toolCallsJson != null);
+      final calls =
+          jsonDecode(withTools.first.toolCallsJson!) as List<dynamic>;
+      final activity =
+          ToolCallActivity.fromJson(calls.first as Map<String, dynamic>);
+      expect(activity.hunks, isNotNull);
+      expect(activity.hunks!.length, 2);
+      expect(activity.hunks![0].startLine, 12);
+      expect(activity.hunks![1].oldText, 'old forty');
+
+      // 卡片重开后仍能画出差异
+      expect(find.byType(ToolCallCard), findsOneWidget);
+      await tester.tap(find.text('Expand result'));
+      await tester.pump();
+      expect(find.text('第 12 行'), findsOneWidget);
+      expect(find.text('第 40 行'), findsOneWidget);
+      expect(find.text('- old twelve'), findsOneWidget);
+      expect(find.text('+ new forty'), findsOneWidget);
     });
 
     // 18.T5 — Tool cards survive session switch and return

@@ -78,6 +78,11 @@ std::string grep_file(const std::string& request_json);
 /// (Docs/ripgrepDoc.md section 4).
 bool classify_grep_regex_error(const std::string& stderr_data);
 
+/// Drop every recorded file observation. Tests only: without it one case's
+/// successful read would authorize another case's edit, making the
+/// "must read before edit" cases depend on execution order.
+void reset_observation_state_for_tests();
+
 /// Build a grep match entry {path, line?, text?} from an --json match message's
 /// `data` object, de-rooting the path. Degrades when fields are absent
 /// (path/lines via base64 `bytes`, missing line_number omitted).

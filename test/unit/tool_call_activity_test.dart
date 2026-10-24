@@ -119,4 +119,64 @@ void main() {
       expect(restored.resultSections![0].items[0].title, 'Result 1');
     });
   });
+
+  group('edit hunks', () {
+    test('hunks survive a serialization round-trip', () {
+      final original = ToolCallActivity(
+        id: 'tc2',
+        toolName: 'edit_file',
+        input: {'path': 'a.txt'},
+        status: ToolCallStatus.done,
+        hunks: const [
+          EditHunk(startLine: 3, oldText: 'old three', newText: 'new three'),
+          EditHunk(startLine: 40, oldText: 'old forty', newText: 'new forty'),
+        ],
+      );
+      final restored = ToolCallActivity.fromJson(original.toJson());
+      expect(restored.hunks, isNotNull);
+      expect(restored.hunks!.length, 2);
+      expect(restored.hunks![0].startLine, 3);
+      expect(restored.hunks![0].oldText, 'old three');
+      expect(restored.hunks![0].newText, 'new three');
+      expect(restored.hunks![1].startLine, 40);
+      expect(restored.hunks![1].oldText, 'old forty');
+      expect(restored.hunks![1].newText, 'new forty');
+    });
+
+    test('an old record without hunks deserializes to null', () {
+      final json = <String, dynamic>{
+        'id': 'tc2',
+        'toolName': 'edit_file',
+        'input': {'path': 'a.txt'},
+        'status': 'done',
+        'result': 'Edited a.txt (1 replacement)',
+      };
+      final activity = ToolCallActivity.fromJson(json);
+      expect(activity.hunks, isNull);
+      expect(activity.hunksOmitted, isNull);
+    });
+
+    test('a null hunks list is not written into toJson', () {
+      const activity = ToolCallActivity(
+        id: 'tc3',
+        toolName: 'read_file',
+        input: {'path': 'a.txt'},
+      );
+      expect(activity.toJson().containsKey('hunks'), isFalse);
+      expect(activity.toJson().containsKey('hunksOmitted'), isFalse);
+    });
+
+    test('the omission marker survives a round-trip', () {
+      const original = ToolCallActivity(
+        id: 'tc4',
+        toolName: 'edit_file',
+        input: {'path': 'big.txt'},
+        status: ToolCallStatus.done,
+        hunksOmitted: 'too large',
+      );
+      final restored = ToolCallActivity.fromJson(original.toJson());
+      expect(restored.hunksOmitted, 'too large');
+      expect(restored.hunks, isNull);
+    });
+  });
 }

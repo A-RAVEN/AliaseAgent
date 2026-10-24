@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -5,6 +7,7 @@ import 'package:alias_agent/main.dart';
 import 'package:alias_agent/models/agent_type_config.dart';
 import 'package:alias_agent/models/app_config.dart';
 import 'package:alias_agent/models/provider_config.dart';
+import 'package:alias_agent/models/tool_call_activity.dart';
 import 'package:alias_agent/ui/message_bubble.dart';
 import 'package:alias_agent/ui/tool_call_card.dart';
 
@@ -392,6 +395,131 @@ void main() {
       expect(find.textContaining('BUILD-FAILED'), findsWidgets);
       expect(find.textContaining('boom: detail'), findsWidgets);
       expect(find.textContaining('[exit code: 7]'), findsWidgets);
+    });
+
+    // ------------------------------------------------------------------
+    // edit_file 的 hunks：模型可见文案、错误透传、请求体（5.1/5.2/5.3）
+    // ------------------------------------------------------------------
+
+    /// 跑一次 edit_file 调用，返回 (活动卡片, 最后一发请求体)。
+    Future<(ToolCallActivity, String?)> runEdit(
+      WidgetTester tester, {
+      required String stubResult,
+    }) async {
+      _setupAgentRegistry();
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final sessions = testSessions(1);
+      final sessionRepo = FakeSessionRepository(sessions);
+      final msgRepo = FakeMessageRepository();
+      final sidecar = FakeSidecar()
+        ..stubEditFile(stubResult)
+        ..queueToolCall(
+            '{"name":"edit_file","input":{"path":"/a.txt","edits":[{"old_text":"a","new_text":"b"}]}}')
+        ..queueDone();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo, msgRepo: msgRepo, sidecar: sidecar,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'Edit it');
+      await tester.tap(find.byTooltip('Send'));
+      for (var i = 0; i < 4; i++) {
+        await tester.pump();
+      }
+
+      final stored = await msgRepo.queryBySession('s1');
+      final withTools = stored.where(
+          (m) => m.role == 'assistant' && m.toolCallsJson != null);
+      final calls = jsonDecode(withTools.first.toolCallsJson!) as List<dynamic>;
+      final activity =
+          ToolCallActivity.fromJson(calls.first as Map<String, dynamic>);
+      return (activity, sidecar.lastMessagesJson);
+    }
+
+    testWidgets('hunks 让模型可见文本带上行号（5.3①）', (tester) async {
+      final (activity, _) = await runEdit(tester,
+          stubResult: '{"ok":true,"replacements":2,"hunks":['
+              '{"start_line":12,"old_text":"a","new_text":"b"},'
+              '{"start_line":40,"old_text":"c","new_text":"d"}]}');
+      expect(activity.hunks, isNotNull);
+      expect(activity.hunks!.length, 2);
+      expect(activity.hunks![0].startLine, 12);
+      expect(activity.hunks![1].startLine, 40);
+      expect(activity.result, contains('第 12、40 行'));
+    });
+
+    testWidgets('matched_with 排在行号之前（5.3②）', (tester) async {
+      final (activity, _) = await runEdit(tester,
+          stubResult: '{"ok":true,"replacements":1,'
+              '"matched_with":"whitespace normalization",'
+              '"hunks":[{"start_line":7,"old_text":"a","new_text":"b"}]}');
+      final text = activity.result!;
+      expect(text.indexOf('matched with'), greaterThan(0));
+      expect(text.indexOf('matched with'), lessThan(text.indexOf('第 7 行')));
+    });
+
+    testWidgets('stale 错误原文透传，卡片是 error（5.3③）', (tester) async {
+      const raw = 'cannot edit \\"a.txt\\": file changed since it was read; '
+          'read it again before editing';
+      final (activity, _) = await runEdit(
+          tester, stubResult: '{"ok":false,"code":"stale","error":"$raw"}');
+      expect(activity.status, ToolCallStatus.error);
+      expect(activity.result, 'cannot edit "a.txt": file changed since it was read; '
+          'read it again before editing');
+    });
+
+    testWidgets('hunks_omitted 时文案与改动前逐字一致（5.3④）', (tester) async {
+      final (activity, _) = await runEdit(tester,
+          stubResult: '{"ok":true,"replacements":3,"hunks_omitted":"too large"}');
+      expect(activity.hunks, isNull);
+      expect(activity.hunksOmitted, 'too large');
+      expect(activity.result, 'Edited /a.txt (3 replacements)');
+    });
+
+    testWidgets('没有 hunks 的成功结果文案不变（5.3⑤）', (tester) async {
+      final (activity, _) =
+          await runEdit(tester, stubResult: '{"ok":true,"replacements":1}');
+      expect(activity.hunks, isNull);
+      expect(activity.result, 'Edited /a.txt (1 replacement)');
+    });
+
+    testWidgets('行号清单超过 8000 字符时写明总数与去处（5.3⑥）', (tester) async {
+      final hunks = List.generate(
+        3000,
+        (i) => '{"start_line":${i + 1},"old_text":"a","new_text":"b"}',
+      ).join(',');
+      final (activity, _) = await runEdit(tester,
+          stubResult: '{"ok":true,"replacements":3000,"hunks":[$hunks]}');
+      final text = activity.result!;
+      expect(text, contains('共 '));
+      expect(text, contains('其余行号见卡片'));
+      expect(text.length, lessThan(8500));
+    });
+
+    testWidgets('同一工具轮的第二发请求里没有 hunks（5.2）', (tester) async {
+      final (_, lastJson) = await runEdit(tester,
+          stubResult: '{"ok":true,"replacements":1,'
+              '"hunks":[{"start_line":3,"old_text":"a","new_text":"b"}]}');
+      expect(lastJson, isNotNull);
+      expect(lastJson!.contains('"hunks"'), isFalse,
+          reason: 'hunks 只给界面用，不能进请求体');
+      final messages = jsonDecode(lastJson) as List<dynamic>;
+      Map<String, dynamic>? toolUse;
+      for (final m in messages) {
+        final content = (m as Map<String, dynamic>)['content'];
+        if (content is! List) continue;
+        for (final block in content) {
+          if (block is Map<String, dynamic> && block['type'] == 'tool_use') {
+            toolUse = block;
+          }
+        }
+      }
+      expect(toolUse, isNotNull);
+      expect(toolUse!.keys.toSet(), {'type', 'id', 'name', 'input'});
     });
   });
 }

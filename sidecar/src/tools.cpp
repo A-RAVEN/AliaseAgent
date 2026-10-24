@@ -4,16 +4,20 @@
 
 #include <string>
 #include <vector>
+#include <map>
 #include <fstream>
 #include <sstream>
 #include <algorithm>
 #include <cstring>
 #include <cctype>
+#include <cstdio>
+#include <cerrno>
 #include <nlohmann/json.hpp>
 
 #ifdef _WIN32
 #include <windows.h>
 #include <direct.h>
+#include <io.h>
 #define mkdir_impl(p) _mkdir(p)
 #else
 #include <limits.h>
@@ -226,6 +230,59 @@ static std::string check_path(const std::string& path, std::string& resolved) {
 }
 
 // ---------------------------------------------------------------------------
+// Observation table — which files this process has seen, and at which version
+//
+// A key is the canonical absolute path, so `a/../a.txt` and `a.txt` share one
+// entry. The value is the file's last-write time plus its size; both come from
+// one metadata call, no handle needed. Only successful reads/writes of a file
+// count — listing a directory or grepping its contents does not observe them.
+// ---------------------------------------------------------------------------
+
+struct FileVersion {
+  long long mtime_ticks;  // Windows: 100ns FILETIME ticks; POSIX: ns since epoch
+  long long size;
+};
+
+static std::map<std::string, FileVersion> g_observed;
+
+/// Read a path's current version. Returns false when the path is absent/unreadable.
+static bool stat_version(const std::string& path, FileVersion& out) {
+#ifdef _WIN32
+  WIN32_FILE_ATTRIBUTE_DATA data;
+  if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &data)) return false;
+  ULARGE_INTEGER ft;
+  ft.LowPart = data.ftLastWriteTime.dwLowDateTime;
+  ft.HighPart = data.ftLastWriteTime.dwHighDateTime;
+  ULARGE_INTEGER sz;
+  sz.LowPart = data.nFileSizeLow;
+  sz.HighPart = data.nFileSizeHigh;
+  out.mtime_ticks = static_cast<long long>(ft.QuadPart);
+  out.size = static_cast<long long>(sz.QuadPart);
+  return true;
+#else
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0) return false;
+  out.mtime_ticks = static_cast<long long>(st.st_mtim.tv_sec) * 1000000000LL +
+                    static_cast<long long>(st.st_mtim.tv_nsec);
+  out.size = static_cast<long long>(st.st_size);
+  return true;
+#endif
+}
+
+/// Record that this process has seen `resolved` in its current version.
+static void record_observation(const std::string& resolved) {
+  FileVersion version;
+  if (stat_version(resolved, version)) {
+    g_observed[resolved] = version;
+  }
+}
+
+/// Drop every observation (tests only: keeps one case from authorizing another).
+void reset_observation_state_for_tests() {
+  g_observed.clear();
+}
+
+// ---------------------------------------------------------------------------
 // read_file (enhanced: line numbers + offset/limit + 2000-line cap)
 // ---------------------------------------------------------------------------
 
@@ -343,6 +400,7 @@ std::string read_file(const std::string& request_json) {
     resp["start_line"] = 0;
     resp["end_line"] = 0;
     LOG_INFO("read_file: " + resolved + " (empty file)");
+    record_observation(resolved);
     return resp.dump();
   }
 
@@ -355,6 +413,7 @@ std::string read_file(const std::string& request_json) {
     resp["start_line"] = 0;
     resp["end_line"] = 0;
     resp["notice"] = "offset exceeds file length (" + std::to_string(total_lines) + " lines)";
+    record_observation(resolved);
     return resp.dump();
   }
 
@@ -375,7 +434,9 @@ std::string read_file(const std::string& request_json) {
   }
 
   std::string result_content = out.str();
-  bool truncated = (total_lines > 2000 && offset == 1 && limit == 2000);
+  // 只要这一次没读到文件末尾，就要给标记与续读参数 —— 不只是"默认第一页"那次。
+  // 模型自己传 limit=5000 读 8000 行时，尾部被截掉同样必须说出来。
+  bool truncated = (end < total_lines);
 
   json resp;
   resp["ok"] = true;
@@ -397,7 +458,136 @@ std::string read_file(const std::string& request_json) {
   }
 
   LOG_INFO("read_file: " + resolved + " (" + std::to_string(content.size()) + " bytes, lines " + std::to_string(offset) + "-" + std::to_string(end) + ")");
+  record_observation(resolved);
   return resp.dump();
+}
+
+// ---------------------------------------------------------------------------
+// Atomic publication
+//
+// A write must never leave the target half-written: stage the whole content to a
+// sibling temp file, then rename it over the target. The rename is atomic between
+// the old and the new file, so a crash leaves either the old file or the new one.
+// ---------------------------------------------------------------------------
+
+static std::string path_dir(const std::string& p) {
+  size_t s = p.rfind('/');
+  return (s == std::string::npos) ? std::string(".") : p.substr(0, s);
+}
+
+static std::string path_base(const std::string& p) {
+  size_t s = p.rfind('/');
+  return (s == std::string::npos) ? p : p.substr(s + 1);
+}
+
+/// Sibling staging path: <dir>/<name>.tmp-<pid>-<n>. Must share the directory,
+/// otherwise the final rename could cross a volume and stop being atomic.
+static std::string next_staging_path(const std::string& resolved) {
+  static unsigned long counter = 0;
+#ifdef _WIN32
+  const unsigned long pid = static_cast<unsigned long>(GetCurrentProcessId());
+#else
+  const unsigned long pid = static_cast<unsigned long>(getpid());
+#endif
+  return path_dir(resolved) + "/" + path_base(resolved) + ".tmp-" +
+         std::to_string(pid) + "-" + std::to_string(++counter);
+}
+
+/// Remove staging files a previous run left behind for this same target
+/// (process killed between staging and rename). Failure to clean is not fatal.
+static void cleanup_stale_staging(const std::string& resolved) {
+  const std::string dir = path_dir(resolved);
+  const std::string prefix = path_base(resolved) + ".tmp-";
+#ifdef _WIN32
+  const std::string pattern = dir + "/*";
+  WIN32_FIND_DATAA fd;
+  HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) return;
+  do {
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+    if (std::strncmp(fd.cFileName, prefix.c_str(), prefix.size()) == 0) {
+      DeleteFileA((dir + "/" + fd.cFileName).c_str());
+    }
+  } while (FindNextFileA(h, &fd));
+  FindClose(h);
+#else
+  DIR* d = opendir(dir.c_str());
+  if (!d) return;
+  struct dirent* entry;
+  while ((entry = readdir(d)) != nullptr) {
+    if (std::strncmp(entry->d_name, prefix.c_str(), prefix.size()) == 0) {
+      unlink((dir + "/" + entry->d_name).c_str());
+    }
+  }
+  closedir(d);
+#endif
+}
+
+#ifdef _WIN32
+/// Widen with the ANSI code page: every path in this file came from an A-suffixed
+/// API (GetFullPathNameA / GetFileAttributesA), so CP_ACP is the matching decode.
+/// CP_UTF8 here would corrupt non-ASCII directory names.
+static std::wstring widen_acp(const std::string& s) {
+  if (s.empty()) return std::wstring();
+  const int need = MultiByteToWideChar(CP_ACP, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
+  if (need <= 0) return std::wstring();
+  std::wstring wide(static_cast<size_t>(need), L'\0');
+  MultiByteToWideChar(CP_ACP, 0, s.c_str(), static_cast<int>(s.size()), &wide[0], need);
+  return wide;
+}
+#endif
+
+/// Atomically replace `resolved` with `content`.
+/// Returns an empty string on success, or a JSON error result:
+///   "Cannot stage file: <path>"                                  — temp could not be written
+///   "Cannot replace file: <path> (rename failed, error <code>)"  — rename refused (e.g. read-only)
+static std::string write_atomically(const std::string& resolved, const std::string& content) {
+  cleanup_stale_staging(resolved);
+  const std::string temp = next_staging_path(resolved);
+
+#ifdef _WIN32
+  FILE* fp = nullptr;
+  const errno_t open_err = fopen_s(&fp, temp.c_str(), "wb");
+  if (open_err != 0 || fp == nullptr) {
+    return error_result("Cannot stage file: " + resolved);
+  }
+  bool staged_ok = (fwrite(content.data(), 1, content.size(), fp) == content.size());
+  if (staged_ok && _commit(_fileno(fp)) != 0) staged_ok = false;  // flush to disk
+  fclose(fp);
+  if (!staged_ok) {
+    DeleteFileA(temp.c_str());
+    return error_result("Cannot stage file: " + resolved);
+  }
+  const std::wstring wide_temp = widen_acp(temp);
+  const std::wstring wide_target = widen_acp(resolved);
+  if (!MoveFileExW(wide_temp.c_str(), wide_target.c_str(),
+                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    const DWORD code = GetLastError();
+    DeleteFileA(temp.c_str());
+    return error_result("Cannot replace file: " + resolved + " (rename failed, error " +
+                        std::to_string(static_cast<unsigned long>(code)) + ")");
+  }
+  return "";
+#else
+  FILE* fp = std::fopen(temp.c_str(), "wb");
+  if (fp == nullptr) {
+    return error_result("Cannot stage file: " + resolved);
+  }
+  bool staged_ok = (fwrite(content.data(), 1, content.size(), fp) == content.size());
+  if (staged_ok && fsync(fileno(fp)) != 0) staged_ok = false;
+  std::fclose(fp);
+  if (!staged_ok) {
+    std::remove(temp.c_str());
+    return error_result("Cannot stage file: " + resolved);
+  }
+  if (std::rename(temp.c_str(), resolved.c_str()) != 0) {
+    const int code = errno;
+    std::remove(temp.c_str());
+    return error_result("Cannot replace file: " + resolved + " (rename failed, error " +
+                        std::to_string(code) + ")");
+  }
+  return "";
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -460,17 +650,10 @@ std::string write_file(const std::string& request_json) {
     }
   }
 
-  // Write file
+  // Write file atomically: stage to a sibling temp file, then rename over the target
   {
-    std::ofstream f(resolved, std::ios::binary | std::ios::trunc);
-    if (!f) {
-      return error_result("Cannot write file: " + path);
-    }
-    f.write(content.data(), content.size());
-    if (!f) {
-      return error_result("Write failed (disk full?): " + path);
-    }
-    f.close();
+    std::string write_err = write_atomically(resolved, content);
+    if (!write_err.empty()) return write_err;
   }
 
   json resp;
@@ -480,6 +663,7 @@ std::string write_file(const std::string& request_json) {
   resp["created"] = created;
 
   LOG_INFO("write_file: " + resolved + " (" + std::to_string(content.size()) + " bytes, created=" + (created ? "true" : "false") + ")");
+  record_observation(resolved);
   return resp.dump();
 }
 
@@ -935,6 +1119,33 @@ std::string edit_file(const std::string& request_json) {
     }
   }
 
+  // ---- Read-before-edit and freshness guard ----
+  // Placed after the unreadable/oversized/directory protections (their verdicts are
+  // final and "go read it first" would be wrong advice) and before reading the
+  // content (a stale basis must report staleness, not a misleading match failure).
+  {
+    auto observed = g_observed.find(resolved);
+    if (observed == g_observed.end()) {
+      json resp;
+      resp["ok"] = false;
+      resp["code"] = "not_observed";
+      resp["error"] = "cannot edit \"" + resolved + "\": read the file first";
+      return resp.dump();
+    }
+    FileVersion current;
+    const bool changed = !stat_version(resolved, current) ||
+                         current.mtime_ticks != observed->second.mtime_ticks ||
+                         current.size != observed->second.size;
+    if (changed) {
+      json resp;
+      resp["ok"] = false;
+      resp["code"] = "stale";
+      resp["error"] = "cannot edit \"" + resolved +
+                      "\": file changed since it was read; read it again before editing";
+      return resp.dump();
+    }
+  }
+
   // ---- Read file content ----
   std::ifstream f(resolved, std::ios::binary);
   if (!f) {
@@ -1019,6 +1230,27 @@ std::string edit_file(const std::string& request_json) {
     }
   }
 
+  // ---- Collect one hunk per applied hit, in file order ----
+  // Built from the ORIGINAL content and the actual hit ranges, so a
+  // whitespace-normalized match reports the bytes that really left the file,
+  // not the caller's old_text.
+  json hunks_json = json::array();
+  {
+    std::vector<AppliedHit> ordered = hits;
+    std::sort(ordered.begin(), ordered.end(),
+              [](const AppliedHit& a, const AppliedHit& b) {
+                if (a.start != b.start) return a.start < b.start;
+                return a.end < b.end;
+              });
+    for (const auto& h : ordered) {
+      json hunk;
+      hunk["start_line"] = line_of(content, h.start);
+      hunk["old_text"] = content.substr(h.start, h.end - h.start);
+      hunk["new_text"] = pairs[h.pair].new_text;
+      hunks_json.push_back(hunk);
+    }
+  }
+
   // ---- Apply: per-hit, global reverse byte-offset order ----
   std::sort(hits.begin(), hits.end(),
             [](const AppliedHit& a, const AppliedHit& b) {
@@ -1034,16 +1266,24 @@ std::string edit_file(const std::string& request_json) {
   }
 
   {
-    std::ofstream out(resolved, std::ios::binary | std::ios::trunc);
-    if (!out) return error_result("Cannot write file: " + path);
-    out.write(result.data(), result.size());
+    std::string write_err = write_atomically(resolved, result);
+    if (!write_err.empty()) return write_err;
   }
 
   LOG_INFO("edit_file: " + resolved + " " + std::to_string(hits.size()) + " replacements (batch)");
+  record_observation(resolved);
   json resp;
   resp["ok"] = true;
   resp["replacements"] = replacements;
   if (any_normalized) resp["matched_with"] = "whitespace normalization";
+  // A replace_all over a large file can produce tens of thousands of hits; the
+  // serialized hunks would then dwarf the whole-file text we refused to return.
+  // Same 1MB bound as the file itself, and the omission is stated, never silent.
+  if (hunks_json.dump().size() > 1024 * 1024) {
+    resp["hunks_omitted"] = "too large";
+  } else {
+    resp["hunks"] = hunks_json;
+  }
   return resp.dump();
 }
 

@@ -51,6 +51,33 @@ class ResultSection {
   }
 }
 
+/// 一处实际被替换的片段：行号从 1 数起，oldText/newText 是磁盘上真实进出的文本。
+class EditHunk {
+  final int startLine;
+  final String oldText;
+  final String newText;
+
+  const EditHunk({
+    required this.startLine,
+    required this.oldText,
+    required this.newText,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'start_line': startLine,
+        'old_text': oldText,
+        'new_text': newText,
+      };
+
+  factory EditHunk.fromJson(Map<String, dynamic> json) {
+    return EditHunk(
+      startLine: (json['start_line'] as num?)?.toInt() ?? 0,
+      oldText: (json['old_text'] as String?) ?? '',
+      newText: (json['new_text'] as String?) ?? '',
+    );
+  }
+}
+
 class ToolCallActivity {
   final String id;
   final String toolName;
@@ -60,6 +87,12 @@ class ToolCallActivity {
   final String? resultPreview;
   final List<ResultSection>? resultSections;
 
+  /// edit_file 实际改动的每一处（行号 + 磁盘上真实进出的文本）；非 edit_file 为 null。
+  final List<EditHunk>? hunks;
+
+  /// sidecar 因体积过大省略了 hunks 时带的原因（如 "too large"），否则为 null。
+  final String? hunksOmitted;
+
   const ToolCallActivity({
     required this.id,
     required this.toolName,
@@ -68,6 +101,8 @@ class ToolCallActivity {
     this.result,
     this.resultPreview,
     this.resultSections,
+    this.hunks,
+    this.hunksOmitted,
   });
 
   ToolCallActivity copyWith({
@@ -78,6 +113,8 @@ class ToolCallActivity {
     String? result,
     String? resultPreview,
     List<ResultSection>? resultSections,
+    List<EditHunk>? hunks,
+    String? hunksOmitted,
   }) {
     return ToolCallActivity(
       id: id ?? this.id,
@@ -87,6 +124,8 @@ class ToolCallActivity {
       result: result ?? this.result,
       resultPreview: resultPreview ?? this.resultPreview,
       resultSections: resultSections ?? this.resultSections,
+      hunks: hunks ?? this.hunks,
+      hunksOmitted: hunksOmitted ?? this.hunksOmitted,
     );
   }
 
@@ -99,6 +138,9 @@ class ToolCallActivity {
         'resultPreview': resultPreview,
         if (resultSections != null)
           'resultSections': resultSections!.map((s) => s.toJson()).toList(),
+        if (hunks != null && hunks!.isNotEmpty)
+          'hunks': hunks!.map((h) => h.toJson()).toList(),
+        if (hunksOmitted != null) 'hunksOmitted': hunksOmitted,
       };
 
   factory ToolCallActivity.fromJson(Map<String, dynamic> json) {
@@ -114,6 +156,10 @@ class ToolCallActivity {
       resultSections: (json['resultSections'] as List<dynamic>?)
           ?.map((e) => ResultSection.fromJson(e as Map<String, dynamic>))
           .toList(),
+      hunks: (json['hunks'] as List<dynamic>?)
+          ?.map((e) => EditHunk.fromJson(e as Map<String, dynamic>))
+          .toList(),
+      hunksOmitted: json['hunksOmitted'] as String?,
     );
   }
 }

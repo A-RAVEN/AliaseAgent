@@ -1568,7 +1568,18 @@ class ChatScreenState extends State<ChatScreen> {
       if (turnText.isNotEmpty) {
         assistantBlocks.add({'type': 'text', 'text': turnText});
       }
-      assistantBlocks.addAll(turnToolCalls);
+      // 只放 tool_use 必需的四个键，与重放路径 _buildApiMessages 一致。
+      // 下面的工具循环会 tc.addAll(activity.toJson()) 原地填充同一个 Map
+      // （result / resultPreview / hunks…），若这里持有它的引用，那些字段
+      // 就会随同一工具轮的第二发请求被真的发出去。
+      for (final tc in turnToolCalls) {
+        assistantBlocks.add({
+          'type': tc['type'] ?? 'tool_use',
+          'id': tc['id'] ?? '',
+          'name': tc['name'] ?? '',
+          'input': tc['input'] ?? <String, dynamic>{},
+        });
+      }
 
       apiMessages.add({
         'role': 'assistant',
@@ -1608,6 +1619,8 @@ class ChatScreenState extends State<ChatScreen> {
                   resultSections: isSearchTool
                       ? _buildResultSections(toolName2, result)
                       : null,
+                  hunks: _parseEditHunks(result['hunks']),
+                  hunksOmitted: result['hunks_omitted'] as String?,
                 ));
                 break;
               }
@@ -2878,10 +2891,53 @@ class ChatScreenState extends State<ChatScreen> {
         '$kToolResultElisionThreshold$refetch]';
   }
 
+  /// `edit_file` 模型可见文本的尾巴：`— 第 12、40 行`。
+  ///
+  /// 行号清单本身也受 [kToolResultElisionThreshold] 约束：超过它时只列前几条，
+  /// 并写明共几处、其余去哪看——砍内容必须可见、可见之后必须可取回。
+  static String _editLineSuffix(List<dynamic> hunks) {
+    final lines = <int>[];
+    for (final hunk in hunks) {
+      if (hunk is! Map) continue;
+      final line = (hunk['start_line'] as num?)?.toInt();
+      if (line != null && line > 0 && !lines.contains(line)) lines.add(line);
+    }
+    if (lines.isEmpty) return '';
+    final full = ' — 第 ${lines.join('、')} 行';
+    if (full.length <= kToolResultElisionThreshold) return full;
+    final note = ' — 共 ${lines.length} 处改动，其余行号见卡片';
+    final budget =
+        kToolResultElisionThreshold - note.length - ' — 第  行'.length;
+    final shown = <int>[];
+    var used = 0;
+    for (final line in lines) {
+      final added = (shown.isEmpty ? 0 : 1) + '$line'.length;
+      if (used + added > budget) break;
+      shown.add(line);
+      used += added;
+    }
+    if (shown.isEmpty) return note;
+    return ' — 第 ${shown.join('、')} 行$note';
+  }
+
+  /// 把 sidecar 返回的 hunks 转成活动对象用的形态；不可用时给 null。
+  static List<EditHunk>? _parseEditHunks(Object? raw) {
+    if (raw is! List || raw.isEmpty) return null;
+    final hunks = <EditHunk>[];
+    for (final item in raw) {
+      if (item is! Map) continue;
+      final line = (item['start_line'] as num?)?.toInt();
+      final oldText = item['old_text'];
+      final newText = item['new_text'];
+      if (line == null || oldText is! String || newText is! String) continue;
+      hunks.add(EditHunk(startLine: line, oldText: oldText, newText: newText));
+    }
+    return hunks.isEmpty ? null : hunks;
+  }
+
   /// Execute a tool call. Returns a JSON-like result map.
   /// Async because web_search/web_fetch run on worker isolates (tasks 8.3a, 8.5).
-  Future<Map<String, dynamic>> _executeTool(Map<String, dynamic> toolCall) async {
-    final name = toolCall['name'] as String?;
+  Future<Map<String, dynamic>> _executeTool(Map<String, dynamic> toolCall) async {    final name = toolCall['name'] as String?;
     final input = (toolCall['input'] as Map<String, dynamic>?) ?? {};
     final path = (input['path'] as String?) ?? '';
 
@@ -3053,6 +3109,10 @@ class ChatScreenState extends State<ChatScreen> {
         final matchedWith = parsed['matched_with'] as String?;
         var content = 'Edited $path ($reps replacement${reps == 1 ? '' : 's'})';
         if (matchedWith != null) content += ' — matched with $matchedWith';
+        final hunks = parsed['hunks'];
+        if (parsed['ok'] == true && hunks is List) {
+          content += _editLineSuffix(hunks);
+        }
         parsed['content'] = content;
       } else if (name == 'glob_file') {
         // Model-facing content: one relative path per line. Show the full

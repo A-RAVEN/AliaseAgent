@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import '../models/message.dart';
 
 /// Deterministic local proxy estimator used to project the next request's input
@@ -34,12 +36,38 @@ class ContextEstimator {
     var t = estimateTokens(m.content) + _messageOverhead;
     if (m.toolCallsJson != null && m.toolCallsJson!.isNotEmpty) {
       // Tool round overhead: the round + its synthetic tool_result user message.
-      t += estimateTokens(m.toolCallsJson!) + _toolRoundOverhead;
+      t += estimateTokens(_withoutEditHunks(m.toolCallsJson!)) +
+          _toolRoundOverhead;
     }
     if (m.thinkingJson != null && m.thinkingJson!.isNotEmpty) {
       t += estimateTokens(m.thinkingJson!) + _thinkingOverhead;
     }
     return t;
+  }
+
+  /// 去掉工具活动里的 `hunks` / `hunksOmitted` 再估。
+  ///
+  /// 这两个字段只给界面画 diff 用，从不进入任何一次请求体（`_buildApiMessages`
+  /// 只取 type/id/name/input），按它们计数就是把"没发出去的东西"算进预算，
+  /// 会让一次大编辑凭空抬高占用率、提前触发压缩。
+  ///
+  /// 解析失败时按原样返回：宁可多算一点，也不把真实的工具活动漏掉。
+  static String _withoutEditHunks(String toolCallsJson) {
+    if (!toolCallsJson.contains('"hunks')) return toolCallsJson;
+    try {
+      final decoded = jsonDecode(toolCallsJson);
+      if (decoded is! List) return toolCallsJson;
+      var stripped = false;
+      for (final entry in decoded) {
+        if (entry is Map<String, dynamic>) {
+          if (entry.remove('hunks') != null) stripped = true;
+          if (entry.remove('hunksOmitted') != null) stripped = true;
+        }
+      }
+      return stripped ? jsonEncode(decoded) : toolCallsJson;
+    } catch (_) {
+      return toolCallsJson;
+    }
   }
 
   /// Estimate the proxy token cost of a whole persisted conversation.
