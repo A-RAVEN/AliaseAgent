@@ -10,6 +10,12 @@
 > 2. **上一版 §2.7.1 的「控制表列归属无法确定」已解决。** 本次从 HTML 的 `colspan` / `rowspan` 精确确认了三列归属（见 §2.7.1）。
 > 3. **官方「首次调用 API」页删除了 `deepseek-v4-pro` 的下线/路由脚注 (2)**，`model` 行现在只带脚注 (1)（见 §1.1 的变化提示）。
 > 4. **本项目 §2.7.5 的实测结论与本次确认后的官方表格不再冲突**，说明见 §2.7.5 末尾的补充段落。
+>
+> **本次（2026-10-24）增补：图像理解**
+>
+> 上一版未收录官方「图像理解」页（`https://api-docs.deepseek.com/zh-cn/guides/vision`）。本项目要加图片输入能力，本次用 `web_fetch` 抓取该页（HTTP 200，正文完整），新增 §6.4 **逐字照录**该页内容；并在 §6.2 末尾补一段**明确标注为「本项目推导 + 实测校准」**的图片 token 估算式。§8 来源表与「未能覆盖的章节」已同步。
+>
+> 除 §6.2 末尾那一段（已标注非官方）与 §6.4.5 末尾那句「本项目备注」外，本次新增内容均为官方原文照录。
 
 ---
 
@@ -1287,9 +1293,114 @@ token 是模型用来表示自然语言文本的基本单位，也是我们的�
 
 官方页面还提供了一个「图片 Token 计算器」交互组件（输入：宽度 (px)、高度 (px)；按钮：计算）——该组件为前端交互，抓取到的页面文本中**不含其计算公式或结果**，故本文无法给出计算公式。
 
+> **【本项目推导 + 实测校准，非官方原文】**（2026-10-24 增补）
+>
+> 官方虽未公布「像素 → token」的逐点公式，但官方「图像理解」页（见 §6.4）给出了缩放规则与每张图的 token 上限，据此可反推一个可用的估算式：
+>
+> 1. **缩放规则（官方原文）**：总像素小于约 544×544 的图片会被保持长宽比**放大**；更大的图片会被保持长宽比**缩小**，缩小后的总像素约相当于 **1300×1300** 的图片。
+> 2. **上限（官方原文）**：每张图片消耗的 token 数存在上限（**1024** 个）；「2000×2000 和 5000×5000 的图片，经缩放后消耗的 token 数是相同的」。
+> 3. **反推比例**：1300 × 1300 = 1690000 像素对应 1024 token ⇒ 约 **1650 像素 / token**。（两个输入数字都来自官方原文，除数 1650 是它俩相除的结果。）
+> 4. **估算式**：`缩放后总像素 = min(1300×1300, max(544×544, 宽 × 高))`；`图片 token ≈ min(1024, 缩放后总像素 ÷ 1650)`。
+> 5. **实测校准（本项目，2026-10-24）**：全部走 Anthropic 兼容端点 `https://api.deepseek.com/anthropic`、`thinking.type = "disabled"`、同一张 512×512 纯色 PNG（红 / 蓝两张 242 与 2055 字节）、同一个问法「这张图片的主要颜色是什么？只回答一个中文颜色词。」
+>
+>    | 请求 | 模型 | `usage.input_tokens` | 回答 | 说明 |
+>    | --- | --- | --- | --- | --- |
+>    | 文字（不带图，对照） | `deepseek-v4-pro` | 14 | 白色 | 看不见图时的基线 |
+>    | 文字 + 纯红图 | `deepseek-v4-pro` | 22 | 蓝色 | 只多 8 token，且答错 |
+>    | 文字 + 纯蓝图 | `deepseek-v4-pro` | 22 | 白色 | 与红图同为 22，答案与图像内容无关 |
+>    | 文字 + 纯红图 | `deepseek-flash` | 201 | 红色 | 真的看了图 |
+>    | 纯红图放在 `tool_result.content` 数组里 | `deepseek-flash` | 485 | 红色 | 工具结果带图的通道可用 |
+>    | 纯红图放在 `tool_result.content` 数组里 | `deepseek-v4-pro` | 312 | 自称看到「Unsupported Image」 | 该模型不支持图片输入 |
+>
+>    由第 1、4 条估算：512×512 = 262144 像素低于 544×544，应被放大到约 295936 像素，295936 ÷ 1650 ≈ 179 token；实测 `deepseek-flash` 那一次是 201（含约 14～22 token 的文字），图片部分约 180～187，与估算吻合。
+>
+>    **结论**：`deepseek-flash` 能看图；`deepseek-v4-pro` 收下图片但不看（只计 8 token、答案与内容无关），且不报错。
+> 6. **使用建议**：这是拟合值，不是官方承诺；做上下文预算时**直接按上限 1024 token/张计**（官方原文数字，只会高估不会低估），要显示给用户的估算值再用第 4 条。
+
 ### 6.3 Usage 响应字段
 
 响应中的 `usage` 字段结构见 §3.2（非流式：`completion_tokens` / `prompt_tokens` / `prompt_tokens_details` / `total_tokens` / `completion_tokens_details`）与 §3.3 的示例 JSON。流式响应中 `usage` 出现在最后一个 chunk 上，见 §3.7 最后一个 `data:` 行与 §3.1 的「include_usage 语义」。
+
+### 6.4 图像理解（图片输入）
+
+> **来源**：`https://api-docs.deepseek.com/zh-cn/guides/vision`，2026-10-24 用 `web_fetch` 抓取（HTTP 200，正文完整）。以下官方内容逐字照录，未使用记忆或推测。
+
+`deepseek-flash` 模型支持在文本之外输入图片，你可以让模型描述图片、识别截图中的文字、分析图表等。旧模型名 `deepseek-v4-flash-vision-exp` 仍可调用，但该模型已下线，其请求同样由最新的 Flash 模型承接。
+
+支持的图片格式：**JPEG、PNG、GIF、WebP**。格式由文件实际内容判断，而非文件名或声明的 MIME 类型。
+
+#### 6.4.1 三种传入方式
+
+> 原文：共有三种方式向模型提供图片，均使用标准的 OpenAI 兼容对话补全格式，即 `content` 为一个块（block）数组，而非纯字符串。
+
+| 方式 | 承载字段 | 关键限制（原文） |
+| --- | --- | --- |
+| 1. Base64 编码图片（内联） | `{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,<DATA>"}}` | 编码后的数据会计入 **48 MiB** 请求体大小限制 |
+| 2. 外部图片 URL | `{"type":"image_url","image_url":{"url":"https://…"}}` | URL 长度最多 **8192 个字符**；图片文件最大 **32 MiB**；需在 **60 秒**内完成下载 |
+| 3. Files API `file_id` | `{"type":"file","file_id":"file-api-…"}` | 最大可达 **64 MiB**，且不受 32 MiB 单图检查限制 |
+
+第三种方式也可用 `file_data` 以 base64 形式内联携带图片，原文：`file_data` 与 `file_id` 二者互斥，形如 `{"type":"file","file_data":"data:image/jpeg;base64,<DATA>","filename":"image.jpg"}`。
+
+#### 6.4.2 细节级别（Detail Level）
+
+> 原文：对于 `image_url` 输入，你可以选填 `detail` 字段来控制图片的处理方式。
+
+| 取值 | 行为（原文） |
+| --- | --- |
+| `low` | 推理前将图片缩放到 512×512。当不需要精细视觉细节时更快、更省 token。 |
+| `high` | 保留原图。（为兼容性提供，等价于 `original`。） |
+| `original` | 保留原图。 |
+| `auto` | 自动选择。当前等价于 `original`。 |
+
+#### 6.4.3 限制（原文表格逐字照录）
+
+| 限制项 | 数值 |
+| --- | --- |
+| 支持的格式 | JPEG、PNG、GIF、WebP |
+| 外部 URL 长度 | 8192 个字符 |
+| 请求体大小 | 48 MiB |
+| 单张图片最大大小（base64 / 外部 URL） | 32 MiB |
+| 单张图片最大大小（Files API `file_id`） | 64 MiB |
+| 单个请求最大图片数 | 600 |
+| 单个请求图片总大小 | 不含 `file_id` 图片最多 64 MiB；包含 `file_id` 图片最高 200 MiB |
+| 图片最大尺寸 | 单边最长 8192 像素；单个请求包含 15 张及以上图片时，降为单边最长 4096 像素 |
+
+#### 6.4.4 使用限制（原文）
+
+- 图片仅支持出现在 `user` 消息中。`system` 或 `assistant` 消息携带图片会返回 `400` 错误。
+
+#### 6.4.5 通过 Anthropic 兼容端点（`/messages`）传图
+
+> 原文：除了上面的 OpenAI 兼容端点，你也可以通过 Anthropic 兼容的 `/messages` 端点发送图片（`base_url` 为 `https://api.deepseek.com/anthropic`）。基础配置请参考 [Anthropic API](https://api-docs.deepseek.com/zh-cn/guides/anthropic_api)。区别在于图片内容块的结构。Anthropic 不使用 `image_url`，而是使用 `image` 块，其 `source` 对象的 `type` 为 `base64`、`url` 或 `file` 之一。
+
+| `source.type` | 对应的 OpenAI 方式 | 说明（原文） |
+| --- | --- | --- |
+| `base64` | Base64 编码图片 | 需要 `media_type` 字段（`image/jpeg`、`image/png`、`image/gif` 或 `image/webp`）。 |
+| `url` | 外部图片 URL | 最多 8192 个字符。 |
+| `file` | Files API `file_id` | 需要请求头 `anthropic-beta: files-api-2025-04-14`。 |
+
+原文示例（Anthropic SDK，`model="deepseek-flash"`，`content` 数组里的图片块）：
+
+```python
+{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "<BASE64_DATA>"}}
+```
+
+> **本项目备注（非官方）**：该页没有为 Anthropic 端点的 `image` 块列出 `detail` 字段（只有 §6.4.2 说的 `image_url` 输入可填）。因此走 `/messages` 时无法用 `detail: "low"` 让服务端把小图按 512×512 处理；要省 token 只能在客户端自己缩小后再送（见 §6.2 的估算式）。
+
+#### 6.4.6 Token 用量（原文）
+
+图片会根据其尺寸换算成 token，并与文本 token 一起计费。
+
+在进入模型前，每张图片都会被自动缩放：
+
+- 总像素小于约 544×544 的图片会被保持长宽比放大；
+- 更大的图片会被保持长宽比缩小，缩小后的总像素约相当于 **1300×1300** 的图片。
+
+因此，每张图片消耗的 token 数存在上限（**1024** 个）：例如 2000×2000 和 5000×5000 的图片，经缩放后消耗的 token 数是相同的。单个请求包含多张图片时，每张图片独立按同一规则计算，不存在额外的计算方式。
+
+如需估算具体尺寸图片的 token 消耗，请使用 [Token 与用量计算](https://api-docs.deepseek.com/zh-cn/quick_start/token_usage) 页面的图片 Token 计算器。
+
+> **本项目备注（非官方）**：第 6.2 节末尾那段「缩放后总像素 ÷ 1650」的估算式就是据此反推的，含推导与实测校准，**不是官方公式**。
 
 ---
 
@@ -1367,6 +1478,7 @@ token 是模型用来表示自然语言文本的基本单位，也是我们的�
 | Tool Calls（中文，§4 主源） | https://api-docs.deepseek.com/zh-cn/guides/tool_calls | ✅ 成功（HTTP 200，1 次成功，内容完整） |
 | 错误码（中文，§5 主源） | https://api-docs.deepseek.com/zh-cn/quick_start/error_codes | ✅ 成功（HTTP 200，1 次成功，内容完整） |
 | Token 用量计算（中文，§6 主源） | https://api-docs.deepseek.com/zh-cn/quick_start/token_usage | ✅ 成功（HTTP 200，1 次成功，内容完整） |
+| 图像理解（中文，§6.4 主源；2026-10-24 增补） | https://api-docs.deepseek.com/zh-cn/guides/vision | ✅ 成功（2026-10-24 抓取，HTTP 200，正文完整：三种传图方式、Detail Level 表、限制表、使用限制、Anthropic/Responses 两节俱全，未触发 `web_fetch` 截断） |
 | 思考模式（中文，§2.7 来源，非任务指定） | https://api-docs.deepseek.com/zh-cn/guides/thinking_mode | ✅ **本次已完整取得**（上一版此处被截断）。`curl.exe -L` 取原始 HTML 108003 字节，取得控制参数表（含 `colspan`/`rowspan` 结构）、两个多轮样例代码、工具调用样例与说明 |
 
 **未能覆盖的章节 / 内容（如实记录）**
@@ -1375,7 +1487,7 @@ token 是模型用来表示自然语言文本的基本单位，也是我们的�
 2. **§2 开头「将 DeepSeek 模型接入 Claude Code」**：官方该小节只有一句指引，指向 `https://api-docs.deepseek.com/zh-cn/quick_start/agent_integrations/claude_code`；该指南页不在本次抓取范围，未收录其内容。
 3. **§2.7.3 与 §2.7.4 的示意图**：官方页面各配有一张调用流程示意图，属前端图片资源，本文件未收录图片本身。
 4. **§2.7.4 的样例输出**：官方给出该工具调用样例的完整运行输出（Turn 1.1 ~ Turn 2.2），属运行输出而非接口定义，本文件未逐行转录。
-5. **§6.2 图片 Token 计算器**：官方为前端交互组件，抓取到的页面文本中不含其计算公式。
+5. **§6.2 图片 Token 计算器**：官方为前端交互组件，抓取到的页面文本中**仍不含其计算公式**（2026-10-24 抓取的「图像理解」页也没给公式，只给了缩放规则与每张图 1024 token 的上限，见 §6.4；据此反推的估算式见 §6.2 末尾那一段，已标注为本项目推导）。
 6. **§1.4 的 `python` / `nodejs` 标签页**：官方「调用对话 API」提供三个标签页，本文件只照录了 `curl` 标签页。
 7. **§3.9 的无状态说明**：来自「多轮对话」页，本次未重新抓取，沿用上一版结果。
 
