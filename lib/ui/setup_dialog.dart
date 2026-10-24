@@ -71,6 +71,9 @@ class _SetupDialogState extends State<SetupDialog> {
           systemPrompt: 'You are a helpful assistant.',
           tools: ['read_file', 'list_dir'],
           maxContextTokens: maxContextTokens,
+          // 默认只有文本，图片不发（模型能不能看图由这一项声明，见
+          // Docs/user-guide/configuration.md 的 input_modalities）。
+          inputModalities: AgentTypeConfig.kDefaultInputModalities,
         ),
       },
     );

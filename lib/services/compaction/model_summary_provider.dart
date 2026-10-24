@@ -167,13 +167,46 @@ class ModelSummaryProvider implements SummaryProvider {
       // done==0 + empty-content gap in the R1-5 fix, which only handled done!=0.
       throw StateError('Summarization returned empty content (code=0, no text)');
     }
+    // 图片被压掉时要说出来（add-image-input 10.3）：摘要只发纯文本，原来那几张图
+    // 一个都没进摘要。不点名就是静默降级；点名并给出恢复路径（本地数据库 +
+    // 「真实上下文」那一屏）才算"砍内容可见、可见之后可恢复"。
+    final foldedImages = _countImages(folded);
+    final withImageNote = foldedImages == 0
+        ? content
+        : '$content\n\n（本段另有 $foldedImages 张图片，已随原文压缩省略；'
+            '原始记录仍在本地数据库，可用「真实上下文」查看）';
     return SummaryResult(
-      text: content,
+      text: withImageNote,
       // Real measured size; if the provider didn't report usage (0), fall back to
       // a deterministic tokenizer estimate so the budget check still has a size.
-      tokens: outTokens > 0 ? outTokens : ContextEstimator.estimateTokens(content),
+      // 注意：`outTokens` 是模型实测的输出量，**不含**上面追加的这句图片说明
+      // （它是本地拼的）。这几百字节的量级与"实测 vs 估算"的口径差异不能混，
+      // 所以只在没有实测值时用估算。
+      tokens: outTokens > 0 ? outTokens : ContextEstimator.estimateTokens(withImageNote),
       inputTokens: inTokens,
     );
+  }
+
+  /// 数一批被折叠消息里有多少张图：用户消息的 `attachments` 加上工具轮里的 `image`。
+  static int _countImages(List<Message> folded) {
+    var count = 0;
+    for (final m in folded) {
+      count += m.attachments.length;
+      final toolCalls = m.toolCallsJson;
+      if (toolCalls != null && toolCalls.contains('"image"')) {
+        try {
+          final decoded = jsonDecode(toolCalls);
+          if (decoded is List) {
+            for (final entry in decoded) {
+              if (entry is Map && entry['image'] != null) count++;
+            }
+          }
+        } catch (_) {
+          // 解不动就当没有图：这里只影响一句提示文字，不该让摘要失败
+        }
+      }
+    }
+    return count;
   }
 
   @override

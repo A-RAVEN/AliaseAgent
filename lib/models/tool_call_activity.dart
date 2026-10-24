@@ -93,6 +93,13 @@ class ToolCallActivity {
   /// sidecar 因体积过大省略了 hunks 时带的原因（如 "too large"），否则为 null。
   final String? hunksOmitted;
 
+  /// 这次工具调用带回来的图片路径（`read_image` 才有），否则为 null。
+  ///
+  /// **只存路径**：库里不存字节、不存宽高/媒体类型/字节数（用户要求"历史先只存
+  /// 路径"，见 `Message.attachments`）。卡片要显示的那些数字从 `result` 里的文字
+  /// 信封解析，解析不到再读一次文件头 —— 存一份元数据只会在源文件被换掉之后撒谎。
+  final String? imagePath;
+
   const ToolCallActivity({
     required this.id,
     required this.toolName,
@@ -103,6 +110,7 @@ class ToolCallActivity {
     this.resultSections,
     this.hunks,
     this.hunksOmitted,
+    this.imagePath,
   });
 
   ToolCallActivity copyWith({
@@ -115,6 +123,7 @@ class ToolCallActivity {
     List<ResultSection>? resultSections,
     List<EditHunk>? hunks,
     String? hunksOmitted,
+    String? imagePath,
   }) {
     return ToolCallActivity(
       id: id ?? this.id,
@@ -126,8 +135,16 @@ class ToolCallActivity {
       resultSections: resultSections ?? this.resultSections,
       hunks: hunks ?? this.hunks,
       hunksOmitted: hunksOmitted ?? this.hunksOmitted,
+      imagePath: imagePath ?? this.imagePath,
     );
   }
+
+  /// 把 `image` 这个字段写成 `{"path": "…"}` —— **只有一个键**。
+  ///
+  /// 这个形状与请求拼装里 `_toolImagePath` 读的完全一致；多一个键就是违背
+  /// "历史只存路径"。
+  Map<String, dynamic>? get imageJson =>
+      imagePath == null ? null : {'path': imagePath};
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -141,6 +158,7 @@ class ToolCallActivity {
         if (hunks != null && hunks!.isNotEmpty)
           'hunks': hunks!.map((h) => h.toJson()).toList(),
         if (hunksOmitted != null) 'hunksOmitted': hunksOmitted,
+        if (imagePath != null) 'image': imageJson,
       };
 
   factory ToolCallActivity.fromJson(Map<String, dynamic> json) {
@@ -160,6 +178,10 @@ class ToolCallActivity {
           ?.map((e) => EditHunk.fromJson(e as Map<String, dynamic>))
           .toList(),
       hunksOmitted: json['hunksOmitted'] as String?,
+      // 只读 `path`：老数据里就算混进了别的键，也不会被带进内存模型。
+      imagePath: (json['image'] is Map)
+          ? ((json['image'] as Map)['path'] as String?)
+          : null,
     );
   }
 }

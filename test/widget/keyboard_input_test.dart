@@ -12,11 +12,13 @@ import 'package:alias_agent/ui/input_bar.dart';
 Widget _withInputBar({
   required void Function(String) onCapture,
   required TextEditingController controller,
+  List<String> pendingImagePaths = const [],
 }) {
   return MaterialApp(
     home: Scaffold(
       body: InputBar(
         controller: controller,
+        pendingImagePaths: pendingImagePaths,
         onSubmit: () {
           onCapture(controller.text);
           controller.clear();
@@ -59,6 +61,11 @@ void main() {
       await tester.pumpWidget(
           _withInputBar(onCapture: (text) => sent = text, controller: ctrl));
 
+      // 先点一下输入框拿到焦点：没有焦点时按键根本到不了 Focus.onKeyEvent，
+      // 那样"空输入不发送"就成了恒真的空断言。
+      await tester.tap(find.byType(TextField));
+      await tester.pump();
+
       await tester.sendKeyDownEvent(LogicalKeyboardKey.enter);
       await tester.pump();
 
@@ -81,6 +88,30 @@ void main() {
       await tester.pump();
 
       expect(sent, isNull, reason: '只有空白也算空');
+    });
+
+    // ── 2.2b 有图时可以没有文字（add-image-input）─────────────────
+
+    testWidgets('Enter with a pending image and no text still sends', (tester) async {
+      String? sent;
+      final ctrl = TextEditingController();
+      addTearDown(ctrl.dispose);
+
+      await tester.pumpWidget(_withInputBar(
+        onCapture: (text) => sent = text,
+        controller: ctrl,
+        pendingImagePaths: const ['C:\\tmp\\pasted.png'],
+      ));
+
+      await tester.tap(find.byType(TextField));
+      await tester.pump();
+
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.enter);
+      await tester.pump();
+
+      expect(sent, isNotNull,
+          reason: '贴了图、没写文字：这也是一条合法消息，守卫不能只看文字');
+      expect(sent, '');
     });
 
     // ── 2.3 Shift+Enter inserts newline, does not submit ───────────

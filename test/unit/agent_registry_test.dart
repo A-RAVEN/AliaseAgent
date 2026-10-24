@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:alias_agent/models/agent_type_config.dart';
@@ -119,6 +120,60 @@ void main() {
         );
         final json = config.toJson();
         expect(json.containsKey('thinking_effort'), isFalse);
+      });
+    });
+
+    group('AgentTypeConfig input_modalities', () {
+      AgentTypeConfig parse(Object? value) => AgentTypeConfig.fromJson('general', {
+            'provider': 'anthropic',
+            'model': 'deepseek-flash',
+            'system_prompt': '',
+            'input_modalities': ?value,
+          });
+
+      test('缺省时回落成只有文本', () {
+        expect(parse(null).inputModalities, ['text']);
+      });
+
+      test('合法值原样保留，重复的只留一次', () {
+        expect(parse(['text', 'image']).inputModalities, ['text', 'image']);
+        expect(parse(['image']).inputModalities, ['image']);
+        expect(parse(['text', 'text', 'image']).inputModalities, ['text', 'image']);
+      });
+
+      test('不是数组、含非法取值、或空数组都整体回落', () {
+        expect(parse('image').inputModalities, ['text']);
+        expect(parse(['text', 'audio']).inputModalities, ['text']);
+        expect(parse([1, 2]).inputModalities, ['text']);
+        expect(parse(<String>[]).inputModalities, ['text']);
+      });
+
+      test('非法值会打一行日志', () {
+        final original = debugPrint;
+        final lines = <String>[];
+        debugPrint = (String? message, {int? wrapWidth}) {
+          if (message != null) lines.add(message);
+        };
+        addTearDown(() => debugPrint = original);
+        AgentTypeConfig.resetInputModalitiesReportForTests();
+
+        expect(parse(['text', 'audio']).inputModalities, ['text']);
+        expect(lines, isNotEmpty, reason: '回落必须留下痕迹，不能静默');
+        expect(lines.join('\n'), contains('input_modalities'));
+        expect(lines.join('\n'), contains('audio'));
+      });
+
+      test('toJson 总是写回这个键', () {
+        const explicit = AgentTypeConfig(
+          name: 'g', provider: 'a', model: 'm', systemPrompt: '',
+          inputModalities: ['text', 'image'],
+        );
+        expect(explicit.toJson()['input_modalities'], ['text', 'image']);
+
+        const fallback = AgentTypeConfig(
+          name: 'g', provider: 'a', model: 'm', systemPrompt: '',
+        );
+        expect(fallback.toJson()['input_modalities'], ['text']);
       });
     });
 

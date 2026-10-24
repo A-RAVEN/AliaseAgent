@@ -69,6 +69,39 @@ std::string glob_file(const std::string& request_json);
 /// or {"ok":false,"error":"..."}
 std::string grep_file(const std::string& request_json);
 
+/// Validate an image file inside the workspace and describe it.
+///
+/// The bytes do NOT come back through this call. Dart reads the file itself and
+/// puts it into the outgoing request as an `image` content block; this tool only
+/// checks the file and produces the model-facing envelope.
+///
+/// Request JSON: {"path":"..."}
+/// Returns JSON:
+///   {"ok":true,
+///    "content":"<path>a.png</path>\n<type>image</type>\n<content>\nimage/png image, 4x3 px, 130 bytes\n</content>",
+///    "image":{"path":"a.png","media_type":"image/png","width":4,"height":3,"bytes":130}}
+///   or {"ok":false,"error":"..."}
+///
+/// Checks, in this order (limits per Docs/DeepSeekAPIDoc.md §6.4.3): path sandbox →
+/// existence → is-a-file → extension is one of .png/.jpg/.jpeg/.webp/.gif →
+/// bytes <= 33554432 → magic bytes name a supported format → magic agrees with the
+/// extension → dimensions are readable → neither side exceeds 8192 px.
+std::string read_image(const std::string& request_json);
+
+/// Read the current clipboard image and write it as a PNG file into `dest_dir`.
+///
+/// The clipboard may hold either PNG bytes (browsers) or a raw DIB (screenshot
+/// tools); both end up as the same normalized PNG file on disk. Nothing is
+/// returned through FFI as bytes — Dart reads the file back when it builds the
+/// request, exactly like a user-attached image.
+///
+/// Request JSON: {"dest_dir":"<absolute directory>"} (created recursively)
+/// Returns JSON:
+///   {"ok":true,"path":"<absolute path>","media_type":"image/png",
+///    "width":W,"height":H,"bytes":N}
+///   or {"ok":false,"error":"..."} — `clipboard has no image` when empty
+std::string read_clipboard_image(const std::string& request_json);
+
 // ============================================================================
 // Testable helpers (exposed for unit tests, like web_fetch.h)
 // ============================================================================

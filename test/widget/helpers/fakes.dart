@@ -73,6 +73,7 @@ class FakeMessageRepository implements MessageRepository {
     String? thinkingJson,
     int? tokenCount,
     int? outputTokenCount,
+    List<String> attachments = const [],
   }) async {
     final msg = Message(
       id: 'msg-${messages.length}',
@@ -84,6 +85,7 @@ class FakeMessageRepository implements MessageRepository {
       tokenCount: tokenCount,
       outputTokenCount: outputTokenCount,
       createdAt: DateTime.now().millisecondsSinceEpoch,
+      attachments: attachments,
     );
     messages.add(msg);
     return msg;

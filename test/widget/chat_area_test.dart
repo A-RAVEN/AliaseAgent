@@ -81,6 +81,32 @@ void main() {
       expect(sent, isNull);
     });
 
+    testWidgets('a pasted image makes an empty-text message sendable', (tester) async {
+      // add-image-input：贴了图但一个字没写，这也是一条合法消息。
+      // 守卫必须从"只看文字"放宽成"没有文字**且**没有待发图片"。
+      String? sent;
+      var submitted = 0;
+      final ctrl = TextEditingController();
+      addTearDown(ctrl.dispose);
+
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: InputBar(
+            controller: ctrl,
+            pendingImagePaths: const ['C:\\tmp\\pasted.png'],
+            onSubmit: () {
+              submitted++;
+              sent = ctrl.text;
+            },
+          ),
+        ),
+      ));
+
+      await tester.tap(find.byIcon(Icons.send));
+      expect(submitted, 1, reason: '有图、无文字也必须能提交');
+      expect(sent, '', reason: '这条路提交的是空文字 + 一张图');
+    });
+
     testWidgets('sends message and clears input', (tester) async {
       String? sent;
       final ctrl = TextEditingController();

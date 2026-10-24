@@ -101,6 +101,18 @@ File has 2050 lines, showing 1-2000. To continue reading, call read_file with {"
 
 返回格式是 `路径:行号: 那一行的内容`。**注意：一旦你填了 `glob`，被 git 忽略的文件也会被搜**（这是它与默认行为的区别）。一条都没搜到时返回 `(no matches)`。
 
+### `read_image` —— 让模型看一张图
+
+| 参数 | 含义 |
+|---|---|
+| `path` | 图片路径（相对工作区） |
+
+模型调它之后，**图上真的会进到它眼里**（连同路径、类型、像素宽高、字节数一起），所以它能回答"这张图是什么颜色""截图里的报错是什么"这类问题。卡片上也会显示这张图的缩略图 —— 你看到的和它看到的是同一张。
+
+支持 PNG / JPEG / GIF / WebP，**格式按文件内容判断，不看扩展名**。尺寸由服务端自动缩放，不需要你先把图改小。
+
+前置条件：配置里 `input_modalities` 必须含 image 这一项，否则这个工具会直接失败并说明"当前模型没声明图片输入"（见 [配置](configuration.md)）。
+
 ## 出错时会看到什么
 
 | 卡片上的现象 | 含义 | 下一步 |
@@ -112,6 +124,11 @@ File has 2050 lines, showing 1-2000. To continue reading, call read_file with {"
 | `cannot edit "…": read the file first` | 这个文件在本次运行里还没被读过 | 让它先读一遍再改 |
 | `cannot edit "…": file changed since it was read` | 你（或别的程序）在它读过之后改了同一个文件 | 让它重新读一遍再改 |
 | 卡片上是 `diff 未显示：改动过大（N 处改动）` | 这次改动太多，完整差异没有带回来 | 改动本身已经生效；要核对就自己打开文件看 |
+| `Not an image: <路径>（扩展名 … 不声明受支持的图片格式…）` | 拿 `read_image` 去读了一个扩展名不是 `.png/.jpg/.jpeg/.webp/.gif` 的文件 | 图片必须是这四种之一 |
+| `Image type mismatch: <路径>（扩展名声明 …，字节实际是 …）` | 扩展名和真实内容对不上（例如把 JPEG 改名成 `.png`） | 改回正确的扩展名 |
+| `Image too large: <路径>（N 字节，单张上限 33554432 字节）` | 图片超过 32 MiB | 自己先压缩或缩小 |
+| `Image dimension too large: <路径>（WxH，单边上限 8192 像素）` | 单边超过 8192 像素 | 自己先缩小 |
+| `Unsupported image format: <路径>` | 字节不是 PNG/JPEG/GIF/WebP | 换一张图 |
 
 ## 限制
 
@@ -119,5 +136,6 @@ File has 2050 lines, showing 1-2000. To continue reading, call read_file with {"
 - **`read_file` 一次最多 2000 行**：大文件要分段读。注意"读过一次"按整个文件算，所以被 2000 行截断时，没读到的那部分也会被允许改。
 - **`edit_file` 有 1MB 上限**，且改的是文字文件；它对**新建文件**无能为力（用 `write_file`）。
 - **只有 `edit_file` 有"先读再改"和"改过就拒"这两层保护**；`write_file` 覆盖文件不受它们保护，模型可以直接整份重写。
+- **`read_image` 只看工作区里的图片文件**：它不会替你截图，也不读剪贴板（贴图那条路在输入框的「粘贴图片」按钮上，见 [对话](chat.md)）。
 - **版本检查看的是修改时间与文件大小**：外部程序若只改内容、既不改修改时间也不改大小，这层检查发现不了。
 - **这些工具不弹确认框**：模型一旦调用就直接执行。要限制它能碰什么，办法是别把重要文件放在主目录里被它看到，或者干脆从配置的 `tools` 里去掉这些工具（见 [配置](configuration.md)）。

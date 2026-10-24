@@ -69,6 +69,8 @@ typedef WriteFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef EditFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef GlobFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef GrepFileDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
+typedef ReadImageDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
+typedef ReadClipboardImageDart = Pointer<Utf8> Function(Pointer<Utf8> requestJson);
 typedef CancelRequestDart = void Function(int requestId);
 
 // ---------------------------------------------------------------------------
@@ -118,6 +120,12 @@ abstract class ISidecar {
   String globFile(String requestJson);
   String grepFile(String requestJson);
 
+  // Image tools (add-image-input). readImage 只校验并描述一张已有的图，图片字节
+  // 不从这里过 FFI —— 拼请求时由 Dart 读文件、base64 编码后放进 image 内容块。
+  // readClipboardImage 把剪贴板里的图写成 PNG 文件并返回它的路径。
+  String readImage(String requestJson);
+  String readClipboardImage(String requestJson);
+
   // Search & web fetch
   String ensureSearchInfra(String configJson);
   String getSearchProviders();
@@ -163,6 +171,8 @@ class SidecarBridge implements ISidecar {
   late final EditFileDart _editFileFn;
   late final GlobFileDart _globFileFn;
   late final GrepFileDart _grepFileFn;
+  late final ReadImageDart _readImageFn;
+  late final ReadClipboardImageDart _readClipboardImageFn;
   late final CancelRequestDart _cancelRequestFn;
 
   // Serialization gate (D3): all sendMessage calls execute strictly one at a
@@ -220,6 +230,10 @@ class SidecarBridge implements ISidecar {
         _lib.lookupFunction<SetWorkspaceNative, GlobFileDart>('glob_file');
     _grepFileFn =
         _lib.lookupFunction<SetWorkspaceNative, GrepFileDart>('grep_file');
+    _readImageFn =
+        _lib.lookupFunction<SetWorkspaceNative, ReadImageDart>('read_image');
+    _readClipboardImageFn =
+        _lib.lookupFunction<SetWorkspaceNative, ReadClipboardImageDart>('read_clipboard_image');
     _cancelRequestFn =
         _lib.lookupFunction<CancelRequestNative, CancelRequestDart>('cancel_request');
   }
@@ -584,6 +598,22 @@ class SidecarBridge implements ISidecar {
   String grepFile(String requestJson) {
     final ptr = requestJson.toNativeUtf8();
     final resultPtr = _grepFileFn(ptr);
+    malloc.free(ptr);
+    return resultPtr.toDartString();
+  }
+
+  @override
+  String readImage(String requestJson) {
+    final ptr = requestJson.toNativeUtf8();
+    final resultPtr = _readImageFn(ptr);
+    malloc.free(ptr);
+    return resultPtr.toDartString();
+  }
+
+  @override
+  String readClipboardImage(String requestJson) {
+    final ptr = requestJson.toNativeUtf8();
+    final resultPtr = _readClipboardImageFn(ptr);
     malloc.free(ptr);
     return resultPtr.toDartString();
   }

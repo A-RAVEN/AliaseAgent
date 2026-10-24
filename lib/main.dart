@@ -23,6 +23,8 @@ import 'services/config_service.dart';
 import 'services/context_estimator.dart';
 import 'services/context_snapshot.dart';
 import 'services/database_service.dart';
+import 'services/image_budget.dart';
+import 'services/image_request.dart';
 import 'services/message_repository.dart';
 import 'services/provider_resolver.dart';
 import 'services/search_text_assembly.dart';
@@ -333,14 +335,63 @@ class ChatScreenState extends State<ChatScreen> {
   /// 文件构造、两屏共用（见 `lib/ui/input_bar.dart` 的 `InputBar`）。
   final _inputCtrl = TextEditingController();
 
+  /// 已经贴进来、还没发出去的图片路径（只存路径，见 `lib/models/message.dart`
+  /// 的 `attachments`）。发送时整批交给这条用户消息，然后清空。
+  final List<String> _pendingImagePaths = [];
+
+  /// 贴图失败时要在界面上显示的一句话（null = 不显示）。清空时机是下一次贴图
+  /// 成功或用户下一次发送 —— 不让它一直挂在那里。
+  String? _pasteImageNotice;
+
+  /// 把剪贴板里的图贴进输入区（「粘贴图片」按钮与 `Ctrl+V` 都走这里）。
+  ///
+  /// 落盘由 sidecar 的 `read_clipboard_image` 做（PNG 优先、DIB 转 PNG），这里只
+  /// 收它的返回：成功就把**路径**加进待发列表，失败就给出可见提示（不静默）。
+  Future<bool> _pasteImageFromClipboard() async {
+    if (!_toolsReady) return false;
+    String? failure;
+    try {
+      final raw = _sidecar.readClipboardImage(
+          jsonEncode({'dest_dir': ConfigService.attachmentsDir}));
+      final parsed = jsonDecode(raw);
+      if (parsed is Map && parsed['ok'] == true) {
+        final path = parsed['path'];
+        if (path is String && path.isNotEmpty) {
+          setState(() {
+            _pendingImagePaths.add(path);
+            _pasteImageNotice = null;
+          });
+          return true;
+        }
+        failure = '返回里没有路径';
+      } else {
+        failure = parsed is Map
+            ? (parsed['error']?.toString() ?? '未知原因')
+            : '返回不是对象';
+      }
+    } catch (e) {
+      failure = '$e';
+    }
+    debugPrint('[AliasAgent] 贴图失败：$failure');
+    if (mounted) setState(() => _pasteImageNotice = '剪贴板里没有图片（$failure）');
+    return false;
+  }
+
   /// 提交输入框里的内容（按 Enter 或点发送都会走这里）。
   ///
   /// 工具清单没装好就不发：那一轮请求会带着残缺的工具清单出去，模型白白空转一轮。
+  ///
+  /// 判据是「没有文字**且**没有待发图片」才拦（add-image-input）：贴一张图、一个字
+  /// 没写也是一条合法消息 —— 用户就是想问"这图是什么"。
   void _submitInput() {
     if (!_toolsReady) return;
     final text = _inputCtrl.text;
-    if (text.trim().isEmpty) return;
-    _sendMessage(text);
+    final hasText = text.trim().isNotEmpty;
+    final hasImages = _pendingImagePaths.isNotEmpty;
+    if (!hasText && !hasImages) return;
+    final images = List<String>.from(_pendingImagePaths);
+    _pendingImagePaths.clear();
+    _sendMessage(text, attachments: images);
     _inputCtrl.clear();
   }
 
@@ -587,6 +638,27 @@ class ChatScreenState extends State<ChatScreen> {
             },
           },
           'required': ['pattern'],
+        },
+      },
+      // 图片工具（add-image-input）：无条件注册。模型能不能收图由 `input_modalities`
+      // 决定 —— 关着的时候调用这个工具会**直接失败并说清原因**（见 `_executeTool`），
+      // 比"工具不存在"更容易让模型改口。
+      'read_image': const {
+        'name': 'read_image',
+        'description': 'Read a PNG/JPEG/GIF/WebP image file inside the workspace '
+            'and return the image itself so you can look at it. Large images are '
+            'downscaled by the provider automatically; do not install image '
+            'libraries or create thumbnails to inspect an image. The result also '
+            'names the file path, media type, pixel size and byte size.',
+        'input_schema': {
+          'type': 'object',
+          'properties': {
+            'path': {
+              'type': 'string',
+              'description': 'Path to the image file relative to the workspace root.',
+            },
+          },
+          'required': ['path'],
         },
       },
       // Command tool (add-command-tool): 无条件可用（与 read_file / grep_file 一样，
@@ -988,7 +1060,7 @@ class ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  Future<void> _sendMessage(String text) async {
+  Future<void> _sendMessage(String text, {List<String> attachments = const []}) async {
     if (_isStreaming) return;
     // 2.6 —— preempt ANY scheduled or in-flight background fold before issuing the
     // user's request. A PENDING idle timer means a fold is SCHEDULED (not yet
@@ -1023,6 +1095,7 @@ class ChatScreenState extends State<ChatScreen> {
       sessionId: sessionId,
       role: 'user',
       content: text,
+      attachments: attachments,
     );
     await _sessionRepo.touch(sessionId);
 
@@ -1621,6 +1694,8 @@ class ChatScreenState extends State<ChatScreen> {
                       : null,
                   hunks: _parseEditHunks(result['hunks']),
                   hunksOmitted: result['hunks_omitted'] as String?,
+                  // 库里只存路径（10.4）：`read_image` 的图片路径落在这里
+                  imagePath: _toolImagePath(result),
                 ));
                 break;
               }
@@ -1631,7 +1706,12 @@ class ChatScreenState extends State<ChatScreen> {
         toolResults.add({
           'type': 'tool_result',
           'tool_use_id': tc['id'] ?? '',
-          'content': resultContent,
+          // 带图的工具结果（`read_image`）在这里就变成 `[{text}, {image}]` 数组，
+          // 这样"这一轮"和"重放这一轮"发出去的形状完全一样。
+          'content': _toolResultContent(
+            text: resultContent,
+            imagePath: _toolImagePath(result),
+          ),
         });
 
         // Enrich turnToolCalls entry with result data for persistence (D6)
@@ -2751,13 +2831,124 @@ class ChatScreenState extends State<ChatScreen> {
   /// content-empty tool-call assistant must be retained in the message list: it is
   /// the first owner of its tool calls, so the round (and its tool_use input, a
   /// re-execution key) reaches the model and the summarizer.
-  List<Map<String, dynamic>> _buildApiMessages(List<Message> messages) {
+  /// 当前 agent 类型声明的输入模态里有没有 `image`。
+  ///
+  /// 缺省（没配置 `input_modalities`）就是**没有** —— 见 `AgentTypeConfig.inputModalities`
+  /// 的说明：不声明就不发图，比"发过去、模型悄悄看不见"正确。
+  bool get _agentAcceptsImages {
+    final agent = registry.lookup('general');
+    return agent?.inputModalities.contains('image') ?? false;
+  }
+
+  /// 从工具调用/工具结果里取它带的图片路径（形状固定是 `{"image":{"path":…}}`，
+  /// 库里只存路径）。没有图或形状不对都返回 null。
+  static String? _toolImagePath(Map<String, dynamic> source) {
+    final image = source['image'];
+    if (image is! Map) return null;
+    final path = image['path'];
+    return path is String && path.isNotEmpty ? path : null;
+  }
+
+  /// 拼一条 `tool_result` 的 `content`。
+  ///
+  /// 没有图时**保持原来的字符串形态**（既有工具、既有测试、正文截断的语义都不变）；
+  /// 带图时变成 `[{text}, {image}]` 数组，正文照旧走 [text] 参数，图片块原样跟在后面。
+  /// 模型没声明 `image` 时图片位置换成可见标记，文件读不出来时换成"图片已丢失"标记。
+  Object _toolResultContent({
+    required String text,
+    String? imagePath,
+  }) {
+    if (imagePath == null) return text;
+    final blocks = <Map<String, dynamic>>[
+      {'type': 'text', 'text': text},
+    ];
+    final parts = buildImageRequestParts(imagePath);
+    if (parts.block == null) {
+      blocks.add({'type': 'text', 'text': parts.note});
+    } else if (!_agentAcceptsImages) {
+      final modelName = registry.lookup('general')?.model ?? '当前模型';
+      blocks.add({
+        'type': 'text',
+        'text': '[图片未发送：当前模型 $modelName 未声明图片输入'
+            '（input_modalities 不含 image）；图片路径：$imagePath]',
+      });
+    } else {
+      blocks.add(parts.block!);
+    }
+    return blocks;
+  }
+
+  List<Map<String, dynamic>> _buildApiMessages(List<Message> messages,
+      {bool? allowImages}) {
     final apiMessages = <Map<String, dynamic>>[];
     final emittedToolUseIds = <String>{};
-    for (final msg in messages) {
-      final content = <Map<String, dynamic>>[
-        {'type': 'text', 'text': msg.content},
-      ];
+    final imagesAllowed = allowImages ?? _agentAcceptsImages;
+    final modelName = registry.lookup('general')?.model ?? '当前模型';
+
+    // 先把这次请求里所有用户带的图**按出现顺序**准备好，再统一过一次请求级预算
+    // （单张/单边/≥15 张时单边收紧/base64 总负载，数值全部来自官方 §6.4.3）。
+    // 预算要从最旧的开始丢，所以必须先把它们收齐，不能边遍历边决定。
+    final preparedByMsg = <int, List<ImageRequestParts>>{};
+    final planned = <PlannedImage>[];
+    for (var mi = 0; mi < messages.length; mi++) {
+      final msg = messages[mi];
+      if (msg.role != 'user' || msg.attachments.isEmpty) continue;
+      final partsList = <ImageRequestParts>[];
+      for (var j = 0; j < msg.attachments.length; j++) {
+        final parts = buildImageRequestParts(msg.attachments[j], index: j + 1);
+        partsList.add(parts);
+        planned.add(PlannedImage(path: msg.attachments[j], parts: parts));
+      }
+      preparedByMsg[mi] = partsList;
+    }
+    final omissions = planImageOmissions(planned);
+    final omittedByMsg = <int, List<String?>>{};
+    var planCursor = 0;
+    for (final entry in preparedByMsg.entries) {
+      final notes = List<String?>.filled(entry.value.length, null);
+      for (var j = 0; j < entry.value.length; j++) {
+        notes[j] = omissions[planCursor++];
+      }
+      omittedByMsg[entry.key] = notes;
+    }
+
+    for (var mi = 0; mi < messages.length; mi++) {
+      final msg = messages[mi];
+      // 正文为空时不发空文本块（只有图片的 user 消息、只有 tool_use 的 assistant
+      // 消息都属于这种）。实测 DeepSeek 收得下空 text 块，但发它没有意义。
+      final content = <Map<String, dynamic>>[];
+      if (msg.content.isNotEmpty) {
+        content.add({'type': 'text', 'text': msg.content});
+      }
+
+      // 用户消息带的图：每张先一句说明文本，再跟一个 image 块（顺序照 design D6）。
+      // 模型没声明 `image` 输入时**不发图**，改成一句可见的标记 —— 实测
+      // `deepseek-v4-pro` 会收下图片却不看，静默出错比明确不发更糟。
+      if (msg.role == 'user' && msg.attachments.isNotEmpty) {
+        final partsList = preparedByMsg[mi]!;
+        final omitted = omittedByMsg[mi]!;
+        for (var i = 0; i < msg.attachments.length; i++) {
+          final path = msg.attachments[i];
+          final parts = partsList[i];
+          final omission = omitted[i];
+          if (omission != null) {
+            // 请求级预算把这一张省略了（单张/单边/张数/总负载）：必须是可见文本
+            content.add({'type': 'text', 'text': omission});
+          } else if (parts.block == null) {
+            // 文件不在/读不出来：这条标记比"模型不支持"更要紧，原样保留
+            content.add({'type': 'text', 'text': parts.note});
+          } else if (!imagesAllowed) {
+            content.add({
+              'type': 'text',
+              'text': '[图片未发送：当前模型 $modelName 未声明图片输入'
+                  '（input_modalities 不含 image）；图片路径：$path]',
+            });
+          } else {
+            content.add({'type': 'text', 'text': parts.note});
+            content.add(parts.block!);
+          }
+        }
+      }
 
       // If assistant message has thinking blocks, prepend them before text
       if (msg.role == 'assistant' &&
@@ -2839,8 +3030,14 @@ class ChatScreenState extends State<ChatScreen> {
               // record (path/bytes), preserving the tool_use block, the tool_result
               // placement, and the round structure. Never folds/splits the round;
               // full body stays on disk and is recoverable via the tool+path.
-              'content': _elideOversizedToolResult(
-                name: toolName, path: refetchArg, body: rawBody),
+              //
+              // 带图的工具结果（`read_image`）在这里变成 `[{text}, {image}]` 数组：
+              // 正文仍旧走同一道截断，图片块原样跟在后面（10.4：库里只存路径）。
+              'content': _toolResultContent(
+                text: _elideOversizedToolResult(
+                    name: toolName, path: refetchArg, body: rawBody),
+                imagePath: _toolImagePath(tc),
+              ),
             });
           }
           apiMessages.add({
@@ -3037,6 +3234,19 @@ class ChatScreenState extends State<ChatScreen> {
           'timezone': tzStr,
           'content': 'Current time: $date $time $tzStr',
         });
+      case 'read_image':
+        // 模型看不见图的时候让它读文件只会白烧一轮请求（实测 `deepseek-v4-pro`
+        // 收下图片却不看），所以能力门放在**调 sidecar 之前**，直接给一句能读懂的失败。
+        if (!_agentAcceptsImages) {
+          final model = registry.lookup('general')?.model ?? '当前模型';
+          resultJson = jsonEncode({
+            'ok': false,
+            'error': 'cannot read "$path" as an image: model "$model" does not '
+                'declare image input (input_modalities)',
+          });
+        } else {
+          resultJson = _sidecar.readImage(jsonEncode({'path': path}));
+        }
       default:
         resultJson = '{"ok":false,"error":"Unknown tool: $name"}';
     }
@@ -3358,6 +3568,8 @@ class ChatScreenState extends State<ChatScreen> {
                         items: _chatItems,
                         isStreaming: _isStreaming,
                         compactionStatus: _compactionStatus,
+                        // 气泡据此决定要不要加"本次没有发送图片"那句（11.1）
+                        imagesSent: _agentAcceptsImages,
                       )
                     : ContextView(
                         snapshot: _contextSnapshot,
@@ -3366,10 +3578,35 @@ class ChatScreenState extends State<ChatScreen> {
               ),
               // 10.1：输入行在两屏之外（`Expanded` 之后、同一个 Column 里），所以切到
               // 「真实上下文」那一屏时输入框与发送按钮仍在 —— 占用环跟着它一起留下。
+              // 贴图失败的提示：贴在输入行正上方（用户刚点的就是那个按钮），
+              // 下一次贴图成功或下一次发送时消失。
+              if (_pasteImageNotice != null)
+                Container(
+                  width: double.infinity,
+                  color: Theme.of(context).colorScheme.errorContainer,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  child: Text(
+                    _pasteImageNotice!,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Theme.of(context).colorScheme.onErrorContainer,
+                    ),
+                  ),
+                ),
               InputBar(
                 controller: _inputCtrl,
                 onSubmit: _submitInput,
                 toolsReady: _toolsReady,
+                // 贴进来还没发出去的图：只参与"没文字时还能不能提交"这一条判断。
+                pendingImagePaths: _pendingImagePaths,
+                onPasteImage: () {
+                  _pasteImageFromClipboard();
+                },
+                // Ctrl+V：先试贴图，没贴到由输入行退回文本粘贴。
+                onPasteShortcut: _pasteImageFromClipboard,
+                onRemoveImage: (index) {
+                  setState(() => _pendingImagePaths.removeAt(index));
+                },
                 // 10.4：占用环贴在发送按钮左侧、与它同一行。
                 accessory: ContextRingLabeled(
                   breakdown: _contextSnapshot?.breakdown,

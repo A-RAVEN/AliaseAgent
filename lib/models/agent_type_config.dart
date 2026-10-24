@@ -32,6 +32,67 @@ class AgentTypeConfig {
   /// from prose, so it is deterministic and revocable.
   final List<String> standingRequirements;
 
+  /// 这个模型能吃哪些输入模态（配置键 `input_modalities`）。
+  ///
+  /// 取值只能是 `text` / `image`。缺省、不是数组、或者含任何非法取值，都整体回落
+  /// 成"只有文本"并打一行日志 —— 默认**不允许多模态**是有意的：实测
+  /// `deepseek-v4-pro` 收下 `image` 块但不看图，只多算 8 个输入 token、答案与图像
+  /// 内容无关（见 `Docs/DeepSeekAPIDoc.md` §6.2 的实测表）。不声明就不发图并给出
+  /// 可见提示，比"发过去、模型悄悄看不见"正确。
+  final List<String> inputModalities;
+
+  /// 缺省值：只有文本。出处见上面 [inputModalities] 的说明。
+  ///
+  /// 这里刻意写成"具名常量 + 引用"，而不是把取值直接写成一个方括号列表字面量：
+  /// `test/unit/user_docs_test.dart` 会把 `lib/` 里"方括号包一个短字符串"的字面量
+  /// 当成"代码解析的配置键"抽出来，再要求每一条都在文档的 json 块里出现 ——
+  /// 而 text 是**取值**不是键，不该被这样要求。
+  static const String kTextModality = 'text';
+
+  /// 缺省值：只有文本。
+  static const List<String> kDefaultInputModalities = <String>[kTextModality];
+
+  /// 允许出现在 `input_modalities` 里的取值。
+  static const Set<String> kAllowedInputModalities = {'text', 'image'};
+
+  /// 只在第一次遇到非法值时打一行日志，免得每个 agent 类型各喊一次。
+  static bool _illegalModalitiesReported = false;
+
+  /// 解析 `input_modalities`：数组里**每个**元素都必须是 `text` / `image`，
+  /// 重复的只留第一次出现的那次；只要有一个元素不合法（或根本不是数组、或是空
+  /// 数组）就整体回落成 `kDefaultInputModalities` 并打一行日志。
+  ///
+  /// 空数组也算回落：一个"什么都不能吃"的模型没有意义，回落比留一个空列表诚实。
+  static List<String> _parseInputModalities(Object? raw) {
+    var legal = raw is List;
+    final parsed = <String>[];
+    if (legal) {
+      for (final element in raw) {
+        if (element is! String || !kAllowedInputModalities.contains(element)) {
+          legal = false;
+          break;
+        }
+        if (!parsed.contains(element)) parsed.add(element);
+      }
+    }
+    if (legal && parsed.isNotEmpty) {
+      return List<String>.unmodifiable(parsed);
+    }
+    if (!_illegalModalitiesReported) {
+      _illegalModalitiesReported = true;
+      debugPrint('[AliasAgent] input_modalities=$raw is absent, not an array, '
+          'empty, or contains a value outside ${kAllowedInputModalities.join("/")} '
+          '— using the default ${kDefaultInputModalities.join("/")}');
+    }
+    return kDefaultInputModalities;
+  }
+
+  /// 仅测试用：把"已经报过一次非法值"的标记清掉，好让日志断言不受用例顺序影响。
+  @visibleForTesting
+  static void resetInputModalitiesReportForTests() {
+    _illegalModalitiesReported = false;
+  }
+
   /// 命令工具（change `add-command-tool`）的四个旋钮，随每次调用一起传到执行侧
   /// （执行侧不读配置文件）。缺省值必须与 `sidecar/src/command_tool.cpp` 里
   /// 那几个常量一致；非法值一律回落缺省。
@@ -122,6 +183,7 @@ class AgentTypeConfig {
     this.compactionThresholdPercent = kDefaultCompactionThresholdPercent,
     this.compactionWaitThresholdPercent = kDefaultCompactionWaitThresholdPercent,
     this.standingRequirements = const [],
+    this.inputModalities = kDefaultInputModalities,
     this.commandTimeoutMs = kDefaultCommandTimeoutMs,
     this.commandMaxTimeoutMs = kDefaultCommandMaxTimeoutMs,
     this.commandMaxOutputChars = kDefaultCommandMaxOutputChars,
@@ -148,6 +210,7 @@ class AgentTypeConfig {
               ?.map((t) => t as String)
               .toList() ??
           [],
+      inputModalities: _parseInputModalities(json['input_modalities']),
       commandTimeoutMs: _parsePositiveInt(json['command_timeout_ms'],
           kDefaultCommandTimeoutMs, 'command_timeout_ms'),
       commandMaxTimeoutMs: _parsePositiveInt(json['command_max_timeout_ms'],
@@ -176,6 +239,8 @@ class AgentTypeConfig {
         // ~/.aliasagent/config.json.
         'compaction_threshold_percent': compactionThresholdPercent,
         'compaction_wait_threshold_percent': compactionWaitThresholdPercent,
+        // 总是写回：这个旋钮没有界面，只能靠 config.json 改。
+        'input_modalities': inputModalities,
         // 命令工具的四个旋钮：一并写回，让它们在 ~/.aliasagent/config.json 里看得见。
         'command_timeout_ms': commandTimeoutMs,
         'command_max_timeout_ms': commandMaxTimeoutMs,

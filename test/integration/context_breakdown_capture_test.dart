@@ -216,6 +216,59 @@ void main() {
           reason: '历史变长了 ⇒ 原文那一段必须跟着变大，不许停在上一次的数上');
     });
 
+    testWidgets('4.4 带图历史：图片按 1024/张计入原文段，分项之和等于合计', (tester) async {
+      _setupAgentRegistry(maxContextTokens: 100000);
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final sessionId = testSessions(1).first.id;
+      // 故意只给很短的文字 + 一张图：如果图片没被计入，原文段会小到只有几十 token，
+      // 那条 `>= 1024` 的断言就会红 —— 所以它是能判死的。
+      final history = <Message>[
+        Message(
+          id: 'u1',
+          seq: 1,
+          sessionId: sessionId,
+          role: 'user',
+          content: '看图',
+          createdAt: 1,
+          attachments: const ['C:/tmp/one.png'],
+        ),
+        Message(
+          id: 'a1',
+          seq: 2,
+          sessionId: sessionId,
+          role: 'assistant',
+          content: '好',
+          createdAt: 2,
+        ),
+      ];
+
+      final sidecar = FakeSidecar()..queueChunk('Reply')..queueDone();
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: FakeSessionRepository(testSessions(1)),
+        msgRepo: FakeMessageRepository(history),
+        sidecar: sidecar,
+        summaryProvider: _EchoSummaryProvider(),
+      ));
+      await tester.pump();
+      await tester.pump();
+      await _send(tester, '继续');
+
+      final b = tester.widget<ContextRing>(find.byType(ContextRing)).breakdown!;
+      // ignore: avoid_print
+      print('  [OBS] 4.4 raw=${b.rawTokens} 合计=${b.usedTokens} '
+          '(L2=${b.level2Tokens} L1=${b.level1Tokens} '
+          '固定=${b.fixedOverheadTokens})');
+
+      expect(b.usedTokens,
+          b.level2Tokens + b.level1Tokens + b.rawTokens + b.fixedOverheadTokens,
+          reason: '分项之和必须等于合计（面板上那个数就是四项相加）');
+      expect(b.rawTokens, greaterThanOrEqualTo(ContextEstimator.kImageTokens),
+          reason: '这一段历史里只有一张图和几个字：图片没被计入的话原文段只有几十 token，'
+              '这条就会红');
+    });
+
     testWidgets('4.3 切到另一屏之后环还在同一个位置', (tester) async {
       _setupAgentRegistry(maxContextTokens: 100000);
       tester.view.physicalSize = const Size(1280, 720);

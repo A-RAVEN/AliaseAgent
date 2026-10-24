@@ -1804,3 +1804,123 @@ TEST_CASE("read_file: a caller-supplied limit still reports truncation", "[read_
     REQUIRE(tail["ok"] == true);
     REQUIRE(!tail.contains("truncated"));
 }
+
+// ============================================================================
+// read_image（tasks.md 4.1）
+//
+// 七条：成功、文件不存在、路径是目录、越界、超字节、超单边、扩展名撒谎。
+// 夹具来自 sidecar/test/fixtures/images（4×3 的真图，见 tasks.md 3.1）。
+// ============================================================================
+
+namespace {
+
+std::string image_fixture_bytes(const char* name) {
+    std::ifstream f(std::string(IMAGE_FIXTURE_DIR) + "/" + name, std::ios::binary);
+    if (!f) return std::string();
+    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
+}  // namespace
+
+TEST_CASE("read_image: success describes the image", "[image]") {
+    TempDir tmp;
+    std::string png = image_fixture_bytes("tiny.png");
+    REQUIRE(png.size() > 0);
+    tmp.write("pic.png", png);
+    WorkspaceGuard ws(tmp.path());
+
+    auto j = parse_result(tools::read_image("{\"path\":\"pic.png\"}"));
+    REQUIRE(j["ok"] == true);
+    REQUIRE(j["image"]["media_type"] == "image/png");
+    REQUIRE(j["image"]["width"] == 4);
+    REQUIRE(j["image"]["height"] == 3);
+    REQUIRE(j["image"]["bytes"] == static_cast<int>(png.size()));
+    // 路径必须是**解析后的绝对路径**，不是模型给的那串 `pic.png`：Dart 侧要用它读文件
+    // （卡片缩略图、下一轮请求里的 image 块），相对路径在界面进程里打不开。
+    // 这条比原来严：不只比对字符串，还要求这个路径真的能读回文件。
+    const std::string returned = j["image"]["path"];
+    REQUIRE(returned != "pic.png");
+    REQUIRE(returned.find("pic.png") != std::string::npos);
+    {
+      std::ifstream probe(returned, std::ios::binary);
+      REQUIRE(probe.good());
+    }
+    std::string content = j["content"];
+    REQUIRE(content.find("<path>" + returned + "</path>") != std::string::npos);
+    REQUIRE(content.find("<type>image</type>") != std::string::npos);
+    REQUIRE(content.find("image/png image, 4x3 px,") != std::string::npos);
+}
+
+TEST_CASE("read_image: file not found", "[image]") {
+    TempDir tmp;
+    WorkspaceGuard ws(tmp.path());
+
+    auto j = parse_result(tools::read_image("{\"path\":\"nope.png\"}"));
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "File not found: nope.png");
+}
+
+TEST_CASE("read_image: path is a directory", "[image]") {
+    TempDir tmp;
+    tmp.mkdir("folder.png");
+    WorkspaceGuard ws(tmp.path());
+
+    auto j = parse_result(tools::read_image("{\"path\":\"folder.png\"}"));
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "Path is a directory, not a file: folder.png");
+}
+
+TEST_CASE("read_image: path outside workspace is denied", "[image]") {
+    TempDir tmp;
+    tmp.mkdir("sub");
+    WorkspaceGuard ws(tmp.path() + "/sub");
+
+    auto j = parse_result(tools::read_image("{\"path\":\"../outside.png\"}"));
+    REQUIRE(j["ok"] == false);
+    REQUIRE(j["error"] == "Access denied: path outside workspace");
+}
+
+TEST_CASE("read_image: oversized file is rejected before reading it", "[image]") {
+    TempDir tmp;
+    // 33554432 字节是官方单张上限（Docs/DeepSeekAPIDoc.md §6.4.3），这里多出 1 字节。
+    std::string big(33554432 + 1, '\0');
+    tmp.write("big.png", big);
+    WorkspaceGuard ws(tmp.path());
+
+    auto j = parse_result(tools::read_image("{\"path\":\"big.png\"}"));
+    REQUIRE(j["ok"] == false);
+    std::string err = j["error"];
+    REQUIRE(err.find("Image too large: big.png") == 0);
+    REQUIRE(err.find("33554432") != std::string::npos);
+}
+
+TEST_CASE("read_image: oversized dimension is rejected", "[image]") {
+    TempDir tmp;
+    // 夹具是一张真的 9000×100 PNG（3799 字节）：单边超过官方 8192 像素上限。
+    std::string wide = image_fixture_bytes("wide.png");
+    REQUIRE(wide.size() > 0);
+    tmp.write("wide.png", wide);
+    WorkspaceGuard ws(tmp.path());
+
+    auto j = parse_result(tools::read_image("{\"path\":\"wide.png\"}"));
+    REQUIRE(j["ok"] == false);
+    std::string err = j["error"];
+    REQUIRE(err.find("Image dimension too large: wide.png") == 0);
+    REQUIRE(err.find("9000x100") != std::string::npos);
+    REQUIRE(err.find("8192") != std::string::npos);
+}
+
+TEST_CASE("read_image: extension that lies about the bytes is rejected", "[image]") {
+    TempDir tmp;
+    std::string jpeg = image_fixture_bytes("tiny.jpg");
+    REQUIRE(jpeg.size() > 0);
+    tmp.write("lying.png", jpeg);   // 真实字节是 JPEG
+    WorkspaceGuard ws(tmp.path());
+
+    auto j = parse_result(tools::read_image("{\"path\":\"lying.png\"}"));
+    REQUIRE(j["ok"] == false);
+    std::string err = j["error"];
+    REQUIRE(err.find("Image type mismatch: lying.png") == 0);
+    REQUIRE(err.find("image/png") != std::string::npos);
+    REQUIRE(err.find("image/jpeg") != std::string::npos);
+}

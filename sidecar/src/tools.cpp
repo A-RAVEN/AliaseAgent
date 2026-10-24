@@ -1,6 +1,8 @@
 #include "tools.h"
 #include "logger.h"
 #include "subprocess.h"
+#include "image_probe.h"
+#include "clipboard_image.h"
 
 #include <string>
 #include <vector>
@@ -8,9 +10,12 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <cerrno>
 #include <nlohmann/json.hpp>
 
@@ -1802,6 +1807,244 @@ std::string grep_file(const std::string& request_json) {
   LOG_INFO("grep_file: pattern=" + pattern + " matches=" + std::to_string(matches.size()) +
            " truncated=" + (truncated ? "true" : "false"));
   return resp.dump();
+}
+
+// ---------------------------------------------------------------------------
+// read_image — 校验并描述一张图（字节本身不从这里回传，由 Dart 读文件后发票）
+//
+// 校验顺序见 tools.h 的注释：沙箱 → 存在 → 是文件 → 扩展名 → 字节上限 →
+// 魔数 → 魔数与扩展名对账 → 宽高可读 → 单边 ≤ 8192。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// 文件字节数；取不到返回 -1。
+long long image_file_size(const std::string& path) {
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if (!f) return -1;
+  std::streamoff size = f.tellg();
+  return size < 0 ? -1 : static_cast<long long>(size);
+}
+
+/// 整个文件读进内存；失败返回 false。
+bool image_read_all(const std::string& path, std::string& out) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return false;
+  out.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+  return f.good() || f.eof();
+}
+
+}  // namespace
+
+// 官方单张图片上限（Docs/DeepSeekAPIDoc.md §6.4.3「单张图片最大大小（base64 / 外部
+// URL）32 MiB」）与单边像素上限（同表「图片最大尺寸：单边最长 8192 像素」）。
+constexpr long long kMaxImageBytes = 33554432;   // 32 MiB
+constexpr int kMaxImageSide = 8192;
+
+std::string read_image(const std::string& request_json) {
+  LOG_TRACE("tools::read_image entry");
+
+  // 参数：与 read_file 一样，同时接受 JSON 对象与裸路径字符串
+  std::string path;
+  try {
+    if (!request_json.empty() && request_json[0] == '{') {
+      auto req = json::parse(request_json);
+      path = req.value("path", "");
+    } else {
+      path = request_json;
+    }
+  } catch (const json::parse_error&) {
+    path = request_json;
+  }
+  if (path.empty()) return error_result("Missing required parameter: path");
+
+  // 1. 沙箱 → 2. 存在 → 3. 是文件
+  std::string resolved;
+  std::string err = check_path(path, resolved);
+  if (!err.empty()) return error_result(err);
+  if (!path_exists(resolved)) return error_result("File not found: " + path);
+  if (is_dir(resolved)) return error_result("Path is a directory, not a file: " + path);
+
+  // 4. 扩展名先筛一遍
+  image_probe::Format declared = image_probe::format_for_extension(path);
+  if (declared == image_probe::Format::kUnknown) {
+    std::string ext = "（无扩展名）";
+    size_t dot = path.find_last_of('.');
+    size_t sep = path.find_last_of("/\\");
+    if (dot != std::string::npos && (sep == std::string::npos || dot > sep)) {
+      ext = path.substr(dot);
+    }
+    return error_result("Not an image: " + path + "（扩展名 " + ext +
+                        " 不声明受支持的图片格式；只接受 .png/.jpg/.jpeg/.webp/.gif）");
+  }
+
+  // 5. 字节上限：先看大小再读内容，别为了报错把 33 MB 读进内存
+  const long long bytes = image_file_size(resolved);
+  if (bytes < 0) return error_result("Cannot read file: " + path);
+  if (bytes > kMaxImageBytes) {
+    return error_result("Image too large: " + path + "（" + std::to_string(bytes) +
+                        " 字节，单张上限 " + std::to_string(kMaxImageBytes) + " 字节）");
+  }
+
+  std::string data;
+  if (!image_read_all(resolved, data)) return error_result("Cannot read file: " + path);
+
+  // 6. 魔数 → 7. 与扩展名对账
+  image_probe::Format actual = image_probe::format_for_magic(
+      reinterpret_cast<const unsigned char*>(data.data()), data.size());
+  if (actual == image_probe::Format::kUnknown) {
+    return error_result("Unsupported image format: " + path +
+                        "（文件内容不是 PNG/JPEG/GIF/WebP）");
+  }
+  if (actual != declared) {
+    return error_result("Image type mismatch: " + path + "（扩展名声明 " +
+                        image_probe::media_type(declared) + "，字节实际是 " +
+                        image_probe::media_type(actual) + "）");
+  }
+
+  // 8. 宽高可读 → 9. 单边上限
+  image_probe::Size size = image_probe::dimensions(data);
+  if (!size.ok()) return error_result("Cannot read image dimensions: " + path);
+  if (size.width > kMaxImageSide || size.height > kMaxImageSide) {
+    return error_result("Image dimension too large: " + path + "（" +
+                        std::to_string(size.width) + "x" + std::to_string(size.height) +
+                        "，单边上限 " + std::to_string(kMaxImageSide) + " 像素）");
+  }
+
+  const std::string media = image_probe::media_type(actual);
+  // 信封与结构化字段里的路径都用**解析后的绝对路径**（`resolved`），不用模型给的那串。
+  // 原因：Dart 侧要拿这个路径去读文件 —— 卡片缩略图（`Image.file`）和下一轮请求里的
+  // image 块都从它来。工作区相对路径在界面进程里打不开（CWD 不是工作区），
+  // 实测到了：模型传 `blue64.png`，卡片上就显示 `[图片已丢失：blue64.png]`。
+  const std::string envelope = "<path>" + resolved + "</path>\n<type>image</type>\n<content>\n" +
+                               media + " image, " + std::to_string(size.width) + "x" +
+                               std::to_string(size.height) + " px, " + std::to_string(bytes) +
+                               " bytes\n</content>";
+
+  json out;
+  out["ok"] = true;
+  out["content"] = envelope;
+  out["image"] = {
+      {"path", resolved},
+      {"media_type", media},
+      {"width", size.width},
+      {"height", size.height},
+      {"bytes", static_cast<int>(bytes)},
+  };
+  LOG_INFO("read_image: " + resolved + " " + media + " " + std::to_string(size.width) + "x" +
+           std::to_string(size.height) + " " + std::to_string(bytes) + " bytes");
+  return out.dump();
+}
+
+// ---------------------------------------------------------------------------
+// read_clipboard_image — 把剪贴板里的图落成一个 PNG 文件并回报路径
+//
+// 剪贴板里可能是 PNG（浏览器复制图片给的那一种），也可能只有 DIB（截图工具
+// 给的那一种，要自己编码）。两条都由 clipboard_image 负责，这里只管：
+// 建目录 → 取数 → 转 PNG → 落盘 → 回报路径与尺寸。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// 递归创建目录（也接受已经存在的）。路径里的反斜杠先统一成斜杠。
+void ensure_dirs(const std::string& dir) {
+  std::string normalized = dir;
+  for (auto& c : normalized) {
+    if (c == '\\') c = '/';
+  }
+  std::string current;
+  for (size_t i = 0; i < normalized.size(); ++i) {
+    current += normalized[i];
+    if (normalized[i] == '/' || i == normalized.size() - 1) {
+      if (!current.empty() && current.back() == '/') current.pop_back();
+      if (!current.empty()) {
+#ifdef _WIN32
+        if (current.size() == 2 && current[1] == ':') {
+          if (i < normalized.size()) current += '/';
+          continue;
+        }
+#endif
+        mkdir_impl(current.c_str());
+      }
+      if (i < normalized.size()) current += '/';
+    }
+  }
+}
+
+/// `paste-YYYYMMDD-HHMMSS-mmm`：粘贴那一刻的时间戳，用来给落盘文件起名。
+std::string paste_timestamp() {
+  const auto now = std::chrono::system_clock::now();
+  const std::time_t seconds = std::chrono::system_clock::to_time_t(now);
+  const long long millis =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() %
+      1000;
+  std::tm local{};
+#ifdef _WIN32
+  localtime_s(&local, &seconds);
+#else
+  localtime_r(&seconds, &local);
+#endif
+  char date_part[32] = {0};
+  std::strftime(date_part, sizeof(date_part), "%Y%m%d-%H%M%S", &local);
+  char buffer[48] = {0};
+  std::snprintf(buffer, sizeof(buffer), "%s-%03lld", date_part, millis);
+  return std::string(buffer);
+}
+
+}  // namespace
+
+std::string read_clipboard_image(const std::string& request_json) {
+  LOG_TRACE("tools::read_clipboard_image entry");
+
+  std::string dest_dir;
+  try {
+    auto req = json::parse(request_json);
+    dest_dir = req.value("dest_dir", "");
+  } catch (const json::parse_error&) {
+    return error_result("Invalid request JSON");
+  }
+  if (dest_dir.empty()) return error_result("Missing required parameter: dest_dir");
+
+  ensure_dirs(dest_dir);
+
+  clipboard_image::RawClipboard raw;
+  const bool got = clipboard_image::current_reader()(raw);
+  if (raw.kind == clipboard_image::Kind::kBusy) {
+    // 打不开剪贴板 ≠ 里面没有图：Windows 的剪贴板是独占资源，别的程序可能正占着它。
+    // 报"没有图"会让用户以为自己白复制了，所以这里单独给一句能照着做的提示。
+    return error_result("clipboard is busy (another program is holding it) — try again");
+  }
+  if (!got || raw.kind == clipboard_image::Kind::kNone || raw.bytes.empty()) {
+    return error_result("clipboard has no image");
+  }
+
+  const std::string png = clipboard_image::raw_to_png_bytes(raw);
+  if (png.empty()) return error_result("clipboard image could not be converted to PNG");
+
+  image_probe::Size size = image_probe::dimensions(png);
+  if (!size.ok()) return error_result("clipboard image could not be converted to PNG");
+
+  // 同一毫秒撞名就往后加序号，直到找到空位（正常情况第一次就中）
+  const std::string stamp = paste_timestamp();
+  std::string target;
+  for (int index = 1;; ++index) {
+    target = dest_dir + "/paste-" + stamp + "-" + std::to_string(index) + ".png";
+    if (!path_exists(target)) break;
+  }
+
+  const std::string write_error = write_atomically(target, png);
+  if (!write_error.empty()) return write_error;  // 已经是 {"ok":false,...}
+
+  json out;
+  out["ok"] = true;
+  out["path"] = target;
+  out["media_type"] = "image/png";
+  out["width"] = size.width;
+  out["height"] = size.height;
+  out["bytes"] = static_cast<int>(png.size());
+  LOG_INFO("read_clipboard_image: wrote " + target + " " + std::to_string(size.width) + "x" +
+           std::to_string(size.height) + " " + std::to_string(png.size()) + " bytes");
+  return out.dump();
 }
 
 } // namespace tools

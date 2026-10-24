@@ -14,6 +14,7 @@ class MessageRepository {
     String? thinkingJson,
     int? tokenCount,
     int? outputTokenCount,
+    List<String> attachments = const [],
   }) async {
     final db = await DatabaseService.database;
     final msg = Message(
@@ -26,6 +27,7 @@ class MessageRepository {
       tokenCount: tokenCount,
       outputTokenCount: outputTokenCount,
       createdAt: DateTime.now().millisecondsSinceEpoch,
+      attachments: attachments,
     );
     // seq is the message's stable ordering key. Assign it from the SQLite
     // rowid (monotonic per insert, unique even under same-millisecond inserts)
@@ -44,6 +46,7 @@ class MessageRepository {
       tokenCount: tokenCount,
       outputTokenCount: outputTokenCount,
       createdAt: msg.createdAt,
+      attachments: attachments,
     );
     return inserted;
   }

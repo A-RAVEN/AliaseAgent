@@ -246,6 +246,33 @@ SIDECAR_API const char* grep_file(const char* request_json) {
   return g_grep_file_result.c_str();
 }
 
+// 图片工具（add-image-input）。两个都走"校验/落盘 + 返回描述"的模式，
+// 字节本身不从这里过 FFI：read_image 只描述已有文件，read_clipboard_image
+// 把剪贴板位图写成 PNG 后返回路径，真正要发给模型的 base64 由 Dart 读文件产生。
+static std::string g_read_image_result;
+
+SIDECAR_API const char* read_image(const char* request_json) {
+  LOG_TRACE("read_image called");
+  if (!request_json) {
+    g_read_image_result = "{\"ok\":false,\"error\":\"No request provided\"}";
+    return g_read_image_result.c_str();
+  }
+  g_read_image_result = tools::read_image(request_json);
+  return g_read_image_result.c_str();
+}
+
+static std::string g_read_clipboard_image_result;
+
+SIDECAR_API const char* read_clipboard_image(const char* request_json) {
+  LOG_TRACE("read_clipboard_image called");
+  if (!request_json) {
+    g_read_clipboard_image_result = "{\"ok\":false,\"error\":\"No request provided\"}";
+    return g_read_clipboard_image_result.c_str();
+  }
+  g_read_clipboard_image_result = tools::read_clipboard_image(request_json);
+  return g_read_clipboard_image_result.c_str();
+}
+
 // ============================================================================
 // Browser tool (add-browser-tool) — persistent-headed Edge worker
 // ============================================================================

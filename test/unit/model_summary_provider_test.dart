@@ -87,6 +87,81 @@ void main() {
     });
   });
 
+  group('ModelSummaryProvider — 图片被压缩时要留一句可见的省略说明（10.3）', () {
+    test('被折叠的段里有一张图 ⇒ 摘要末尾追加"本段另有 1 张图片"', () async {
+      final sidecar = FakeSidecar()
+        ..queueChunk('摘要：用户贴了一张截图，问了配色。')
+        ..queueDone(outputTokens: 20);
+      final provider = ModelSummaryProvider(sidecar: sidecar, resolver: _resolver());
+
+      final withImage = Message(
+        id: 'u1',
+        sessionId: 's',
+        role: 'user',
+        content: '看看这张图的配色',
+        createdAt: 1,
+        attachments: const ['C:/tmp/a.png'],
+      );
+      final reply = _msg('assistant', '图里的主色是深蓝。');
+
+      final result = await provider.summarize(
+          folded: [withImage, reply], config: _config());
+      // ignore: avoid_print
+      print('  [OBS] 摘要正文 => ${result.text}');
+
+      expect(result.text, contains('本段另有 1 张图片'),
+          reason: '图没进摘要却不说，就是静默丢内容');
+      expect(result.text, contains('原始记录仍在本地数据库'),
+          reason: '砍掉的内容要给出可恢复的去处');
+      expect(result.text, contains('真实上下文'));
+    });
+
+    test('被折叠的段里没有图 ⇒ 一个字都不加', () async {
+      final sidecar = FakeSidecar()
+        ..queueChunk('摘要：只是聊天。')
+        ..queueDone(outputTokens: 12);
+      final provider = ModelSummaryProvider(sidecar: sidecar, resolver: _resolver());
+
+      final result = await provider.summarize(
+          folded: [_msg('user', '你好'), _msg('assistant', '你好，有什么可以帮你')],
+          config: _config());
+      expect(result.text, isNot(contains('本段另有')));
+      expect(result.text, isNot(contains('图片')));
+    });
+
+    test('工具轮带回来的图也算在内（用户贴的 + 工具读的 = 2 张）', () async {
+      final sidecar = FakeSidecar()
+        ..queueChunk('摘要：贴了一张、又让模型读了一张。')
+        ..queueDone(outputTokens: 18);
+      final provider = ModelSummaryProvider(sidecar: sidecar, resolver: _resolver());
+
+      final userImage = Message(
+        id: 'u1',
+        sessionId: 's',
+        role: 'user',
+        content: '贴一张',
+        createdAt: 1,
+        attachments: const ['C:/tmp/pasted.png'],
+      );
+      final toolRound = _msg('assistant', '', toolCallsJson: jsonEncode([
+        {
+          'id': 'call_img',
+          'toolName': 'read_image',
+          'name': 'read_image',
+          'input': {'path': 'pic.png'},
+          'result': '<path>pic.png</path>',
+          'image': {'path': 'pic.png'},
+        }
+      ]));
+
+      final result = await provider.summarize(
+          folded: [userImage, toolRound], config: _config());
+      // ignore: avoid_print
+      print('  [OBS] 带工具轮的摘要 => ${result.text}');
+      expect(result.text, contains('本段另有 2 张图片'));
+    });
+  });
+
   group('ModelSummaryProvider — 摘要调用的输入 token 观测（本变更新增）', () {
     // 本变更的判据：每一次摘要调用都要把"这次发了多少 token"留成读数。落点在
     // provider 内部（两个方法各自打），所以这里必须把**两个方法都驱动一次** ——

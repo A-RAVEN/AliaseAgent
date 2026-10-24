@@ -35,6 +35,17 @@ class FakeSidecar implements ISidecar {
   String _globFileResult = '{"ok":true,"paths":[],"count":0}';
   String _grepFileResult = '{"ok":true,"matches":[],"count":0}';
 
+  // Image tool stubs (add-image-input). 默认都失败，用例按需覆盖。
+  String _readImageResult = '{"ok":false,"error":"fake: read_image not stubbed"}';
+  String _readClipboardImageResult = '{"ok":false,"error":"clipboard has no image"}';
+
+  /// 最近一次 read_image / read_clipboard_image 的入参原文与调用次数 —— 用来断言
+  /// "模型没声明图片输入时，工具前置检查直接失败、根本没调 sidecar"。
+  String? lastReadImageRequest;
+  String? lastReadClipboardImageRequest;
+  int readImageCallCount = 0;
+  int readClipboardImageCallCount = 0;
+
   void stubSearchProviders(String json) { _searchProvidersResult = json; }
   void stubWebSearch(String json) { _webSearchResult = json; }
   void stubWebFetch(String json) { _webFetchResult = json; }
@@ -64,6 +75,8 @@ class FakeSidecar implements ISidecar {
   void stubEditFile(String json) { _editFileResult = json; }
   void stubGlobFile(String json) { _globFileResult = json; }
   void stubGrepFile(String json) { _grepFileResult = json; }
+  void stubReadImage(String json) { _readImageResult = json; }
+  void stubReadClipboardImage(String json) { _readClipboardImageResult = json; }
 
   // ---------------------------------------------------------------------------
   // Queue API
@@ -272,6 +285,20 @@ class FakeSidecar implements ISidecar {
 
   @override
   String grepFile(String requestJson) => _grepFileResult;
+
+  @override
+  String readImage(String requestJson) {
+    readImageCallCount++;
+    lastReadImageRequest = requestJson;
+    return _readImageResult;
+  }
+
+  @override
+  String readClipboardImage(String requestJson) {
+    readClipboardImageCallCount++;
+    lastReadClipboardImageRequest = requestJson;
+    return _readClipboardImageResult;
+  }
 }
 
 // ---------------------------------------------------------------------------

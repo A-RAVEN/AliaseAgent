@@ -82,6 +82,12 @@ void main() {
         200000,
         reason: 'max context tokens must be required and captured on setup',
       );
+      expect(
+        savedConfig!.agentTypes['general']!.toJson()['input_modalities'],
+        ['text'],
+        reason: 'setup 写出的配置必须带 input_modalities：默认只有 text，'
+            '模型能不能收图由用户改这一项，且图片不会被静默发出去',
+      );
     });
 
     // ── 4.3b Max context tokens is required → validation error ─────

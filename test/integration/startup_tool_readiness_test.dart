@@ -119,8 +119,8 @@ void main() {
         reason: 'web_search 是 await 之后才加进清单的 —— 未就绪那一刻不该有');
     expect(unreadyNames, isNot(contains('web_fetch')),
         reason: 'web_fetch 同上');
-    expect(unreadyNames.length, 8,
-        reason: '未就绪那一刻恰好是"8 个本地工具"这种残缺状态（不是空清单、也不是完整清单）');
+    expect(unreadyNames.length, 9,
+        reason: '未就绪那一刻恰好是"9 个本地工具"这种残缺状态（不是空清单、也不是完整清单）');
 
     // ---- 放行探测，就绪 ----
     gate.complete();
@@ -149,14 +149,16 @@ void main() {
     expect(sent, isNotEmpty, reason: '就绪后发送要真的发出去');
     expect(names, contains('web_search'),
         reason: '就绪后那一轮请求的工具清单必须完整（含 web_search）');
-    // 6.4 的症状核对走**清单构成的对照**：就绪后是 10 个（8 个本地 + web_search +
+    // 6.4 的症状核对走**清单构成的对照**：就绪后是 11 个（9 个本地 + web_search +
     // web_fetch），而那两个动态工具是在 await 之后才加进 `base` 的（源码顺序：
     // `await browserAvailable()` → `hasProviders` → `base['web_search']` / `base['web_fetch']`）。
     // 也就是说挡住的那一瞬，"动态那批"确实还没进清单 —— 这是这条用例能给出的最强证据：
     // 未就绪时**一个请求都没发**（上一段那条断言），因此不存在"带着残缺清单发出去"的情况。
-    expect(names.length, 10,
-        reason: '完整清单 = 8 个本地工具 + web_search + web_fetch');
+    expect(names.length, 11,
+        reason: '完整清单 = 9 个本地工具 + web_search + web_fetch');
     expect(names, contains('read_file'));
     expect(names, contains('run_command'));
+    expect(names, contains('read_image'),
+        reason: 'read_image 是本地工具，未就绪那一刻就在场（add-image-input）');
   });
 }

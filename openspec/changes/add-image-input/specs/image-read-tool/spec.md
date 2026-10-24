@@ -11,6 +11,8 @@ C++ Sidecar SHALL 实现 `read_image` 工具，入参 `{"path": "<工作区内�
 
 `content` 是给模型的文字信封（含路径、类型、宽高、字节数四样），`image` 是给 Dart 拼 `image` 内容块用的结构化元数据。工具定义 SHALL 出现在 Dart 的工具清单里，名字为 `read_image`。
 
+`content` 信封里的 `<path>` 与 `image.path` 两处 MUST 都是**工作区解析后的绝对路径**，不是模型传进来的那串（模型常传工作区相对路径，例如 `blue64.png`）。理由：Dart 侧要拿这个路径去读文件 —— 工具卡片画缩略图、下一轮请求拼 `image` 块都从它来，而界面进程的工作目录不是工作区，相对路径在那儿打不开（13.2 实测踩到：卡片显示 `[图片已丢失：blue64.png]`）。错误文案里的路径仍用模型传的那串（错误说的是"你给的哪个路径有问题"）。
+
 #### Scenario: 读一张 PNG
 - **WHEN** 模型调用 `read_image`，路径指向工作区里一张 800×600 的 PNG
 - **THEN** 返回 `ok:true`，`image.media_type` 为 `image/png`、`width` 为 800、`height` 为 600，`content` 里同时含该路径与 `800x600`

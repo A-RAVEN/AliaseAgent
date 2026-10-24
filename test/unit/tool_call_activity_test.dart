@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:alias_agent/models/tool_call_activity.dart';
@@ -177,6 +179,67 @@ void main() {
       final restored = ToolCallActivity.fromJson(original.toJson());
       expect(restored.hunksOmitted, 'too large');
       expect(restored.hunks, isNull);
+    });
+  });
+
+  group('image（add-image-input 10.4 / 11.2）', () {
+    test('11.2：imagePath 写进 toJson、能被 fromJson 读回，copyWith 也带得动', () {
+      const original = ToolCallActivity(
+        id: 'tc-img',
+        toolName: 'read_image',
+        input: {'path': 'pic.png'},
+        status: ToolCallStatus.done,
+        result: '<path>pic.png</path>',
+        imagePath: 'C:/tmp/pic.png',
+      );
+      final json = original.toJson();
+      expect(json['image'], {'path': 'C:/tmp/pic.png'});
+
+      final restored = ToolCallActivity.fromJson(json);
+      expect(restored.imagePath, 'C:/tmp/pic.png');
+
+      final copied = original.copyWith(result: 'new result');
+      expect(copied.imagePath, 'C:/tmp/pic.png',
+          reason: 'copyWith 不该把图片路径弄丢（工具结果回填时就是这么复制的）');
+    });
+
+    test('11.2：没有图时不写这个键，老数据读出来是 null', () {
+      const plain = ToolCallActivity(
+        id: 'tc-plain', toolName: 'read_file', input: {'path': 'a.txt'},
+        status: ToolCallStatus.done,
+      );
+      expect(plain.toJson().containsKey('image'), isFalse);
+
+      final legacy = ToolCallActivity.fromJson(<String, dynamic>{
+        'id': 'tc-old',
+        'toolName': 'read_file',
+        'input': {'path': 'a.txt'},
+        'status': 'done',
+      });
+      expect(legacy.imagePath, isNull);
+    });
+
+    test('10.4：落库的 tool_calls JSON 里 image 只有一个 path 键，没有任何元数据', () {
+      const activity = ToolCallActivity(
+        id: 'tc-img',
+        toolName: 'read_image',
+        input: {'path': 'pic.png'},
+        status: ToolCallStatus.done,
+        result: '<path>pic.png</path>\n<type>image</type>\n<content>\n'
+            'image/png image, 4x3 px, 98 bytes\n</content>',
+        imagePath: 'C:/tmp/pic.png',
+      );
+      // 这一串就是写进 messages.tool_calls 的那段文本
+      final persisted = jsonEncode([activity.toJson()]);
+      final decoded = (jsonDecode(persisted) as List).first as Map<String, dynamic>;
+      final image = decoded['image'] as Map<String, dynamic>;
+
+      expect(image.keys.toList(), ['path'],
+          reason: '库里只许存路径：宽高/媒体类型/字节数一个都不许有');
+      for (final forbidden in ['width', 'height', 'media_type', 'bytes']) {
+        expect(image.containsKey(forbidden), isFalse);
+      }
+      expect(image['path'], 'C:/tmp/pic.png');
     });
   });
 }

@@ -15,6 +15,12 @@ class ChatArea extends StatefulWidget {
   /// 它只表示"压缩正在做"，与 [isStreaming] 是两件事：没触发压缩的发送不会让它亮。
   final CompactionStatus compactionStatus;
 
+  /// 当前模型能不能收图（`input_modalities` 含不含 image）。
+  ///
+  /// 气泡用它决定要不要加一句「模型未声明图片输入，本次没有发送图片」——
+  /// 图还在历史里、但没发出去，这件事必须看得见。
+  final bool imagesSent;
+
   /// **2026-10-18 起 `ChatArea` 只管消息列表与压缩提示**：输入行（输入框 + 发送按钮）
   /// 搬到了 `lib/ui/input_bar.dart` 的公开控件 `InputBar`，由 `lib/main.dart` 在两屏之间
   /// 共用 —— 这样上下文占用环在「对话视图」与「真实上下文」两屏都能贴着发送按钮显示。
@@ -24,6 +30,7 @@ class ChatArea extends StatefulWidget {
     this.items = const [],
     this.isStreaming = false,
     this.compactionStatus = CompactionStatus.idle,
+    this.imagesSent = true,
   });
 
   @override
@@ -95,15 +102,20 @@ class _ChatAreaState extends State<ChatArea> {
                   itemCount: items.length,
                   itemBuilder: (context, i) {
                     return switch (items[i]) {
-                      ChatMessageItem(:final message) => message.content.isEmpty
+                      ChatMessageItem(:final message) => message.content.isEmpty &&
+                              message.attachments.isEmpty
                           // A content-empty message (e.g. a tool-call assistant whose
                           // ToolCallCard represents the response, D7) — still tracked
                           // in the message list (so the tool round reaches the model /
                           // summarizer) but never renders an empty bubble.
+                          // 「只有图片、没有文字」的 user 消息不是这种：它有附件，
+                          // 必须画出来（add-image-input 11.1）。
                           ? const SizedBox.shrink()
                           : MessageBubble(
                               role: message.role,
                               content: message.content,
+                              imagePaths: message.attachments,
+                              imagesSent: widget.imagesSent,
                             ),
                       ChatToolCallItem(:final activity) => ToolCallCard(
                           activity: activity,

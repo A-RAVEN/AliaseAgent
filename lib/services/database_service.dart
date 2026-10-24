@@ -6,7 +6,7 @@ import 'package:path/path.dart' as p;
 import 'config_service.dart';
 
 class DatabaseService {
-  static const _schemaVersion = 6;
+  static const _schemaVersion = 7;
   static Database? _db;
 
   /// Whether a database is currently open. Compaction-tree persistence
@@ -67,6 +67,7 @@ class DatabaseService {
         thinking_json TEXT,
         token_count INTEGER,
         output_token_count INTEGER,
+        attachments TEXT,
         created_at INTEGER NOT NULL
       )
     ''');
@@ -145,6 +146,11 @@ class DatabaseService {
       // v5 → v6: persist measured output tokens alongside input (task 7.3) so the
       // usage telemetry is complete, not just input-only.
       await db.execute('ALTER TABLE messages ADD COLUMN output_token_count INTEGER');
+    }
+    if (oldV <= 6) {
+      // v6 → v7: 图片附件只记路径（add-image-input，用户要求"历史先只存路径"）。
+      // 存的是 `[{"path":"…"}]`；旧行保持 NULL，等价于"没有附件"。
+      await db.execute('ALTER TABLE messages ADD COLUMN attachments TEXT');
     }
     if (oldV < 1 || oldV > _schemaVersion) {
       await db.execute('DROP TABLE IF EXISTS messages');

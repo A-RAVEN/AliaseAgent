@@ -109,6 +109,27 @@ SIDECAR_API const char* glob_file(const char* request_json);
 ///                "count":N,"truncated":true|false}
 SIDECAR_API const char* grep_file(const char* request_json);
 
+/// Validate and describe an image file inside the workspace. The bytes do NOT
+/// cross the FFI boundary: Dart reads the file and puts it into the request as an
+/// `image` content block.
+/// @param request_json  {"path":"..."}
+/// Returns JSON: {"ok":true,
+///                "content":"<path>a.png</path>\n<type>image</type>\n<content>\n…\n</content>",
+///                "image":{"path":"a.png","media_type":"image/png",
+///                         "width":4,"height":3,"bytes":130}}
+///                or {"ok":false,"error":"..."}
+SIDECAR_API const char* read_image(const char* request_json);
+
+/// Read the current clipboard image, write it as a PNG file into `dest_dir`, and
+/// return its path plus dimensions. The clipboard may hold PNG bytes (browsers)
+/// or a raw DIB (screenshot tools); both end up as the same PNG on disk.
+/// @param request_json  {"dest_dir":"<absolute directory>"} — created recursively
+/// Returns JSON: {"ok":true,"path":"…","media_type":"image/png",
+///                "width":W,"height":H,"bytes":N}
+///           or {"ok":false,"error":"…"}；剪贴板里没有图时 error 恰为
+///              "clipboard has no image"
+SIDECAR_API const char* read_clipboard_image(const char* request_json);
+
 /// Probe whether the browser tool stack is present (Playwright + a usable
 /// Edge/Chromium). One-shot. Returns JSON: {"ok":true,"available":bool,...}
 /// or {"ok":false,"error":"..."}

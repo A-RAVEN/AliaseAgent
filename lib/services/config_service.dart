@@ -39,6 +39,13 @@ class ConfigService {
   static String get configDir => '$_homeDir${Platform.pathSeparator}.aliasagent';
   static String get configPath => '$configDir${Platform.pathSeparator}config.json';
 
+  /// 贴进输入区的图片落盘的位置（add-image-input）。
+  ///
+  /// 消息里**只记路径**，图片文件就放在这里。删除会话不会删这些文件 ——
+  /// 记录里可能还引用着它们，清理规则见 `Docs/user-guide/chat.md` 的"限制"。
+  static String get attachmentsDir =>
+      '$configDir${Platform.pathSeparator}attachments';
+
   static ConfigResult load({String? configPath}) {
     final file = File(configPath ?? ConfigService.configPath);
     if (!file.existsSync()) return ConfigResult.notFound();

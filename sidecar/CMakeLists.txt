@@ -32,6 +32,15 @@ if(NOT EXISTS "${JSON_INCLUDE_DIR}/nlohmann/json.hpp")
   endif()
 endif()
 
+# stb 单头文件（vendored）：只用来读图片头拿宽高（stb_image）与把剪贴板位图编码成
+# PNG（stb_image_write）。版本与 SHA-256 见 third_party/stb/README.md。
+# 两个实现宏各只在一个源文件里定义：STB_IMAGE_IMPLEMENTATION 在 src/image_probe.cpp，
+# STB_IMAGE_WRITE_IMPLEMENTATION 在 src/clipboard_image.cpp。
+set(STB_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb")
+if(NOT EXISTS "${STB_INCLUDE_DIR}/stb_image.h" OR NOT EXISTS "${STB_INCLUDE_DIR}/stb_image_write.h")
+  message(FATAL_ERROR "sidecar/third_party/stb 下缺少 stb_image.h 或 stb_image_write.h，见该目录 README.md")
+endif()
+
 # libcurl
 find_package(CURL REQUIRED)
 
@@ -52,12 +61,15 @@ set(SOURCES
   src/browser.cpp
   src/command_tool.cpp
   src/deepseek_search.cpp
+  src/image_probe.cpp
+  src/clipboard_image.cpp
 )
 
 # Shared library
 add_library(sidecar SHARED ${SOURCES})
 target_include_directories(sidecar PUBLIC include)
 target_include_directories(sidecar PUBLIC "${JSON_INCLUDE_DIR}")
+target_include_directories(sidecar PRIVATE "${STB_INCLUDE_DIR}")
 target_compile_definitions(sidecar PRIVATE SIDECAR_EXPORTS)
 target_link_libraries(sidecar PUBLIC CURL::libcurl ${PLATFORM_LIB})
 
@@ -101,6 +113,8 @@ add_executable(sidecar_tests
   src/browser.cpp
   src/command_tool.cpp
   src/deepseek_search.cpp
+  src/image_probe.cpp
+  src/clipboard_image.cpp
   test/sse_parser_test.cpp
   test/tool_execution_test.cpp
   test/subprocess_test.cpp
@@ -111,10 +125,13 @@ add_executable(sidecar_tests
   test/browser_test.cpp
   test/command_tool_test.cpp
   test/deepseek_search_test.cpp
+  test/image_probe_test.cpp
+  test/clipboard_image_test.cpp
 )
-target_include_directories(sidecar_tests PRIVATE include src test "${JSON_INCLUDE_DIR}")
+target_include_directories(sidecar_tests PRIVATE include src test "${JSON_INCLUDE_DIR}" "${STB_INCLUDE_DIR}")
 target_compile_definitions(sidecar_tests PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN NOMINMAX
-    FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/sse")
+    FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/sse"
+    IMAGE_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/images")
 target_link_libraries(sidecar_tests PRIVATE Catch2::Catch2 CURL::libcurl ${PLATFORM_LIB})
 
 add_test(NAME sidecar_tests COMMAND sidecar_tests)

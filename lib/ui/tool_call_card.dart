@@ -1,7 +1,10 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../models/tool_call_activity.dart';
+import '../services/image_probe.dart';
 
 class ToolCallCard extends StatefulWidget {
   final ToolCallActivity activity;
@@ -140,9 +143,12 @@ class _ToolCallCardState extends State<ToolCallCard> {
     );
   }
 
-  /// edit_file / write_file 只显示路径；其余工具沿用整行参数预览。
+  /// edit_file / write_file 只显示路径；`read_image` 同理（元数据放正文里，
+  /// 不塞进标题）；其余工具沿用整行参数预览。
   String _cardTitle(ToolCallActivity a, String inputPreview) {
-    if (a.toolName == 'edit_file' || a.toolName == 'write_file') {
+    if (a.toolName == 'edit_file' ||
+        a.toolName == 'write_file' ||
+        a.toolName == 'read_image') {
       final path = (a.input['path'] as String?) ?? '';
       final stat = _diffStat(a);
       return stat == null
@@ -150,6 +156,88 @@ class _ToolCallCardState extends State<ToolCallCard> {
           : '${a.toolName}($path) $stat';
     }
     return '${a.toolName}($inputPreview)';
+  }
+
+  /// `read_image` 卡片正文里那一行元数据：`image/png · 800×600 · 12345 字节`。
+  ///
+  /// 数据从**已经落库的 `result` 信封**里解析（`image/png image, 800x600 px, 12345 bytes`）；
+  /// 解析不到才去读一次文件头 —— 库里只存路径，存一份元数据只会在源文件被换掉之后撒谎。
+  String _imageMetaLine(ToolCallActivity a) {
+    final match = RegExp(r'(\S+) image, (\d+)x(\d+) px, (\d+) bytes')
+        .firstMatch(a.result ?? '');
+    if (match != null) {
+      return '${match.group(1)} · ${match.group(2)}×${match.group(3)} · '
+          '${match.group(4)} 字节';
+    }
+    final path = a.imagePath;
+    if (path != null) {
+      try {
+        final info = probeImageBytes(File(path).readAsBytesSync());
+        if (info.ok) {
+          return '${info.mediaType} · ${info.width}×${info.height} · '
+              '${info.bytes} 字节';
+        }
+      } catch (_) {
+        // 读不到就走下面的兜底字符串
+      }
+    }
+    return '图片元数据不可用';
+  }
+
+  /// `read_image` 的卡片正文：缩略图（展开后是大图 + 文字信封）。
+  ///
+  /// 收起状态就画出图 —— 用户要看的正是"模型看到的那张"，藏起来要他点一下才知道。
+  Widget _buildImageBody(ThemeData theme, ToolCallActivity a, bool expanded) {
+    final path = a.imagePath!;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        ConstrainedBox(
+          constraints: const BoxConstraints(
+            maxWidth: 600, // 与卡片自身的 maxWidth 一致
+            maxHeight: 400, // 与结果区既有的 maxHeight 一致
+          ),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(6),
+            child: Image.file(
+              File(path),
+              fit: BoxFit.contain,
+              errorBuilder: (_, _, _) => Text(
+                '[图片已丢失：$path]',
+                style: TextStyle(fontSize: 12, color: theme.colorScheme.error),
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          _imageMetaLine(a),
+          style: TextStyle(
+            fontSize: 11,
+            fontFamily: 'monospace',
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        if (expanded && (a.result ?? '').isNotEmpty) ...[
+          const SizedBox(height: 6),
+          _resultBox(
+            theme,
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: SelectableText(
+                a.result!,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontFamily: 'monospace',
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
   }
 
   /// `+N/−M`：所有 hunk 的新增/删除行数；没有 hunks 时给 null。
@@ -244,6 +332,11 @@ class _ToolCallCardState extends State<ToolCallCard> {
 
   Widget _buildResultBody(BuildContext context, ToolCallActivity a, bool expanded) {
     final theme = Theme.of(context);
+
+    // 带图的工具结果（`read_image`）：收起也要画出图，展开再加文字信封。
+    if (a.imagePath != null) {
+      return _buildImageBody(theme, a, expanded);
+    }
 
     // 省略必须看得见：hunks 因过大被 sidecar 丢了时，卡片要说清为什么没有 diff。
     if (a.hunksOmitted != null) {
