@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束测试用假 sidecar：事件可按需排队，调用记录可断言。
+
+## Requirements
 
 ### Requirement: Fake sidecar event queuing
 The system SHALL provide a `FakeSidecar` that allows pre-queuing events to be replayed when `sendMessage()` is called.

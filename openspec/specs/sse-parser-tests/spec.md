@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束 SSE 流解析：各类事件被正确切分，截断与非法帧不崩。
+
+## Requirements
 
 ### Requirement: Parse text delta event
 The C++ SSE parser SHALL extract and deliver text content from content_block_delta events.

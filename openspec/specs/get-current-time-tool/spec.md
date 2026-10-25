@@ -1,6 +1,10 @@
 # Get Current Time Tool — Spec
 
-## ADDED Requirements
+## Purpose
+
+约束"查当前时间"工具：参数校验、时区正确、结果格式稳定。
+
+## Requirements
 
 ### Requirement: AI can query current time
 The system SHALL provide a `get_current_time` tool that returns the current date, time, and timezone in ISO 8601 format.

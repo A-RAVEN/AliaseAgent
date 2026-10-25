@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束冒烟入口：依赖检查、步骤顺序、失败即停并报出卡在哪一步。
+
+## Requirements
 
 ### Requirement: Dependency verification
 The system SHALL verify that all required tools (`flutter`, `dart`, `powershell`, `sqlite3`) are available on PATH before executing any verification steps.

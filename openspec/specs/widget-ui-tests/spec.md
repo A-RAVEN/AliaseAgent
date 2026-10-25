@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束界面基础渲染：空状态文案、布局层级、可见元素与文档一致。
+
+## Requirements
 
 ### Requirement: Empty state placeholder text
 The system SHALL display a placeholder text in the input field when no conversation is active.

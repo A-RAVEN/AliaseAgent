@@ -1,6 +1,10 @@
 # FFI Boundary Tracing — Spec
 
-## ADDED Requirements
+## Purpose
+
+约束 FFI 调用追踪：C 到 Dart 的回调可追踪、可按开关关闭。
+
+## Requirements
 
 ### Requirement: C-to-Dart callback invocation tracing
 The sidecar SHALL log each invocation of a C-to-Dart callback (on_chunk, on_tool_call, on_thinking, on_done) at TRACE level with callback type and thread ID.

@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束首次配置对话框：字段校验、保存路径、错误提示。
+
+## Requirements
 
 ### Requirement: Setup dialog renders
 The system SHALL render a setup dialog with API key input field and Start button when no config exists.

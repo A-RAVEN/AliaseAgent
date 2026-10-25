@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束控件交互：发送流程、按钮状态、错误路径都能点得到。
+
+## Requirements
 
 ### Requirement: Send message flow
 The system SHALL accept text input, send it as a user message, and add the message to the list.

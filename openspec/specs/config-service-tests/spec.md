@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束配置文件解析：合法文件读得出，缺失或非法值有明确错误与回落。
+
+## Requirements
 
 ### Requirement: Valid config file
 The system SHALL correctly parse a valid config.json and return an AppConfig with providers and agent types populated.

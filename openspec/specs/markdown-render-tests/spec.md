@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束 Markdown 渲染：代码块、列表、行内样式按预期显示。
+
+## Requirements
 
 ### Requirement: Code block rendering
 The system SHALL render fenced code blocks in assistant messages with monospace font and a visually distinct background.

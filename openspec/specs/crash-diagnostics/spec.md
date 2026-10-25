@@ -1,6 +1,10 @@
 # Crash Diagnostics — Spec
 
-## ADDED Requirements
+## Purpose
+
+约束未捕获异常的处理：装全局过滤器，留下可读的崩溃记录。
+
+## Requirements
 
 ### Requirement: Unhandled exception filter registration
 The C++ sidecar SHALL register a crash handler via `SetUnhandledExceptionFilter` and `std::set_terminate` on first use of any sidecar function, covering both SEH exceptions (access violation, divide-by-zero) and C++ uncaught exceptions.

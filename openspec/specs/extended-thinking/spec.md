@@ -1,6 +1,10 @@
 # Extended Thinking — Spec
 
-## ADDED Requirements
+## Purpose
+
+约束扩展思考开关：按配置启用、透传到接口、并在界面上体现。
+
+## Requirements
 
 ### Requirement: Extended thinking enablement via adaptive API
 When an agent type config specifies a valid `thinking_effort` (`"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"`), the C++ Sidecar SHALL include `"thinking":{"type":"adaptive","display":"summarized"}` and `"output_config":{"effort":"<level>"}` in the API request body. The system SHALL set `max_tokens` to 16000 to accommodate both thinking and output tokens. When `thinking_effort` is absent or unrecognized, no thinking parameter SHALL be sent and `max_tokens` SHALL remain at 4096.

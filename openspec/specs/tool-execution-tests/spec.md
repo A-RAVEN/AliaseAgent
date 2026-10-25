@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束工具执行：工作区限制、参数校验、结果形状与错误分支。
+
+## Requirements
 
 ### Requirement: set_workspace configures the workspace root
 The C++ Sidecar SHALL validate and set the workspace directory, returning an error message on failure or empty string on success.

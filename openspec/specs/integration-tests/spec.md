@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束端到端收发消息：从输入到落库、再到界面渲染整条链路。
+
+## Requirements
 
 ### Requirement: End-to-end message send and receive
 The system SHALL verify the full message send→receive→render pipeline using a FakeSidecar and fake repos.

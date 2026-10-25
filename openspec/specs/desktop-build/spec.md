@@ -1,6 +1,10 @@
 # Desktop Build — Spec
 
-## ADDED Requirements
+## Purpose
+
+约束桌面端构建：失败能自愈重试，产物路径与命令可核。
+
+## Requirements
 
 ### Requirement: Build failure self-heal
 When `run.bat` triggers a `flutter build windows --debug` that fails, the launcher SHALL clean the stale native-assets incremental build cache under `.dart_tool\flutter_build` AND the native-assets hook cache under `.dart_tool\hooks_runner` (which holds the persisted `output.json` manifest that re-points at a removed native asset), then retry once before giving up, so a transient cache-driven failure recovers without requiring the user to run `flutter clean` manually. The self-heal SHALL NOT run a full `flutter clean` and SHALL NOT delete the `build\` output — the incremental compile artifacts remain, so the retry is an incremental rebuild. Clearing the hook cache forces the native-assets hook to re-download the sqlite3 native asset into a fresh per-process random-hash directory (the previously-downloaded native assets under `.dart_tool\hooks_runner` are discarded; this re-download is inherent churn). Recovery presupposes network access to re-download the sqlite3 native asset; when offline, the retry fails at the asset download and is surfaced as a network cause rather than recovering.

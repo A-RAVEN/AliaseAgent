@@ -1,6 +1,10 @@
 # Debug Logging — Spec
 
-## ADDED Requirements
+## Purpose
+
+约束日志分级与开关：各级别可按配置打开，生产构建不输出调试日志。
+
+## Requirements
 
 ### Requirement: LOG_TRACE log level
 The Logger SHALL support a TRACE log level below INFO, controlled by the `ALIASAGENT_LOG_LEVEL` environment variable read at `Logger::init()` time.

@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束应用外壳的启动流程：加载态、会话就绪与错误提示都要在界面上看得见。
+
+## Requirements
 
 ### Requirement: AppShell shows loading state
 The system SHALL display a loading indicator while config is being loaded.

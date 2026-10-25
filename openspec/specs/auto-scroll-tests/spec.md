@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束消息列表自动滚动：新消息滚到底，用户手动上滚后不再抢位置。
+
+## Requirements
 
 ### Requirement: Scroll to bottom on new user message
 The system SHALL auto-scroll the message list to the bottom when a user sends a message.

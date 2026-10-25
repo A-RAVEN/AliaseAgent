@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束视觉回归：基准图与当前图像素级比较，差异给出可视化证据。
+
+## Requirements
 
 ### Requirement: Automated screenshot capture in test scenarios
 The system SHALL capture screenshots at defined points during integration test scenarios using Flutter's `RenderRepaintBoundary.toImage()` API.

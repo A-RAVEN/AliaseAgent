@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束 HTTP 请求构造与错误处理：请求形状可断言，错误码不被吞。
+
+## Requirements
 
 ### Requirement: HTTP request construction
 The C++ Sidecar SHALL construct HTTP POST requests with correct headers and JSON body.

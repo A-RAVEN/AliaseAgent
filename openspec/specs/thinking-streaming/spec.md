@@ -1,6 +1,10 @@
 # Thinking Streaming — Spec
 
-## ADDED Requirements
+## Purpose
+
+约束思考过程的流式呈现：增量到达、可折叠、不与正文混淆。
+
+## Requirements
 
 ### Requirement: Real-time thinking delta delivery
 The C++ Sidecar SHALL deliver thinking content incrementally in real-time while the API stream is active, not after curl completes. Each wire `content_block_delta` event with `delta.type == "thinking_delta"` SHALL trigger an immediate `on_thinking` callback with the sidecar-composed payload `{"type":"thinking_delta","index":N,"delta":"<partial>"}` (wire mapping: `content_block_delta.index` → `index`, `delta.thinking` → `delta`; the composed format is internal to the sidecar callback, NOT a wire event type). At `content_block_stop` — which in the wire stream carries only `type` and `index` and NO content block object — the Sidecar SHALL deliver the final complete block, accumulated by the parser from the preceding `thinking_delta`/`signature_delta` events, as `{"type":"thinking","index":N,"thinking":"<full>","signature":"<sig>"}`.

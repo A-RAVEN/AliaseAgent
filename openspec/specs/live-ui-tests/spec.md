@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束真机界面用例：真窗口下的基本对话能跑通并留下截图。
+
+## Requirements
 
 ### Requirement: Basic conversation via UI
 The system SHALL support an integration test that types a message into the chat TextField, taps Send, and verifies a COMPLETED (non-empty, non-"Error:") assistant reply is reliably detected.

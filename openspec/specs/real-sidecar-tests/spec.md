@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束真实动态库的 FFI 调用：符号解析、ping、错误形状都符合约定。
+
+## Requirements
 
 ### Requirement: ping FFI call returns pong
 The system SHALL verify that `ping` FFI function returns "pong", confirming basic FFI bridge connectivity.

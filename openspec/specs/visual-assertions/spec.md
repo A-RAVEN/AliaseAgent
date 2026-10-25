@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束截图断言：能截到目标窗口，像素比对有明确判据。
+
+## Requirements
 
 ### Requirement: Screenshot capture of AliasAgent window
 The system SHALL capture a screenshot of the AliasAgent application window using PowerShell `CopyFromScreen`.

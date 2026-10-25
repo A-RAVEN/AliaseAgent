@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束 C++ 侧边进程的接口契约：接口定义与实现一致、失败形状统一。
+
+## Requirements
 
 ### Requirement: ISidecar interface definition
 The system SHALL define an `ISidecar` abstract interface exposing `sendMessage()`, `setWorkspace()`, `readFile()`, and `listDir()` methods with the same signatures as `SidecarBridge`'s public API.

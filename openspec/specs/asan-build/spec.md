@@ -1,6 +1,10 @@
 # ASan Build Mode — Spec
 
-## ADDED Requirements
+## Purpose
+
+约束 ASan 构建开关：能在 CMake 里打开、生成单独产物、失败时给出可读诊断。
+
+## Requirements
 
 ### Requirement: ASan CMake option
 The CMake build SHALL support an `-DENABLE_ASAN=ON` option that enables AddressSanitizer for the `sidecar_tests` executable target only.

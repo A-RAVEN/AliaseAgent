@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+约束键盘交互：Enter 发送、Shift+Enter 换行、快捷键不互相吞。
+
+## Requirements
 
 ### Requirement: Enter key submits message
 The system SHALL submit the input text as a message when the Enter key is pressed without Shift.
