@@ -4,6 +4,7 @@
 // 由 ChatScreen 持有状态：按钮 → 调 sidecar → 把返回的**路径**加进待发列表 →
 // 缩略图出现 → 移除或发送后消失。sidecar 用 FakeSidecar，剪贴板内容由
 // `stubReadClipboardImage` 伪造，不碰真实剪贴板。
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -145,6 +146,47 @@ void main() {
       expect(find.byTooltip('移除这张图'), findsNothing);
       expect(find.textContaining('剪贴板里没有图片'), findsOneWidget,
           reason: '失败必须留下看得见的一句话，不能只写日志');
+    });
+
+    // 18.3（2026-10-25）：工具还没就绪时按 Ctrl+V 贴图，**不许静默无反应**。
+    // 用 `browserAvailableGate` 把"动态工具还没探完"那段窗口撑住（这个门是既有夹具给
+    // fix-silent-truncation 6.3 用的，正好是同一个状态）。
+    testWidgets('工具还没就绪时按 Ctrl+V：必须有可见提示，不许静默', (tester) async {
+      final sidecar = FakeSidecar();
+      final gate = Completer<void>();
+      sidecar.browserAvailableGate = gate;
+      addTearDown(() {
+        if (!gate.isCompleted) gate.complete();
+        sidecar.browserAvailableGate = null;
+      });
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: FakeSessionRepository([]),
+        msgRepo: FakeMessageRepository(),
+        sidecar: sidecar,
+      ));
+      // 只推几帧，不 settle（settle 会一直等那个永远不会完成的门）。
+      await tester.pump();
+      await tester.pump();
+
+      final ready = tester
+          .state<ChatScreenState>(find.byType(ChatScreen))
+          .toolsReady;
+      // ignore: avoid_print
+      print('  [OBS] 门撑住时 toolsReady=$ready；'
+          '输入框存在=${find.byType(TextField).evaluate().isNotEmpty}');
+      expect(ready, isFalse, reason: '门没放行时工具就必须是未就绪状态');
+
+      // Ctrl+V 是输入框上的快捷键 —— 必须先让输入框拿到焦点，否则按键事件没人接。
+      await tester.tap(find.byType(TextField));
+      await tester.pump();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyV);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      await tester.pump();
+
+      expect(find.textContaining('工具还在准备'), findsOneWidget,
+          reason: '未就绪时按 Ctrl+V 必须留一句看得见的话；静默就是 18.3 要修的缺陷');
     });
   });
 

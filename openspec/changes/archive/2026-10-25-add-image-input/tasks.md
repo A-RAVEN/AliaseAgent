@@ -127,13 +127,28 @@
 
 背景：这一组四条都是"行为已实现、但没有任何用例把它钉住"的样式细节，外加用户当场指出的一条修正。每条判据都要求**能失败**（把参数改回错的一侧必须红）。
 
-- [ ] 16.1 附图靠用户侧（右侧）：用户消息里的缩略图右边缘与同一消息文字的右边缘对齐，整组位于窗口右半侧；助手消息仍在左侧。判据：`test/widget/message_bubble_image_test.dart` 新增一条用例，断言 `isUser` 时缩略图 `right` == 文字 `right` 且 `left > 窗口宽/2`；把 `MessageBubble` 里 `CrossAxisAlignment.end` 改成 `.start` 后该条必须红，改回后绿。
-- [ ] 16.2 待发附件条的位置与删除：附件条在输入框**上方**、左对齐；每张缩略图 48×48、右上角删除只删自己那张。判据：新建 `test/widget/input_bar_image_test.dart`，断言附件条 `top` < 输入框 `top`、两张图各点一次删除后剩余张数分别为 1 与 0；把删除回调的下标写死成 0 后该条必须红。
-- [ ] 16.3 气泡内附图不吃掉气泡视觉：附图宽度 ≤ 气泡 `maxWidth: 600`、高度 ≤ `maxHeight: 400`，且气泡底色与圆角仍可见（不是一张裸图）。判据：同 16.1 的用例里断言图片渲染尺寸 ≤ 600×400、气泡容器仍有 `primaryContainer` 底色；把 `maxImageHeight` 改成 100000 后该条必须红。
-- [ ] 16.4 界面文案与用户文档对齐：用户文档里反引号引用的界面文案（例如"未发送"那句）必须能在 `lib/` 里 grep 到。判据：`test/unit/user_docs_test.dart` 的覆盖面包含该文档；改掉 `message_bubble.dart` 里那句提示文案后必须红。
-- [ ] 16.5 点缩略图看原图：气泡里每张附图可点开一个**覆盖整个窗口的查看层**（`InteractiveViewer`，缩放上限用框架默认值，不自定义），可用关闭按钮或 `Esc` 退出。判据：`test/widget/message_bubble_image_test.dart` 新增一条用例，点缩略图后能 `find` 到查看层（给它一个稳定 key）、按 `Esc` 后查看层消失；把缩略图外层的 `InkWell` 去掉后该条必须红（点了没反应）。这条同时是 16.7「+N」点开后的落点。
+- [x] 16.1 附图靠用户侧（右侧）：用户消息里的缩略图右边缘与同一消息文字的右边缘对齐，整组位于窗口右半侧；助手消息仍在左侧。判据：`test/widget/message_bubble_image_test.dart` 新增一条用例，断言 `isUser` 时缩略图 `right` == 文字 `right` 且 `left > 窗口宽/2`；把 `MessageBubble` 里 `CrossAxisAlignment.end` 改成 `.start` 后该条必须红，改回后绿。
+  **实测（2026-10-24）**：窗口 800×600，用 `ListView` 复现产品环境（`chat_area.dart` 用 `ListView.builder`，会给子项满宽约束；直接塞进 `Scaffold` body 拿到的是松约束，第一版因此量出 339.5 而误判）。绿：`图 right=774.0 文字 right=774.0`，助手 `图 left=26.0 文字 left=26.0`。变异（`.end`→`.start`）⇒ `Expected: a value greater than <400> Actual: <339.5>` 红；撤回后 `+7 All tests passed!`，`MUTATION-TEST` 残留 0 处。
+- [x] 16.2 待发附件条的位置与删除：附件条在输入框**上方**、左对齐；每张缩略图 48×48、右上角删除只删自己那张。判据：新建 `test/widget/input_bar_image_test.dart`，断言附件条 `top` < 输入框 `top`、两张图各点一次删除后剩余张数分别为 1 与 0；把删除回调的下标写死成 0 后该条必须红。
+  **实测（2026-10-24）**：绿 `+2 All tests passed!`，读数 `附件条 top=488.0 输入框 top=548.0`（条在上方）；`两张时点第二个删除 ⇒ 回调收到 [1]`、`一张时点删除 ⇒ 回调收到 [0]`。
+  **变异证明**：把删除回调改成 `onRemoveImage!(0)` ⇒ `Expected: [1] Actual: [0]`、`+1 -1` 红；撤回后 `+2` 全绿，`MUTATION-TEST` 残留 0 处。
+- [x] 16.3 气泡内附图不吃掉气泡视觉：附图宽度 ≤ 气泡 `maxWidth: 600`、高度 ≤ `maxHeight: 400`，且气泡底色与圆角仍可见（不是一张裸图）。判据：同 16.1 的用例里断言图片渲染尺寸 ≤ 600×400、气泡容器仍有 `primaryContainer` 底色；把 `maxImageHeight` 改成 100000 后该条必须红。
+  **实测（2026-10-24）**：绿 `+7 All tests passed!`，读数 `限高容器=[600.0x400.0]`。
+  **改写过的判据（必须交代）**：原判据里的"图片渲染尺寸 ≤ 600×400"在 widget 测试里是**恒真**的 —— 1×1 的测试图未解码完，渲染尺寸是 `0.0x0.0`，任何上界都满足。改成断言 `ConstrainedBox` 的**约束值**等于 600×400，并补 `expect(MessageBubble.maxImageWidth, 600)` / `maxImageHeight, 400` 钉住常量数值（只比常量自己，把常量改成 100000 也会绿）。
+  **变异证明**：把 `maxImageHeight` 改成 800 ⇒ `Expected: <400> Actual: <800.0>`、`+5 -2` 两条红；撤回后 `+7` 全绿，`MUTATION-TEST` 残留 0 处。
+- [x] 16.4 界面文案与用户文档对齐：用户文档里反引号引用的界面文案（例如"未发送"那句）必须能在 `lib/` 里 grep 到。判据：`test/unit/user_docs_test.dart` 的覆盖面包含该文档；改掉 `message_bubble.dart` 里那句提示文案后必须红。
+  **实测（2026-10-24）后发现原判据守不住，已加一条更硬的**：`test/unit/user_docs_test.dart` 是拿文档句子去 grep **全部 lib 源码**，而这句文案在 `chat_area.dart` 的**注释**里也出现过 —— 把 `message_bubble.dart` 里的真实文案整句换掉，那条守卫**仍然全绿**（注释里还命中），所以它只保"文档与代码某处一致"，保不住"界面上真的这么写"。
+  因此新建 `test/widget/bubble_ui_copy_test.dart`：从 `Docs/user-guide/chat.md` 里取出标成「界面文案：」的那句，渲染一个 `imagesSent: false` 的气泡，断言**渲染出来的文字与该句逐字相同**。绿：`文档里标出的界面文案共 6 条，其中"未发送"提示 [模型未声明图片输入，本次没有发送图片]`、`+1`。
+  **变异证明**：把文案换成"模型没有图片输入能力，这次只发了文字" ⇒ `Found 0 widgets with text "模型未声明图片输入，本次没有发送图片"` 红；撤回后两条一起跑 `+6 All tests passed!`，残留 0 处。
+- [x] 16.5 点缩略图看原图：气泡里每张附图可点开一个**覆盖整个窗口的查看层**（`InteractiveViewer`，缩放上限用框架默认值，不自定义），可用关闭按钮或 `Esc` 退出。判据：`test/widget/message_bubble_image_test.dart` 新增一条用例，点缩略图后能 `find` 到查看层（给它一个稳定 key）、按 `Esc` 后查看层消失；把缩略图外层的 `InkWell` 去掉后该条必须红（点了没反应）。这条同时是 16.7「+N」点开后的落点。
+  **实测（2026-10-24）**：实现 `lib/ui/message_bubble.dart` 的 `_buildImage` 外面包 `InkWell`（key `bubble-image-<path>`）+ `_openImageViewer`（`showDialog` + `InteractiveViewer` + `CallbackShortcuts` 绑 `Esc` + 右上角关闭按钮），导出稳定 key `imageViewerKey`。绿：`点缩略图后 查看层存在=true`、`按 Esc 后 查看层存在=false`、`+8 All tests passed!`。
+  **判据的一处实现说明（不是放松）**：用例没有用 `tester.tap` 派发真实点击，而是取缩略图外层的 `InkWell` 直接调用 `onTap`。原因是测试图是 1×1 PNG、在 widget 测试里没解码完，缩略图命中区域接近 0 像素，`tap` 会因"可能被遮挡"而派不出去（实测两次），那不是产品缺陷。删掉 `InkWell` 时用例连 widget 都找不到，仍然会红 —— 拦得住本任务要拦的回归。
+  **变异证明**：把 `onTap` 改成 `null` ⇒ `Expected: not null  Actual: <null>`、`+7 -1` 红；撤回后 `+8` 全绿，`MUTATION-TEST` 残留 0 处。
 
-- [ ] 16.7 多图布局按 DeepSeek 官方规格定尺寸：**每格 300×200，一条消息最多显示 2 行 × 2 列 = 4 张；超过 4 张时第 4 格显示「+N」，点开进入全屏查看层，气泡本身不撑高。**
+- [x] 16.7 多图布局按 DeepSeek 官方规格定尺寸：**每格 300×200，一条消息最多显示 2 行 × 2 列 = 4 张；超过 4 张时第 4 格显示「+N」，点开进入全屏查看层，气泡本身不撑高。**
+  **实测（2026-10-24）**：实现 `_buildImageGrid` / `_buildImageCell`（`lib/ui/message_bubble.dart`），单张仍走 600×400 原路径。绿：`5 张图：Image 个数=4，气泡高=400.0`、`单张图限高容器=[600.0x400.0]`、`点第 4 格后 查看层存在=true，页码文案 4/5=true`、`+11 All tests passed!`。
+  **尺寸要修正一处（实测得出，不是拍的）**：原计划的 300×200 会让气泡超高——气泡自身有 14/10 的内边距，内容区只有 572×380。改成按内容区反推：`cellW=(572−12)/2=280`、`cellH=(380−12)/2=184`，两行 (184+6)×2=380，加内边距 20 = **400**，正好等于既有上界。另外图后那 6 像素间距只在"后面还有文字"时加，否则会多出 406。
+  **变异证明**：`perRow` 由 2 改成 1（单列直排）⇒ `气泡高=1540.0`、`Expected: ≤400 Actual: 406→1540` 红；撤回后 `+11` 全绿，`MUTATION-TEST` 残留 0 处。
   数字链（每个都能溯源，没有我自己编的数）：
   - 每格 **300×200** = 气泡既有的 `maxWidth: 600` ÷ 2 与既有 `maxImageHeight: 400` ÷ 2 —— 两个数都来自 `lib/ui/message_bubble.dart` 现有常量；
   - 一条消息总高上界 **400** = 既有的 `maxImageHeight: 400`；
@@ -144,4 +159,48 @@
 
 
 **明确不采纳**（我在效果图里画过、但产品现状没有，属于我自己编的视觉）：圆形头像、附件条末尾的虚线「+」位。这两样若要加，单独立项，不混进本组。
+
+## 17. 第二轮编译与全量验证（2026-10-24 用户要求补）
+
+**为什么要有这一组**：第 16 组改动了 `lib/ui/message_bubble.dart`（附图包 `InkWell`、新增全窗查看层、多图网格），并新增了 3 个测试文件。而 14.1 / 15.1–15.3 的读数是在这些改动**之前**由另一个会话记录的 —— 按项目规则「代码一改，之前结果作废」，那些数字不能再当本轮通过的依据。这一组就是把它们在本轮代码上重跑一遍。
+
+- [x] 17.1 C++ 构建：`cmake --build sidecar/build/windows --config Debug`。判据：退出码 0，且日志里出现 `sidecar.dll` 与 `sidecar_tests.exe` 两个产物路径；构建失败时贴出第一条 error 原文。
+  **实测（2026-10-24）**：`build exit=0`，日志尾部两个产物都在：`sidecar.vcxproj -> ...\Debug\sidecar.dll`、`sidecar_tests.vcxproj -> ...\Debug\sidecar_tests.exe`。
+- [x] 17.2 C++ 测试：`ctest --test-dir sidecar/build/windows -C Debug`。判据：把"总数 / 通过 / 失败"与本文件 14.1 记的基线 `342 | 341 passed | 1 failed` 逐项对照 —— 失败数不得超过基线，且若仍有 1 条失败，必须核实它就是基线里那条联网限流用例（`Rate guard …`）；若失败用例换了人或失败数变多，本任务判为未通过并贴原始输出。
+  **实测（2026-10-24）**：`ctest` 只把整包 `sidecar_tests` 当一个 test 跑，默认不带失败明细（exit 8），所以直接跑 `sidecar_tests.exe` 取明细：`test cases: 343 | 342 passed | 1 failed`、`assertions: 4282 | 4281 passed | 1 failed`。
+  唯一失败是 **`Rate guard: rapid-fire 5 consecutive ZhipuAI searches`**（`search_provider_test.cpp(1922/1956)`），断言 `REQUIRE( success_count == N )` 展开为 `0 == 5`，前一行日志是 `[rate-guard live] 0/5 succeeded, 5 errors`、`ZhipuAI: connection error — Could not connect to server`。
+  **判定**：失败数 1 = 基线 1（未变多），且就是基线点名的 `Rate guard` 联网用例 ⇒ 本条通过。用例总数从 315 涨到 343 是 10-24 那批新用例带来的，不是回归。
+- [x] 17.3 刷新 DLL：`powershell -NoProfile -File scripts\sync_sidecar_dll.ps1`。判据：输出 `SYNC-OK`；否则贴它提示的那条命令并按其执行。
+  **实测（2026-10-24）**：`SYNC-OK: sidecar.dll already current (2026/10/24 17:21:30)`。
+- [x] 17.4 静态检查：`flutter analyze`。判据：我本轮碰过的文件（`lib/ui/message_bubble.dart`、`test/widget/message_bubble_image_test.dart`、`test/widget/message_bubble_image_grid_test.dart`、`test/widget/bubble_ui_copy_test.dart`、`test/widget/input_bar_image_test.dart`）在这份输出里 **0 条**；仓库总计数与 15.3 的基线（171）相比不得增加。
+  **实测（2026-10-24）**：`171 issues found`（与基线 171 相同，未增加）；按上面五个文件名过滤 ⇒ **命中 0 条**。
+- [x] 17.5 全量 Dart 测试：`flutter test`。判据：`All tests passed!`，且通过数与 15.1 记录的基线对照（本次新增 3 个测试文件、若干用例，通过数应不低于基线）；有红则贴失败用例全名与断言原文。
+  **第一次（2026-10-24）**：`02:35 +470 -1`，唯一失败 `test/integration/browser_worker_test.dart:396`，`Expected: true / Actual: <false>`，前一行 `[OBS] navigate -> {"ok":false,"error":"worker response timeout"}`。
+  **判定为环境抖动（三条证据）**：① 该文件里 `MessageBubble` / `ChatScreen` / `pumpWidget` 命中 **0** 处，失败点是 sidecar 浏览器 worker 的 FFI 超时，与本次改的界面文件无关；② 同一份代码重复跑，第 2 次 `+18 All tests passed!`（第 1 次才是 1 红）；③ 把 `lib/ui/message_bubble.dart` 临时 stash 掉跑同一用例也全绿 —— 说明红绿与这份改动无关。
+  **第二次全量（本轮收尾）**：`02:02 +471: All tests passed!` —— 判据满足，通过数 471 ≥ 基线 407（多出来的部分是 10-24 那批新用例与本轮新增的 3 个测试文件）。
+
+## 18. 「粘贴图片」第一次点没反应（2026-10-25 用户要求在本 change 内修）
+
+**来源**：跑 13.1 的真机用例时，日志里出现 `第 1 次点「粘贴图片」→ 待发缩略图 = false`、`第 2 次 → true`。用例点 3 次能过，但**用户只会点一次** —— 点一次没动静，他会以为功能坏了。
+
+**先复现基线，再修**（顺序不许颠倒）：
+
+- [x] 18.1 建一条**不调模型**的复现用例 `integration_test/live_image_paste_click_test.dart`：把纯色 PNG 放进真实剪贴板 → 起真窗口 → **只点一次**「粘贴图片」→ 在 2 秒内轮询缩略图（`移除这张图` 的 tooltip）。判据：这条用例必须先把现象复现出来（红），并把"第几次轮询才出现 / 始终没出现"与 C++ `read_clipboard_image` 的返回原文一起打进日志；若**一次点就成功**（绿），也要把这条绿读数记下来，说明不是必现、需要更多轮定基线。
+  **实测（2026-10-25）：三组变体全部一次点就成功，现象不可复现** ——
+  ```
+  变体 1（干净的一次点击）                      第 1 次轮询（100ms）就出现缩略图
+  变体 2（复刻 13.1：先直接调 C++ 读一次剪贴板）  第 1 次轮询就出现；C++ 返回 ok=true 262 字节 64×64
+  变体 3（复刻 13.1 时序：只 pump 2 秒就点）      起窗口 2 秒时"工具已就绪 = true"，点一次仍然第 1 次轮询出现
+  ```
+  三组都是 `+1 All tests passed!`、界面剪贴板提示条数 0。**13.1 那次"第 1 次 false"的原因仍未知**，但已排除两个候选：① 工具未就绪（2 秒时就绪为 true）；② 点击前先调过 C++ 影响状态（变体 2 证明不影响）。
+- [x] 18.2 按基线读数定位并修：先读 `_pasteImageFromClipboard`（`lib/main.dart`）与 `read_clipboard_image`（`sidecar/src/clipboard_image.cpp`）确认失败在哪一段（`_toolsReady` 拦了？剪贴板被占？FFI 返回错误？还是 `setState` 没触发重绘？），再改。判据：18.1 那条从红转绿且连跑 3 次都绿；改动处注明依据（哪次日志、C++ 返回什么）。
+  **改判据（2026-10-25，依据是 18.1 的三组实测）**：现象**不可复现**，所以没有"从红转绿"可做。本条改成"把 18.1 的用例留作守卫 + 如实记录未能复现"。
+  **落地**：`integration_test/live_image_paste_click_test.dart` 保留在仓库里，判据为"点一次必须成功"（现在绿；将来真出现"点一次没反应"它会红）。三组变体读数见 18.1。13.1 那次 `第 1 次 false` 仍未解释 —— 按项目规则，构造不出失败状态就明写「未能证明此检查可失败」，这里记的就是这句：**未能证明**该现象可稳定复现。
+- [x] 18.3 失败时必须有可见提示：现在 `_pasteImageFromClipboard` 在 `!_toolsReady` 时**直接 return false、什么都不显示**，其它失败分支才给 `_pasteImageNotice`。判据：`test/widget/input_bar_paste_test.dart` 加一条用例，令工具未就绪时点「粘贴图片」，断言界面出现可见提示（不是静默无反应）；把提示去掉后该条必须红。
+  **按用户裁定改走 Ctrl+V 那条路（2026-10-25）**：先试按钮那条，发现按钮在未就绪时刻还渲染不出来（只 pump 一帧时命中 0 个），够不着；改用 `FakeSidecar.browserAvailableGate` 这个既有的 Completer 把"动态工具还没探完"的窗口撑住 —— 那时 `toolsReady=false` 但**输入框已经在**，`Ctrl+V` 会被调到。
+  实现：`lib/main.dart` 的 `_pasteImageFromClipboard` 在 `!_toolsReady` 时不再是静默 `return false`，而是 `setState(_pasteImageNotice = '工具还在准备，稍等一下再贴图')`。
+  判据落地：`test/widget/input_bar_paste_test.dart` 新增「工具还没就绪时按 Ctrl+V：必须有可见提示，不许静默」，先点输入框拿焦点，再发 `Ctrl+V`，断言出现那句话。绿：`门撑住时 toolsReady=false；输入框存在=true`、`+6 All tests passed!`。
+  **变异证明**：把 `!_toolsReady` 分支改回静默 `return false` ⇒ `Found 0 widgets with text containing 工具还在准备`、`+5 -1` 红；撤回后 `+6` 全绿，`MUTATION-TEST` 残留 0 处。
+
+
 

@@ -136,3 +136,62 @@ C API 包装函数 `ensure_search_infra` 和 C++ 实现函数 `ensure_search_inf
 ### 修复思路
 
 在 `_initSearchAndTools` 组装完 `_toolDefs` 之后，按当前 Agent 的 `tools` 列表做一次过滤（空列表是"全给"还是"什么都不给"要当场定死并写进规范）。这是一处独立的行为改动（会改变模型看到的工具集合，也会影响 `test/unit/user_docs_test.dart` 的"注册的工具都在文档里"那条检查），所以不在 `add-command-tool` 里顺手改。
+
+## sidecar_test: `Rate guard` 用例依赖真实网络，离线必红
+
+**来源**: `add-image-input` 第二轮编译验证（tasks 17.2）
+**发现日期**: 2026-10-24
+**相关文件**: `sidecar/test/search_provider_test.cpp`（用例 `Rate guard: rapid-fire 5 consecutive ZhipuAI searches`）
+
+### 症状
+
+跑 `sidecar/build/windows/Debug/sidecar_tests.exe`（或 `ctest --test-dir sidecar/build/windows -C Debug`）时整包失败：
+
+```
+[rate-guard live] 0/5 succeeded, 5 errors, 11176ms total
+ZhipuAI: connection error — Could not connect to server
+search_provider_test.cpp(1956): FAILED:
+  REQUIRE( success_count == N )
+with expansion:  0 == 5
+test cases: 343 | 342 passed | 1 failed
+```
+
+`ctest` 把整包当一个 test 跑、默认不带失败明细，所以外部只看到 `exit=8`；要看是哪条必须直接跑 `sidecar_tests.exe`。
+
+### 根因
+
+这条用例要连真实的 ZhipuAI 搜索接口。无外网（或该服务不可达）时 5 次全失败 ⇒ 断言必红。与代码好坏无关，是"联网用例没有离线开关"的设计问题。
+
+### 现状与规避
+
+第二轮验证的判据写成"失败数不得超过基线（也是这 1 条）"，所以没有卡住。要它变绿得让它能按环境变量或 Catch2 tag 排除 `[live]`，属于独立改动，尚未立项。
+
+## widget_test: `browser_worker_test` 偶发 `worker response timeout`
+
+**来源**: `add-image-input` 第二轮编译验证（tasks 17.5）
+**发现日期**: 2026-10-24
+**相关文件**: `test/integration/browser_worker_test.dart`（失败点约在 396 行的 `expect(r0['ok'], isTrue)`）、sidecar 的浏览器 worker
+
+### 症状
+
+全量 `flutter test` 偶发 1 红：
+
+```
+[OBS] navigate -> {"ok":false,"error":"worker response timeout"}
+test\integration\browser_worker_test.dart 396:7
+  Expected: true
+    Actual: <false>
+```
+
+### 已核实的性质
+
+- 该文件里 `MessageBubble` / `ChatScreen` / `pumpWidget` 命中 **0** 处，与聊天界面无关；
+- **同一份代码**重复跑：第一次 `+17 -1`，第二次 `+18 All tests passed!`；
+- 把当时正在改的 `lib/ui/message_bubble.dart` 临时 stash 掉跑同一用例，也是全绿。
+
+⇒ 判断为真实浏览器子进程的响应超时抖动，不是某次改动的回归。
+
+### 修复思路
+
+把 worker 的等待上限做成可配置项，或在该用例里放宽等待并写明依据；数字来源必须指出现有常量在哪个文件，不许再凭空发明一个毫秒数。
+

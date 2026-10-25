@@ -348,7 +348,14 @@ class ChatScreenState extends State<ChatScreen> {
   /// 落盘由 sidecar 的 `read_clipboard_image` 做（PNG 优先、DIB 转 PNG），这里只
   /// 收它的返回：成功就把**路径**加进待发列表，失败就给出可见提示（不静默）。
   Future<bool> _pasteImageFromClipboard() async {
-    if (!_toolsReady) return false;
+    // 18.3（2026-10-25）：工具还没就绪时**不许静默返回 false** —— 用户点一下
+    // 什么反应都没有，只会以为按钮坏了。给一句看得见的话，原因写清楚。
+    if (!_toolsReady) {
+      if (mounted) {
+        setState(() => _pasteImageNotice = '工具还在准备，稍等一下再贴图');
+      }
+      return false;
+    }
     String? failure;
     try {
       final raw = _sidecar.readClipboardImage(
