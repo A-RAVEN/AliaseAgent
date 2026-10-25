@@ -1,6 +1,10 @@
 # Agent Config — Spec
 
-## ADDED Requirements
+## Purpose
+
+规定「每个 Agent Type 能收什么模态」。`input_modalities` 是"这个模型能不能收图"的唯一真相来源：缺省按只有 `text` 处理（宁可少发图，也不让模型悄悄看不见），非法值回落成 `["text"]` 并打一行日志点名原始值，保存时要原样写回。
+
+## Requirements
 
 ### Requirement: Provider configuration file
 The system SHALL read provider and agent type configuration from `~/.aliasagent/config.json` at startup. The file SHALL use JSON format with `version`, `providers`, and `agent_types` sections.

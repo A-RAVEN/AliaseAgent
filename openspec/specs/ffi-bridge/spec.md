@@ -1,6 +1,10 @@
 # FFI Bridge — Spec
 
-## ADDED Requirements
+## Purpose
+
+规定 Dart 与 C++ 动态库之间那层桥的接口形状：导出的符号名、入参 JSON、返回的可解析 JSON、以及失败时的统一形状（`ok:false` + `error`，不带成功字段）。图片相关的两个入口是 `read_image`（读工作区位图）与 `read_clipboard_image`（把剪贴板位图落成 PNG，且必须能注入剪贴板来源，让测试二进制永远不碰真实的 Win32 剪贴板、也不开窗口）。
+
+## Requirements
 
 ### Requirement: Dynamic library loading
 The system SHALL load the C++ Sidecar dynamic library at Flutter application startup using `dart:ffi`, supporting `.so` (Linux), `.dylib` (Mac), and `.dll` (Windows).

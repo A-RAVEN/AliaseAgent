@@ -50,6 +50,9 @@ Flutter 桌面 AI 对话应用，通过 dart:ffi 调用 C++ Sidecar 动态库（
 
 - **openspec 下不许存在只有 proposal 的活跃 change** — 判定范围：`openspec/changes/<name>/` 顶层直接子目录且含 `.openspec.yaml` 的活跃 change；用 `openspec status --change <name> --json` 判定，`tasks` 为 `blocked`（缺 design / specs）即垃圾 → `rm -rf` 后用 `/opsx:propose` 重来。**永不删**：`openspec/changes/archive/` 下的任何内容（那是合法归档历史，不许用"目录里文件少"这种感性判断去删）；不含 `.openspec.yaml` 的目录不是活跃 change，不适用本条。
 
+- **归档 change 时必须先把 delta spec 同步进 `openspec/specs/`**（2026-10-25 用户明令：记 CLAUDE，spec 归档时必须同步）—— 不许走"不同步直接归档"那条路，也不许边归档边问。做法：对 `openspec/changes/<name>/specs/<能力>/spec.md` 逐份处理 —— 主 spec 已存在的，把 delta 的 `## ADDED Requirements` / `## MODIFIED Requirements` 等块应用进主 spec 的 `## Requirements` 段；主 spec 不存在的，新建 `openspec/specs/<能力>/spec.md`，**必须带 `## Purpose`**（缺它 `openspec validate` 直接判失败）。落地后 `openspec validate --specs` 的总数与归档前对照，把"同步前 / 同步后"两组数字写进归档报告；仍失败的逐条说明是不是既有缺口。
+  **两个已踩过的坑**：① 顺序是先同步、再归档 —— 归档后 delta 已经在 `archive/` 下，补起来别扭；② PowerShell 的 `Set-Content -Encoding UTF8` 会写 **UTF-8 BOM**（文件头 `239,187,191`），解析器看到的是 `\uFEFF## Purpose`，会报「缺 Purpose」；新建规范一律按无 BOM 写（`New-Object System.Text.UTF8Encoding($false)`）。
+
 - **开了 Workflow 后不要等** — 启动 Workflow 或任何后台任务后，禁止阻塞等待或空转等待；完成会自动通知，收到通知再处理。等待期间有可推进的工作就继续做，没有就结束本轮回复。
 
 - **Git 提交需要明确授权** — 用户没说"提交 / commit / 交"就不许执行 commit / amend / reset / rebase。"任务做完了"不是授权。提交内容要干净，不夹带调试文件和未确认的改动。

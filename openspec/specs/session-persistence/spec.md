@@ -1,6 +1,10 @@
 # Session Persistence — Spec
 
-## ADDED Requirements
+## Purpose
+
+规定会话与消息怎么落库、以及库结构怎么演进。核心约束：消息可带附件列（只存路径的 JSON 数组，不存字节）；升级走"只加列不改行"的迁移；读到时把 `NULL`、坏 JSON、非数组一律当成"没有附件"，并留一行日志；任何历史数据都不许因为新列而读失败。
+
+## Requirements
 
 ### Requirement: Session storage
 The system SHALL persist chat sessions to a local SQLite database, with each session having an ID, title, agent type, creation timestamp, and last update timestamp.
