@@ -145,6 +145,11 @@ abstract class ISidecar {
   // 走 worker isolate（与上面的 web/browser 同一通道），所以一条跑几分钟的命令
   // 不会把界面冻住；超时的判定仍在 sidecar 里。
   Future<String> runCommand(String requestJson);
+
+  // Spill 读回（spill-large-tool-output）：按字节读回 spill 文件的一段。
+  // 只读 `~/.aliasagent/spill/` 里的文件（C++ 侧校验），读一次就返回，不进 worker
+  // isolate —— 它只有一次本地文件读，没有超时与子进程。
+  String readSpill(String requestJson);
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +179,7 @@ class SidecarBridge implements ISidecar {
   late final ReadImageDart _readImageFn;
   late final ReadClipboardImageDart _readClipboardImageFn;
   late final CancelRequestDart _cancelRequestFn;
+  late final RunCommandDart _readSpillFn;
 
   // Serialization gate (D3): all sendMessage calls execute strictly one at a
   // time. A new request starts only after the previous request's done callback
@@ -236,6 +242,8 @@ class SidecarBridge implements ISidecar {
         _lib.lookupFunction<SetWorkspaceNative, ReadClipboardImageDart>('read_clipboard_image');
     _cancelRequestFn =
         _lib.lookupFunction<CancelRequestNative, CancelRequestDart>('cancel_request');
+    _readSpillFn =
+        _lib.lookupFunction<SetWorkspaceNative, RunCommandDart>('read_spill');
   }
 
   static SidecarBridge get instance {
@@ -598,6 +606,14 @@ class SidecarBridge implements ISidecar {
   String grepFile(String requestJson) {
     final ptr = requestJson.toNativeUtf8();
     final resultPtr = _grepFileFn(ptr);
+    malloc.free(ptr);
+    return resultPtr.toDartString();
+  }
+
+  @override
+  String readSpill(String requestJson) {
+    final ptr = requestJson.toNativeUtf8();
+    final resultPtr = _readSpillFn(ptr);
     malloc.free(ptr);
     return resultPtr.toDartString();
   }

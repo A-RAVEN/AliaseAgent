@@ -93,32 +93,21 @@ class AgentTypeConfig {
     _illegalModalitiesReported = false;
   }
 
-  /// 命令工具（change `add-command-tool`）的四个旋钮，随每次调用一起传到执行侧
+  /// 命令工具（change `add-command-tool`）的超时旋钮，随每次调用一起传到执行侧
   /// （执行侧不读配置文件）。缺省值必须与 `sidecar/src/command_tool.cpp` 里
   /// 那几个常量一致；非法值一律回落缺省。
   ///
-  /// `command_max_output_chars` 的缺省值 8000 是为了与 `lib/main.dart` 的
-  /// `kToolResultElisionThreshold` 对齐：大于它的话，工具刚拼好的"截断了、全文
-  /// 在哪"会被发给模型之前那道通用截断掐掉中间。
+  /// **原来的两个输出上限旋钮已删除**（change `spill-large-tool-output`）：头尾预览
+  /// 长度改由顶层 `spill.preview_chars` 一项决定，`command_max_output_chars` /
+  /// `command_output_full_chars` 读到只打废弃告警、不再写回配置。
   final int commandTimeoutMs;
   final int commandMaxTimeoutMs;
-  final int commandMaxOutputChars;
-  final int commandOutputFullChars;
 
   /// 命令缺省超时毫秒数（与 C++ 侧一致）。
   static const int kDefaultCommandTimeoutMs = 120000;
 
   /// 命令超时上限（与 C++ 侧一致）。
   static const int kDefaultCommandMaxTimeoutMs = 600000;
-
-  /// 每条流在内存里保留的字符上限（与 C++ 侧、与 kToolResultElisionThreshold 一致）。
-  static const int kDefaultCommandMaxOutputChars = 8000;
-
-  /// 写临时文件的完整输出上限（与 C++ 侧一致）。
-  static const int kDefaultCommandOutputFullChars = 2000000;
-
-  /// 字符上限的下限（与 C++ 侧一致）：再小就连截断说明和全文路径都放不下。
-  static const int kMinCommandMaxOutputChars = 1000;
 
   /// 解析一个正整数旋钮：不是正整数（缺失 / 非数字 / 0 / 负数）就回落缺省值，
   /// 并打印一行，免得配置里的手误被静默忽略。
@@ -128,6 +117,17 @@ class AgentTypeConfig {
         'using the default $fallback');
     return fallback;
   }
+
+  /// 废弃键的告警（每个键只打一次，免得每次读配置都刷屏）。
+  /// 传的是**读到的值**，`null` 表示配置里没有这个键。
+  static void _warnDeprecated(Object? raw, String key) {
+    if (raw == null) return;
+    if (!_deprecatedKeysReported.add(key)) return;
+    debugPrint('[AliasAgent] $key=$raw 已废弃并被忽略：头尾各留多少字符改由顶层配置 '
+        'spill.preview_chars 决定（缺省 1000）。');
+  }
+
+  static final Set<String> _deprecatedKeysReported = <String>{};
 
   /// The default used when the config key is absent or illegal.
   static const int kDefaultCompactionThresholdPercent = 25;
@@ -186,11 +186,15 @@ class AgentTypeConfig {
     this.inputModalities = kDefaultInputModalities,
     this.commandTimeoutMs = kDefaultCommandTimeoutMs,
     this.commandMaxTimeoutMs = kDefaultCommandMaxTimeoutMs,
-    this.commandMaxOutputChars = kDefaultCommandMaxOutputChars,
-    this.commandOutputFullChars = kDefaultCommandOutputFullChars,
   });
 
   factory AgentTypeConfig.fromJson(String name, Map<String, dynamic> json) {
+    // 两个输出上限键已废弃（change spill-large-tool-output）：头尾各留多少改由
+    // 顶层 `spill.preview_chars` 决定。读到旧键时**打一行告警再忽略** ——
+    // 静默忽略会让用户以为改这两个键还有用。这里显式读一次，也让
+    // `user_docs_test` 的"文档里的键 ↔ 代码解析路径"这条检查对得上。
+    _warnDeprecated(json['command_max_output_chars'], 'command_max_output_chars');
+    _warnDeprecated(json['command_output_full_chars'], 'command_output_full_chars');
     return AgentTypeConfig(
       name: name,
       provider: json['provider'] as String,
@@ -215,16 +219,6 @@ class AgentTypeConfig {
           kDefaultCommandTimeoutMs, 'command_timeout_ms'),
       commandMaxTimeoutMs: _parsePositiveInt(json['command_max_timeout_ms'],
           kDefaultCommandMaxTimeoutMs, 'command_max_timeout_ms'),
-      // 字符上限另有一个下限：配得比它小一律按它执行（否则连截断说明都放不下）。
-      commandMaxOutputChars: (() {
-        final parsed = _parsePositiveInt(json['command_max_output_chars'],
-            kDefaultCommandMaxOutputChars, 'command_max_output_chars');
-        return parsed < kMinCommandMaxOutputChars
-            ? kMinCommandMaxOutputChars
-            : parsed;
-      })(),
-      commandOutputFullChars: _parsePositiveInt(json['command_output_full_chars'],
-          kDefaultCommandOutputFullChars, 'command_output_full_chars'),
     );
   }
 
@@ -241,11 +235,10 @@ class AgentTypeConfig {
         'compaction_wait_threshold_percent': compactionWaitThresholdPercent,
         // 总是写回：这个旋钮没有界面，只能靠 config.json 改。
         'input_modalities': inputModalities,
-        // 命令工具的四个旋钮：一并写回，让它们在 ~/.aliasagent/config.json 里看得见。
+        // 命令工具的两项超时：一并写回，让它们在 ~/.aliasagent/config.json 里看得见。
+        // **两个输出上限键不再写回** —— 它们已废弃，写回去等于告诉用户它们还有用。
         'command_timeout_ms': commandTimeoutMs,
         'command_max_timeout_ms': commandMaxTimeoutMs,
-        'command_max_output_chars': commandMaxOutputChars,
-        'command_output_full_chars': commandOutputFullChars,
         if (standingRequirements.isNotEmpty)
           'standing_requirements': standingRequirements,
       };

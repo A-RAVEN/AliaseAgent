@@ -1,12 +1,21 @@
-## ADDED Requirements
+# tool-output-spill Specification
 
-### Requirement: 工具输出一律先落盘
+## Purpose
 
-每一次会产生文本输出的工具调用 SHALL 先把**完整输出**写到一个 spill 文件，写成功之后才决定怎么交付给模型。
+规定工具输出如何交付给模型：完整输出先原样落盘，再按体积决定内联全文还是只给头尾预览；省略的内容必须能用 `read_spill` 按字节读回；信封必须带量（总量、省略量、引用）；写盘失败必须可见。**本能力目前只在 `run_command` 上实现**，`web_fetch` / `grep_file` / `read_file` 的迁移不在本期范围。
 
-- 路径 SHALL 落在 `~/.aliasagent/spill/` 下，按会话分目录，文件名含调用序号；
-- 写入 SHALL NOT 截断、SHALL NOT 改变字节（含末尾换行：写入什么就是什么，规范化只允许发生在"内联预览"这一步，且必须写进用户文档）；
-- 会话被删除时，该会话的 spill 目录 SHALL 一并清理。
+## Requirements
+
+### Requirement: 工具输出先落盘（本期适用范围：`run_command`）
+
+`run_command` 的**每条流**在产生文本输出时 SHALL 先把**完整输出**写到一个 spill 文件，写成功之后才决定怎么交付给模型。
+
+> **适用范围**：本能力目前只在 `run_command` 上实现（全仓 `spill::write` 只有 `sidecar/src/command_tool.cpp` 一个调用点）。`web_fetch` / `grep_file` / `read_file` 的迁移**不在本期**、另开 change，它们现在仍按旧路径交付 —— 这不是"已统一"，是"迁移到一半"（初稿把本条写成"每一次会产生文本输出的工具调用"，与实现不符，已收窄）。
+
+- 路径 SHALL 落在 `~/.aliasagent/spill/` 下，按会话分目录，文件名含调用序号与流名（`<6 位序号>-<流>.txt`，每条流一个文件）；
+- 写入 SHALL NOT 截断、SHALL NOT 改变字节（含末尾换行：写入什么就是什么）；
+- **规范化只允许发生在"内联预览"这一步，且必须写进用户文档**：C++ 侧拼给模型的 `stdout` / `stderr` 会把 CRLF 归一成 LF、把非法 UTF-8 字节换成 U+FFFD（`command_tool.cpp` 的 `sanitize_utf8`），而 spill 文件里写的是原始字节。这条转换 SHALL 在 `Docs/user-guide/tools-command.md` 里写明（否则就是静默改动内容）；
+- 会话被删除时，该会话的 spill 目录 SHALL 一并清理；**对应不到会话的无主目录**（会话 id 为空时落进去的 `no-session/`）SHALL 在应用启动时清掉，且 SHALL 在用户文档里写明。
 
 #### Scenario: 小输出也先写盘
 - **WHEN** 调用 `run_command` 执行一条输出只有 `ok` 的命令

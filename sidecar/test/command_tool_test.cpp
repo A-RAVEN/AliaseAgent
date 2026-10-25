@@ -9,6 +9,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -17,6 +18,7 @@
 #include <nlohmann/json.hpp>
 
 #include "command_tool.h"
+#include "spill.h"
 #include "subprocess.h"
 #include "temp_dir.h"
 #include "tools.h"
@@ -28,6 +30,12 @@
 using nlohmann::json;
 
 namespace {
+
+/// 递归删掉一个目录，用例结束把 `cpp-test` 这个会话目录清掉（不往用户主目录留垃圾）。
+void remove_dir_recursive(const std::string& dir) {
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
 
 json run_req(const std::string& request) {
     return json::parse(command_tool::run_command(request));
@@ -131,14 +139,14 @@ TEST_CASE("run_command: 解释器落在本机真实存在的 PowerShell 上", "[
 // 输出的取舍
 // ---------------------------------------------------------------------------
 
-TEST_CASE("run_command: 超长输出保留尾部且标出截断", "[command_tool]") {
+TEST_CASE("run_command: 超长输出头尾都保留、并给出 spill 引用", "[command_tool]") {
     const int before = full_output_files();
     // 先写一个可识别的头、再写大量内容、最后写一个可识别的尾
     const std::string cmd =
         "Write-Output 'HEAD-MARKER'\n"
         "1..400 | ForEach-Object { Write-Output ('x' * 40) }\n"
         "Write-Output 'TAIL-MARKER'\n";
-    const json r = run_req(json{{"command", cmd}, {"max_output_chars", 1000}}.dump());
+    const json r = run_req(json{{"command", cmd}}.dump());
     INFO("r 摘要: ok=" << r["ok"] << " exit=" << r["exit_code"]
                        << " stdout_chars=" << r["stdout"].get<std::string>().size()
                        << " truncated=" << r["truncated"]["stdout"]);
@@ -146,19 +154,117 @@ TEST_CASE("run_command: 超长输出保留尾部且标出截断", "[command_tool
     const std::string out = r["stdout"].get<std::string>();
     REQUIRE(r["truncated"]["stdout"] == true);
     REQUIRE(out.find("TAIL-MARKER") != std::string::npos);      // 尾部留下
-    REQUIRE(out.find("HEAD-MARKER") == std::string::npos);      // 头部丢掉
-    REQUIRE(r["stdout_original_chars"].get<size_t>() > 1000);
-    REQUIRE(r["stdout_kept_chars"].get<size_t>() <= 1000);
-    REQUIRE(r["full_output_paths"]["stdout"].get<std::string>().empty() == false);
-    REQUIRE(full_output_files() == before + 1);                 // 落了一个文件
-    // 完整输出文件里两头的标记都在
-    std::ifstream f(r["full_output_paths"]["stdout"].get<std::string>(), std::ios::binary);
+    REQUIRE(out.find("HEAD-MARKER") != std::string::npos);      // 头部也留下（旧行为在这里丢过）
+
+    // 完整输出改落 spill 文件并给出引用，不再写系统临时目录
+    REQUIRE(r.contains("full_output_paths") == false);
+    REQUIRE(r.contains("spill"));
+    const std::string ref = r["spill"]["stdout"]["ref"].get<std::string>();
+    INFO("引用 = " << ref);
+    REQUIRE(ref.find(".aliasagent") != std::string::npos);
+    REQUIRE(file_exists(ref));
+    // 文件里两头的标记都在（它就是"完整输出"）
+    std::ifstream f(ref, std::ios::binary);
     const std::string full((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     REQUIRE(full.find("HEAD-MARKER") != std::string::npos);
     REQUIRE(full.find("TAIL-MARKER") != std::string::npos);
+    REQUIRE(full.size() == r["spill"]["stdout"]["total_bytes"].get<size_t>());
+    REQUIRE(full_output_files() == before);  // 系统临时目录里不再新增文件
 }
 
-TEST_CASE("run_command: 未超限时不写文件也不标截断", "[command_tool]") {
+TEST_CASE("run_command: 超长输出头尾都进结果、并给出 spill 引用", "[spill]") {
+    const int before = full_output_files();
+    // 构建失败的现场：第一条 error 在**头部**、总结在**尾部**，中间是大段日志。
+    // 旧行为只留尾部，头部的 error 必被砍掉 —— 这条用例就是钉这件事。
+    const std::string cmd =
+        "[Console]::Out.Write(\"error C2065: 'foo': undeclared identifier`n\")\n"
+        "[Console]::Out.Write('A' * 199950)\n"
+        "[Console]::Out.Write(\"`nBuild FAILED.`n\")\n";
+    const json r = run_req(json{{"command", cmd}, {"spill_session", "cpp-test"}}.dump());
+    INFO("r 摘要: ok=" << r["ok"] << " exit=" << r["exit_code"]
+                       << " stdout_chars=" << r["stdout"].get<std::string>().size());
+    REQUIRE(r["ok"] == true);
+
+    // ① 给模型看的那份里，头部那条 error 与尾部那句总结**都在**
+    const std::string out = r["stdout"].get<std::string>();
+    INFO("给模型的那份（前 200 字符）：" << out.substr(0, 200));
+    REQUIRE(out.find("error C2065") != std::string::npos);   // 头部留下
+    REQUIRE(out.find("Build FAILED.") != std::string::npos);  // 尾部留下
+
+    // ② 信封带量，且引用指向的文件真的存着 200000 字节左右的内容
+    REQUIRE(r.contains("spill"));
+    const json& env = r["spill"]["stdout"];
+    INFO("信封: " << env.dump());
+    REQUIRE(env["total_bytes"].get<size_t>() > 100000);
+    REQUIRE(env["omitted_bytes"].get<size_t>() > 0);
+    REQUIRE(env["head"].get<std::string>().find("error C2065") != std::string::npos);
+    REQUIRE(env["tail"].get<std::string>().find("Build FAILED.") != std::string::npos);
+
+    const std::string ref = env["ref"].get<std::string>();
+    INFO("引用 = " << ref);
+    REQUIRE(file_exists(ref));
+    // 信封的总量必须等于文件实际大小（不是信封自己说多少就是多少）
+    std::ifstream f(ref, std::ios::binary);
+    f.seekg(0, std::ios::end);
+    REQUIRE(static_cast<size_t>(f.tellg()) == env["total_bytes"].get<size_t>());
+    f.close();
+    // 全长 / 内联 / 省略三个数必须闭合
+    REQUIRE(env["head"].get<std::string>().size() +
+                env["tail"].get<std::string>().size() +
+                env["omitted_bytes"].get<size_t>() ==
+            env["total_bytes"].get<size_t>());
+
+    // ③ 不再有任何指向系统临时目录的东西：旧的 `full_output_paths` 与两个旧计数
+    //    字段都不许出现，系统临时目录里也不许新增 `aliasagent_run_command_*.log`。
+    REQUIRE(r.contains("full_output_paths") == false);
+    REQUIRE(r.contains("stdout_original_chars") == false);
+    REQUIRE(r.contains("stdout_kept_chars") == false);
+    REQUIRE(ref.find(".aliasagent") != std::string::npos);
+    REQUIRE(ref.find("spill") != std::string::npos);
+    REQUIRE(full_output_files() == before);
+
+    // 用例自己建的会话目录自己清掉（别往用户主目录里留测试垃圾）
+    remove_dir_recursive(spill::root() + "\\cpp-test");
+}
+
+TEST_CASE("run_command: 两条流同时超限时各给一个引用", "[spill]") {
+    // 规范 `command-tool` 的场景：stdout 与 stderr 都远超预览阈值。
+    // 两边各写一个自己的 spill 文件，两个引用必须不同、文件各是 200000 字节。
+    const std::string cmd =
+        "[Console]::Out.Write('X' * 200000); "
+        "[Console]::Error.Write('Y' * 200000)";
+    const json r = run_req(json{{"command", cmd}, {"spill_session", "cpp-test"}}.dump());
+    INFO("r 摘要: ok=" << r["ok"] << " truncated=" << r["truncated"].dump());
+    REQUIRE(r["ok"] == true);
+    REQUIRE(r["truncated"]["stdout"] == true);
+    REQUIRE(r["truncated"]["stderr"] == true);
+
+    const std::string outRef = r["spill"]["stdout"]["ref"].get<std::string>();
+    const std::string errRef = r["spill"]["stderr"]["ref"].get<std::string>();
+    INFO("outRef=" << outRef);
+    INFO("errRef=" << errRef);
+    REQUIRE(outRef != errRef);
+    REQUIRE(file_exists(outRef));
+    REQUIRE(file_exists(errRef));
+    // 两个文件都装着 200000 字节的完整输出，且信封的总量与之相符
+    for (const auto& pair : {std::make_pair(outRef, "stdout"), std::make_pair(errRef, "stderr")}) {
+        std::ifstream f(pair.first, std::ios::binary);
+        f.seekg(0, std::ios::end);
+        REQUIRE(static_cast<size_t>(f.tellg()) == 200000);
+        f.close();
+        REQUIRE(r["spill"][pair.second]["total_bytes"].get<size_t>() == 200000);
+        REQUIRE(r["spill"][pair.second]["omitted_bytes"].get<size_t>() > 0);
+    }
+    // 给模型的那份里两条流都被标成省略（不是只省略一条）
+    const std::string out = r["stdout"].get<std::string>();
+    const std::string err = r["stderr"].get<std::string>();
+    REQUIRE(out.find("bytes omitted") != std::string::npos);
+    REQUIRE(err.find("bytes omitted") != std::string::npos);
+
+    remove_dir_recursive(spill::root() + "\\cpp-test");
+}
+
+TEST_CASE("run_command: 未超限时也落盘、内联全文、临时目录不新增文件", "[command_tool]") {
     const int before = full_output_files();
     const json r = run_req(json{{"command", "Write-Output 'short-output'"}}.dump());
     INFO("r = " << r.dump());
@@ -166,32 +272,29 @@ TEST_CASE("run_command: 未超限时不写文件也不标截断", "[command_tool
     REQUIRE(r["truncated"]["stdout"] == false);
     REQUIRE(r["truncated"]["stderr"] == false);
     REQUIRE(r.contains("full_output_paths") == false);
-    REQUIRE(full_output_files() == before);  // 临时目录没有新增
+    REQUIRE(full_output_files() == before);  // 系统临时目录没有新增
+    // 小输出也要落盘：引用在、文件在、一个字节都没省略
+    REQUIRE(r.contains("spill"));
+    const std::string ref = r["spill"]["stdout"]["ref"].get<std::string>();
+    REQUIRE(file_exists(ref));
+    REQUIRE(r["spill"]["stdout"]["omitted_bytes"].get<size_t>() == 0);
+    REQUIRE(r["stdout"].get<std::string>().find("short-output") != std::string::npos);
 }
 
-TEST_CASE("run_command: 超过写文件上限时不落文件并如实说明", "[command_tool]") {
-    const int before = full_output_files();
-    const std::string cmd =
-        "1..400 | ForEach-Object { Write-Output ('y' * 40) }\n";
-    const json r = run_req(json{{"command", cmd},
-                                {"max_output_chars", 1000},
-                                {"full_output_chars", 1500}}  // 输出比它大 → 不落文件
-                                    .dump());
+TEST_CASE("run_command: preview_chars 非法时回落到缺省 1000", "[command_tool]") {
+    // 0 不是合法的"每侧字符数"，必须回落到缺省 1000，而不是"什么都不留"。
+    // （旧用例在这里传的是已废弃的 `max_output_chars`；那个键不再影响任何行为，
+    //  它的"超过写文件上限就不落文件"分支也随系统临时文件一起删掉了 ——
+    //  写盘失败的两种处置改由 `spill_write_test.cpp` 的 4.1 / 4.2 覆盖。）
+    const std::string cmd = "1..400 | ForEach-Object { Write-Output ('y' * 40) }";
+    const json r = run_req(json{{"command", cmd}, {"preview_chars", 0}}.dump());
     INFO("r 摘要: truncated=" << r["truncated"]["stdout"]
-                              << " 有路径=" << r.contains("full_output_paths"));
+                              << " head_bytes="
+                              << r["spill"]["stdout"]["head"].get<std::string>().size());
     REQUIRE(r["ok"] == true);
     REQUIRE(r["truncated"]["stdout"] == true);
-    REQUIRE(r.contains("full_output_paths") == false);  // 没有留下完整输出文件
-    REQUIRE(full_output_files() == before);
-}
-
-TEST_CASE("run_command: 字符上限低于下限时被抬到下限", "[command_tool]") {
-    const json r = run_req(json{{"command", "Write-Output 'ok'"},
-                                {"max_output_chars", 200}}  // 小于下限 1000
-                                    .dump());
-    INFO("r = " << r.dump());
-    REQUIRE(r["ok"] == true);
-    REQUIRE(r["stdout"].get<std::string>().find("ok") != std::string::npos);
+    // head 是全 ASCII 的原始字节切片 ⇒ 字节数就是字符数，必须正好 1000
+    REQUIRE(r["spill"]["stdout"]["head"].get<std::string>().size() == 1000);
 }
 
 // ---------------------------------------------------------------------------

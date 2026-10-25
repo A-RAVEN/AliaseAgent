@@ -322,7 +322,6 @@ void main() {
         model: 'test-model',
         systemPrompt: '',
         tools: ['read_file', 'list_dir'],
-        commandMaxOutputChars: 1234,
       ));
       resolver = ProviderResolver(const AppConfig(
         version: 1,
@@ -358,9 +357,14 @@ void main() {
       expect(sent, isNotNull);
       expect(sent, contains('"timeout_ms":120000'));
       expect(sent, contains('"max_timeout_ms":600000'));
-      expect(sent, contains('"max_output_chars":1234'),
-          reason: '配置里的 1234 必须出现在请求里；出现 8000 就说明配置没传下去');
-      expect(sent, contains('"full_output_chars":2000000'));
+      // 旧的两个输出上限键（command_max_output_chars / command_output_full_chars）
+      // 已废弃：改由 `spill.preview_chars` 一项决定头尾各留多少（见 change
+      // spill-large-tool-output 的 command-tool 规范）。所以请求里**不许**再出现旧键，
+      // 改断言新键 —— 这一条比"旧键还在"更严：旧键回来它就红。
+      expect(sent, isNot(contains('"max_output_chars"')));
+      expect(sent, isNot(contains('"full_output_chars"')));
+      expect(sent, contains('"preview_chars":1000'));
+      expect(sent, contains('"spill_session"'));
 
       expect(find.byType(ToolCallCard), findsOneWidget);
       expect(find.textContaining('COMMAND-OK'), findsWidgets);
@@ -395,6 +399,57 @@ void main() {
       expect(find.textContaining('BUILD-FAILED'), findsWidgets);
       expect(find.textContaining('boom: detail'), findsWidgets);
       expect(find.textContaining('[exit code: 7]'), findsWidgets);
+    });
+
+    // ------------------------------------------------------------------
+    // read_spill 走模型路径（change spill-large-tool-output，task 3.1）
+    // ------------------------------------------------------------------
+
+    testWidgets('read_spill 走模型路径：工具定义在、分支在、正文是读回的那段',
+        (tester) async {
+      _setupAgentRegistry();
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+
+      final sessions = testSessions(1);
+      final sessionRepo = FakeSessionRepository(sessions);
+      final msgRepo = FakeMessageRepository();
+      final sidecar = FakeSidecar()
+        ..stubReadSpill('{"ok":true,"text":"MIDDLE-SEGMENT","bytes_read":14,'
+            '"total_bytes":1000}')
+        ..queueToolCall('{"name":"read_spill","input":{"ref":"C:\\\\spill\\\\a.txt",'
+            '"offset":50000,"limit":14}}')
+        ..queueDone();
+
+      await tester.pumpWidget(_buildApp(
+        sessionRepo: sessionRepo, msgRepo: msgRepo, sidecar: sidecar,
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'Read the middle');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pump();
+
+      // ① 工具定义真的交给了模型（少了定义，模型不可能调它）
+      final tools = sidecar.lastToolsJson ?? '';
+      // ignore: avoid_print
+      print('[read_spill/假sidecar] 工具定义里有 read_spill: '
+          '${tools.contains('"read_spill"')}');
+      expect(tools, contains('"read_spill"'));
+
+      // ② 组装出的请求带上了 ref 与字节区间
+      final sent = sidecar.lastReadSpillRequest;
+      // ignore: avoid_print
+      print('[read_spill/假sidecar] 组装出的请求: $sent');
+      expect(sent, isNotNull);
+      expect(sent, contains('"offset":50000'));
+      expect(sent, contains('"limit":14'));
+
+      // ③ 没有落到 default 分支，而且模型看到的就是读回的那段原文
+      expect(find.textContaining('Unknown tool'), findsNothing);
+      expect(find.textContaining('MIDDLE-SEGMENT'), findsWidgets);
     });
 
     // ------------------------------------------------------------------

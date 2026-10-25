@@ -1,6 +1,6 @@
 ## Context
 
-工具输出现在由各工具各自截断，最典型的是 `run_command`：工具说明原文写着 *"Long output is truncated to its tail and the full output is written to a temp file whose path is reported."* 三个后果：只留尾部（构建的第一条 error 在头部，必被砍）、临时文件无保留策略、占位不带量。另有 `kToolResultElisionThreshold`（8000 字符，砍工具结果中段）与命令输出的 `maxLen = 2000`（Dart 侧二次截断）。
+工具输出现在由各工具各自截断，最典型的是 `run_command`：工具说明原文写着 *"Long output is truncated to its tail and the full output is written to a temp file whose path is reported."* 三个后果：只留尾部（构建的第一条 error 在头部，必被砍）、临时文件无保留策略、占位不带量。另有一道通用截断 `kToolResultElisionThreshold`（8000 字符，砍任何工具结果的中段）。**注意**：初稿在这里写过"命令输出的 `maxLen = 2000`（Dart 侧二次截断）"——**那个常量不存在**，`lib/` 里唯一的 `maxLen` 是 `search_text_assembly.dart` 的搜索文本预算（= 8000），2000 只出现在 `web_fetch` 的展示分支里（见 D7 末段）。
 
 相关既有设施：`ConfigService.attachmentsDir`（`~/.aliasagent/attachments/`，图片落盘就在用这套习惯）；`sidecar/src/tools.cpp` 的工作区沙箱（`Access denied: path outside workspace`）；`sidecar_api.cpp` 每个导出函数共用一块 `static std::string g_*_result`。
 
@@ -54,7 +54,7 @@
 
 ### D5 存放位置与会话绑定
 
-**选择**：`~/.aliasagent/spill/<会话 id>/<调用序号>.txt`；引用就是这个路径（或路径的相对形式）。
+**选择**：`~/.aliasagent/spill/<会话 id>/<6 位序号>-<流>.txt`（例如 `000001-stdout.txt`、`000001-stderr.txt`）。**每条流一个文件**：一次调用里 stdout 与 stderr 各写各的，两个引用必然不同（`spill.cpp` 的 `path_for` 是 `"%06u-%s.txt"`，`tag` 取 `stdout` / `stderr`）。引用就是这个路径（或路径的相对形式）。
 
 **理由**：与 `attachments` 同源，用户能在同一个目录下找到自己的东西；按会话分目录使"删会话 ⇒ 删目录"成为一条机械操作。
 
@@ -66,14 +66,16 @@
 
 **理由**：读回契约建立在"文件要么完整存在、要么不存在"之上；半截文件会让 `read_spill` 返回错误内容而不报错。
 
-### D7 迁移顺序：先 `run_command`，再其余；并处理三类"已有取回办法"的差异
+### D7 迁移顺序：本期只动 `run_command`，其余另开 change
 
-**选择**：本期只把 `run_command` 的交付改成 spill 信封；`web_fetch` / `grep_file` / `read_file` 的迁移放到后续任务。
+**选择**：本期只把 `run_command` 的交付改成 spill 信封。`web_fetch` / `grep_file` / `read_file` 的迁移**不在本期范围**，各自另开一个 change（本 change 的 `tasks.md` 里没有它们的条目，也没改它们的代码）。
 
-**核实过的事实（决定谁该改）**：
-- `run_command`：完整输出写**系统临时目录**，随时可能被清掉 —— 取回没有保障，必须改；
-- `web_fetch`：正文中段被 `substring(0, 2000)` 硬切、只留 `...`，没有任何取回指针 —— 必须改（`CLAUDE.md` 已把它列为既有缺陷实例）；
-- `glob_file` / `grep_file` / `read_file`：结果里已经写着取回办法（"call glob_file again with max_results=2N"、"use offset/limit to read more"），属于**可恢复**，优先级最低。
+**核实过的事实（决定谁该改、谁这期不改）**：
+- `run_command`：完整输出写**系统临时目录**，随时可能被清掉 —— 取回没有保障，本期必须改（已改）；
+- `web_fetch`：正文中段被 `substring(0, 2000)` 硬切、只留 `...`，没有任何取回指针 —— **这期不改**，它现在仍然是缺陷（`CLAUDE.md` 已把它列为既有缺陷实例），迁到 spill 要另开一个 change；
+- `glob_file` / `grep_file` / `read_file`：结果里已经写着取回办法（"call glob_file again with max_results=2N"、"use offset/limit to read more"），属于**可恢复**，优先级最低，同样不在本期。
+
+**为什么把 `web_fetch` 划出去**：这一期只承诺"`run_command` 的头一条 error 不再被砍"。把 `web_fetch` 一并塞进来会让验收面翻倍（要另测正文中段省略、另测引用可读回），而它现在的缺陷不会因为拖一期而变坏 —— 老实写在文档里，比假装它已修好要强。
 
 **注意**：`lib/main.dart` 里并没有 `const maxLen = 2000`（初稿与 design 初版都把它当"要删的二次截断"，核实后该常量不存在；相关逻辑是 `search_text_assembly.dart` 的 `maxLen = budget ?? searchTextElisionThreshold` 与 `web_fetch` 分支里的 2000 硬切）。
 
@@ -98,11 +100,11 @@
 1. C++：加 spill 写入（原子写）与 UTF-8 安全切分；`run_command` 改用新信封；导出 `read_spill`。
 2. Dart：`_toolDefs` 加 `read_spill` 并在 `_executeTool` 的 `switch` 里加分支；确认 `run_command` 的新信封不会被 `_elideOversizedToolResult`（8000 字符）掐掉引用段；配置读取 `spill.preview_chars`。
 3. 测试：先写/改用例到红，再改实现到绿（`tool-execution-tests` 与 `ffi-bridge` 的 delta 已给出判据）。
-4. 文档：`Docs/user-guide/tools-command.md` 补"输出怎么交付、怎么读回"；`configuration.md` 补 `spill.preview_chars` 并把两个旧命令键标废弃。
-5. 回滚：删掉 spill 目录不影响历史（历史里只存消息文本，不存 spill 引用）；工具结果退回旧信封即可。
+4. 文档：`Docs/user-guide/tools-command.md` 补"输出怎么交付、怎么读回"，并在那里把两个旧命令键标废弃（`configuration.md` 里从头到尾没有这两个键，它只需要补 `spill.preview_chars` 一行）。
+5. 回滚：删掉 spill 目录**不是**无影响的 —— 历史消息里存着 `[spill refs: …]` 那些引用（`composeCommandResultText` 把它拼进了工具结果正文，正文存进 `toolCallsJson`），文件删掉后这些引用会指空。回滚应以"停用新信封 + 让旧引用失效可接受"为前提，不要把它写成"删了没事"。
 
 ## Open Questions
 
 1. **引用形式**：go 绝对路径（`~/.aliasagent/spill/<会话>/<n>.txt`）—— 用户能直接打开查看；同时由 `read_spill` 做"必须在 spill 根目录内"的校验（见 D8 与 tasks 2.6）。逻辑引用（会话 id + 序号）留作以后若要把 spill 搬进别处时的选择。
 2. **`limit` 省略时的默认值**：取 `preview_chars × 2`（与内联阈值同源，不新增数）。本稿已把它写进 `ffi-bridge` 的 delta。
-3. ~~`web_fetch` 的正文中段省略标记里要不要再给路径~~ → 已定：迁移到 spill 时一并解决（D7 已把它列为"必须改"的第二条）。
+3. ~~`web_fetch` 的正文中段省略标记里要不要再给路径~~ → 已定：**不在本期解决**。`web_fetch` 的 2000 字硬切迁到 spill 是另一个 change 的事（D7 已把它划到本期范围外），它现在仍然是缺陷。

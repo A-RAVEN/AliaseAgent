@@ -13,6 +13,7 @@ import 'models/message.dart';
 import 'models/session.dart';
 import 'models/tool_call_activity.dart';
 import 'services/agent_type_registry.dart';
+import 'services/spill_paths.dart';
 import 'services/compaction/compaction_plan.dart';
 import 'services/compaction/guard_anchors.dart';
 import 'services/compaction/model_summary_provider.dart';
@@ -55,6 +56,16 @@ class _BackgroundFoldCancelled implements Exception {
 void main() {
   sqfliteFfiInit();
   databaseFactory = databaseFactoryFfi;
+  // 无主的 spill 目录（`no-session` 与测试留下的 `_it_*`）对应不到任何会话，
+  // "删会话"永远删不到它们 —— 启动时清一次，别让它只增不减。
+  try {
+    final removed = cleanOrphanSpillDirs();
+    if (removed.isNotEmpty) {
+      debugPrint('[AliasAgent] 启动清理无主 spill 目录：$removed');
+    }
+  } catch (e) {
+    debugPrint('[AliasAgent] 清理无主 spill 目录失败：$e');
+  }
   runApp(const MyApp());
 }
 
@@ -681,8 +692,10 @@ class ChatScreenState extends State<ChatScreen> {
             'environment variables with \$env:NAME. Each call is a fresh '
             'process — pass workdir instead of using cd. A non-zero exit code '
             'is NOT a tool failure: it is reported in the result so you can read '
-            'it. Long output is truncated to its tail and the full output is '
-            'written to a temp file whose path is reported.',
+            'it. The full output is always written to a spill file first; when it '
+            'is long, you get a head+tail preview (1000 characters each by '
+            'default) plus the file path as `ref` — read any byte range back with '
+            'the read_spill tool.',
         'input_schema': {
           'type': 'object',
           'properties': {
@@ -704,6 +717,40 @@ class ChatScreenState extends State<ChatScreen> {
             },
           },
           'required': ['command'],
+        },
+      },
+      // Spill 读回（spill-large-tool-output）：长输出被截成头尾预览后，模型用这条
+      // 按字节把中间段取回来。只认 spill 根目录里的引用（C++ 侧校验），不是通用
+      // 文件读取器 —— 读文件请用 read_file。
+      'read_spill': const {
+        'name': 'read_spill',
+        'description': 'Read a byte range back out of a spill file that a previous '
+            'tool result pointed at (the `ref` field). Use it when a tool result '
+            'says bytes were omitted. Only files under the app spill directory are '
+            'readable; anything else is refused. Offsets and limits are BYTES, not '
+            'characters — a range that cuts a multi-byte character in half is '
+            'refused instead of returning half a character.',
+        'input_schema': {
+          'type': 'object',
+          'properties': {
+            'ref': {
+              'type': 'string',
+              'description': 'The `ref` reported by the tool result (the spill '
+                  'file path).',
+            },
+            'offset': {
+              'type': 'integer',
+              'minimum': 0,
+              'description': 'Byte offset to start at. Defaults to 0.',
+            },
+            'limit': {
+              'type': 'integer',
+              'minimum': 1,
+              'description': 'How many bytes to return. Defaults to twice the '
+                  'configured preview length (2000 bytes by default).',
+            },
+          },
+          'required': ['ref'],
         },
       },
     };
@@ -1052,6 +1099,15 @@ class ChatScreenState extends State<ChatScreen> {
       _foldIdleTimer = null;
     }
     await _sessionRepo.delete(s.id);
+    // spill 随会话删除（规范「工具输出一律先落盘」的最后一条）：该会话留下的
+    // 工具输出文件已经没有引用了，留着只会占磁盘。规则与 C++ 侧同一套
+    // （`lib/services/spill_paths.dart` 是 `sidecar/src/spill.cpp` 的镜像）。
+    try {
+      final removedSpill = deleteSessionSpill(s.id);
+      debugPrint('[AliasAgent] 删除会话 ${s.id}：spill 目录已清理=$removedSpill');
+    } catch (e) {
+      debugPrint('[AliasAgent] 删除会话 ${s.id} 的 spill 目录失败：$e');
+    }
     if (!mounted) return;
     if (wasCurrent) {
       if (_isStreaming) _switchEpoch = _requestEpoch;
@@ -3041,7 +3097,7 @@ class ChatScreenState extends State<ChatScreen> {
               // 带图的工具结果（`read_image`）在这里变成 `[{text}, {image}]` 数组：
               // 正文仍旧走同一道截断，图片块原样跟在后面（10.4：库里只存路径）。
               'content': _toolResultContent(
-                text: _elideOversizedToolResult(
+                text: elideOversizedToolResult(
                     name: toolName, path: refetchArg, body: rawBody),
                 imagePath: _toolImagePath(tc),
               ),
@@ -3068,6 +3124,67 @@ class ChatScreenState extends State<ChatScreen> {
   /// 定义在 `search_text_assembly.dart`（本文件只 re-export 这个名字给内部用）。
   static const int kToolResultElisionThreshold = searchTextElisionThreshold;
 
+  /// `run_command` 的**模型可见正文**：标准输出、可选的 `[stderr]` 段、spill 引用
+  /// 一行、超时与退出码标记。
+  ///
+  /// 单独抽出来是为了能被单测直接调（`test/unit/spill_envelope_test.dart` 的 3.2 那条
+  /// 要验证"整段结果落进通用截断阈值时，引用段仍在"）。顺序有讲究：**引用必须放在
+  /// 最后一行** —— 通用截断只保留头尾两段，放中间等于被自己掐掉。
+  static String composeCommandResultText(Map<String, dynamic> parsed) {
+    final sb = StringBuffer();
+    final outText = (parsed['stdout'] as String?) ?? '';
+    final errText = (parsed['stderr'] as String?) ?? '';
+    if (outText.trim().isEmpty && errText.trim().isEmpty) {
+      sb.writeln('(no output)');
+    } else {
+      if (outText.isNotEmpty) {
+        sb.write(outText.endsWith('\n') ? outText : '$outText\n');
+      }
+      if (errText.isNotEmpty) {
+        sb.writeln('[stderr]');
+        sb.write(errText.endsWith('\n') ? errText : '$errText\n');
+      }
+    }
+    // spill 引用与省略量：**永远放在最后**，这样通用截断（保头保尾）掐不到它。
+    final spill = parsed['spill'];
+    if (spill is Map) {
+      final parts = <String>[];
+      for (final entry in spill.entries) {
+        final env = entry.value;
+        if (env is! Map) continue;
+        final ref = (env['ref'] as String?) ?? '';
+        if (ref.isEmpty) continue;
+        final total = env['total_bytes'] ?? 0;
+        final omitted = env['omitted_bytes'] ?? 0;
+        parts.add('${entry.key}=$ref ($total bytes, $omitted omitted)');
+      }
+      if (parts.isNotEmpty) {
+        sb.writeln('$kSpillRefsMarker ${parts.join('; ')} — read any byte range back '
+            'with read_spill(ref, offset, limit)]');
+      }
+    }
+    if (parsed['timed_out'] == true) {
+      sb.writeln('[timed out after ${(parsed['duration_ms'] ?? 0)}ms]');
+    }
+    final exitCode = parsed['exit_code'];
+    if (exitCode is int && exitCode != 0) {
+      sb.writeln('[exit code: $exitCode]');
+    }
+    return sb.toString().trimRight();
+  }
+
+  /// spill 引用行在模型可见正文里的固定标记。**只在这里写一次**：
+  /// `composeCommandResultText` 拼它、`bodyHasSpillRefs` 认它，两处一改就一起坏。
+  static const String kSpillRefsMarker = '[spill refs:';
+
+  /// 这段正文里有没有 spill 引用（决定通用截断的尾注该说什么）。
+  ///
+  /// 为什么只能靠字符串判断：走到 `elideOversizedToolResult` 那一层时，手里只有
+  /// 拼好的正文，结构化入参（`spill.*.ref`）在那之前已经变成文本了。
+  /// 所以标记收成常量 + 这条守卫，避免文案一改就静默失效。
+  static bool bodyHasSpillRefs(String body) =>
+      body.contains(kSpillRefsMarker);
+
   /// Elide an oversized tool_result BODY (near-zone elision). Keeps a head/tail
   /// preview (~the threshold total) + a truncation marker recording the original
   /// byte length + the refetch path, so the round stays a valid tool_use/
@@ -3076,7 +3193,8 @@ class ChatScreenState extends State<ChatScreen> {
   ///
   /// 阈值常量住在 `lib/services/search_text_assembly.dart`（`kToolResultElisionThreshold`）：
   /// 搜索结果那段拼装也用它当预算，两处**只留一份定义**，结构上不会漂移。
-  static String _elideOversizedToolResult({
+  /// 公开是为了能被单测直接调（3.2 的判据要能走真实拼装 + 真实截断）。
+  static String elideOversizedToolResult({
     required String name,
     required String path,
     required String body,
@@ -3087,9 +3205,16 @@ class ChatScreenState extends State<ChatScreen> {
     final tail = body.substring(body.length - half);
     // 再取记录：有可用的入参就给一条**能照抄**的动作；一个都没有就明说取不回，
     // 不许留空（留空等于告诉模型"中间没了"却不给它办法）。
+    //
+    // `run_command` 这类工具没有 path/url 可复述，但它的正文里带着
+    // `[spill refs: … read_spill(ref, offset, limit)]` —— 那时说"无法自动再取"
+    // 就是自相矛盾（上面一行刚给了取回办法）。所以先看正文里有没有 spill 引用。
+    final hasSpillRef = bodyHasSpillRefs(body);
     final refetch = path.isNotEmpty
         ? '; refetch via $name "$path"'
-        : '; 本篇无法自动再取，请重新给出地址后再试';
+        : (hasSpillRef
+            ? '; 中间的原文可用 read_spill(ref, offset, limit) 读回（ref 见上面那行 spill refs）'
+            : '; 本篇无法自动再取，请重新给出地址后再试');
     return '$head\n...[truncated middle of ${body.length - 2 * half} chars]...\n$tail'
         '\n[tool_result body elided: ${body.length} chars > threshold '
         '$kToolResultElisionThreshold$refetch]';
@@ -3210,8 +3335,10 @@ class ChatScreenState extends State<ChatScreen> {
       case 'browser_snapshot':
         resultJson = await _sidecar.browserSnapshot(jsonEncode({}));
       case 'run_command':
-        // 命令工具（add-command-tool）：四个配置值随每次调用一起传到执行侧，
-        // 执行侧不读配置文件（design 决策 7）。缺省值在这里补一份，与 C++ 侧一致。
+        // 命令工具：配置值随每次调用一起传到执行侧，执行侧不读配置文件
+        // （design 决策 7）。`spill.preview_chars` 的缺省值在这里补一份，与 C++ 侧一致；
+        // `spill_session` 决定 spill 子目录 —— 为了"删会话 ⇒ 删该会话 spill 目录"
+        // 能对上，目录名必须与库里的会话 id 同源（C++ 侧只做路径安全字符映射）。
         final cmdCfg = registry.lookup('general');
         final request = <String, dynamic>{
           'command': input['command'] ?? '',
@@ -3223,9 +3350,18 @@ class ChatScreenState extends State<ChatScreen> {
         request['timeout_ms'] =
             (input['timeout_ms'] as int?) ?? cmdCfg?.commandTimeoutMs ?? 120000;
         request['max_timeout_ms'] = cmdCfg?.commandMaxTimeoutMs ?? 600000;
-        request['max_output_chars'] = cmdCfg?.commandMaxOutputChars ?? 8000;
-        request['full_output_chars'] = cmdCfg?.commandOutputFullChars ?? 2000000;
+        request['preview_chars'] = widget.config.spillPreviewChars;
+        request['spill_session'] = _currentId ?? '';
         resultJson = await _sidecar.runCommand(jsonEncode(request));
+      case 'read_spill':
+        // 引用 + 字节区间。`preview_chars` 一起带上，好让 C++ 侧在缺 `limit` 时
+        // 用与内联预览同一个数（不另造一个默认值）。
+        resultJson = _sidecar.readSpill(jsonEncode({
+          'ref': input['ref'] ?? '',
+          if (input['offset'] is int) 'offset': input['offset'],
+          if (input['limit'] is int) 'limit': input['limit'],
+          'preview_chars': widget.config.spillPreviewChars,
+        }));
       case 'get_current_time':
         final now = DateTime.now();
         final dt = now.toIso8601String();
@@ -3284,36 +3420,7 @@ class ChatScreenState extends State<ChatScreen> {
             ? '(no page text captured)'
             : sb.toString().trim();
       } else if (name == 'run_command') {
-        // 模型看到的是"正文 + 可选的 stderr + 状态标记"，不是原始 JSON。
-        // 顺序有讲究：截断说明与全文路径必须留在结果里（它们可能紧跟在被截断的
-        // 尾部之后），而整段结果要落在 kToolResultElisionThreshold 之内 —— 工具
-        // 侧的上限取 8000 就是为了这件事，见 agent_type_config.dart 的注释。
-        final sb = StringBuffer();
-        final outText = (parsed['stdout'] as String?) ?? '';
-        final errText = (parsed['stderr'] as String?) ?? '';
-        if (outText.trim().isEmpty && errText.trim().isEmpty) {
-          sb.writeln('(no output)');
-        } else {
-          if (outText.isNotEmpty) sb.write(outText.endsWith('\n') ? outText : '$outText\n');
-          if (errText.isNotEmpty) {
-            sb.writeln('[stderr]');
-            sb.write(errText.endsWith('\n') ? errText : '$errText\n');
-          }
-        }
-        final paths = parsed['full_output_paths'];
-        if (paths is Map) {
-          for (final entry in paths.entries) {
-            sb.writeln('[output truncated; full output: ${entry.value}]');
-          }
-        }
-        if (parsed['timed_out'] == true) {
-          sb.writeln('[timed out after ${(parsed['duration_ms'] ?? 0)}ms]');
-        }
-        final exitCode = parsed['exit_code'];
-        if (exitCode is int && exitCode != 0) {
-          sb.writeln('[exit code: $exitCode]');
-        }
-        parsed['content'] = sb.toString().trimRight();
+        parsed['content'] = composeCommandResultText(parsed);
       } else if (name == 'write_file') {
         final bytes = parsed['bytes_written'] as int? ?? 0;
         final created = parsed['created'] as bool? ?? false;
@@ -3376,6 +3483,10 @@ class ChatScreenState extends State<ChatScreen> {
         parsed['content'] = sb.toString().trim().isEmpty
             ? '(no matches)'
             : sb.toString().trim();
+      } else if (name == 'read_spill') {
+        // 成功时模型要的**就是那段原文**；不设 content 的话上面那层会拿到空串，
+        // 于是"读回成功但什么都没有"—— 这比报错更难查。
+        parsed['content'] = (parsed['text'] as String?) ?? '';
       }
       return parsed;
     } catch (e) {

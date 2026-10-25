@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include "subprocess.h"
+#include "spill.h"
 #include "tools.h"
 
 #ifdef _WIN32
@@ -26,21 +27,17 @@ namespace command_tool {
 namespace {
 
 // ---------------------------------------------------------------------------
-// 缺省值与下限（规范：四个配置项与缺省值）
+// 缺省值（规范：`spill.preview_chars` 与两个超时）
 // ---------------------------------------------------------------------------
 
 /// 命令缺省超时毫秒数。
 constexpr long long kDefaultTimeoutMs = 120000;
 /// 超时上限：调用方给得比它大就按它执行。
 constexpr long long kDefaultMaxTimeoutMs = 600000;
-/// 每条流在内存里保留的字符上限。与 `lib/main.dart` 的
-/// `kToolResultElisionThreshold`（8000）对齐 —— 大于它的话，工具刚拼好的
-/// "截断了、全文在哪"会被发给模型之前那道通用截断掐掉中间。
-constexpr size_t kDefaultMaxOutputChars = 8000;
-/// 字符上限的下限：再小就连截断说明和全文路径都放不下。
-constexpr size_t kMinMaxOutputChars = 1000;
-/// 写临时文件的完整输出上限，超过它就不落文件、只标截断。
-constexpr size_t kDefaultFullOutputChars = 2000000;
+/// 头尾各留多少字符（`preview_chars` 的缺省值）。用户 2026-10-25 的决定：原话
+/// 「4000字听起来也好多，改成1000字吧」。可配，配置键 `spill.preview_chars`。
+/// 判断"要不要省略"的阈值是它的 2 倍（头 + 尾），算术推论，不是第二个魔数。
+constexpr long long kDefaultPreviewChars = 1000;
 
 /// UTF-8 输出钉成不带 BOM 的 UTF-8；用 `; ` 与命令接在同一行，好让 PowerShell
 /// 报错时的行号仍对应调用方命令的行号（前缀与命令之间**不许插换行**）。
@@ -148,7 +145,7 @@ std::string resolve_powershell() {
 }
 
 // ---------------------------------------------------------------------------
-// 小工具：取配置值、取临时目录、清洗 UTF-8、按字符取尾部
+// 小工具：取配置值、清洗 UTF-8、按字符切头尾、把一条流落盘并算出交付形状
 // ---------------------------------------------------------------------------
 
 long long int_field(const json& req, const char* key, long long fallback,
@@ -158,19 +155,6 @@ long long int_field(const json& req, const char* key, long long fallback,
   if (!v.is_number_integer() && !v.is_number_float()) return fallback;
   const long long n = v.get<long long>();
   return n < minimum ? fallback : n;
-}
-
-std::string temp_dir() {
-#ifdef _WIN32
-  char buf[MAX_PATH];
-  const DWORD n = GetTempPathA(MAX_PATH, buf);
-  std::string dir = (n > 0 && n < MAX_PATH) ? std::string(buf, n) : std::string(".");
-  while (dir.size() > 1 && (dir.back() == '\\' || dir.back() == '/')) dir.pop_back();
-  return dir;
-#else
-  const char* t = getenv("TMPDIR");
-  return t && *t ? std::string(t) : std::string("/tmp");
-#endif
 }
 
 /// 把不合法的 UTF-8 字节换成替换字符；顺便把 CRLF 归一成 LF（发给模型的文本用
@@ -221,78 +205,68 @@ std::string sanitize_utf8(const std::string& in) {
   return normalized;
 }
 
-/// 按字符数（不是字节数）取尾部。UTF-8 里一个字符最多 4 字节，所以按字节从后往前
-/// 扫、遇到字符起始字节就计一个字符，保证不会把多字节字符切成半个。
-/// 总字符数不超过上限时**原样返回**（早先这里写错过一次：短输出返回了空串，
-/// 症状是"命令明明有输出、返回的 stdout 却是空的"）。
-std::string tail_chars(const std::string& s, size_t max_chars, size_t* total_chars) {
-  size_t total = 0;
-  for (size_t i = 0; i < s.size(); ++i) {
-    if ((static_cast<unsigned char>(s[i]) & 0xC0) != 0x80) ++total;
-  }
-  if (total_chars) *total_chars = total;
-  if (total <= max_chars) return s;
-
-  size_t seen = 0;
-  for (size_t i = s.size(); i > 0;) {
-    --i;
-    if ((static_cast<unsigned char>(s[i]) & 0xC0) != 0x80) {
-      ++seen;
-      if (seen == max_chars) return s.substr(i);
-    }
-  }
-  return s;  // 到不了这里（total > max_chars 时必然找得到切点）
-}
-
-/// 把一条流的完整内容写进系统临时目录。返回路径；写不了则返回空串。
-std::string write_full_output(const std::string& content, const char* tag) {
-  static unsigned counter = 0;
-  ++counter;
-#ifdef _WIN32
-  const unsigned long pid = GetCurrentProcessId();
-#else
-  const unsigned long pid = static_cast<unsigned long>(getpid());
-#endif
-  char name[512];
-  std::snprintf(name, sizeof(name), "%s\\aliasagent_run_command_%lu_%u_%s.log",
-                temp_dir().c_str(), pid, counter, tag);
-  FILE* f = std::fopen(name, "wb");
-  if (!f) return "";
-  const size_t written = std::fwrite(content.data(), 1, content.size(), f);
-  std::fclose(f);
-  if (written != content.size()) return "";
-  return name;
-}
-
-/// 一条流的取舍结果。
-struct StreamResult {
-  std::string text;       // 交给模型的尾部
+/// 一条流的交付形状。
+///
+/// 三条不变量（`spill-large-tool-output` 的判据就钉在这三条上）：
+///   ① `head` / `tail` 是 spill 文件里的**原始字节切片**（只在码点边界落刀），
+///      所以 `|head| + |tail| + omitted_bytes == total_bytes` 恒成立；
+///   ② 给模型看的 `inline_text` 由 `sanitize_utf8(head/tail)` 拼出来 —— 换行归一
+///      与坏字节替换**只发生在这一步**，不落到文件上；
+///   ③ `ref` 就是那个文件的绝对路径，`read_spill` 能按字节读回中间段。
+struct StreamShape {
+  std::string inline_text;  // 交给模型的那份
   bool truncated = false;
-  size_t original_chars = 0;
-  size_t kept_chars = 0;
-  std::string full_path;  // 写了完整输出文件时非空
+  json envelope = json::object();  // {ref,total_bytes,omitted_bytes,head,tail}
 };
 
-StreamResult shape_stream(const std::string& raw, size_t max_chars, size_t full_limit,
-                          const char* tag) {
-  StreamResult r;
-  const std::string cleaned = sanitize_utf8(raw);
-  size_t total_chars = 0;
-  r.text = tail_chars(cleaned, max_chars, &total_chars);
-  r.original_chars = total_chars;
-  r.kept_chars = (total_chars > max_chars) ? max_chars : total_chars;
-  r.truncated = total_chars > max_chars;
-  if (r.truncated && cleaned.size() <= full_limit) {
-    r.full_path = write_full_output(cleaned, tag);
+/// 把一条流先落盘，再按 `preview_chars × 2` 决定内联全文还是头尾 + 引用。
+///
+/// 落盘失败时不返回 `ok:false` —— 由调用方按"输出是否超过预览阈值"决定兜底方式
+/// （小的直接内联，大的必须报错，见规范"写盘失败必须可见"）。
+StreamShape shape_stream(const std::string& raw, size_t preview_chars,
+                         const std::string& session, const char* tag,
+                         spill::Written* written_out) {
+  StreamShape r;
+  const spill::Written w = spill::write(session, tag, raw);
+  if (written_out) *written_out = w;
+  if (!w.ok) {
+    // 写盘失败：先把能给的给出去，形态交给调用方判断。
+    r.inline_text = sanitize_utf8(raw);
+    return r;
   }
-  return r;
-}
+  const size_t total = w.bytes;
+  const size_t chars = spill::char_count(raw);
+  if (chars <= preview_chars * 2) {
+    // 内联全文：不出现任何"省略"字样（否则省略量会是 0 或负数）
+    r.inline_text = sanitize_utf8(raw);
+    r.truncated = false;
+    r.envelope = {{"ref", w.path},
+                  {"total_bytes", total},
+                  {"omitted_bytes", 0},
+                  {"head", raw},
+                  {"tail", ""}};
+    return r;
+  }
 
-void merge_stream(json& out, const StreamResult& s, const char* key) {
-  out[key] = s.text;
-  if (!s.truncated) return;
-  out[std::string(key) + "_original_chars"] = s.original_chars;
-  out[std::string(key) + "_kept_chars"] = s.kept_chars;
+  const std::string head = spill::head_chars(raw, preview_chars);
+  const std::string tail = spill::tail_chars(raw, preview_chars);
+  const size_t covered = head.size() + tail.size();
+  const size_t omitted = total > covered ? total - covered : 0;
+  r.truncated = true;
+  r.envelope = {{"ref", w.path},
+                {"total_bytes", total},
+                {"omitted_bytes", omitted},
+                {"head", head},
+                {"tail", tail}};
+
+  // 省略说明写在**头尾之间**：说清略去了多少、全文在哪、怎么读回。
+  char how[256];
+  std::snprintf(how, sizeof(how),
+                "[... %zu bytes omitted of %zu; full output: %s — read it back with "
+                "read_spill (ref, offset=%zu, limit=%zu)]",
+                omitted, total, w.path.c_str(), head.size(), omitted);
+  r.inline_text = sanitize_utf8(head) + "\n" + how + "\n" + sanitize_utf8(tail);
+  return r;
 }
 
 }  // namespace
@@ -370,13 +344,10 @@ std::string run_command(const std::string& request_json) {
   if (max_timeout_ms < 1) max_timeout_ms = kDefaultMaxTimeoutMs;
   const long long effective_timeout = std::min(timeout_ms, max_timeout_ms);
 
-  long long max_output_chars =
-      int_field(req, "max_output_chars", static_cast<long long>(kDefaultMaxOutputChars));
-  if (max_output_chars < static_cast<long long>(kMinMaxOutputChars)) {
-    max_output_chars = static_cast<long long>(kMinMaxOutputChars);
-  }
-  const long long full_output_chars =
-      int_field(req, "full_output_chars", static_cast<long long>(kDefaultFullOutputChars));
+  // 头尾各留多少字符：单一配置项 `spill.preview_chars`（配置由 Dart 侧读好随请求
+  // 传进来，执行侧不读配置文件 —— 与超时那几个值的做法一致）。
+  const long long preview_chars = int_field(req, "preview_chars", kDefaultPreviewChars);
+  const std::string spill_session = req.value("spill_session", std::string("no-session"));
 
   // ---- 起进程 ----
   subprocess::Options opts;
@@ -398,26 +369,43 @@ std::string run_command(const std::string& request_json) {
         .dump();
   }
 
-  const StreamResult out = shape_stream(res.stdout_data, static_cast<size_t>(max_output_chars),
-                                        static_cast<size_t>(full_output_chars), "stdout");
-  const StreamResult err = shape_stream(res.stderr_data, static_cast<size_t>(max_output_chars),
-                                        static_cast<size_t>(full_output_chars), "stderr");
+  spill::Written out_written;
+  spill::Written err_written;
+  const StreamShape out = shape_stream(res.stdout_data, static_cast<size_t>(preview_chars),
+                                       spill_session, "stdout", &out_written);
+  const StreamShape err = shape_stream(res.stderr_data, static_cast<size_t>(preview_chars),
+                                       spill_session, "stderr", &err_written);
+
+  // 写盘失败要看得见（规范"写盘失败必须可见"）：小输出已经内联全文，不算失败；
+  // 大输出则**不能**只给一部分冒充完整结果 —— 直接报错，说清目录与原因。
+  const size_t preview_limit = static_cast<size_t>(preview_chars) * 2;
+  for (const auto* pair : {&out_written, &err_written}) {
+    if (pair->ok) continue;
+    const bool is_stdout = (pair == &out_written);
+    const std::string& raw = is_stdout ? res.stdout_data : res.stderr_data;
+    if (spill::char_count(raw) <= preview_limit) continue;
+    return json{{"ok", false},
+                {"error", std::string(is_stdout ? "标准输出" : "标准错误") +
+                              "没能写进 spill 文件，且输出超过了预览阈值（无法只给一部分"
+                              "冒充完整结果）：" + pair->error}}
+        .dump(-1, ' ', false, json::error_handler_t::replace);
+  }
 
   json result;
   result["ok"] = true;
   result["exit_code"] = res.exit_code;
   result["timed_out"] = res.timed_out;
   result["duration_ms"] = duration_ms;
-  merge_stream(result, out, "stdout");
-  merge_stream(result, err, "stderr");
+  result["stdout"] = out.inline_text;
+  result["stderr"] = err.inline_text;
   result["truncated"] = {{"stdout", out.truncated}, {"stderr", err.truncated}};
-  if (!out.full_path.empty() || !err.full_path.empty()) {
-    json paths = json::object();
-    if (!out.full_path.empty()) paths["stdout"] = out.full_path;
-    if (!err.full_path.empty()) paths["stderr"] = err.full_path;
-    result["full_output_paths"] = paths;
-  }
-  return result.dump();
+  json envelopes = json::object();
+  if (out_written.ok) envelopes["stdout"] = out.envelope;
+  if (err_written.ok) envelopes["stderr"] = err.envelope;
+  if (!envelopes.empty()) result["spill"] = envelopes;
+  // `error_handler_t::replace`：输出里可能有不是合法 UTF-8 的字节，替换掉而不是抛异常
+  // （文件里仍是原始字节，替换只影响这份 JSON 里的呈现）。
+  return result.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
 }  // namespace command_tool

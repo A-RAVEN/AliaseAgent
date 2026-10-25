@@ -4,7 +4,8 @@
 
 动态库 SHALL 导出 `read_spill(const char* request_json)`，`request_json` 形如 `{"ref":"<spill 引用>","offset":0,"limit":1000}`，返回以 NUL 结尾的 JSON 字符串。
 
-- `offset` 与 `limit` 的单位都是**字节**；`offset` 省略时按 0 处理，`limit` 省略时按 `preview_chars × 2` 处理（与内联预览的上界一致，不额外造数）；
+- `offset` 与 `limit` 的单位都是**字节**；`offset` 省略时按 0 处理，`limit` 省略时按 `preview_chars × 2` 处理。
+  > **单位说明（对抗验证后补）**：`preview_chars × 2` 只是**复用了那个数字**，不是"与内联预览的上界一致"—— 内联预览按**字符**计（1000 个汉字 = 1000 字符 = 3000 字节），而 `limit` 按**字节**计，缺省 2000 字节只够 666 个汉字。要取"预览里那 1000 个字符的字节数"，调用方必须自己按字节算区间；本条不承诺两者相等。
 - 成功：`{"ok":true,"text":"<该区间原文>","bytes_read":N,"total_bytes":M}`；
 - 失败：`{"ok":false,"error":"<原因>"}`，与其它工具失败形状一致。
 

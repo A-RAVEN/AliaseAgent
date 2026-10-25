@@ -8,27 +8,29 @@
 /// 标准错误还给调用方。
 ///
 /// 三条硬规矩（设计与规范里的决策，改动前先读
-/// `openspec/changes/add-command-tool/design.md` 的决策 1~5）：
+/// `openspec/changes/add-command-tool/design.md` 的决策 1~5，以及
+/// `openspec/changes/spill-large-tool-output/`）：
 ///   1. 命令字符串作为 `-Command` 的**单个** argv 元素交出去，外层不再套一层解析；
 ///   2. 对子进程**额外注入**环境变量而不是替换（PATH 必须留给子进程）；
-///   3. 输出只保留尾部、截断可见、完整内容写进系统临时目录并把路径交回去。
+///   3. 每条流的**完整输出先落盘**到 `~/.aliasagent/spill/<会话>/<序号>-<流>.txt`
+///      （原子写），内存里保留头尾各 `preview_chars` 个字符并给出可取回的引用。
 ///
 /// 请求 JSON：
 ///   {"command":"...",            // 必填，PowerShell 方言
 ///    "workdir":"...",            // 可选，缺省为当前工作区；越界拒绝
 ///    "timeout_ms":120000,        // 可选，毫秒；非法值回落缺省；超过上限按上限
 ///    "max_timeout_ms":600000,    // 可选，超时上限
-///    "max_output_chars":8000,    // 可选，每条流保留的字符上限（下限 1000）
-///    "full_output_chars":2000000}// 可选，写临时文件的完整输出上限
+///    "preview_chars":1000,       // 可选，头尾各留多少字符（配置键 spill.preview_chars）
+///    "spill_session":"<会话 id>"} // 可选，决定 spill 子目录；缺省 no-session
 ///
 /// 返回 JSON（成功执行，无论命令自身退出码是否为 0）：
-///   {"ok":true,"exit_code":N,"stdout":"...","stderr":"...","timed_out":bool,
-///    "duration_ms":N,
-///    "truncated":{"stdout":bool,"stderr":bool},
-///    "stdout_original_chars":N,"stdout_kept_chars":N,   // 仅在被截断时出现
-///    "stderr_original_chars":N,"stderr_kept_chars":N,
-///    "full_output_paths":{"stdout":"...","stderr":"..."}} // 仅在写了文件时出现
-/// 工具自身无法执行时返回 {"ok":false,"error":"<中文可读说明>"}。
+///   {"ok":true,"exit_code":N,"timed_out":bool,"duration_ms":N,
+///    "stdout":"...","stderr":"...",                       // 给模型看的那份
+///    "truncated":{"stdout":bool,"stderr":bool},           // 是否只给了头尾
+///    "spill":{"stdout":{"ref":"...","total_bytes":N,"omitted_bytes":N,
+///                       "head":"...","tail":"..."}, "stderr":{...}}}
+/// 工具自身无法执行、或输出超限又写不进 spill 时返回
+/// {"ok":false,"error":"<中文可读说明>"}。
 namespace command_tool {
 
 /// 起进程时用的 argv。**单独暴露出来是为了能被断言**：规范要求"命令字符串作为

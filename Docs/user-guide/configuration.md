@@ -119,6 +119,8 @@ C:\Users\你的名字\.aliasagent\config.json
 | `compaction_wait_threshold_percent` | 每个 agent | **等待**阈值百分比，1 到 100 的整数：这一轮要发出去的内容占模型总上下文超过这个比例时，才等压缩做完再发（见 [上下文压缩](context-compaction.md)） | 用 75 |
 | `standing_requirements` | 每个 agent | 你写死的目标，压缩时不许丢掉 | 空清单 |
 | `input_modalities` | 每个 agent | 这个模型能吃哪些输入：一个数组，取值只能是 text 和 image。**不写 image，贴进来的图片就不会发给模型**，界面上会提示"模型未声明图片输入，本次没有发送图片" | `["text"]`（只有文字） |
+| `spill` | 顶层 | 工具输出的落盘与预览配置（整块都可以不写） | 用下表里的缺省值 |
+| `preview_chars` | `spill` 下（完整键名 `spill.preview_chars`） | 工具输出太长时，结果里**头尾各留多少字符**（其余写进 spill 文件、靠 `read_spill` 按字节读回）。判"要不要省略"的阈值是它的 2 倍：头 1000 + 尾 1000 = 2000，超过 2000 字符才省略 | 1000 |
 | `search` | 顶层 | 搜索服务配置（整块都可以不写） | 不注册任何搜索服务，也就没有 `web_search` 工具 |
 | `zhipuai` / `kimi` / `searxng` | 每个搜索服务 | 三家搜索服务的名字，对应各自的键 | 该服务不启用 |
 | `deepseek` | `search` 下 | DeepSeek 自己的搜索：**不用另外买搜索 key**，复用你在 `providers` 里已经填的那把（前提是那个地址指向 `api.deepseek.com`） | 该服务不启用（写一个空的 `{}` 就算启用） |

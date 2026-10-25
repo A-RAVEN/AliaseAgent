@@ -274,6 +274,17 @@ class FakeSidecar implements ISidecar {
     return _runCommandResult;
   }
 
+  // Spill 读回桩（spill-large-tool-output）。默认返回空区间，用例按需覆盖。
+  String _readSpillResult = '{"ok":true,"text":"","bytes_read":0,"total_bytes":0}';
+  String? lastReadSpillRequest;
+  void stubReadSpill(String json) { _readSpillResult = json; }
+
+  @override
+  String readSpill(String requestJson) {
+    lastReadSpillRequest = requestJson;
+    return _readSpillResult;
+  }
+
   @override
   String writeFile(String requestJson) => _writeFileResult;
 

@@ -149,14 +149,26 @@ SIDECAR_API const char* browser_snapshot(const char* request_json);
 
 /// Run one PowerShell command and return its exit code, stdout and stderr.
 /// 命令字符串作为 `-Command` 的单个参数交出去，外层不再套第二层解析；
-/// 输出只保留尾部，被截断时完整内容写在系统临时目录并把路径带回来。
+/// 每条流的**完整输出先落盘**到 `~/.aliasagent/spill/<会话>/<序号>-<流>.txt`，
+/// 超长时只内联头尾各 `preview_chars` 个字符并给出可取回的引用。
 /// @param request_json  {"command":"...","workdir":"...","timeout_ms":N,
-///                       "max_timeout_ms":N,"max_output_chars":N,"full_output_chars":N}
+///                       "max_timeout_ms":N,"preview_chars":N,"spill_session":"..."}
 /// Returns JSON: {"ok":true,"exit_code":N,"stdout":"...","stderr":"...",
 ///                "timed_out":bool,"duration_ms":N,
-///                "truncated":{"stdout":bool,"stderr":bool}, ...}
+///                "truncated":{"stdout":bool,"stderr":bool},
+///                "spill":{"stdout":{"ref":"...","total_bytes":N,
+///                                   "omitted_bytes":N,"head":"...","tail":"..."},...}}
 ///           or {"ok":false,"error":"..."}
 SIDECAR_API const char* run_command(const char* request_json);
+
+/// Read a byte range back out of a spill file written by run_command.
+/// `offset` / `limit` 的单位都是**字节**；`limit` 省略时按 `preview_chars × 2` 取。
+/// `ref` 解析后必须落在 spill 根目录（`~/.aliasagent/spill/`）之内，否则拒绝 ——
+/// 这条是"不许把 read_spill 变成任意文件读取器"的守卫。
+/// @param request_json  {"ref":"...","offset":N,"limit":N,"preview_chars":N}
+/// Returns JSON: {"ok":true,"text":"...","bytes_read":N,"total_bytes":M}
+///           or {"ok":false,"error":"..."}（错误文本按原因各不相同）
+SIDECAR_API const char* read_spill(const char* request_json);
 
 #ifdef __cplusplus
 }

@@ -60,6 +60,7 @@ set(SOURCES
   src/kimi_search.cpp
   src/browser.cpp
   src/command_tool.cpp
+  src/spill.cpp
   src/deepseek_search.cpp
   src/image_probe.cpp
   src/clipboard_image.cpp
@@ -112,6 +113,7 @@ add_executable(sidecar_tests
   src/kimi_search.cpp
   src/browser.cpp
   src/command_tool.cpp
+  src/spill.cpp
   src/deepseek_search.cpp
   src/image_probe.cpp
   src/clipboard_image.cpp
@@ -124,6 +126,7 @@ add_executable(sidecar_tests
   test/search_provider_test.cpp
   test/browser_test.cpp
   test/command_tool_test.cpp
+  test/spill_write_test.cpp
   test/deepseek_search_test.cpp
   test/image_probe_test.cpp
   test/clipboard_image_test.cpp

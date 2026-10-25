@@ -7,6 +7,7 @@
 #include "web_fetch.h"
 #include "browser.h"
 #include "command_tool.h"
+#include "spill.h"
 #include <string>
 #include <cstring>
 
@@ -301,6 +302,30 @@ SIDECAR_API const char* run_command(const char* request_json) {
     return err_static.c_str();
   } catch (...) {
     LOG_ERR("run_command: unknown exception");
+    return "{\"ok\":false,\"error\":\"Unknown internal error\"}";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// read_spill（把 spill 文件的一段按字节读回来，change spill-large-tool-output）
+//
+// 只读 spill 根目录（`~/.aliasagent/spill/`）里的文件；越界、越界引用、切在多字节
+// 字符中间各有不同错误文本，由 `spill::read_request` 给出。
+// ---------------------------------------------------------------------------
+static std::string g_read_spill_result;
+
+SIDECAR_API const char* read_spill(const char* request_json) {
+  LOG_TRACE("read_spill called");
+  try {
+    g_read_spill_result = spill::read_request(request_json ? request_json : "{}");
+    return g_read_spill_result.c_str();
+  } catch (const std::exception& e) {
+    static std::string err_static;
+    err_static = "{\"ok\":false,\"error\":\"" + tools::json_escape(e.what()) + "\"}";
+    LOG_ERR("read_spill exception: " + std::string(e.what()));
+    return err_static.c_str();
+  } catch (...) {
+    LOG_ERR("read_spill: unknown exception");
     return "{\"ok\":false,\"error\":\"Unknown internal error\"}";
   }
 }

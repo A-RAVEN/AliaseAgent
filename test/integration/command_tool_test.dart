@@ -153,29 +153,40 @@ void main() {
     bridge.setWorkspace('.');
   });
 
-  test('配置改小后同一条命令的输出真的变短（覆盖 8）', () async {
+  test('预览长度改小后同一条命令的预览真的变短（覆盖 8）', () async {
+    // 改前用的是已废弃的 `max_output_chars`（"保留尾部 N 个字符"）。那条交付方式
+    // 已被 change spill-large-tool-output 取代：现在唯一的旋钮是 `preview_chars`
+    // （头尾各留多少），判"要不要省略"的阈值是它的 2 倍。
     final command =
         "1..400 | ForEach-Object { Write-Output ('x' * 40) }";
     // ignore: avoid_print
-    print('[命令工具] 实际执行的命令: $command（先按上限 1000，再按缺省）');
+    print('[命令工具] 实际执行的命令: $command（先按 preview_chars=500，再按缺省 1000）');
     final small = await bridge
-        .runCommand(jsonEncode({'command': command, 'max_output_chars': 1000}))
+        .runCommand(jsonEncode({'command': command, 'preview_chars': 500}))
         .then(jsonDecode);
     final plain = await bridge
         .runCommand(jsonEncode({'command': command}))
         .then(jsonDecode);
     // ignore: avoid_print
-    print('[命令工具] 实测读数: 小上限长度=${(small['stdout'] as String).length} '
+    print('[命令工具] 实测读数: 小预览长度=${(small['stdout'] as String).length} '
         '截断=${small['truncated']?['stdout']} | '
         '缺省长度=${(plain['stdout'] as String).length} '
         '截断=${plain['truncated']?['stdout']}');
     expect(small['ok'], isTrue);
     expect(plain['ok'], isTrue);
-    expect((small['stdout'] as String).length, lessThanOrEqualTo(1000));
     expect(small['truncated']['stdout'], isTrue);
-    // 这条命令的输出（约 16800 字符）比缺省上限 8000 大，所以缺省也该截断，
-    // 但保留的字符一定比"上限 1000"那次多 —— 差别证明上限这个值真的走到了执行侧。
+    expect(plain['truncated']['stdout'], isTrue);
+
+    // 头尾各 500 ⇒ 正文 ≈ 1000 + 一行省略说明；留一截余量（省略说明的长度可变）
+    final smallLen = (small['stdout'] as String).length;
+    expect(smallLen, lessThan(1500), reason: 'preview_chars=500 时正文不该超过 1000 + 说明');
+    expect(smallLen, greaterThanOrEqualTo(1000),
+        reason: '头 500 + 尾 500 一个字都不许少');
+    // 缺省 1000 的正文一定比 500 那次长 —— 差别证明这个值真的走到了执行侧
     expect((plain['stdout'] as String).length,
-        greaterThan((small['stdout'] as String).length));
+        greaterThan(smallLen));
+    // 两边的 head 长度也必须真的是 500 / 1000（不是"看起来短了"）
+    expect(((small['spill'] as Map)['stdout'] as Map)['head'], hasLength(500));
+    expect(((plain['spill'] as Map)['stdout'] as Map)['head'], hasLength(1000));
   });
 }
