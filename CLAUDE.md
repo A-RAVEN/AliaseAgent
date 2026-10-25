@@ -50,6 +50,8 @@ Flutter 桌面 AI 对话应用，通过 dart:ffi 调用 C++ Sidecar 动态库（
 
 - **openspec 下不许存在只有 proposal 的活跃 change** — 判定范围：`openspec/changes/<name>/` 顶层直接子目录且含 `.openspec.yaml` 的活跃 change；用 `openspec status --change <name> --json` 判定，`tasks` 为 `blocked`（缺 design / specs）即垃圾 → `rm -rf` 后用 `/opsx:propose` 重来。**永不删**：`openspec/changes/archive/` 下的任何内容（那是合法归档历史，不许用"目录里文件少"这种感性判断去删）；不含 `.openspec.yaml` 的目录不是活跃 change，不适用本条。
 
+- **本产品是零审批的全权限设计**（2026-10-25 用户明令：「我习惯完全权限的ai，讨厌批准执行」）—— **不许**给工具加"执行前确认"弹窗、沙箱、危险命令拦截、权限模式开关；也不许把"没有这些"写成已知缺陷或待办。工具说明里如实告诉模型"没有沙箱、不可撤销"就够，剩下的靠模型自觉 + 用户用 git 兜底。这条与失败方案台账第 24、25 条配套：以后再想提"快照回退"或"命令确认"，先读那两条，给不出可核的"这次哪里不同"就别提。
+
 - **归档 change 时必须先把 delta spec 同步进 `openspec/specs/`**（2026-10-25 用户明令：记 CLAUDE，spec 归档时必须同步）—— 不许走"不同步直接归档"那条路，也不许边归档边问。做法：对 `openspec/changes/<name>/specs/<能力>/spec.md` 逐份处理 —— 主 spec 已存在的，把 delta 的 `## ADDED Requirements` / `## MODIFIED Requirements` 等块应用进主 spec 的 `## Requirements` 段；主 spec 不存在的，新建 `openspec/specs/<能力>/spec.md`，**必须带 `## Purpose`**（缺它 `openspec validate` 直接判失败）。落地后 `openspec validate --specs` 的总数与归档前对照，把"同步前 / 同步后"两组数字写进归档报告；仍失败的逐条说明是不是既有缺口。
   **两个已踩过的坑**：① 顺序是先同步、再归档 —— 归档后 delta 已经在 `archive/` 下，补起来别扭；② PowerShell 的 `Set-Content -Encoding UTF8` 会写 **UTF-8 BOM**（文件头 `239,187,191`），解析器看到的是 `\uFEFF## Purpose`，会报「缺 Purpose」；新建规范一律按无 BOM 写（`New-Object System.Text.UTF8Encoding($false)`）。
 
@@ -101,3 +103,57 @@ Flutter 桌面 AI 对话应用，通过 dart:ffi 调用 C++ Sidecar 动态库（
   5. 举证责任在提出方：新方案与台账某条实质相同时，必须给出"这次哪里不同"的可核证据，给不出即作废。
 
 - **迭代不收敛（"鬼打墙"）** — 实测教训（add-browser-tool，2026-09-12）：连续三轮 Workflow 审查确认数 15 → 15 → 11，其中真产品缺陷仅 1 条；反复出现的是"记录声称已改而文件未改""行号被后续编辑顶偏"，根因是记录方式而不是代码缺陷。识别与处置的完整规则见全局 `AGENTS.md` 的同名条目；本项目另外记住两点：审查对象必须是产物而不是措辞；净进展检查要按**交付物**分类（改 `design.md` / `spec.md` / 任务清单不算前进），不要按文件类型分类。
+
+## 文档地图与维护规则（2026-10-25 用户要求整理进本节）
+
+**总原则：一份事实只有一个载体。** 同一个问题在两份文档里都有答案，就一定会不一致；所以下面每条都写明「只装什么 / 不装什么」。
+
+### 一、各文档的唯一职责
+
+| 文档 | 只装什么 | **不**装什么 |
+|---|---|---|
+| `~/.dsh/AGENTS.md`（全局规则） | 跨项目通用的行为规则 | 本项目的技术细节、本项目的待办 |
+| `CLAUDE.md`（本节所在的文件） | 本项目的规则与判据（怎么干、怎么算干完） | 待办条目、缺陷清单、方案台账、功能说明 |
+| `README.md` | 这是什么、装什么、怎么编译/运行/配置，**功能文档索引** | 内部实现、待办、缺陷 |
+| `TODO.md` | **唯一**的可勾选待办：尚未开始 / 已立项待做 | 已确认缺陷（→ `known-bugs.md`）、被否方案（→ `rejected-approaches.md`）、顺序理由（→ `RoadMap.md`） |
+| `Docs/RoadMap.md` | 阶段顺序与**为什么是这个顺序**（前置关系） | 可勾选条目（一律指向 `TODO.md`），具体任务（→ change 的 `tasks.md`） |
+| `Docs/known-bugs.md` | 已确认缺陷：症状 + 根因 + 期望方向 | 未确认的怀疑、待办、方案讨论 |
+| `Docs/rejected-approaches.md` | 试过并被否决的方案（四要素：方案/为什么失败/证据/何时可重考虑） | 还没试过的想法、审查记录 |
+| `Docs/TESTING.md` | 测试分层的权威口径（怎么写、怎么跑、怎么读） | 具体用例清单 |
+| `Docs/user-guide/*.md` | 面向用户：在哪、怎么操作、参数、报错、已知限制 | 内部实现、设计取舍 |
+| `Docs/AnthropicAPIDoc.md`、`Docs/DeepSeekAPIDoc.md`、`Docs/ripgrepDoc.md` | 外部接口的**事实源**（抓取时间 + 来源 URL） | 本项目的推论（推论要标明是本项目推导） |
+| `Docs/context-compression-reference.md`、`Docs/context-history-sample.md` | 参考材料与实测样本 | 规范条文（规范在 `openspec/specs/`） |
+| `openspec/specs/<能力>/spec.md` | **已成规范的行为真相**（归档时从 delta 同步进来，必须带 `## Purpose`） | 提案、待办、实现细节 |
+| `openspec/changes/<名字>/` | 未归档的提案：proposal / design / delta spec / tasks | 已归档的真相 |
+| `openspec/changes/archive/` | 归档历史（**永不删**） | —— |
+| `DEBUGGING.md`、`sidecar/test/README.md` | C++ 调试与测试的操作说明 | 产品行为规范 |
+
+### 二、冲突时谁赢（从高到低）
+
+1. **用户当场的明确要求**（对话里的裁定）；
+2. `~/.dsh/AGENTS.md` + `CLAUDE.md` 的规则；
+3. `openspec/specs/` 里已成规范的行为；
+4. 未归档 change 的 proposal / design / tasks；
+5. `TODO.md` 与 `Docs/RoadMap.md`（排队与顺序）；
+6. 台账类（`known-bugs.md`、`rejected-approaches.md`）—— 只追加，**不作为审查对象**；
+7. 面向用户的 `Docs/user-guide/` 与 `README.md`（必须与前六项一致，不一致就是文档缺陷）。
+
+外部 API 的事实以 `Docs/*APIDoc.md` 为准；与官方不一致时先更新文档并记录抓取时间，再改代码。
+
+### 三、维护触发（写代码时顺手要做的事）
+
+| 你做了什么 | 必须同步改哪里 |
+|---|---|
+| 新增/改动用户可见行为、参数、界面文案、报错 | 同 change 内改 `Docs/user-guide/<功能>.md` + `README.md` 索引，并在 tasks 里落**能失败**的验收（如文档文案与代码 grep 一致） |
+| 改了已成规范的行为 | 改对应 `openspec/specs/<能力>/spec.md`（或走 change 的 delta，归档时同步） |
+| 发现确认缺陷 | 追一条到 `Docs/known-bugs.md` |
+| 方案被实测或用户否决 | 追一条到 `Docs/rejected-approaches.md`（含"何时可重新考虑"） |
+| 顺序或前置关系变化 | 改 `Docs/RoadMap.md` 的阶段与理由，并在 `TODO.md` 勾掉/新增对应条目 |
+| 归档一个 change | **先**把 delta spec 同步进 `openspec/specs/`（缺 `## Purpose` 会判失败），再移动目录，最后在归档报告里贴"同步前/后"的 `validate --specs` 数字 |
+
+### 四、三条硬约束（防止同一事实出现两份）
+
+1. **可勾选条目只在 `TODO.md`**；其它文档若要引用待办，只能写"见 TODO.md 的某条"，不许复制成第二份清单。
+2. **规则只写在 `AGENTS.md`（全局）与 `CLAUDE.md`（项目）**；change 工件、user-guide、spec 里不许夹带"以后要怎么做"的规则 —— 规则要落就落进这两个文件，落完在工件里引用。
+3. **不许出现只有指针没有正文的规则**：任何一条规则或不变量，若它只在一处写全，那一处必须是 `AGENTS.md` 或 `CLAUDE.md`，不许指向"某份 change 的 design 里写着"。
+

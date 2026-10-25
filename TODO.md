@@ -92,7 +92,7 @@
 
 ---
 
-### [ ] 把 36 个既有 spec 迁到当前格式（缺 `## Purpose` / `## Requirements`）
+### [x] 把 36 个既有 spec 迁到当前格式（缺 `## Purpose` / `## Requirements`）
 
 **现象（可核）**：`openspec/specs/` 下 39 份 spec 里，**36 份**仍是旧格式 —— 顶层只有 `## ADDED Requirements`，既没有 `## Requirements`（openspec 只在这个小节下收集条文），也没有 `## Purpose`。归档某份 spec 的改动时会直接失败，报错原文两种：
 `<名字> MODIFIED failed for header "### Requirement: …" - not found` 与 `Spec must have a Purpose section. Missing required sections. Expected headers: "## Purpose" and "## Requirements"`。
@@ -104,9 +104,49 @@
 
 **验收（能失败的判据）**：`openspec validate --specs` 输出里**不再有 ✗**（或仅剩明确记为豁免的项）；且每份 spec 至少含一个 `#### Scenario:` 块。
 
+**已完成（2026-10-25）**：`openspec validate --specs` → **53 passed / 0 failed**。做法分三批：8 份 delta 同步进 `openspec/specs/`（其中 3 份新建、带 `## Purpose`）、补 3 份既有缺口、再给 27 份统一插 `## Purpose` 并把 `## ADDED Requirements` 改成 `## Requirements`。提交 `c2fc400`、`551be89`、`353899f`。踩过的坑（新建规范必须无 BOM）已写进 `CLAUDE.md`。
+
 ---
 
-### [ ] 上下文压缩：L1 摘要泄漏 `ASSISTANT` 角色标签 + 重复对话下 L1 摘要冗余
+## 接下来要做的事（顺序见 `Docs/RoadMap.md`）
+
+### [ ] 大工具输出的交付契约 —— **已立项**：`openspec/changes/spill-large-tool-output`
+
+- 现状痛点：`run_command` 只留尾部（构建的第一条 error 在头部，必被砍）、临时文件无保留策略、占位不带量。
+- 已定口径：一律先落盘 → 超限时内联**头尾各 1000 字符**（用户 2026-10-25 定）→ 给引用 → 用 `read_spill` 按偏移读回。
+- 进度：proposal + 3 份 delta 已完成且 `validate` 通过；**design 与 tasks 待写**。
+
+### [ ] 把 sidecar 的进程级全局改成「每 agent 一份上下文」 —— 未立项
+
+- 依据（可核）：`sidecar/src/tools.cpp` 的 `static std::string g_workspace`；`sidecar/src/sidecar_api.cpp` 里十几个 `static std::string g_*_result`（注释自认 `thread-unsafe but single-threaded usage`）；`browser.cpp` 的唯一浏览器 worker。
+- 目标：导出改成 `create_context` 拿句柄，工具都带句柄；并发不需要全局锁。**这是工具并发的前置条件**。
+
+### [ ] 只读工具并行 —— 未立项，依赖上一条
+
+- 只让 read/grep/glob/web 并行；写类工具保持串行。今天工具循环是 `for (…) { await _executeTool(tc); }`，完全串行。
+
+### [ ] 子 agent 当工具（`spawn_subagent`）—— 未立项
+
+- 开一个新上下文干窄活，只回传结论。这是治「上下文装不下」最直接的办法，比检索排序更有效。
+
+### [ ] 进程即 agent（每 agent 一个 exe）—— 未立项，长期
+
+- 收益：崩溃隔离（今天 DLL 同进程，C++ 一崩 App 整体死）。代价：流式回调要改成帧协议。
+- 前提：上面那步「上下文句柄化」的 API 必须先做，否则等于重写。
+
+### [ ] 符号索引（定义/调用/所在文件）—— 未立项，大仓库痛时再做
+
+### 明确不做（见 `Docs/rejected-approaches.md` 第 24、25 条）
+
+快照回退、命令审批/沙箱、向量检索 —— 已由用户否掉，不再提。
+
+
+---
+
+### [x] 上下文压缩：L1 摘要泄漏 `ASSISTANT` 角色标签 —— **已修（2026-10-25 核实）**；后半（重复对话下 L1 冗余）已拆成单独条目
+
+> **2026-10-25 核实记录**：清洗函数已经落地 —— `lib/services/compaction/model_summary_provider.dart` 的 `stripLeadingRoleLabel(String)`，在两个返回值处都调用了（文件内两处 `stripLeadingRoleLabel(...)` 调用点）。
+> **但没有任何用例守着它**：全 `test/` 搜 `stripLeadingRoleLabel` 命中 0；`test/unit/model_summary_provider_test.dart` 跑 `+10 All tests passed!` 也不覆盖这条。所以「改坏了不会红」—— 补用例另立一条（见本文件末尾）。
 
 **性质**：真缺陷（角色标签泄漏）＋ 设计商榷（冗余收拢）。
 
@@ -220,3 +260,25 @@
 3. live 真实桌面可用性需重新验证；在此之前 5.3 不视为通过。
 
 **来源**：`integration_test/browser_live_test.dart`、`sidecar/src/browser.cpp`（browser_available subprocess probe、run_browser_op 进程管理）、`lib/main.dart`（_initSearchAndTools 异步化）。
+
+---
+
+### [ ] 给 `stripLeadingRoleLabel` 补一条守卫用例（2026-10-25 从「L1 泄漏 ASSISTANT」条目拆出）
+
+**现状**：修复已落地（`lib/services/compaction/model_summary_provider.dart`），但全 `test/` 搜 `stripLeadingRoleLabel` 命中 **0** —— 改坏了不会有测试变红。
+
+**验收（能失败的判据）**：新增用例断言 `ASSISTANT: 用户目标…` → `用户目标…`、`ASSISTANT本次…` → `本次…`、以及正常开头（无标签）原样返回；把 `stripLeadingRoleLabel` 改成恒返回原文后该条必须红。
+
+**来源**：`lib/services/compaction/model_summary_provider.dart`、原条目「上下文压缩：L1 摘要泄漏 ASSISTANT 角色标签」。
+
+---
+
+### [ ] 重复对话下 L1 摘要冗余（2026-10-25 从同一条目拆出的「设计商榷」半）
+
+**现象（原条目记录）**：高度重复的对话被按「原始 token 累加 > T」切成多个 L1 批，每批独立成摘要 ⇒ 多条内容重叠的 L1 摘要同时进上下文（该 case 为 2 条：`[1,133]` 628 tokens / `[134,270]` 548 tokens），L2 因投影放得下而未触发。
+
+**⚠️ 动手前必读**：任何让 L2 更早触发的调整都必须先过本文件顶部「🔒 钉死的原始要求」的自检五问；**不得**用「至少 N 条才合并」这类条数门槛（那正是被禁止的偏离方式）。
+
+**验收（能失败的判据）**：待设计。先给一个可核的度量：同一段重复对话下「投影里 L1 摘要的 token 合计」应当下降，且不引入条数门槛。
+
+**来源**：`lib/services/compaction/compaction_plan.dart`、`lib/services/compaction/model_summary_provider.dart`。
