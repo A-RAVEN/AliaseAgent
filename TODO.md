@@ -37,7 +37,7 @@
 4. 我有没有为了让某个机制"能跑起来"而**额外加一条计数门槛**？——**有 ⇒ 直接判偏离。**
 5. 这个设计**真的够得着**这个百分比阈值吗？算一下：够着它最多需要多少条摘要同时存在？**够不着 ⇒ 是实现缺陷，必须修**，不许写成"已知限制/病理情况"收口。
 
-**现状核对（2026-09-20 更新 —— 本节的上一版是 2026-09-13 读代码得出的，其中列出的偏离项已由 `openspec/changes/align-compaction-thresholds` 逐条处置；下面每条都附可核判据）**：
+**现状核对（2026-09-20 更新 —— 本节的上一版是 2026-09-13 读代码得出的，其中列出的偏离项已由 `openspec/changes/archive/2026-09-20-align-compaction-thresholds` 逐条处置；下面每条都附可核判据）**：
 
 - ✅ **R2 / R3 已对齐（阈值只由一个百分比算出来，不再有写死的数）**：阈值现在只有一个计算点 —— `CompactionEngine.thresholdTokens(maxContextTokens, percent)`（模型容量 × 百分比 ÷ 100），原来的 `_batchThreshold`（写死"容量除以 2"）已删除，三处用途（分批边界、最新原文保留量、合成 L2 的阈值）全部改调它。百分比来自配置 `compaction_threshold_percent`（`AgentTypeConfig.compactionThresholdPercent`，缺省 25，缺失/非法值回落缺省并打印一次提示）。
   **可核判据**：`test/unit/compaction_engine_test.dart` 的「thresholdTokens」两条用例 —— 实测 `threshold 20000*25%=5000 40000*25%=10000`（容量翻倍 ⇒ 阈值翻倍）、`batchCount capacity20000=11 capacity40000=5 firstBatchRaw small=5285 large=10570`（容量翻倍 ⇒ 每一批的 raw 也跟着翻倍）；配置那条的判据在 `test/unit/agent_registry_test.dart`（有值 / 没有这一项 / 6 种非法值全部回落到 25）。
@@ -110,16 +110,25 @@
 
 ## 接下来要做的事（顺序见 `Docs/RoadMap.md`）
 
-### [ ] 大工具输出的交付契约 —— **已立项**：`openspec/changes/spill-large-tool-output`
+### [x] 大工具输出的交付契约 —— **已完成并归档**：`openspec/changes/archive/2026-10-25-spill-large-tool-output`
 
-- 现状痛点：`run_command` 只留尾部（构建的第一条 error 在头部，必被砍）、临时文件无保留策略、占位不带量。
-- 已定口径：一律先落盘 → 超限时内联**头尾各 1000 字符**（用户 2026-10-25 定）→ 给引用 → 用 `read_spill` 按偏移读回。
-- 进度：proposal + 3 份 delta 已完成且 `validate` 通过；**design 与 tasks 待写**。
+- 现状痛点（已解决）：`run_command` 只留尾部（构建的第一条 error 在头部，必被砍）、临时文件无保留策略、占位不带量。
+- 定下的口径：一律先落盘 → 超限时内联**头尾各 1000 字符**（用户 2026-10-25 定，配置键 `spill.preview_chars`）→ 给引用 → 用 `read_spill` 按偏移读回。
+- 实测证据：一条**真的失败**的 C++ 构建里，头部第 2 行的 `error C2065: "undeclared_symbol_at_line_1"` 出现在结果里；`read_spill(offset=1018, limit=2000)` 读回的 2000 字节与文件对应区间逐字节相同（`integration_test/live_spill_output_test.dart`）。
+- 规范：主规范 53 → 54 份，`openspec validate --specs` 全绿；其中 `command-tool` / `command-tool-tests` 是两条 MODIFIED 改写。
+- 提交：`fbc4cef`。
+
+### [ ] 把 `web_fetch` 的 2000 字硬切迁到 spill 交付 —— 未立项
+
+- 现状（仍是缺陷）：`lib/main.dart` 的 `web_fetch` 分支把正文 `substring(0, 2000)` 硬切、只留 `...`，**没有任何取回指针** —— 切掉就真取不回。上一件事只修了 `run_command`，`web_fetch` 当时被明确划到本期范围之外（见归档 change 的 design D7）。
+- 目标：与 `run_command` 同一套契约（先落盘 → 头尾预览 → 引用 → `read_spill` 读回），并把 `Docs/user-guide/` 里对应说明改掉。
+- 为什么现在不做也行：它不会因为拖延变坏；但它现在是"日志里最长的那条已知静默截断"，排在上面的上下文句柄化之后。
 
 ### [ ] 把 sidecar 的进程级全局改成「每 agent 一份上下文」 —— 未立项
 
-- 依据（可核）：`sidecar/src/tools.cpp` 的 `static std::string g_workspace`；`sidecar/src/sidecar_api.cpp` 里十几个 `static std::string g_*_result`（注释自认 `thread-unsafe but single-threaded usage`）；`browser.cpp` 的唯一浏览器 worker。
-- 目标：导出改成 `create_context` 拿句柄，工具都带句柄；并发不需要全局锁。**这是工具并发的前置条件**。
+- 依据（可核）：`sidecar/src/tools.cpp` 的 `static std::string g_workspace`；`sidecar/src/sidecar_api.cpp` 里十几个 `static std::string g_*_result`（含 `g_read_spill_result`，注释自认 `thread-unsafe but single-threaded usage`）；`browser.cpp` 的唯一浏览器 worker；`sidecar/src/spill.cpp` 的 `static unsigned g_call_seq`（非原子自增，同一会话内并发会撞序号）。
+- 目标：导出改成 `create_context` 拿句柄，工具都带句柄；**Dart 侧按会话/agent 建销句柄**，`sendMessage` 的串行化也按上下文分；浏览器 worker 变成"每上下文一个"（或每上下文一个浏览器会话）。**这是工具并发的前置条件**。
+- 注意：这条**不是**给"开两个 session"做内容隔离（消息已按 `session_id` 隔离），是为了并发时工具结果、工作区、spill 序号不被互相覆盖。
 
 ### [ ] 只读工具并行 —— 未立项，依赖上一条
 
@@ -208,9 +217,9 @@
 
 ---
 
-### [x] 添加「独立浏览器工具」，已定路线甲（外置窗口）——**已立项并实现**：`openspec/changes/add-browser-tool`
+### [x] 添加「独立浏览器工具」，已定路线甲（外置窗口）——**已立项、已实现、已归档**：`openspec/changes/archive/2026-09-13-add-browser-tool`
 
-**⚠️ round-10 更正（12.26(15)）**：本条原先写「仍未实现，需先 spike」「尚处 PARTIAL / 需 spike」「下一步：先跑聚焦验证…再开 change 立项」——**均已过期**。该 change 已立项并落地（`openspec/changes/add-browser-tool/`，含 `.openspec.yaml` + proposal/design/specs/tasks；`scripts/browser_worker.py`、`sidecar/src/browser.cpp` 均已实现）。**剩余未完成项只在 tasks.md 里**：**12.34**（产物收尾审查）。**12.1 已按用户裁定结案（口径是「未复现」，不是「已修复」）**；12.30 / 12.33 已完成。（**⚠️ 更正历史：round-12 时此处写「12.1 与 12.30」，round-13 时写「12.1 与 12.30」均已过期 —— 以 tasks.md 的 checklist 为准，不要以本行为准。**）
+**⚠️ round-10 更正（12.26(15)）**：本条原先写「仍未实现，需先 spike」「尚处 PARTIAL / 需 spike」「下一步：先跑聚焦验证…再开 change 立项」——**均已过期**。该 change 已立项并落地、现已归档（`openspec/changes/archive/2026-09-13-add-browser-tool/`，含 `.openspec.yaml` + proposal/design/specs/tasks；`scripts/browser_worker.py`、`sidecar/src/browser.cpp` 均已实现）。**12.34 在归档前已勾**（2026-10-25 核：该 tasks.md 里 `- [x] 12.34`）；**12.1 已按用户裁定结案（口径是「未复现」，不是「已修复」）**；12.30 / 12.33 已完成。剩下的只有 **live 真实桌面验证**这一条活的待办，见下面「add-browser-tool live 真实桌面验证未通过」。（**⚠️ 更正历史：round-12 / round-13 写的「12.1 与 12.30」、以及「剩余未完成项只有 12.34」都已过期 —— 以归档 tasks.md 的 checklist 为准。**）
 
 **决策**：选 **外置浏览器窗口**（路线甲），非内嵌。内嵌（WebView2）是**另一条独立替代路线**，暂缓，不是“增强”。
 
@@ -223,7 +232,7 @@
 - 绝不与 `web_search` 混；`web_search` 独立保留（付费-only + 失败空结果，见上一条待办）。
 
 **已确认的关键性质（这几轮问答定下）**：
-**⚠️ round-11 更正（12.29）：下面第 82-90 行原写「外部未验证、待 spike 回填」「必须先验证」等 —— 这些实测**已经做完**（`openspec/changes/add-browser-tool/tasks.md` 的 1.1–1.6 均已回填结论：多轮循环支持深多步、headed 资源与最小化/遮挡行为已实测、channel 已定、单 tab/弹窗/下载已实测、遮挡与权限抑制已实测）。以下段落保留为**立项前的原始计划**，其「未验证」措辞**已过期**，不要再按它判断现状。**
+**⚠️ round-11 更正（12.29）：下面第 82-90 行原写「外部未验证、待 spike 回填」「必须先验证」等 —— 这些实测**已经做完**（`openspec/changes/archive/2026-09-13-add-browser-tool/tasks.md` 的 1.1–1.6 均已回填结论：多轮循环支持深多步、headed 资源与最小化/遮挡行为已实测、channel 已定、单 tab/弹窗/下载已实测、遮挡与权限抑制已实测）。以下段落保留为**立项前的原始计划**，其「未验证」措辞**已过期**，不要再按它判断现状。**
 - **AI 走程序级控制**（Playwright/CDP 命令直达浏览器进程，非屏幕级模拟）。~~窗口最小化/被遮挡是否影响 AI 操作……外部未验证行为，需实测（对应 change 的 task 1.2）后回填~~ —— **已实测回填（task 1.2/1.5）**。
 - **默认藏在后台、不频繁弹窗**：不每步调 `bringToFront`；**跟进点击新开的标签页**（design 甲——原「单 tab 复用」的写法已作废，多标签页为预期）；**自动处理** `alert`/`confirm` 对话框；避免触发下载 / 权限弹窗——“不弹窗/无下载/无权限/新页可被跟随是否真能保持”为**外部未验证**，需实测（task 1.4）回填。把窗口提到前台仅通过显式可见请求，该机制**不在本 change 范围**（另行立项）。
 - **健壮性（公共验收标准，须写进实现）**：看门狗**检测关窗→可检测失败→AI 重开会话**；**每步重读实时快照**（不信任上次）；URL / 内容**分叉检测**；**用户接管信号**（检测到用户手动导航/切页 → 知会 AI 重读）。
@@ -233,7 +242,7 @@
 - **headed 资源成本**：约 300-500MB/tab、2-5s 冷启动、孤儿进程风险（归档 `openspec/changes/archive/2026-07-27-upgrade-web-fetch-crawl4ai/design.md`）；**已实测回填（task 1.2）**。
 - ~~**需 spike（外部事实，未验证）**：最小化/隐藏窗口是否会被某些动作重新拉回前台~~ —— **已实测回填（task 1.2）**。
 
-**下一步**：**已不需要「先立项」**（change 已立项并落地）。仍未完成的只有 `openspec/changes/add-browser-tool/tasks.md` 里的 **12.34**（产物收尾审查）。
+**下一步**：**已不需要「先立项」**（change 已立项、落地并归档到 `openspec/changes/archive/2026-09-13-add-browser-tool/`）。该 change 的 tasks.md 里 **12.34 也已勾**（2026-10-25 核）—— 现在**没有**任何未完成条目留在那份 tasks.md 里。剩下的是**活的待办**：`add-browser-tool live 真实桌面验证未通过（白屏卡死 + browser_available probe 超时）`，见本文件后面那一节。
 
 **来源文件**：`sidecar/src/web_fetch.cpp`、`scripts/fetch_worker.py`、`Docs/DeepSeekAPIDoc.md`、`openspec/changes/archive/2026-07-27-upgrade-web-fetch-crawl4ai/design.md`。
 

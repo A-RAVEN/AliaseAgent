@@ -14,23 +14,29 @@
 
 ## 二、阶段
 
-### 阶段 1 —— 工具输出的交付契约（进行中）
+### 阶段 1 —— 工具输出的交付契约（已完成，2026-10-25 归档）
 
-- **change**：`openspec/changes/spill-large-tool-output`
-- **状态**：proposal + 3 份 delta 已完成、`openspec validate` 通过；design 与 tasks 待写
-- **做完的标志**：一条构建命令失败时，头部的第一条 error 在结果里可见；任何超限输出都能用 `read_spill` 按偏移读回，且逐字节一致
+- **change**：`openspec/changes/archive/2026-10-25-spill-large-tool-output`（36/36 任务；已归档，主规范 53 → 54 份）
+- **状态**：已实现、已同步规范、已归档、已提交（`fbc4cef`）
+- **做完的标志（实测，两条都成立）**：① 一条**真的失败**的 C++ 构建里，头部第 2 行的 `error C2065: "undeclared_symbol_at_line_1"` 出现在结果里；② `read_spill(offset=1018, limit=2000)` 读回的 2000 字节与 spill 文件对应区间逐字节相同（`integration_test/live_spill_output_test.dart`）
 - **为什么第一个**：修法明确、不牵动架构，且它先把"输出怎么交付"这套契约定下来，后面子 agent 回传结果时可以直接复用
+- **本期没做**：`web_fetch` / `grep_file` / `read_file` 的迁移（design D7 明确划到本期外）——`web_fetch` 的 2000 字硬切仍是缺陷，作为一条待办记在 `TODO.md`
 
-### 阶段 2 —— 上下文句柄化（未立项）
+### 阶段 2 —— 上下文句柄化（未立项，**下一步**）
 
-- **做什么**：`sidecar` 增加 `create_context` / `dispose_context`；`g_workspace`、十几个 `g_*_result`、浏览器 worker 全部变成"每上下文一份"；其余导出函数首参改成句柄
-- **做完的标志**：两个上下文能同时存在且互不干扰（一个设工作区、另一个调工具，结果不串）
-- **为什么第二个**：它是并发、子 agent、进程隔离三件事共同的前置。跳过它，后面每一步都要先绕开全局状态
-- **依据**：`sidecar/src/tools.cpp` 的 `static std::string g_workspace`；`sidecar/src/sidecar_api.cpp` 的 `static std::string g_*_result`（注释自认 `thread-unsafe but single-threaded usage`）；`sidecar/src/browser.cpp` 的唯一 worker
+- **做什么**：`sidecar` 增加 `create_context` / `dispose_context`；`g_workspace`、结果缓冲、浏览器 worker 全部变成"每上下文一份"；其余导出函数首参改成句柄。**Dart 侧要按会话/agent 建销句柄**，`sendMessage` 的串行化也按上下文分（现在是一条全局 `_chain`，只包模型请求，不包工具）。
+- **本阶段必须覆盖的全局状态（2026-10-25 补全）**：
+  - `sidecar/src/tools.cpp` 的 `static std::string g_workspace`；
+  - `sidecar/src/sidecar_api.cpp` 的 `static std::string g_*_result`（含 `g_last_tool_result` 与 `g_read_spill_result` —— 后者是 spill 这次新引入的）；
+  - `sidecar/src/browser.cpp` 的唯一 worker：要变成"每上下文一个 worker"或"每上下文一个浏览器会话"，不是只挪缓冲；
+  - `sidecar/src/spill.cpp` 的 `static unsigned g_call_seq`（`++g_call_seq` 非原子：**同一会话内**并发调用会撞序号写同一文件；跨会话因目录不同不撞）。
+- **做完的标志**：① 两个上下文同时存在且互不干扰（一个设工作区、另一个调工具，结果不串）；② 同一会话内并发跑 `run_command` / `read_spill` 时结果与 spill 文件都不串、序号不撞；③ 两个会话能各自发模型请求，不再被一条全局 `_chain` 排队。
+- **为什么第二个**：它是并发、子 agent、进程隔离三件事共同的前置。跳过它，后面每一步都要先绕开全局状态。
+- **一个常见误解**：这一步**不是**给"开两个 session"做内容隔离 —— 消息本来就按 `session_id` 存在 SQLite 里（`queryBySession` 用 `where: 'session_id = ?'`），模型上下文在 Dart 侧按会话拼装。它要解决的是**工具执行时的全局状态在并发下被覆盖**。
 
 ### 阶段 3 —— 只读工具并行（未立项，依赖阶段 2）
 
-- **做什么**：工具循环由"逐个 await"改成"按只读/写分组"；只读（read/grep/glob/web）并行，写类串行
+- **做什么**：工具循环由"逐个 await"改成"按只读/写分组"；只读（read/grep/glob/web）并行，写类串行。**并行是效率优化，正确性由阶段 2 保证**——句柄化没做全就并行，会把偶发竞争变成必现。
 - **做完的标志**：一个回合里同时发 3 个 `read_file`，总耗时明显小于串行；同时发 `write_file` + `read_file` 时顺序仍被保证
 - **为什么第三个**：它只在阶段 2 之后才有意义，而且它本身不引入新概念，是纯粹的效率改动
 
