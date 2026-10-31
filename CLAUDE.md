@@ -44,9 +44,9 @@ Flutter 桌面 AI 对话应用，通过 dart:ffi 调用 C++ Sidecar 动态库（
 
 - **测试输出必须可观察（所有测试的基本要求）** — 任何测试的输出都要让运行者看出它实际做了什么，禁止只输出 `OK` 或断言失败。真实模型类测试（live / integration_test）必须在**断言前**输出实际工具调用（工具名、完整 input、result/status）与文件最终状态；失败必须有可归因的现场证据（该轮实际行为 + 文件内容），"失败但日志无现场"视为规范缺陷。观察通道随形态不同（无窗口的直接持有工具调用记录；窗口版经界面卡片 `ToolCallCard.activity` 读），但拿不到测试内容即违规。
 
-- **`/opsx:apply` 期间禁止无故停顿** — 连续执行到全部完成或遇到阻断性阻塞。禁止"做完一批汇报进度""问接下来做什么""展示当前状态""等用户确认"。唯一合法停顿：必须用户亲自决策的阻断问题（环境缺失、网络不通、密钥无效等）。停顿时不汇报进度，只说明阻塞点和需要用户做什么。全部完成后如实报告做了什么、哪些没做、剩余缺口。
+- **`/opsx:apply` 期间禁止无故停顿** — 执行 apply 的子 agent 连续执行到全部完成或遇到阻断性阻塞。禁止"做完一批汇报进度""问接下来做什么""展示当前状态""等用户确认"。唯一合法停顿：必须用户亲自决策的阻断问题（环境缺失、网络不通、密钥无效等）。停顿时不汇报进度，只说明阻塞点和需要用户做什么。主 agent 只监督，不替代子 agent 执行；完成后由子 agent 如实报告做了什么、哪些没做、剩余缺口，主 agent 再核验。
 
-- **用 `/opsx:propose` 生成完整 change** — 一次生成 proposal + design + specs deltas + tasks，禁止手写单个 proposal 再零碎补其余。审查、设计、apply 都在**完整 change** 上做，不对孤立的 proposal 反复审查。OpenSpec 流程由主循环驱动到底，不许把决定权推回用户（"下一步你定""要我继续吗""两件事你选一个"）。自省出的错误必须写进规则或记录后才算完成。
+- **用 `/opsx:propose` 生成完整 change** — 一次生成 proposal + design + specs deltas + tasks，禁止手写单个 proposal 再零碎补其余。审查、设计、apply 都在**完整 change** 上做，不对孤立的 proposal 反复审查。OpenSpec 流程由子 agent 执行、主循环监督到底，不许把决定权推回用户（"下一步你定""要我继续吗""两件事你选一个"）。自省出的错误必须写进规则或记录后才算完成。
 
 - **openspec 下不许存在只有 proposal 的活跃 change** — 判定范围：`openspec/changes/<name>/` 顶层直接子目录且含 `.openspec.yaml` 的活跃 change；用 `openspec status --change <name> --json` 判定，`tasks` 为 `blocked`（缺 design / specs）即垃圾 → `rm -rf` 后用 `/opsx:propose` 重来。**永不删**：`openspec/changes/archive/` 下的任何内容（那是合法归档历史，不许用"目录里文件少"这种感性判断去删）；不含 `.openspec.yaml` 的目录不是活跃 change，不适用本条。
 
@@ -86,7 +86,7 @@ Flutter 桌面 AI 对话应用，通过 dart:ffi 调用 C++ Sidecar 动态库（
   5. 连续两轮没有产物推进 → 立即停 goal 并如实报告，不得制造假进度。
   6. 完成判据是产物状态（测试真跑过、实测数据在、文件落地、截图在），不是"审查说没问题"。
   7. 收尾报告必须写明：哪些数字能追溯到现存证据、哪些不能、本轮工作最薄弱的环节。
-  8. **apply 也要开 todo 表，并且两边实时同勾**（2026-10-03 用户要求：以后 apply change 时除了开 goal，也要开 todo，把每个 task 记成 todo 好追踪进度；每完成一个 task 要同时把 todo 和 tasks 文档里的勾都勾上，保证进度实时）。落成四条：①建完 goal、动第一条任务之前 `todo_write` 建表，`tasks.md` 里**每一条**任务逐条映射成一个 todo 项（条数一致，不许把一组压成一条），文本里带编号与判据；②每做完一条，**同一个动作里改两处** —— 先勾 `tasks.md` 的框，紧接着把该条 todo 置为 `completed`，只改一处算违规；③全部做完之前，表里始终有且只有一条 `in_progress`；④轮末贴表本身（哪几条完成、哪几条没完成）＋ remaining 数，任务数与 todo 数不一致同样是违规。
+  8. **openspec apply 不再走 goal（2026-10-26 用户明令）**：不建 goal，改为后台启动一个子 agent 执行 apply。子 agent 使用 provider 中提供 `deepseek-v41-flash` 的 route、`model=deepseek-v41-flash`、`reasoning_effort=max`；主 agent 只做只读核验、纠偏和完成核验，不编辑代码/测试/工件，也不代勾 `tasks.md`。子 agent 逐条实现并在当轮勾选、跑验收；主 agent 以 `remaining=0`、无未勾条目、可读的测试日志与读数作为完成判据。若工具没有模型/思考强度入参，先报能力缺口并停，不得用提示词冒充。
 
 - **工作记录规范（记录不能成为错误来源）** — 实测教训：两轮审查各有 1 条 HIGH 是"记录写着已修复、文件里根本没改"，另有一批是"行号被后续编辑顶偏"。
   1. **禁止写死行号**（`某文件:123`）—— 一律用函数名 / 变量名 / 唯一字符串。
