@@ -364,6 +364,11 @@ static const int DEADLINE_BASIC_SEC = 30;
 static const int DEADLINE_DEEP_SEC = 90;
 
 std::string dispatch_web_search(const std::string& request_json) {
+  // 进程级互斥（change add-context-handles 任务 1.7）：provider 实例、凭据、限流
+  // 计数与探测结果都是应用级共享状态，两个上下文同时搜索会并发改写它们。串行
+  // 执行，每次的请求与结果各自封装，不会有半个结果混进来。
+  static std::mutex g_dispatch_mutex;
+  std::lock_guard<std::mutex> dispatch_lock(g_dispatch_mutex);
   try {
     auto req = json::parse(request_json);
 

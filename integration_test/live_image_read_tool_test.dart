@@ -149,7 +149,8 @@ void main() {
       await tester.pumpWidget(
           RepaintBoundary(key: captureKey, child: const MyApp()));
       await tester.pump(const Duration(seconds: 2));
-      expect(SidecarBridge.instance.setWorkspace(ws.path), isNull,
+      final chatState = tester.state<ChatScreenState>(find.byType(ChatScreen));
+      expect(await chatState.setCurrentWorkspace(ws.path), isNull,
           reason: 'setWorkspace(夹具工作区) 必须成功 —— 绝不能让模型去碰主目录');
 
       try {

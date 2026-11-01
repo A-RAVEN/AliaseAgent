@@ -47,6 +47,9 @@ find_package(CURL REQUIRED)
 # Source files
 set(SOURCES
   src/sidecar_api.cpp
+  src/context.cpp
+  src/context_api.cpp
+  src/result_buffer.cpp
   src/logger.cpp
   src/model_gateway.cpp
   src/tools.cpp
@@ -97,9 +100,15 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(Catch2)
 
 # Test executable — links production sources directly (NOT sidecar_api.cpp,
-# to avoid SIDECAR_API / __declspec(dllimport) conflicts)
+# to avoid SIDECAR_API / __declspec(dllimport) conflicts). context.cpp /
+# context_api.cpp / result_buffer.cpp ARE linked: the internal acceptance entry
+# (`[context]` tests) must reach the same implementation the exports use,
+# including the thread-local return buffer.
 add_executable(sidecar_tests
   test/test_main.cpp
+  src/context.cpp
+  src/context_api.cpp
+  src/result_buffer.cpp
   src/logger.cpp
   src/model_gateway.cpp
   src/tools.cpp
@@ -130,11 +139,16 @@ add_executable(sidecar_tests
   test/deepseek_search_test.cpp
   test/image_probe_test.cpp
   test/clipboard_image_test.cpp
+  test/context_test.cpp
+  test/context_ownership_test.cpp
+  test/context_lifecycle_test.cpp
 )
 target_include_directories(sidecar_tests PRIVATE include src test "${JSON_INCLUDE_DIR}" "${STB_INCLUDE_DIR}")
 target_compile_definitions(sidecar_tests PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN NOMINMAX
     FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/sse"
-    IMAGE_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/images")
+    IMAGE_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/images"
+    SIDECAR_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src"
+    SPILL_NAMES_TSV="${CMAKE_CURRENT_SOURCE_DIR}/test/spill_session_names.tsv")
 target_link_libraries(sidecar_tests PRIVATE Catch2::Catch2 CURL::libcurl ${PLATFORM_LIB})
 
 add_test(NAME sidecar_tests COMMAND sidecar_tests)

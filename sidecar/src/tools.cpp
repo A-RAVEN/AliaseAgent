@@ -1,4 +1,5 @@
 #include "tools.h"
+#include "context.h"
 #include "logger.h"
 #include "subprocess.h"
 #include "image_probe.h"
@@ -7,6 +8,9 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include <fstream>
 #include <sstream>
 #include <algorithm>
@@ -39,9 +43,11 @@ namespace tools {
 
 // ---------------------------------------------------------------------------
 // Internal state
+//
+// 工作区根与文件版本表都搬进了 Context（change add-context-handles）：这里不再有
+// 进程级变量，所有读写都走 `Context::current()`（由 context_api 在调用前显式
+// 绑定）。也正因为如此，本文件里跨函数传递工作区一律取**副本**，不保存引用。
 // ---------------------------------------------------------------------------
-
-static std::string g_workspace; // canonical form
 
 // ---------------------------------------------------------------------------
 // Path utilities
@@ -99,26 +105,28 @@ static bool is_dir(const std::string& path) {
 
 std::string set_workspace(const std::string& path) {
   LOG_TRACE("tools::set_workspace entry: " + path);
+  context::Context& ctx = context::Context::current();
   if (path.empty()) {
-    g_workspace.clear();
+    ctx.set_workspace_value("");
     return "Workspace path is empty";
   }
   std::string canon = canonical(path);
   if (canon.empty()) {
-    g_workspace.clear();
+    ctx.set_workspace_value("");
     return "Invalid workspace path: " + path;
   }
   if (!is_dir(canon)) {
-    g_workspace.clear();
+    ctx.set_workspace_value("");
     return "Workspace is not a directory: " + path;
   }
-  g_workspace = canon;
-  LOG_INFO("Workspace set to: " + g_workspace);
+  ctx.set_workspace_value(canon);
+  LOG_INFO("Workspace set to: " + canon);
   return ""; // success
 }
 
-const std::string& workspace() {
-  return g_workspace;
+std::string workspace() {
+  // 按值返回：调用方拿不到锁内的引用，临界区外也不会读到被别的线程改写的字符串。
+  return context::Context::current().workspace();
 }
 
 // ---------------------------------------------------------------------------
@@ -139,22 +147,24 @@ std::string resolve(const std::string& path) {
     resolved = canonical(path);
   } else {
     // Relative to workspace
-    if (g_workspace.empty()) return "";
-    resolved = canonical(g_workspace + "/" + path);
+    const std::string ws = workspace();
+    if (ws.empty()) return "";
+    resolved = canonical(ws + "/" + path);
   }
   return resolved;
 }
 
 bool is_within_workspace(const std::string& resolved) {
-  if (g_workspace.empty()) return true; // no workspace set = allow all
+  const std::string ws = workspace();
+  if (ws.empty()) return true; // no workspace set = allow all
   if (resolved.empty()) return false;
 
   // Workspace boundary: resolved path must start with workspace path
   // followed by either end-of-string or a path separator
-  if (resolved.size() < g_workspace.size()) return false;
-  if (resolved.compare(0, g_workspace.size(), g_workspace) != 0) return false;
-  if (resolved.size() == g_workspace.size()) return true;
-  return resolved[g_workspace.size()] == '/';
+  if (resolved.size() < ws.size()) return false;
+  if (resolved.compare(0, ws.size(), ws) != 0) return false;
+  if (resolved.size() == ws.size()) return true;
+  return resolved[ws.size()] == '/';
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +235,7 @@ static bool is_binary(const std::string& path) {
 static std::string check_path(const std::string& path, std::string& resolved) {
   resolved = resolve(path);
   if (resolved.empty()) {
-    if (g_workspace.empty()) return "No workspace set";
+    if (workspace().empty()) return "No workspace set";
     return "Cannot resolve path: " + path;
   }
   if (!is_within_workspace(resolved)) {
@@ -243,14 +253,10 @@ static std::string check_path(const std::string& path, std::string& resolved) {
 // count — listing a directory or grepping its contents does not observe them.
 // ---------------------------------------------------------------------------
 
-struct FileVersion {
-  long long mtime_ticks;  // Windows: 100ns FILETIME ticks; POSIX: ns since epoch
-  long long size;
-};
+// 版本记录按上下文各存一份（Context::observed_version / record_observation）。
+// 这里只保留「怎么读版本」这条无状态逻辑。
+using FileVersion = context::FileVersion;
 
-static std::map<std::string, FileVersion> g_observed;
-
-/// Read a path's current version. Returns false when the path is absent/unreadable.
 static bool stat_version(const std::string& path, FileVersion& out) {
 #ifdef _WIN32
   WIN32_FILE_ATTRIBUTE_DATA data;
@@ -278,13 +284,14 @@ static bool stat_version(const std::string& path, FileVersion& out) {
 static void record_observation(const std::string& resolved) {
   FileVersion version;
   if (stat_version(resolved, version)) {
-    g_observed[resolved] = version;
+    context::Context::current().record_observation(resolved, version);
   }
 }
 
 /// Drop every observation (tests only: keeps one case from authorizing another).
+/// 按上下文重置：只清当前上下文那一份。
 void reset_observation_state_for_tests() {
-  g_observed.clear();
+  context::Context::current().reset_observations();
 }
 
 // ---------------------------------------------------------------------------
@@ -473,7 +480,20 @@ std::string read_file(const std::string& request_json) {
 // A write must never leave the target half-written: stage the whole content to a
 // sibling temp file, then rename it over the target. The rename is atomic between
 // the old and the new file, so a crash leaves either the old file or the new one.
+//
+// 进程级 staging 锁（change add-context-handles）：两个上下文可能同时写同一个目标
+// 文件，而「清理旧暂存 → 生成新暂存 → 改名」三步共用同一组 `.tmp-*` 名字。只靠
+// 每上下文的写闸门会互删对方正在写的暂存文件，所以这三步用一把进程级锁串起来；
+// 序号计数器也必须是原子的（非原子 ++ 会让两个线程生成同名暂存文件）。
 // ---------------------------------------------------------------------------
+
+static std::mutex g_staging_mutex;
+static std::atomic<unsigned long> g_staging_counter{0};
+static std::atomic<int> g_staging_pause_ms{0};
+
+void set_staging_pause_for_tests(int milliseconds) {
+  g_staging_pause_ms.store(milliseconds, std::memory_order_relaxed);
+}
 
 static std::string path_dir(const std::string& p) {
   size_t s = p.rfind('/');
@@ -487,15 +507,16 @@ static std::string path_base(const std::string& p) {
 
 /// Sibling staging path: <dir>/<name>.tmp-<pid>-<n>. Must share the directory,
 /// otherwise the final rename could cross a volume and stop being atomic.
+/// 调用方必须持有 `g_staging_mutex`。
 static std::string next_staging_path(const std::string& resolved) {
-  static unsigned long counter = 0;
 #ifdef _WIN32
   const unsigned long pid = static_cast<unsigned long>(GetCurrentProcessId());
 #else
   const unsigned long pid = static_cast<unsigned long>(getpid());
 #endif
   return path_dir(resolved) + "/" + path_base(resolved) + ".tmp-" +
-         std::to_string(pid) + "-" + std::to_string(++counter);
+         std::to_string(pid) + "-" +
+         std::to_string(g_staging_counter.fetch_add(1, std::memory_order_relaxed) + 1);
 }
 
 /// Remove staging files a previous run left behind for this same target
@@ -546,7 +567,11 @@ static std::wstring widen_acp(const std::string& s) {
 /// Returns an empty string on success, or a JSON error result:
 ///   "Cannot stage file: <path>"                                  — temp could not be written
 ///   "Cannot replace file: <path> (rename failed, error <code>)"  — rename refused (e.g. read-only)
+///
+/// 清理旧暂存、生成新暂存、改名三步在同一把进程级锁里完成：两个上下文写同一目标
+/// 时，任何一方都不会删掉另一方正在写的 `.tmp-*`。
 static std::string write_atomically(const std::string& resolved, const std::string& content) {
+  std::lock_guard<std::mutex> staging_lock(g_staging_mutex);
   cleanup_stale_staging(resolved);
   const std::string temp = next_staging_path(resolved);
 
@@ -563,6 +588,8 @@ static std::string write_atomically(const std::string& resolved, const std::stri
     DeleteFileA(temp.c_str());
     return error_result("Cannot stage file: " + resolved);
   }
+  const int pause_ms = g_staging_pause_ms.load(std::memory_order_relaxed);
+  if (pause_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(pause_ms));
   const std::wstring wide_temp = widen_acp(temp);
   const std::wstring wide_target = widen_acp(resolved);
   if (!MoveFileExW(wide_temp.c_str(), wide_target.c_str(),
@@ -585,6 +612,8 @@ static std::string write_atomically(const std::string& resolved, const std::stri
     std::remove(temp.c_str());
     return error_result("Cannot stage file: " + resolved);
   }
+  const int pause_ms = g_staging_pause_ms.load(std::memory_order_relaxed);
+  if (pause_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(pause_ms));
   if (std::rename(temp.c_str(), resolved.c_str()) != 0) {
     const int code = errno;
     std::remove(temp.c_str());
@@ -1129,8 +1158,8 @@ std::string edit_file(const std::string& request_json) {
   // final and "go read it first" would be wrong advice) and before reading the
   // content (a stale basis must report staleness, not a misleading match failure).
   {
-    auto observed = g_observed.find(resolved);
-    if (observed == g_observed.end()) {
+    FileVersion observed_version;
+    if (!context::Context::current().observed_version(resolved, observed_version)) {
       json resp;
       resp["ok"] = false;
       resp["code"] = "not_observed";
@@ -1139,8 +1168,8 @@ std::string edit_file(const std::string& request_json) {
     }
     FileVersion current;
     const bool changed = !stat_version(resolved, current) ||
-                         current.mtime_ticks != observed->second.mtime_ticks ||
-                         current.size != observed->second.size;
+                         current.mtime_ticks != observed_version.mtime_ticks ||
+                         current.size != observed_version.size;
     if (changed) {
       json resp;
       resp["ok"] = false;
@@ -1519,7 +1548,8 @@ std::string glob_file(const std::string& request_json) {
   std::string verr;
   if (!is_valid_glob_pattern(pattern, verr)) return error_result(verr);
   if (max_results <= 0) return error_result("max_results must be >= 1");
-  if (g_workspace.empty()) return error_result("No workspace set");
+  const std::string glob_root = workspace();
+  if (glob_root.empty()) return error_result("No workspace set");
 
   std::string rg = resolve_rg_path();
   if (rg.empty()) {
@@ -1533,7 +1563,7 @@ std::string glob_file(const std::string& request_json) {
   argv.push_back("--no-require-git");
   argv.push_back("-g");
   argv.push_back(pattern);
-  argv.push_back(g_workspace);
+  argv.push_back(glob_root);
 
   // Stream-parse the newline-delimited --files output and terminate rg early
   // once max_results paths are collected (D4: "max_results 到达即终止"), so a
@@ -1545,7 +1575,7 @@ std::string glob_file(const std::string& request_json) {
 
   subprocess::Options opts;
   opts.timeout_seconds = SEARCH_TIMEOUT_SEC;
-  opts.cwd = g_workspace;
+  opts.cwd = glob_root;
   opts.on_stdout_chunk = [&](const std::string& chunk) -> bool {
     leftover += chunk;
     size_t nl;
@@ -1555,7 +1585,7 @@ std::string glob_file(const std::string& request_json) {
       if (!line.empty() && line.back() == '\r') line.pop_back();
       if (line.empty()) continue;
       if (paths.size() < static_cast<size_t>(max_results)) {
-        paths.push_back(strip_root_prefix(line, g_workspace));
+        paths.push_back(strip_root_prefix(line, glob_root));
       } else {
         truncated = true;
         return true;  // terminate rg — max_results already collected
@@ -1697,7 +1727,8 @@ std::string grep_file(const std::string& request_json) {
     std::string verr;
     if (!is_valid_glob_pattern(glob, verr)) return error_result(verr);
   }
-  if (g_workspace.empty()) return error_result("No workspace set");
+  const std::string grep_root = workspace();
+  if (grep_root.empty()) return error_result("No workspace set");
 
   std::string rg = resolve_rg_path();
   if (rg.empty()) {
@@ -1722,7 +1753,7 @@ std::string grep_file(const std::string& request_json) {
   argv.push_back(std::to_string(static_cast<long long>(max_results) * MAX_COUNT_MULTIPLIER));
   argv.push_back("--");  // isolate pattern so it is never parsed as a flag
   argv.push_back(pattern);
-  argv.push_back(g_workspace);
+  argv.push_back(grep_root);
 
   // Stream-parse the --json message stream and decide truncation by message
   // type (the stream always ends with a `summary` message — ripgrepDoc section
@@ -1736,7 +1767,7 @@ std::string grep_file(const std::string& request_json) {
 
   subprocess::Options opts;
   opts.timeout_seconds = SEARCH_TIMEOUT_SEC;
-  opts.cwd = g_workspace;
+  opts.cwd = grep_root;
   opts.on_stdout_chunk = [&](const std::string& chunk) -> bool {
     leftover += chunk;
     size_t nl;
@@ -1760,7 +1791,7 @@ std::string grep_file(const std::string& request_json) {
           json data = (msg.contains("data") && msg["data"].is_object())
               ? msg["data"]
               : json::object();
-          matches.push_back(build_match_entry(data, g_workspace));
+          matches.push_back(build_match_entry(data, grep_root));
         } else {
           truncated = true;
           decided = true;

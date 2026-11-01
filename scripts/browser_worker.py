@@ -327,6 +327,99 @@ def child_process_pids(max_depth=4) -> "list":
     return out
 
 
+def _descendant_processes(max_depth=4) -> "list":
+    """PIDs of processes DESCENDING from this one (Windows only; [] elsewhere)."""
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    k = ctypes.windll.kernel32
+    snap = k.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    children = {}
+    try:
+        e = PROCESSENTRY32()
+        e.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        ok = k.Process32First(snap, ctypes.byref(e))
+        while ok:
+            children.setdefault(int(e.th32ParentProcessID), []).append(
+                int(e.th32ProcessID))
+            ok = k.Process32Next(snap, ctypes.byref(e))
+    except Exception as e:
+        _log(f"process tree scan failed: {e}")
+    finally:
+        try:
+            k.CloseHandle(snap)
+        except Exception:
+            pass
+
+    out = []
+    frontier = [os.getpid()]
+    for _ in range(max(1, max_depth)):
+        nxt = []
+        for p in frontier:
+            for c in children.get(p, []):
+                if c not in out:
+                    out.append(c)
+                    nxt.append(c)
+        if not nxt:
+            break
+        frontier = nxt
+    return out
+
+
+def _process_image_name(pid) -> str:
+    """Executable path of `pid` ("" when it cannot be queried)."""
+    if os.name != "nt":
+        return ""
+    import ctypes
+    from ctypes import wintypes
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    k = ctypes.windll.kernel32
+    handle = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return ""
+    try:
+        size = wintypes.DWORD(32768)
+        buf = ctypes.create_unicode_buffer(size.value)
+        if k.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return buf.value
+        return ""
+    except Exception:
+        return ""
+    finally:
+        try:
+            k.CloseHandle(handle)
+        except Exception:
+            pass
+
+
+def _browser_process_pid() -> int:
+    """PID of the browser process descending from this worker (0 when unknown).
+
+    Playwright launches a driver that launches the real browser, so the browser
+    is a grandchild. The browser is identified by its executable name; `stats`
+    reports this id so a test can prove two contexts share ONE process.
+    """
+    for pid in _descendant_processes():
+        name = os.path.basename(_process_image_name(pid)).lower()
+        if name in ("msedge.exe", "chrome.exe"):
+            return int(pid)
+    return 0
+
+
 def real_window_rect(pids) -> "tuple | None":
     """REAL (l,t,w,h) in PHYSICAL px of a visible top-level browser window of `pids`.
 
@@ -617,15 +710,113 @@ def reconcile_window_bounds(actual, work_area, apply):
     return b, ("repaired" if moved else "ok"), (fx, fy, fw, fh)
 
 
-class BrowserSession:
-    """One headed Playwright browser session, reused across commands."""
+class BrowserHost:
+    """The single headed browser process shared by every context.
+
+    Playwright may only launch ONE browser per worker (chromium.launch() once);
+    every context then gets its own `BrowserContext` inside it. Launching a
+    browser per context is forbidden by the spec -- that would put one Edge
+    process on screen for every context.
+
+    The host also exposes the browser process identifier (`stats`) so a test can
+    prove two contexts share one process instead of trusting the code comment.
+    """
 
     def __init__(self) -> None:
         self._pw = None
         self._browser = None
+        self._channel = None
+        self._pid = 0
+
+    def start_playwright(self) -> bool:
+        if self._pw is not None:
+            return True
+        if sync_playwright is None:
+            return False
+        try:
+            self._pw = sync_playwright().start()
+            return True
+        except Exception as e:
+            _log(f"failed to start playwright: {e}")
+            self._pw = None
+            return False
+
+    def browser(self):
+        return self._browser
+
+    def launch(self) -> "str | None":
+        """Launch the browser if it is not alive. Returns an error string or None.
+
+        An already-connected browser is REUSED: that is what makes two contexts
+        share one process. Only an explicit open after a dead browser relaunches.
+        """
+        if self._browser is not None and self._browser.is_connected():
+            return None
+        self.close_browser()
+        if not self.start_playwright():
+            return "playwright unavailable"
+        if self._channel is None:
+            self._channel = BrowserSession._probe_channel(self._pw)
+        if self._channel is None:
+            return "no usable Edge/Chromium found (tried msedge, chrome)"
+        try:
+            self._browser = self._pw.chromium.launch(
+                channel=self._channel, headless=False, timeout=OP_TIMEOUT_SEC * 1000,
+                args=_placement_launch_args())
+        except Exception as e:
+            _log(f"launch failed: {e}")
+            self._browser = None
+            return f"browser launch failed: {e}"
+        self._pid = _browser_process_pid()
+        _log(f"browser launched (browser_pid={self._pid})")
+        return None
+
+    def close_browser(self) -> None:
+        if self._browser is not None:
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+        self._browser = None
+        self._pid = 0
+
+    def browser_pid(self) -> int:
+        if self._browser is None or not self._browser.is_connected():
+            return 0
+        if self._pid == 0:
+            self._pid = _browser_process_pid()
+        return self._pid
+
+    def context_count(self) -> int:
+        if self._browser is None:
+            return 0
+        try:
+            return len(self._browser.contexts)
+        except Exception:
+            return 0
+
+    def shutdown(self) -> None:
+        self.close_browser()
+        if self._pw is not None:
+            try:
+                self._pw.stop()
+            except Exception:
+                pass
+            self._pw = None
+
+
+class BrowserSession:
+    """One context's browser session: its own BrowserContext + active page.
+
+    The browser PROCESS is shared (see BrowserHost); everything that isolates a
+    context (cookies, storage, pages) lives in this context-only object.
+    """
+
+    def __init__(self, host: BrowserHost, ctx: str) -> None:
+        self._host = host
+        self._ctx = ctx
         self._context = None
         self._page = None
-        self._channel = None
         self._ever_started = False
         # Tool-emitted counters (kept OUT of the model-visible snapshot text).
         # VACUITY, disclosed (round-10 review): _raise_count and _popup_closed have
@@ -690,53 +881,29 @@ class BrowserSession:
                 continue
         return None
 
-    def _start_playwright(self) -> bool:
-        if self._pw is not None:
-            return True
-        if sync_playwright is None:
-            return False
-        try:
-            self._pw = sync_playwright().start()
-            return True
-        except Exception as e:
-            _log(f"failed to start playwright: {e}")
-            self._pw = None
-            return False
-
     def _launch_browser(self) -> "str | None":
-        """Create a fresh browser+context+page. Returns error string or None."""
+        """(Re)create THIS context's BrowserContext inside the shared browser.
+
+        The browser process itself is launched at most once by BrowserHost; two
+        contexts therefore share one Edge process, which is exactly what the
+        spec requires (one chromium.launch(), one BrowserContext per context).
+        """
         self._ever_started = True
-        if self._browser is not None:
-            try:
-                self._browser.close()
-            except Exception:
-                pass
-            self._browser = None
-        self._context = None
-        self._page = None
+        self._teardown()
         self._reopen_armed = False
         self._expected_url = None
         self._expected_content_hash = None
 
-        if not self._start_playwright():
-            return "playwright unavailable"
-
-        if self._channel is None:
-            self._channel = self._probe_channel(self._pw)
-        if self._channel is None:
-            return "no usable Edge/Chromium found (tried msedge, chrome)"
+        err = self._host.launch()
+        if err is not None:
+            return err
 
         try:
-            # Task 12.13: place the headed window clear of the app window so the
-            # browser does not read as "the app went white".
-            self._browser = self._pw.chromium.launch(
-                channel=self._channel, headless=False, timeout=OP_TIMEOUT_SEC * 1000,
-                args=_placement_launch_args())
             # accept_downloads=True so we can observe and cancel (deny) them via
             # the download handler — a cancelled download never persists a file
             # (spike 1.4 confirmed dl.cancel() leaves no file on disk). This makes
             # download denial observable in the per-call record.
-            self._context = self._browser.new_context(accept_downloads=True)
+            self._context = self._host.browser().new_context(accept_downloads=True)
             self._context.on("download", self._on_download)
             # Design 甲 (follow new tab): grant NO permissions up front so a page
             # that triggers a permission prompt (e.g. Bing's
@@ -768,9 +935,9 @@ class BrowserSession:
             self._install_page_handler()
             return None
         except Exception as e:
-            _log(f"launch failed: {e}")
+            _log(f"context open failed: {e}")
             self._teardown()
-            return f"browser launch failed: {e}"
+            return f"browser context failed: {e}"
 
     def _apply_window_bounds(self) -> None:
         """Pin the OS window bounds, then verify what Chromium ACTUALLY applied.
@@ -985,37 +1152,42 @@ class BrowserSession:
             pass
 
     def _teardown(self) -> None:
+        """Close THIS context only. The shared browser process stays alive."""
         try:
-            if self._browser is not None:
-                self._browser.close()
+            if self._context is not None:
+                self._context.close()
         except Exception:
             pass
-        self._browser = None
         self._context = None
         self._page = None
 
+    def close(self) -> dict:
+        """Explicit `close` for this context: close its BrowserContext, keep browser."""
+        had_context = self._context is not None
+        self._teardown()
+        self._ever_started = False
+        self._reopen_armed = False
+        return {"ok": True, "closed": had_context, "ctx": self._ctx}
+
     def shutdown(self) -> None:
         self._teardown()
-        if self._pw is not None:
-            try:
-                self._pw.stop()
-            except Exception:
-                pass
-            self._pw = None
+
+    def _browser_alive(self) -> bool:
+        browser = self._host.browser()
+        return browser is not None and browser.is_connected()
 
     def _ensure_ready(self) -> tuple:
-        """Ensure a live browser + page. Returns (page, error). On the first
-        command the session starts (open semantics); after a started session
-        dies, the failure is surfaced ONCE (dead=True) and the next command
-        reopens it explicitly (AI-explicit reopen)."""
-        browser_alive = (
-            self._browser is not None
-            and self._browser.is_connected()
-        )
-        if browser_alive:
+        """Ensure this context has a live BrowserContext + page. Returns (page, error).
+
+        On the first command the context opens (open semantics); after a context
+        that HAD opened loses its page/browser, the failure is surfaced ONCE
+        (dead=True) and the next command reopens it explicitly (AI-explicit
+        reopen). A context never silently creates a BrowserContext that the
+        caller did not ask for: an unknown ctx fails in the dispatch loop."""
+        if self._browser_alive() and self._context is not None:
             pass
         elif not self._ever_started:
-            # First command on a fresh worker: this IS the session startup (open).
+            # First command on a fresh context: this IS the session startup (open).
             err = self._launch_browser()
             if err is not None:
                 return None, err
@@ -1116,12 +1288,20 @@ class BrowserSession:
     # -- command handlers ----------------------------------------------------
 
     def _handle_open(self, req: dict) -> dict:
-        if self._browser is not None and self._browser.is_connected():
-            return {"ok": True, "url": self._page.url if self._page else "", "snapshot": "", "already_open": True}
+        """Explicit open/reopen of THIS context's BrowserContext.
+
+        Reuses the shared browser (never a second chromium.launch); only a dead
+        browser triggers a relaunch here, and only because the C++ side asked
+        for `open` explicitly after it saw the death."""
+        if self._browser_alive() and self._context is not None:
+            return {"ok": True, "ctx": self._ctx,
+                    "url": self._page.url if self._page else "", "snapshot": "",
+                    "already_open": True}
         err = self._launch_browser()
         if err is not None:
             return {"ok": False, "error": err}
-        return {"ok": True, "url": self._page.url if self._page else "", "snapshot": ""}
+        return {"ok": True, "ctx": self._ctx,
+                "url": self._page.url if self._page else "", "snapshot": ""}
 
     def _launch_for_op(self):
         """Ensure the session is live for an op. Returns a Page, or a dict error."""
@@ -1314,7 +1494,9 @@ class BrowserSession:
         err = self._launch_browser()
         if err is not None:
             return {"ok": False, "error": err}
-        return {"ok": True, "url": self._page.url if self._page else "", "snapshot": "", "relaunched": True}
+        return {"ok": True, "ctx": self._ctx,
+                "url": self._page.url if self._page else "", "snapshot": "",
+                "relaunched": True}
 
 
 def _emit_record(cmd: str, input_obj: dict, result: dict, session: BrowserSession) -> None:
@@ -1322,21 +1504,23 @@ def _emit_record(cmd: str, input_obj: dict, result: dict, session: BrowserSessio
     try:
         record = {
             "tool": cmd,
+            "ctx": session._ctx if session is not None else "",
             "input": input_obj,
             "ok": result.get("ok", False),
             "status": "ok" if result.get("ok", False) else "error",
             "snapshot_len": result.get("snapshot_len", 0),
             "url": result.get("url", ""),
             "title": result.get("title", ""),
-            "raise_count": session._raise_count,
-            "popup_closed": session._popup_closed,
-            "browser_opened": session._browser_opened,
-            "adopted_tabs": session._adopted_tabs,
-            "download_denied": session._download_denied,
-            "permission_denied": session._permission_denied,
-            "permissions": session._last_permissions,
-            "expected_new_tab_unfulfilled": session._expected_new_tab_unfulfilled,
-            "tabs": len(session._context.pages) if session._context else 0,
+            "raise_count": session._raise_count if session is not None else 0,
+            "popup_closed": session._popup_closed if session is not None else 0,
+            "browser_opened": session._browser_opened if session is not None else 0,
+            "adopted_tabs": session._adopted_tabs if session is not None else 0,
+            "download_denied": session._download_denied if session is not None else 0,
+            "permission_denied": session._permission_denied if session is not None else 0,
+            "permissions": session._last_permissions if session is not None else {},
+            "expected_new_tab_unfulfilled": (
+                session._expected_new_tab_unfulfilled if session is not None else False),
+            "tabs": len(session._context.pages) if session is not None and session._context else 0,
             "divergent": result.get("divergent", False),
             "error": result.get("error", ""),
         }
@@ -1382,7 +1566,8 @@ def main() -> None:
     if _APP_RECT is not None:
         _log(f"app rect from argv: {_APP_RECT}")
 
-    session = BrowserSession()
+    host = BrowserHost()
+    sessions = {}  # ctx -> BrowserSession (each owns ONE BrowserContext)
     while True:
         line = sys.stdin.readline()
         if not line:  # EOF - parent closed our stdin; exit.
@@ -1397,32 +1582,67 @@ def main() -> None:
             continue
 
         cmd = req.get("cmd", "")
+        ctx = req.get("ctx") or ""
 
         # `available` is a one-shot probe: respond, then exit so the parent's
         # one-shot subprocess run sees a clean termination.
         if cmd == "available":
             print(json.dumps(_probe_available(), ensure_ascii=False), flush=True)
-            session.shutdown()
+            host.shutdown()
+            for sess in sessions.values():
+                sess.shutdown()
             return
 
+        session = None
         try:
-            # The per-call record must describe THIS call only: reset the
-            # "expected a new tab but did not observe one" flag before every
-            # command, so a click that did not wait out its bound cannot leave the
-            # flag true on the records of later calls in this long-lived process.
-            session._expected_new_tab_unfulfilled = False
-            if cmd == "open":
-                result = session._handle_open(req)
-            elif cmd == "relaunch":
-                result = session._handle_relaunch(req)
-            elif cmd == "navigate":
-                result = session._handle_navigate(req)
-            elif cmd == "click":
-                result = session._handle_click(req)
-            elif cmd == "type":
-                result = session._handle_type(req)
-            elif cmd == "snapshot":
-                result = session._handle_snapshot(req)
+            if cmd == "stats":
+                result = {
+                    "ok": True,
+                    "browser_pid": host.browser_pid(),
+                    "browser_contexts": host.context_count(),
+                    "contexts": len(sessions),
+                    "ctxs": sorted(sessions.keys()),
+                }
+            elif cmd == "open":
+                if not ctx:
+                    result = {"ok": False, "error": "open: ctx is required"}
+                else:
+                    session = sessions.get(ctx)
+                    if session is None:
+                        session = BrowserSession(host, ctx)
+                        sessions[ctx] = session
+                    session._expected_new_tab_unfulfilled = False
+                    result = session._handle_open(req)
+            elif cmd == "close":
+                session = sessions.pop(ctx, None)
+                if session is None:
+                    result = {"ok": False, "dead": True,
+                              "error": f"unknown context: {ctx!r} - no BrowserContext to close"}
+                else:
+                    result = session.close()
+            elif cmd in ("navigate", "click", "type", "snapshot", "relaunch"):
+                session = sessions.get(ctx)
+                if session is None:
+                    # Never implicitly create a BrowserContext: an unknown ctx
+                    # fails visibly and the caller must send `open` first.
+                    result = {"ok": False, "dead": True, "needs_relaunch": True,
+                              "error": f"unknown context: {ctx!r} - send open first"}
+                else:
+                    # The per-call record must describe THIS call only: reset the
+                    # "expected a new tab but did not observe one" flag before every
+                    # command, so a click that did not wait out its bound cannot leave
+                    # the flag true on the records of later calls.
+                    session._expected_new_tab_unfulfilled = False
+                    if cmd == "relaunch":
+                        result = session._handle_relaunch(req)
+                    elif cmd == "navigate":
+                        result = session._handle_navigate(req)
+                    elif cmd == "click":
+                        result = session._handle_click(req)
+                    elif cmd == "type":
+                        result = session._handle_type(req)
+                    else:
+                        result = session._handle_snapshot(req)
             else:
                 result = {"ok": False, "error": f"unknown command: {cmd}"}
         except Exception as e:
@@ -1432,7 +1652,9 @@ def main() -> None:
         _emit_record(cmd, req, result, session)
         print(json.dumps(result, ensure_ascii=False), flush=True)
 
-    session.shutdown()
+    for sess in sessions.values():
+        sess.shutdown()
+    host.shutdown()
 
 
 if __name__ == "__main__":

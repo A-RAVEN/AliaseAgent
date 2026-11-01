@@ -14,8 +14,9 @@ std::string json_escape(const std::string& s);
 /// Returns empty string on success, error message on failure.
 std::string set_workspace(const std::string& path);
 
-/// Get the current workspace path (canonical form).
-const std::string& workspace();
+/// Get the current context's workspace path (canonical form).
+/// 按值返回：调用方拿不到锁内引用，锁外也不会读到被别的线程改写的字符串。
+std::string workspace();
 
 /// Resolve a relative/absolute path to canonical absolute form.
 /// The input path is resolved relative to the current workspace.
@@ -111,10 +112,16 @@ std::string read_clipboard_image(const std::string& request_json);
 /// (Docs/ripgrepDoc.md section 4).
 bool classify_grep_regex_error(const std::string& stderr_data);
 
-/// Drop every recorded file observation. Tests only: without it one case's
-/// successful read would authorize another case's edit, making the
-/// "must read before edit" cases depend on execution order.
+/// Drop every recorded file observation of the current context. Tests only:
+/// without it one case's successful read would authorize another case's edit,
+/// making the "must read before edit" cases depend on execution order.
 void reset_observation_state_for_tests();
+
+/// 测试用：让 `write_atomically` 在「暂存文件已创建、还没有改名」处停这么多毫秒。
+/// 这段停顿在进程级 staging 锁**之内**，所以带锁时另一个上下文必然等它；
+/// 去掉锁时另一个上下文会在停顿期间删掉这份暂存文件，随后的改名就失败。
+/// 传 0 取消。
+void set_staging_pause_for_tests(int milliseconds);
 
 /// Build a grep match entry {path, line?, text?} from an --json match message's
 /// `data` object, de-rooting the path. Degrades when fields are absent

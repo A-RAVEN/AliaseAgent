@@ -1,8 +1,13 @@
-/// spill 目录的位置与清理（change `spill-large-tool-output`）。
+/// spill 目录的位置与启动清理（change `spill-large-tool-output`，
+/// change `add-context-handles` 改写）。
 ///
-/// 规则与 C++ 侧 `sidecar/src/spill.cpp` 的 `session_dir_name()` **必须一致** ——
-/// 两边都按会话 id 建目录 / 删目录，规则一漂移就会"删了却没删掉"。改这里就要
-/// 同步改那边（反之亦然）。
+/// 目录名规则与 C++ 侧 `sidecar/src/spill.cpp` 的 `session_dir_name()` **必须一致**：
+/// 只保留 `[a-z0-9_-]`，其余字节写成 `%XX`（大写十六进制）；空名字落到
+/// `no-session`。两侧共读 `sidecar/test/spill_session_names.tsv` 的样例表，
+/// 漂移会被 `test/unit/spill_config_test.dart` 抓到。
+///
+/// 目录的**创建与删除**现在都在 C++ 侧按上下文句柄完成（`run_command` 建、
+/// `dispose_context` 删）；Dart 只保留「应用启动时清无主目录」这一件事。
 library;
 
 import 'dart:convert';
@@ -18,46 +23,33 @@ String homeDir() =>
 String spillRoot() =>
     '${homeDir()}${Platform.pathSeparator}.aliasagent${Platform.pathSeparator}spill';
 
-/// 会话 id → 目录名：只留 `[A-Za-z0-9._-]`，其余换成 `_`；
-/// 空串 / `.` / `..` 一律落到 `no-session`。
+/// 上下文句柄 → 目录名：只留 `[a-z0-9_-]`，其余字节写成 `%XX`（大写十六进制）；
+/// 空名字落到 `no-session`。
 ///
-/// **按 UTF-8 字节遍历**，不是按字符 —— C++ 侧就是按字节扫的，按字符遍历会让
-/// 中文 id 在两边得到不同的目录名（实测：按字符 4 个下划线、按字节 12 个）。
+/// **按 UTF-8 字节遍历**，不是按字符 —— C++ 侧就是按字节扫的。
 String spillSessionDirName(String session) {
   if (session.isEmpty) return 'no-session';
+  const hex = '0123456789ABCDEF';
   final out = StringBuffer();
   for (final byte in utf8.encode(session)) {
-    final keep = (byte >= 0x41 && byte <= 0x5A) || // A-Z
-        (byte >= 0x61 && byte <= 0x7A) || // a-z
+    final keep = (byte >= 0x61 && byte <= 0x7A) || // a-z
         (byte >= 0x30 && byte <= 0x39) || // 0-9
-        byte == 0x2E || // .
         byte == 0x5F || // _
         byte == 0x2D; // -
-    out.write(keep ? String.fromCharCode(byte) : '_');
+    if (keep) {
+      out.write(String.fromCharCode(byte));
+    } else {
+      out.write('%${hex[byte >> 4]}${hex[byte & 0x0F]}');
+    }
   }
-  final name = out.toString();
-  if (name.isEmpty || name == '.' || name == '..') return 'no-session';
-  return name;
+  return out.toString();
 }
 
-/// 某会话的 spill 目录（绝对路径）。
-String spillSessionDir(String sessionId) =>
-    '${spillRoot()}${Platform.pathSeparator}${spillSessionDirName(sessionId)}';
-
-/// 删掉某会话的 spill 目录。目录不存在就什么都不做（不报错、不建目录）。
-/// 返回是否真的删了一个存在的目录 —— 测试用它区分"删了"与"本来就没有"。
-bool deleteSessionSpill(String sessionId) {
-  final dir = Directory(spillSessionDir(sessionId));
-  if (!dir.existsSync()) return false;
-  dir.deleteSync(recursive: true);
-  return true;
-}
-
-/// 清掉**无主**的 spill 目录：`no-session`（没有会话 id 时落进去的）与 `_it_` 前缀
-/// （测试自己建的）。
+/// 清掉**无主**的 spill 目录：`no-session`（旧版本没有上下文句柄时落进去的）与
+/// `_it_` 前缀（旧测试自己建的）。
 ///
-/// 为什么需要：删会话只删 `<会话 id>/`，而 `no-session` 不对应任何会话 —— 它只增不减。
-/// 应用启动时清一次就够（无主文件本来就是"下次启动就作废"的东西）。
+/// 为什么还需要：`no-session` 不对应任何上下文 —— 它只增不减。应用启动时清一次就够。
+/// 有主的目录由 `dispose_context` 随上下文删除，这里不碰。
 /// 返回删掉的目录名清单。
 List<String> cleanOrphanSpillDirs() {
   final root = Directory(spillRoot());
@@ -73,4 +65,3 @@ List<String> cleanOrphanSpillDirs() {
   }
   return removed;
 }
-

@@ -4,6 +4,20 @@
 
 ## Requirements
 
+### Requirement: 真实动态库测试使用上下文夹具
+
+真实动态库测试 SHALL 在调用上下文接口前通过 `create_context` 取得有效句柄，并在返回 `created:true` 时设置工作区；`created:false` 表示 C++ 状态仍在，SHALL NOT 重复覆盖工作区。`ping`、`browser_available`、`ensure_search_infra`、`get_search_providers` SHALL 继续按机器级接口直接调用，不得为了测试伪造默认上下文。
+
+#### Scenario: 同一进程恢复上下文不重复初始化
+
+- **WHEN** 测试用同一句柄连续调用两次 `create_context`
+- **THEN** 第二次返回 `created:false`，且第一次设置的工作区与文件版本记录仍然保留
+
+#### Scenario: 机器级接口先于任何上下文也能调用
+
+- **WHEN** 测试进程尚未创建任何上下文时调用 `ping` 或 `ensure_search_infra("{}")`
+- **THEN** 调用 SHALL 按其既有契约返回，SHALL NOT 报 `unknown_context`
+
 ### Requirement: ping FFI call returns pong
 The system SHALL verify that `ping` FFI function returns "pong", confirming basic FFI bridge connectivity.
 
@@ -73,11 +87,15 @@ The system SHALL verify that `web_fetch` rejects internal/private IP addresses a
 - **THEN** the function returns an SSRF error containing "internal address"
 
 ### Requirement: read_file requires set_workspace first
-The system SHALL call `set_workspace` before `read_file` or `list_dir` in all tests, as these functions resolve paths relative to the workspace directory.
+The system SHALL create or ensure a context and call `set_workspace` **on that same context** before `read_file` or `list_dir` in all tests, as these functions resolve paths relative to that context's workspace directory. Calling `set_workspace` on one context SHALL NOT initialize another context.
 
 #### Scenario: read_file after set_workspace
-- **WHEN** `set_workspace` is called with the project root, then `read_file` is called with `pubspec.yaml`
+- **WHEN** a context is created, `set_workspace` is called with the project root on that context, then `read_file` is called with `pubspec.yaml` on the same context
 - **THEN** the file content is returned successfully
+
+#### Scenario: Another context is not implicitly initialized
+- **WHEN** context 甲 has a workspace but context 乙 was only created and never initialized
+- **THEN** `read_file` on 乙 SHALL NOT resolve paths using 甲's workspace; it SHALL report that 乙's workspace is unset
 
 ### Requirement: Live tests are window-based integration tests (规范形态)
 文件工具 live 测试 SHALL 为**窗口版 integration_test**（`integration_test/` 目录，`IntegrationTestWidgetsFlutterBinding` + `pumpWidget(MyApp)`，在真实桌面窗口运行完整应用，可见真实 AI 回答的 UI 渲染），而不是 headless flutter_tester 套件。运行 SHALL 使用窗口版规范命令 `flutter test --tags live --run-skipped integration_test/live_file_tools_test.dart -d windows`。隔离：live 套件 SHALL **无条件**在无完整 config / API 不可用时 `markTestSkipped`（不失败、不静默运行、不 fallback 到错误默认端点）；`dart_test.yaml` 的 `tags.live.skip` 对 `flutter test integration_test/... -d windows` **已实测生效**（task 12.1 探针确认），故套件带 `live` tag 且默认跳过、显式命令触发（`--tags live --run-skipped`）。本要求仅约束本 change 新建的窗口版套件；既有 `integration_test/real_api_test.dart` 不强制改造。

@@ -1,4 +1,5 @@
 #include "browser.h"
+#include "context.h"
 #include "tools.h"
 #include "logger.h"
 #include "subprocess.h"
@@ -161,8 +162,12 @@ static HANDLE g_stderr_rd = nullptr;  // child stderr -> parent
 static bool g_in_job = false;
 static std::thread g_stderr_thread;
 static std::atomic<bool> g_alive{false};
-static bool g_ever_started = false;    // worker spawned at least once (session ever started)
-static bool g_dead_reported = false;   // a dead session was surfaced once; next cmd reopens
+// 子进程代次：每次 start_worker 成功都推进一格。上下文记录自己浏览器会话所属
+// 的代次；代次一变，说明页面已经随旧进程消失，必须先收到一次 dead:true。
+static std::atomic<std::uint64_t> g_worker_generation{0};
+// 锁顺序固定为「生命周期锁 → 命令锁」：存活检查、启停、句柄替换、代次推进都在
+// 生命周期锁内完成，命令的读写再取命令锁。反过来拿就会死锁。
+static std::mutex g_lifecycle_mutex;
 static std::mutex g_cmd_mutex;
 
 // Availability-probe cache (12.2): remember ONLY an authoritative success so a
@@ -414,17 +419,23 @@ static bool start_worker() {
     std::atexit(shutdown_worker_atexit);
   }
   LOG_INFO("browser: worker started (pid handle set)");
+  // 代次推进在成功启动之后、紧接着完成：任何读代次的地方（上下文登记、死亡判断）
+  // 都只在生命周期锁内进行。
+  const std::uint64_t generation =
+      g_worker_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+  LOG_INFO("browser: worker generation=" + std::to_string(generation));
   return true;
 }
 
-static std::string send_command(const json& cmd) {
+// 发一条命令并读回一行响应。**调用方必须已经持有 g_lifecycle_mutex**（在它内部
+// 再取 g_cmd_mutex）：存活检查、停止子进程、句柄替换都与这里的读写同属一个临界区。
+static std::string send_command_locked(const json& cmd) {
   std::lock_guard<std::mutex> lock(g_cmd_mutex);
   if (!g_alive || !worker_running()) {
     // Worker died mid-command (race after run_browser_op's ensure): surface a
     // detectable failure once (never silently restart). The next command reopens.
     LOG_WARN("browser: worker not running on command");
     stop_worker();
-    g_dead_reported = true;  // the next command is an explicit reopen, not a restart
     json resp;
     resp["ok"] = false;
     resp["dead"] = true;
@@ -437,71 +448,150 @@ static std::string send_command(const json& cmd) {
   if (!WriteFile(g_stdin_wr, cmd_str.data(), (DWORD)cmd_str.size(), &written, nullptr)) {
     LOG_WARN("browser: failed to write command to worker");
     stop_worker();
-    g_dead_reported = true;  // surfaced once; the next command is the explicit reopen
     return "{\"ok\":false,\"error\":\"browser worker write failed\",\"dead\":true}";
   }
   std::string line;
   if (!read_response(line)) {
     // Stuck / dead worker: kill so a fresh one is spawned on the next command.
     stop_worker();
-    g_dead_reported = true;  // surfaced once; the next command is the explicit reopen
     return "{\"ok\":false,\"error\":\"browser operation timed out or worker died\",\"dead\":true}";
   }
   return line;
 }
 
+// 子进程是否活着。调用方必须持有 g_lifecycle_mutex。
+static bool worker_alive_locked() { return g_alive && worker_running(); }
+
+// 给一个上下文发 `open`（显式建/重开它的 BrowserContext，不新建浏览器进程）。
+// 调用方必须持有 g_lifecycle_mutex。
+static bool send_open_locked(const std::string& ctx_name, std::string& error) {
+  json open_cmd;
+  open_cmd["cmd"] = "open";
+  open_cmd["ctx"] = ctx_name;
+  const std::string resp_text = send_command_locked(open_cmd);
+  try {
+    const auto j = json::parse(resp_text);
+    if (j.value("ok", false)) return true;
+    error = j.value("error", std::string("open failed"));
+  } catch (const std::exception& e) {
+    error = std::string("open response not JSON: ") + e.what() + " (" + resp_text + ")";
+  }
+  return false;
+}
+
 // Ensure a worker for an op WITHOUT silently hiding a dead session:
-//   - first command ever: this IS the session startup (open semantics) -> spawn.
-//   - worker died between commands: surface the failure ONCE (dead:true) and let
-//     the AI explicitly reopen by issuing the command again (no silent restart).
-//   - after a dead was surfaced: the AI's next command is the explicit reopen ->
-//     spawn a fresh worker and proceed.
+//   - first command ever for this CONTEXT: start the worker if needed, then send
+//     an explicit `open` (open semantics) and issue the command;
+//   - the context's recorded generation is stale (worker died or another context
+//     restarted it): surface the failure ONCE (dead:true) and let the caller
+//     explicitly retry; the retry starts a fresh worker generation + `open`;
+//   - a context never silently gets a BrowserContext it did not open.
 // Returns "" with out_err set on an unavailable stack; otherwise the worker's
 // response JSON (a dead:true error on the first post-death command).
-static std::string run_browser_op(const json& cmd, std::string& out_err) {
-  if (!g_alive || !worker_running()) {
-    if (!g_ever_started) {
-      // Session startup on the first command.
-      g_ever_started = true;
-      g_dead_reported = false;
+// 调用方必须持有 g_lifecycle_mutex。
+static std::string run_browser_op_locked(const json& cmd, std::string& out_err) {
+  context::Context& ctx = context::Context::current();
+  const std::string ctx_name = ctx.name();
+  const context::BrowserSessionState state = ctx.browser_state();
+
+  bool need_open = false;
+  if (!state.has_session) {
+    if (!worker_alive_locked()) {
       if (!start_worker()) {
         out_err = "browser unavailable (python/playwright/script path)";
         LOG_WARN("browser: op rejected, worker not startable: " + out_err);
         return "";
       }
-    } else if (!g_dead_reported) {
-      // Watchdog: never silently restart a dead session. Report it once.
-      LOG_WARN("browser: worker died between commands - surfacing dead:true once");
-      g_dead_reported = true;
+    }
+    need_open = true;
+  } else if (!worker_alive_locked() ||
+             state.generation != g_worker_generation.load(std::memory_order_acquire)) {
+    // 该上下文登记过的页面已经随旧代次消失。
+    if (!ctx.allow_reopen()) {
+      ctx.set_allow_reopen(true);
+      LOG_WARN("browser: context '" + ctx_name +
+               "' sees a stale worker generation - surfacing dead:true once");
       json resp;
       resp["ok"] = false;
       resp["dead"] = true;
       resp["needs_relaunch"] = true;
       resp["error"] = "browser session not connected - issue the command again to reopen";
       return resp.dump();
-    } else {
-      // AI-explicit reopen (the dead was already surfaced).
-      LOG_INFO("browser: AI-explicit reopen (worker was dead)");
-      g_dead_reported = false;
-      if (!start_worker()) {
-        out_err = "browser unavailable (python/playwright/script path)";
-        LOG_WARN("browser: reopen failed, worker not startable: " + out_err);
-        return "";
-      }
     }
+    // 该上下文的显式重试：起新代次，再对它自己的上下文发 open。
+    ctx.set_allow_reopen(false);
+    if (!start_worker()) {
+      out_err = "browser unavailable (python/playwright/script path)";
+      LOG_WARN("browser: reopen failed, worker not startable: " + out_err);
+      return "";
+    }
+    need_open = true;
   }
-  return send_command(cmd);
+
+  if (need_open) {
+    std::string open_error;
+    if (!send_open_locked(ctx_name, open_error)) {
+      json resp;
+      resp["ok"] = false;
+      resp["dead"] = true;
+      resp["needs_relaunch"] = true;
+      resp["error"] = "browser open failed: " + open_error;
+      return resp.dump();
+    }
+    ctx.set_browser_session(
+        true, g_worker_generation.load(std::memory_order_acquire));
+    LOG_INFO("browser: context '" + ctx_name + "' opened at generation " +
+             std::to_string(ctx.browser_state().generation));
+  }
+
+  json with_ctx = cmd;
+  with_ctx["ctx"] = ctx_name;  // ctx wins over any user-supplied key
+  return send_command_locked(with_ctx);
 }
 
-// Test hook: tear down the persistent worker and reset session state.
-//   was_started=false -> fresh state (the next op is a session startup).
-//   was_started=true  -> simulate a session that HAD started then died (the next
+static std::string run_browser_op(const json& cmd, std::string& out_err) {
+  std::lock_guard<std::mutex> life(g_lifecycle_mutex);
+  return run_browser_op_locked(cmd, out_err);
+}
+
+// Test hook: tear down the persistent worker and reset this context's session
+// state: - was_started=false -> fresh state (the next op is a session startup).
+//   - was_started=true  -> simulate a session that HAD started then died (the next
 //                        op is a watchdog dead-detection: dead:true once, then the
 //                        following op is the AI's explicit reopen).
 void reset_session(bool was_started) {
+  std::lock_guard<std::mutex> life(g_lifecycle_mutex);
   stop_worker();
-  g_ever_started = was_started;
-  g_dead_reported = false;
+  context::Context& ctx = context::Context::current();
+  if (was_started) {
+    // 记成「本代次开过、但进程已死」：下一次操作走死亡提示分支。
+    ctx.set_browser_session(true, g_worker_generation.load(std::memory_order_acquire));
+  } else {
+    ctx.clear_browser_session();
+  }
+  ctx.set_allow_reopen(false);
+}
+
+// 销毁上下文时关闭它的浏览器会话：子进程已死时只清本地记录，不为了清理重启进程。
+void close_context(context::Context& ctx) {
+  std::lock_guard<std::mutex> life(g_lifecycle_mutex);
+  const context::BrowserSessionState state = ctx.browser_state();
+  if (!state.has_session) {
+    ctx.clear_browser_session();
+    return;
+  }
+  if (!worker_alive_locked()) {
+    LOG_INFO("browser: close skipped (worker already dead), clearing local state for '" +
+             ctx.name() + "'");
+    ctx.clear_browser_session();
+    return;
+  }
+  json cmd;
+  cmd["cmd"] = "close";
+  cmd["ctx"] = ctx.name();
+  const std::string resp = send_command_locked(cmd);
+  LOG_INFO("browser: close for '" + ctx.name() + "' -> " + resp);
+  ctx.clear_browser_session();
 }
 
 #else  // !_WIN32 — graceful degradation: browser tools not supported here.
@@ -524,6 +614,9 @@ static std::string run_browser_op(const json& cmd, std::string& out_err) {
 void reset_session(bool was_started) {
   (void)was_started;
 }
+
+// Dispose hook: nothing to close on non-Windows; only local bookkeeping remains.
+void close_context(context::Context& ctx) { ctx.clear_browser_session(); }
 
 #endif // _WIN32
 

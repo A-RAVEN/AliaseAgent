@@ -17,6 +17,8 @@
 #include <nlohmann/json.hpp>
 
 #include "command_tool.h"
+#include "context.h"
+#include "context_api.h"
 #include "spill.h"
 #include "temp_dir.h"
 
@@ -37,6 +39,11 @@ std::string read_all(const std::string& path) {
 bool file_exists(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     return f.good();
+}
+
+/// 当前上下文的名字在 spill 目录里的编码形式（`read_spill` 只接受这个目录内的引用）。
+std::string ctx_dir() {
+    return spill::session_dir_name(context::Context::current().name());
 }
 
 /// 把 spill 根指到某个临时目录，结束时恢复默认并清掉注入状态。
@@ -110,10 +117,11 @@ TEST_CASE("spill: read_spill 读到的是文件对应区间的原文", "[spill][
     TempDir tmp;
     SpillRootGuard guard(tmp.path());
     const std::string content = "0123456789ABCDEFGHIJ";
-    tmp.write("s1/probe.txt", content);
-    const std::string ref = spill::root() + "\\s1\\probe.txt";
+    tmp.write(ctx_dir() + "/probe.txt", content);
+    const std::string ref = spill::root() + "\\" + ctx_dir() + "\\probe.txt";
 
     const json ok = json::parse(spill::read_request(
+        context::Context::current(),
         json{{"ref", ref}, {"offset", 5}, {"limit", 4}}.dump()));
     INFO("ok = " << ok.dump());
     REQUIRE(ok["ok"] == true);
@@ -123,8 +131,9 @@ TEST_CASE("spill: read_spill 读到的是文件对应区间的原文", "[spill][
 
     // limit 省略时按 preview_chars × 2 取：这里 preview_chars=5 ⇒ limit=10，
     // 文件 20 字节，所以正好取到前 10 个字节（不是越界）
-    const json omitted_limit = json::parse(
-        spill::read_request(json{{"ref", ref}, {"offset", 0}, {"preview_chars", 5}}.dump()));
+    const json omitted_limit = json::parse(spill::read_request(
+        context::Context::current(),
+        json{{"ref", ref}, {"offset", 0}, {"preview_chars", 5}}.dump()));
     INFO("省略 limit: " << omitted_limit.dump());
     REQUIRE(omitted_limit["ok"] == true);
     REQUIRE(omitted_limit["text"] == "0123456789");
@@ -137,15 +146,16 @@ TEST_CASE("spill: read_spill 的五种失败各有不同错误文本", "[spill][
     // 多字节内容：一个中文字 3 字节，用来验"切点落在字符中间"。
     // 文件名用 ASCII —— Windows 的 `std::ofstream` 认的是 ANSI 代码页，
     // 拿 UTF-8 的中文文件名建出来的会是另一个名字。
-    tmp.write("s1/mb.txt", "中文测试");
+    tmp.write(ctx_dir() + "/mb.txt", "中文测试");
 
-    const std::string inside = spill::root() + "\\s1\\mb.txt";
+    const std::string inside = spill::root() + "\\" + ctx_dir() + "\\mb.txt";
     const std::string outside = tmp.path() + "/../outside.txt";
 
     std::vector<std::string> errors;
     auto error_of = [&](const std::string& ref, long long offset, long long limit) {
-        const json r = json::parse(
-            spill::read_request(json{{"ref", ref}, {"offset", offset}, {"limit", limit}}.dump()));
+        const json r = json::parse(spill::read_request(
+            context::Context::current(),
+            json{{"ref", ref}, {"offset", offset}, {"limit", limit}}.dump()));
         INFO("请求 ref=" << ref << " offset=" << offset << " limit=" << limit
                          << " → " << r.dump());
         REQUIRE(r["ok"] == false);
@@ -156,8 +166,8 @@ TEST_CASE("spill: read_spill 的五种失败各有不同错误文本", "[spill][
 
     // ① 引用不在 spill 根目录内
     const std::string e1 = error_of(outside, 0, 1);
-    // ② 引用不存在（在根目录内，但文件没有）
-    const std::string e2 = error_of(spill::root() + "\\s1\\nope.txt", 0, 1);
+    // ② 引用不存在（在本上下文目录内，但文件没有）
+    const std::string e2 = error_of(spill::root() + "\\" + ctx_dir() + "\\nope.txt", 0, 1);
     // ③ 越界
     const std::string e3 = error_of(inside, 0, 1000);
     // ④ 切点落在多字节字符中间（"中文测试" 的第二个字节）
@@ -174,8 +184,9 @@ TEST_CASE("spill: read_spill 的五种失败各有不同错误文本", "[spill][
 
     // ⑤ 根目录不可读：把根指到一个不存在的位置
     spill::set_root_for_tests(tmp.path() + "/no-such-root/spill");
-    const json r5 = json::parse(
-        spill::read_request(json{{"ref", inside}, {"offset", 0}, {"limit", 1}}.dump()));
+    const json r5 = json::parse(spill::read_request(
+        context::Context::current(),
+        json{{"ref", inside}, {"offset", 0}, {"limit", 1}}.dump()));
     INFO("⑤ " << r5.dump());
     REQUIRE(r5["ok"] == false);
     const std::string e5 = r5["error"].get<std::string>();
@@ -261,8 +272,9 @@ TEST_CASE("spill: spill 根目录之外的引用被拒（拿真实文件试）",
     const std::string self_ref(self, n);
 
     for (const std::string& ref : {config_ref, self_ref}) {
-        const json r = json::parse(
-            spill::read_request(json{{"ref", ref}, {"offset", 0}, {"limit", 10}}.dump()));
+        const json r = json::parse(spill::read_request(
+            context::Context::current(),
+            json{{"ref", ref}, {"offset", 0}, {"limit", 10}}.dump()));
         INFO("ref = " << ref << " → " << r.dump());
         REQUIRE(r["ok"] == false);
         const std::string e = r["error"].get<std::string>();
@@ -273,13 +285,18 @@ TEST_CASE("spill: spill 根目录之外的引用被拒（拿真实文件试）",
 }
 
 TEST_CASE("spill: 目录名映射与 Dart 侧一致", "[spill][spill_write]") {
-    // 与 `test/unit/spill_cleanup_test.dart` 的同一组样例逐字对应：
-    // Dart 侧建目录、C++ 侧也建目录，规则一漂移就会"删了却没删掉"，两边各钉一份。
-    REQUIRE(spill::session_dir_name("abc-123_DEF.4") == "abc-123_DEF.4");
-    REQUIRE(spill::session_dir_name("a/b\\c:d*e") == "a_b_c_d_e");
+    // 与 `test/unit/spill_config_test.dart` 的同一组样例逐字对应（两侧共读
+    // `sidecar/test/spill_session_names.tsv`）：只留 `[a-z0-9_-]`，其余字节写成
+    // `%XX`（大写十六进制）。
+    REQUIRE(spill::session_dir_name("abc-123_def-4") == "abc-123_def-4");
+    REQUIRE(spill::session_dir_name("abc-123_DEF.4") == "abc-123_%44%45%46%2E4");
+    REQUIRE(spill::session_dir_name("a/b\\c:d*e") == "a%2Fb%5Cc%3Ad%2Ae");
     REQUIRE(spill::session_dir_name("") == "no-session");
-    REQUIRE(spill::session_dir_name("..") == "no-session");
-    REQUIRE(spill::session_dir_name("中文会话") == "____________");  // 12 个 UTF-8 字节
+    // `..` 必须编码掉，否则目录会跑到 spill 根目录之外。
+    REQUIRE(spill::session_dir_name("..") == "%2E%2E");
+    REQUIRE(spill::session_dir_name("会话甲") == "%E4%BC%9A%E8%AF%9D%E7%94%B2");
+    // 只差大小写的两个名字必须落到不同目录（Windows 不区分大小写）。
+    REQUIRE(spill::session_dir_name("Agent-7") != spill::session_dir_name("agent-7"));
     INFO("a/b:c ⇒ " << spill::session_dir_name("a/b:c"));
 }
 
@@ -348,4 +365,124 @@ TEST_CASE("spill: 中途写失败时目标文件保持原状（原子写）", "[
     // 把 rename 换成"直接写目标文件"之后，这里会读到 5 个 A —— 这条就是那个守卫。
     REQUIRE(read_all(target) == "OLD-CONTENT");
     REQUIRE(file_exists(target + ".tmp") == false);
+}
+
+// ---------------------------------------------------------------------------
+// 2.4（change add-context-handles）共享样例表、跨上下文拒绝、重启续号
+// ---------------------------------------------------------------------------
+
+TEST_CASE("spill: 编码样例表（C++ 与 Dart 共读同一份）逐行一致", "[spill][spill_write]") {
+    std::ifstream f(SPILL_NAMES_TSV);
+    REQUIRE(f.good());
+    std::string line;
+    std::set<std::string> dirs;
+    int rows = 0;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        const size_t tab1 = line.find('\t');
+        REQUIRE(tab1 != std::string::npos);
+        const size_t tab2 = line.find('\t', tab1 + 1);
+        REQUIRE(tab2 != std::string::npos);
+        const std::string name = line.substr(0, tab1);
+        const std::string expected = line.substr(tab1 + 1, tab2 - tab1 - 1);
+        INFO("name=[" << name << "] expected=[" << expected << "]");
+        REQUIRE(spill::session_dir_name(name) == expected);
+        ++rows;
+        dirs.insert(expected);
+    }
+    // 含中文、`.`、`..`、空串、大小写、UUID：样例表至少 9 行。
+    REQUIRE(rows >= 9);
+    // 不同的非空名字不得落到同一个目录（空名字那一行单独算 no-session）。
+    REQUIRE(dirs.size() == static_cast<size_t>(rows));
+}
+
+TEST_CASE("spill: 用另一个上下文的句柄读引用被拒（含 .. 绕行）", "[spill][spill_write]") {
+    TempDir root;
+    SpillRootGuard guard(root.path());
+    context::reset_registry_for_tests();
+    auto a = context_api::ensure_context("owner-a", nullptr);
+    auto b = context_api::ensure_context("owner-b", nullptr);
+    a->reset_spill_seq_for_tests();
+    b->reset_spill_seq_for_tests();
+
+    const spill::Written wa = spill::write_for_context(*a, a->name(), "stdout", "SECRET-A");
+    REQUIRE(wa.ok);
+
+    // ① 直接引用甲的绝对路径：乙的句柄必须拒绝，且不返回内容。
+    const json direct = json::parse(spill::read_request(
+        *b, json{{"ref", wa.path}, {"offset", 0}, {"limit", 100}}.dump()));
+    INFO("direct -> " << direct.dump());
+    REQUIRE(direct["ok"] == false);
+    REQUIRE(direct["error"].get<std::string>().find("不属于该上下文的目录") != std::string::npos);
+    REQUIRE(direct.dump().find("SECRET-A") == std::string::npos);
+
+    // ② 乙目录/../甲目录/文件名：规范化之后落在甲目录，同样被拒。
+    const std::string file_name = wa.path.substr(wa.path.find_last_of("\\") + 1);
+    const std::string crossed = spill::root() + "\\" +
+                                spill::session_dir_name(b->name()) + "\\..\\" +
+                                spill::session_dir_name(a->name()) + "\\" + file_name;
+    const json cross = json::parse(spill::read_request(
+        *b, json{{"ref", crossed}, {"offset", 0}, {"limit", 100}}.dump()));
+    INFO("crossed -> " << cross.dump());
+    REQUIRE(cross["ok"] == false);
+    REQUIRE(cross.dump().find("SECRET-A") == std::string::npos);
+
+    // ③ 自己的句柄能读到全文（区间必须落在文件内：这里内容是 8 字节）。
+    const json own = json::parse(spill::read_request(
+        *a, json{{"ref", wa.path}, {"offset", 0}, {"limit", 8}}.dump()));
+    INFO("own -> " << own.dump());
+    REQUIRE(own["ok"] == true);
+    REQUIRE(own["text"] == "SECRET-A");
+
+    // ④ 不存在的引用仍报"引用不存在"，不能被规范化失败误报成越界。
+    const std::string missing = spill::context_dir(a->name()) + "\\nope.txt";
+    const json miss = json::parse(spill::read_request(
+        *a, json{{"ref", missing}, {"offset", 0}, {"limit", 10}}.dump()));
+    INFO("missing -> " << miss.dump());
+    REQUIRE(miss["ok"] == false);
+    REQUIRE(miss["error"].get<std::string>().find("引用不存在") != std::string::npos);
+
+    context::reset_registry_for_tests();
+}
+
+TEST_CASE("spill: 重建同名上下文后序号继续，旧引用不被覆盖", "[spill][spill_write]") {
+    TempDir root;
+    SpillRootGuard guard(root.path());
+    context::reset_registry_for_tests();
+
+    std::string old_ref;
+    {
+        auto ctx = context_api::ensure_context("restart-ctx", nullptr);
+        spill::initialize_sequence_for_context(*ctx);
+        ctx->reset_spill_seq_for_tests();
+        // 模拟"进程里第一次写 1 号"：先清号再重建目录里的已有文件。
+        const spill::Written first =
+            spill::write_for_context(*ctx, ctx->name(), "stdout", "FIRST");
+        REQUIRE(first.ok);
+        REQUIRE(first.path.find("000001-stdout.txt") != std::string::npos);
+        old_ref = first.path;
+    }
+
+    // 模拟进程重启：只清注册表（spill 目录保留），再用同名上下文重建。
+    context::reset_registry_for_tests();
+    {
+        auto ctx = context_api::ensure_context("restart-ctx", nullptr);
+        spill::initialize_sequence_for_context(*ctx);
+        const spill::Written second =
+            spill::write_for_context(*ctx, ctx->name(), "stdout", "SECOND");
+        INFO("second path = " << second.path);
+        REQUIRE(second.ok);
+        REQUIRE(second.path != old_ref);
+        REQUIRE(second.path.find("000002-stdout.txt") != std::string::npos);
+        // 旧引用内容不变。
+        REQUIRE(read_all(old_ref) == "FIRST");
+        // 旧引用仍读得回来（"FIRST" 是 5 字节，区间必须落在文件内）。
+        const json old_read = json::parse(spill::read_request(
+            *ctx, json{{"ref", old_ref}, {"offset", 0}, {"limit", 5}}.dump()));
+        INFO("old read -> " << old_read.dump());
+        REQUIRE(old_read["ok"] == true);
+        REQUIRE(old_read["text"] == "FIRST");
+    }
+
+    context::reset_registry_for_tests();
 }

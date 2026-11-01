@@ -12,6 +12,7 @@
 #include "subprocess.h"
 #include "spill.h"
 #include "tools.h"
+#include "context.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -223,11 +224,11 @@ struct StreamShape {
 ///
 /// 落盘失败时不返回 `ok:false` —— 由调用方按"输出是否超过预览阈值"决定兜底方式
 /// （小的直接内联，大的必须报错，见规范"写盘失败必须可见"）。
-StreamShape shape_stream(const std::string& raw, size_t preview_chars,
+StreamShape shape_stream(context::Context& ctx, const std::string& raw, size_t preview_chars,
                          const std::string& session, const char* tag,
                          spill::Written* written_out) {
   StreamShape r;
-  const spill::Written w = spill::write(session, tag, raw);
+  const spill::Written w = spill::write_for_context(ctx, session, tag, raw);
   if (written_out) *written_out = w;
   if (!w.ok) {
     // 写盘失败：先把能给的给出去，形态交给调用方判断。
@@ -347,7 +348,10 @@ std::string run_command(const std::string& request_json) {
   // 头尾各留多少字符：单一配置项 `spill.preview_chars`（配置由 Dart 侧读好随请求
   // 传进来，执行侧不读配置文件 —— 与超时那几个值的做法一致）。
   const long long preview_chars = int_field(req, "preview_chars", kDefaultPreviewChars);
-  const std::string spill_session = req.value("spill_session", std::string("no-session"));
+  // spill 的归属键**就是首参上下文句柄**（change add-context-handles）：不再从请求
+  // 里的会话字段取，否则删除上下文时按句柄找不到按会话建的目录。
+  context::Context& ctx = context::Context::current();
+  const std::string spill_key = ctx.name();
 
   // ---- 起进程 ----
   subprocess::Options opts;
@@ -371,10 +375,10 @@ std::string run_command(const std::string& request_json) {
 
   spill::Written out_written;
   spill::Written err_written;
-  const StreamShape out = shape_stream(res.stdout_data, static_cast<size_t>(preview_chars),
-                                       spill_session, "stdout", &out_written);
-  const StreamShape err = shape_stream(res.stderr_data, static_cast<size_t>(preview_chars),
-                                       spill_session, "stderr", &err_written);
+  const StreamShape out = shape_stream(ctx, res.stdout_data, static_cast<size_t>(preview_chars),
+                                       spill_key, "stdout", &out_written);
+  const StreamShape err = shape_stream(ctx, res.stderr_data, static_cast<size_t>(preview_chars),
+                                       spill_key, "stderr", &err_written);
 
   // 写盘失败要看得见（规范"写盘失败必须可见"）：小输出已经内联全文，不算失败；
   // 大输出则**不能**只给一部分冒充完整结果 —— 直接报错，说清目录与原因。

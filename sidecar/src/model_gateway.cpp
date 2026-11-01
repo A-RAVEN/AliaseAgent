@@ -171,8 +171,15 @@ struct ModelGateway::Impl {
 
 std::atomic<int> ModelGateway::Impl::next_request_id{1};
 
-// Global pointer for crash handler access (dump_ffi_ring_buffer)
+// 全局指针 for crash handler access (dump_ffi_ring_buffer).
+//
+// 每上下文一个网关（change add-context-handles）：这个指针仍然只有一份，因为它
+// 服务的是「崩溃时看一眼最近那次请求的回调环形缓冲」这条诊断用途。它是指向网关
+// 内部缓冲的裸指针，所以必须配一把独立的锁：`execute` 在锁内登记；网关析构时
+// 只在仍指向自己时才清空；崩溃转储在锁内读取。多上下文并发时，最后登记且仍存活
+// 的那一只被转储。
 static FfiRingBuffer* g_ffi_ring = nullptr;
+static std::mutex g_ffi_ring_mutex;
 
 // Forward declarations (defined below write_callback)
 static bool http_status_ok(ModelGateway::Impl* impl);
@@ -480,6 +487,11 @@ ModelGateway::ModelGateway() : impl_(new Impl{}) {
 }
 
 ModelGateway::~ModelGateway() {
+  // 只清自己登记的那一格：别的上下文可能已经把指针换成它自己的网关。
+  {
+    std::lock_guard<std::mutex> lock(g_ffi_ring_mutex);
+    if (g_ffi_ring == &impl_->ffi_ring) g_ffi_ring = nullptr;
+  }
   if (impl_->headers) curl_slist_free_all(impl_->headers);
   if (impl_->curl) curl_easy_cleanup(impl_->curl);
   delete impl_;
@@ -583,7 +595,10 @@ int ModelGateway::execute(
     return -1;
   }
 
-  g_ffi_ring = &impl_->ffi_ring;  // register for crash handler visibility
+  {
+    std::lock_guard<std::mutex> lock(g_ffi_ring_mutex);
+    g_ffi_ring = &impl_->ffi_ring;  // register for crash handler visibility
+  }
 
   LOG_INFO("=== Request #" + std::to_string(rid) + " start ===");
   LOG_TRACE("execute: model=" + std::string(model ? model : "null") + " msgs=" + std::to_string(messages_json ? std::strlen(messages_json) : 0) + " bytes");
@@ -879,22 +894,25 @@ static const char* ffi_event_type_str(FfiEventType t) {
 }
 
 void dump_ffi_ring_buffer() {
+  // 持锁读取：网关析构可能正在另一线程里把指针清空并释放缓冲。锁覆盖「取指针 →
+  // 拷出条目」整段；转储内容先复制到栈上，再释放锁去写崩溃日志。
+  std::lock_guard<std::mutex> lock(g_ffi_ring_mutex);
   if (!g_ffi_ring) {
     crash_log("FFI ring buffer: empty");
     return;
   }
 
-  // Lock-free snapshot: read write_idx once, then iterate
-  size_t write_idx = g_ffi_ring->write_idx.load(std::memory_order_acquire);
-  size_t count = write_idx < FfiRingBuffer::CAPACITY ? write_idx : FfiRingBuffer::CAPACITY;
+  FfiRingBuffer* ring = g_ffi_ring;
+  const size_t write_idx = ring->write_idx.load(std::memory_order_acquire);
+  const size_t count = write_idx < FfiRingBuffer::CAPACITY ? write_idx : FfiRingBuffer::CAPACITY;
 
   char header[128];
   snprintf(header, sizeof(header), "Last %zu FFI calls:", count);
   crash_log(header);
 
   for (size_t i = 0; i < count; ++i) {
-    size_t idx = (write_idx - count + i) % FfiRingBuffer::CAPACITY;
-    const FfiEvent& ev = g_ffi_ring->events[idx];
+    const size_t idx = (write_idx - count + i) % FfiRingBuffer::CAPACITY;
+    const FfiEvent ev = ring->events[idx];
     char line[256];
     snprintf(line, sizeof(line), "  [%llu] %s payload=%zu",
              (unsigned long long)ev.timestamp_ms,

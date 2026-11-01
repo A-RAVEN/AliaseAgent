@@ -1803,10 +1803,23 @@ TEST_CASE("Build: search_provider headers compile and link", "[build]") {
 
 /// Read the search config from the user's config.json and inject API keys
 /// into the provider singletons. Called before each [live] test.
+///
+/// **每次调用都要重设，不能只做一次**：Catch2 默认随机顺序，而智谱/Kimi 的 mock
+/// 用例会把共享单例的 `base_url` 指到已停止的本地 mock 服务、把 `api_key` 改成
+/// `test_key`。实时用例若继承这些状态，就会在「连接失败」或「HTTP 401」上红，
+/// 而不是真的测实时接口（2026-11-01 实测：`--order decl` 下 5/5 连接失败）。
+/// 所以先恢复产品默认地址与空 key，再按配置填 key；配置缺 key 时保持空 key，
+/// 让实时用例按既有约定跳过。
 static void inject_live_config() {
-  static bool done = false;
-  if (done) return;
-  done = true;
+  auto zhipuai = get_zhipuai_provider();
+  zhipuai->set_api_key(std::string());
+  // 产品默认地址见 sidecar/src/zhipuai_search.h 的 `base_url_` 缺省值。
+  zhipuai->set_base_url("https://open.bigmodel.cn/api/paas/v4/web_search");
+
+  auto kimi = get_kimi_provider();
+  kimi->set_api_key(std::string());
+  // 产品默认地址见 sidecar/src/kimi_search.h 的 `base_url_` 缺省值。
+  kimi->set_base_url("https://api.moonshot.cn/v1/chat/completions");
 
   std::string config_path;
 #ifdef _WIN32
@@ -1834,17 +1847,15 @@ static void inject_live_config() {
     if (search.contains("zhipuai") && search["zhipuai"].is_object()) {
       auto& z = search["zhipuai"];
       if (z.contains("api_key")) {
-        auto p = get_zhipuai_provider();
-        p->set_api_key(z["api_key"].get<std::string>());
-        if (z.contains("search_engine")) p->set_search_engine(z["search_engine"].get<std::string>());
+        zhipuai->set_api_key(z["api_key"].get<std::string>());
+        if (z.contains("search_engine")) zhipuai->set_search_engine(z["search_engine"].get<std::string>());
       }
     }
     if (search.contains("kimi") && search["kimi"].is_object()) {
       auto& k = search["kimi"];
       if (k.contains("api_key")) {
-        auto p = get_kimi_provider();
-        p->set_api_key(k["api_key"].get<std::string>());
-        if (k.contains("model")) p->set_model(k["model"].get<std::string>());
+        kimi->set_api_key(k["api_key"].get<std::string>());
+        if (k.contains("model")) kimi->set_model(k["model"].get<std::string>());
       }
     }
   } catch (...) {

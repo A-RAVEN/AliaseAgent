@@ -1,55 +1,68 @@
 #include "sidecar_api.h"
-#include "model_gateway.h"
-#include "tools.h"
-#include "logger.h"
-#include "crash_handler.h"
-#include "search_provider.h"
-#include "web_fetch.h"
-#include "browser.h"
-#include "command_tool.h"
-#include "spill.h"
+
+#include <cstdlib>
+#include <mutex>
 #include <string>
-#include <cstring>
 
-static ModelGateway g_gateway;
-static bool g_log_initialized = false;
-static bool g_debug_infra_initialized = false;
-static std::string g_last_tool_result; // thread-unsafe but single-threaded usage
+#include "context.h"
+#include "context_api.h"
+#include "crash_handler.h"
+#include "logger.h"
 
-static void ensure_log() {
-  if (g_log_initialized) return;
-  g_log_initialized = true;
+// ============================================================================
+// 导出的薄壳（change add-context-handles，第二步）
+//
+// 这里只剩三件事：初始化日志/崩溃设施、把句柄交给 context_api 解析、把调用转给
+// context_api。返回字符串由 context_api 里**每个入口专用的 thread_local 槽**持有，
+// 本文件不再有 g_*_result，也不再有任何 err_static。
+// ============================================================================
 
-  const char* home = nullptr;
+namespace {
+
+std::once_flag g_log_once;
+std::once_flag g_debug_infra_once;
+
+void ensure_log() {
+  std::call_once(g_log_once, []() {
+    const char* home = nullptr;
 #ifdef _WIN32
-  home = getenv("USERPROFILE");
+    home = std::getenv("USERPROFILE");
 #else
-  home = getenv("HOME");
+    home = std::getenv("HOME");
 #endif
-  if (home) {
-    Logger::instance().init(std::string(home) + "/.aliasagent/logs");
-  }
+    if (home) {
+      Logger::instance().init(std::string(home) + "/.aliasagent/logs");
+    }
+  });
 }
 
-static void ensure_debug_infra() {
-  if (g_debug_infra_initialized) return;
-  g_debug_infra_initialized = true;
-
-  crash_init(Logger::crash_dir().c_str());
+void ensure_debug_infra() {
+  std::call_once(g_debug_infra_once, []() { crash_init(Logger::crash_dir().c_str()); });
 }
+
+}  // namespace
 
 extern "C" {
 
-SIDECAR_API const char* ping(void) {
-  return "pong";
+SIDECAR_API const char* ping(void) { return "pong"; }
+
+SIDECAR_API const char* create_context(const char* name) {
+  ensure_log();
+  return context_api::create_context_json(name);
 }
 
-SIDECAR_API void cancel_request(int request_id) {
+SIDECAR_API const char* dispose_context(const char* handle) {
   ensure_log();
-  g_gateway.cancel(request_id);
+  return context_api::dispose_context_json(handle);
+}
+
+SIDECAR_API const char* cancel_request(const char* handle, int request_id) {
+  ensure_log();
+  return context_api::cancel_request(handle, request_id);
 }
 
 SIDECAR_API int send_message(
+  const char* handle,
   const char* api_key,
   const char* base_url,
   const char* model,
@@ -66,349 +79,90 @@ SIDECAR_API int send_message(
 ) {
   ensure_log();
   ensure_debug_infra();
-  LOG_TRACE("send_message: model=" + std::string(model ? model : "null") + " api_key=<REDACTED>");
-
-  if (!api_key || std::strlen(api_key) == 0) {
-    if (on_done) on_done(0, "", "", 0, 0);
-    return 1;
-  }
-
-  return g_gateway.execute(
-    api_key, base_url ? base_url : "",
-    model ? model : "",
-    system_prompt ? system_prompt : "",
-    messages_json ? messages_json : "",
-    tools_json ? tools_json : "",
-    thinking_mode ? thinking_mode : "",
-    thinking_effort ? thinking_effort : "",
-    on_chunk, on_tool_call, on_thinking, on_done,
-    request_id
-  );
+  return context_api::send_message(
+      handle, api_key, base_url, model, system_prompt, messages_json, tools_json,
+      thinking_mode, thinking_effort, on_chunk, on_tool_call, on_thinking, on_done,
+      request_id);
 }
 
-SIDECAR_API const char* set_workspace(const char* path) {
-  LOG_TRACE("set_workspace: path=" + std::string(path ? path : "null"));
-  std::string err = tools::set_workspace(path ? path : "");
-  if (err.empty()) return "";
-  g_last_tool_result = err;
-  return g_last_tool_result.c_str();
+SIDECAR_API const char* set_workspace(const char* handle, const char* path) {
+  return context_api::set_workspace(handle, path);
 }
 
-SIDECAR_API const char* read_file(const char* path) {
-  LOG_TRACE("read_file: path=" + std::string(path ? path : "null"));
-  if (!path) {
-    g_last_tool_result = "{\"ok\":false,\"error\":\"No path provided\"}";
-    return g_last_tool_result.c_str();
-  }
-  // Pass through — Dart side now wraps into JSON {"path":"..."} as needed
-  g_last_tool_result = tools::read_file(path);
-  return g_last_tool_result.c_str();
+SIDECAR_API const char* read_file(const char* handle, const char* path) {
+  return context_api::read_file(handle, path);
 }
 
-SIDECAR_API const char* list_dir(const char* path) {
-  LOG_TRACE("list_dir: path=" + std::string(path ? path : "null"));
-  if (!path) {
-    g_last_tool_result = "{\"ok\":false,\"error\":\"No path provided\"}";
-    return g_last_tool_result.c_str();
-  }
-  g_last_tool_result = tools::list_dir(path);
-  return g_last_tool_result.c_str();
+SIDECAR_API const char* list_dir(const char* handle, const char* path) {
+  return context_api::list_dir(handle, path);
 }
-
-// ============================================================================
-// Search & web fetch API (tasks 7.1-7.6)
-//
-// Thread-safety note: All search functions use per-function static string
-// buffers (matching existing g_last_tool_result pattern). This is safe under
-// the current assumption that Dart executes tool calls serially (_executeTool
-// for loop). Concurrent FFI calls to the same function would race on the
-// static buffer — if parallel tool execution is added in the future, a mutex
-// or per-call allocation would be needed.
-// ============================================================================
-
-// Per-function static buffers (D9: static string pattern)
-static std::string g_search_result;
-static std::string g_fetch_result;
-static std::string g_search_infra_result;
-static std::string g_search_providers_result;
 
 SIDECAR_API const char* ensure_search_infra(const char* search_config_json) {
-  LOG_TRACE("ensure_search_infra called");
-  try {
-    g_search_infra_result = ensure_search_infra_impl(std::string(search_config_json ? search_config_json : "{}"));
-    return g_search_infra_result.c_str();
-  } catch (const std::exception& e) {
-    static std::string err_static;
-    err_static = "{\"ok\":false,\"error\":\"" + tools::json_escape(e.what()) + "\"}";
-    LOG_ERR("ensure_search_infra exception: " + std::string(e.what()));
-    return err_static.c_str();
-  } catch (...) {
-    LOG_ERR("ensure_search_infra: unknown exception");
-    return "{\"ok\":false,\"error\":\"Unknown internal error\"}";
-  }
+  return context_api::ensure_search_infra(search_config_json);
 }
 
 SIDECAR_API const char* get_search_providers(void) {
-  LOG_TRACE("get_search_providers called");
-  try {
-    g_search_providers_result = get_search_providers_json();
-    return g_search_providers_result.c_str();
-  } catch (const std::exception& e) {
-    static std::string err_static;
-    err_static = "[]";
-    LOG_ERR("get_search_providers exception: " + std::string(e.what()));
-    return err_static.c_str();
-  } catch (...) {
-    LOG_ERR("get_search_providers: unknown exception");
-    return "[]";
-  }
+  return context_api::get_search_providers();
 }
 
-SIDECAR_API const char* web_search(const char* request_json) {
-  LOG_TRACE("web_search called");
-  try {
-    g_search_result = dispatch_web_search(request_json ? request_json : "{}");
-    return g_search_result.c_str();
-  } catch (const std::exception& e) {
-    static std::string err_static;
-    err_static = "{\"ok\":false,\"error\":\"" + tools::json_escape(e.what()) + "\"}";
-    LOG_ERR("web_search exception: " + std::string(e.what()));
-    return err_static.c_str();
-  } catch (...) {
-    LOG_ERR("web_search: unknown exception");
-    return "{\"ok\":false,\"error\":\"Unknown internal error\"}";
-  }
+SIDECAR_API const char* web_search(const char* handle, const char* request_json) {
+  return context_api::web_search(handle, request_json);
 }
 
-SIDECAR_API const char* web_fetch(const char* request_json) {
-  LOG_TRACE("web_fetch called");
-  try {
-    // Must cast to std::string to force compiler to pick the C++ overload
-    // (std::string web_fetch(const std::string&)) instead of recursing into
-    // this very function (const char* web_fetch(const char*)).
-    g_fetch_result = web_fetch_impl(std::string(request_json ? request_json : "{}"));
-    return g_fetch_result.c_str();
-  } catch (const std::exception& e) {
-    static std::string err_static;
-    err_static = "{\"ok\":false,\"error\":\"Fetch failed: " + tools::json_escape(e.what()) + "\"}";
-    LOG_ERR("web_fetch exception: " + std::string(e.what()));
-    return err_static.c_str();
-  } catch (...) {
-    LOG_ERR("web_fetch: unknown exception");
-    return "{\"ok\":false,\"error\":\"Fetch failed: unknown error\"}";
-  }
+SIDECAR_API const char* web_fetch(const char* handle, const char* request_json) {
+  return context_api::web_fetch(handle, request_json);
 }
 
-// Per-function static buffers for file edit tools
-static std::string g_write_file_result;
-static std::string g_edit_file_result;
-
-SIDECAR_API const char* write_file(const char* request_json) {
-  LOG_TRACE("write_file called");
-  if (!request_json) {
-    g_write_file_result = "{\"ok\":false,\"error\":\"No request provided\"}";
-    return g_write_file_result.c_str();
-  }
-  g_write_file_result = tools::write_file(request_json);
-  return g_write_file_result.c_str();
+SIDECAR_API const char* write_file(const char* handle, const char* request_json) {
+  return context_api::write_file(handle, request_json);
 }
 
-SIDECAR_API const char* edit_file(const char* request_json) {
-  LOG_TRACE("edit_file called");
-  if (!request_json) {
-    g_edit_file_result = "{\"ok\":false,\"error\":\"No request provided\"}";
-    return g_edit_file_result.c_str();
-  }
-  g_edit_file_result = tools::edit_file(request_json);
-  return g_edit_file_result.c_str();
+SIDECAR_API const char* edit_file(const char* handle, const char* request_json) {
+  return context_api::edit_file(handle, request_json);
 }
 
-// Per-function static buffers for ripgrep-backed search tools
-static std::string g_glob_file_result;
-static std::string g_grep_file_result;
-
-SIDECAR_API const char* glob_file(const char* request_json) {
-  LOG_TRACE("glob_file called");
-  if (!request_json) {
-    g_glob_file_result = "{\"ok\":false,\"error\":\"No request provided\"}";
-    return g_glob_file_result.c_str();
-  }
-  g_glob_file_result = tools::glob_file(request_json);
-  return g_glob_file_result.c_str();
+SIDECAR_API const char* glob_file(const char* handle, const char* request_json) {
+  return context_api::glob_file(handle, request_json);
 }
 
-SIDECAR_API const char* grep_file(const char* request_json) {
-  LOG_TRACE("grep_file called");
-  if (!request_json) {
-    g_grep_file_result = "{\"ok\":false,\"error\":\"No request provided\"}";
-    return g_grep_file_result.c_str();
-  }
-  g_grep_file_result = tools::grep_file(request_json);
-  return g_grep_file_result.c_str();
+SIDECAR_API const char* grep_file(const char* handle, const char* request_json) {
+  return context_api::grep_file(handle, request_json);
 }
 
-// 图片工具（add-image-input）。两个都走"校验/落盘 + 返回描述"的模式，
-// 字节本身不从这里过 FFI：read_image 只描述已有文件，read_clipboard_image
-// 把剪贴板位图写成 PNG 后返回路径，真正要发给模型的 base64 由 Dart 读文件产生。
-static std::string g_read_image_result;
-
-SIDECAR_API const char* read_image(const char* request_json) {
-  LOG_TRACE("read_image called");
-  if (!request_json) {
-    g_read_image_result = "{\"ok\":false,\"error\":\"No request provided\"}";
-    return g_read_image_result.c_str();
-  }
-  g_read_image_result = tools::read_image(request_json);
-  return g_read_image_result.c_str();
+SIDECAR_API const char* read_image(const char* handle, const char* request_json) {
+  return context_api::read_image(handle, request_json);
 }
 
-static std::string g_read_clipboard_image_result;
-
-SIDECAR_API const char* read_clipboard_image(const char* request_json) {
-  LOG_TRACE("read_clipboard_image called");
-  if (!request_json) {
-    g_read_clipboard_image_result = "{\"ok\":false,\"error\":\"No request provided\"}";
-    return g_read_clipboard_image_result.c_str();
-  }
-  g_read_clipboard_image_result = tools::read_clipboard_image(request_json);
-  return g_read_clipboard_image_result.c_str();
-}
-
-// ============================================================================
-// Browser tool (add-browser-tool) — persistent-headed Edge worker
-// ============================================================================
-
-// Per-function static buffers (D9 static string pattern, matching web_fetch).
-static std::string g_browser_available_result;
-static std::string g_browser_navigate_result;
-static std::string g_browser_click_result;
-static std::string g_browser_type_result;
-static std::string g_browser_snapshot_result;
-
-// ---------------------------------------------------------------------------
-// run_command（命令工具，change add-command-tool）
-// ---------------------------------------------------------------------------
-static std::string g_run_command_result;
-
-SIDECAR_API const char* run_command(const char* request_json) {
-  LOG_TRACE("run_command called");
-  try {
-    g_run_command_result = command_tool::run_command(request_json ? request_json : "{}");
-    return g_run_command_result.c_str();
-  } catch (const std::exception& e) {
-    static std::string err_static;
-    err_static = "{\"ok\":false,\"error\":\"" + tools::json_escape(e.what()) + "\"}";
-    LOG_ERR("run_command exception: " + std::string(e.what()));
-    return err_static.c_str();
-  } catch (...) {
-    LOG_ERR("run_command: unknown exception");
-    return "{\"ok\":false,\"error\":\"Unknown internal error\"}";
-  }
-}
-
-// ---------------------------------------------------------------------------
-// read_spill（把 spill 文件的一段按字节读回来，change spill-large-tool-output）
-//
-// 只读 spill 根目录（`~/.aliasagent/spill/`）里的文件；越界、越界引用、切在多字节
-// 字符中间各有不同错误文本，由 `spill::read_request` 给出。
-// ---------------------------------------------------------------------------
-static std::string g_read_spill_result;
-
-SIDECAR_API const char* read_spill(const char* request_json) {
-  LOG_TRACE("read_spill called");
-  try {
-    g_read_spill_result = spill::read_request(request_json ? request_json : "{}");
-    return g_read_spill_result.c_str();
-  } catch (const std::exception& e) {
-    static std::string err_static;
-    err_static = "{\"ok\":false,\"error\":\"" + tools::json_escape(e.what()) + "\"}";
-    LOG_ERR("read_spill exception: " + std::string(e.what()));
-    return err_static.c_str();
-  } catch (...) {
-    LOG_ERR("read_spill: unknown exception");
-    return "{\"ok\":false,\"error\":\"Unknown internal error\"}";
-  }
+SIDECAR_API const char* read_clipboard_image(const char* handle, const char* request_json) {
+  return context_api::read_clipboard_image(handle, request_json);
 }
 
 SIDECAR_API const char* browser_available(void) {
-  LOG_TRACE("browser_available called");
-  try {
-    g_browser_available_result = browser::browser_available();
-    return g_browser_available_result.c_str();
-  } catch (const std::exception& e) {
-    static std::string err_static;
-    err_static = "{\"ok\":true,\"available\":false,\"error\":\"" +
-                 tools::json_escape(e.what()) + "\"}";
-    LOG_ERR("browser_available exception: " + std::string(e.what()));
-    return err_static.c_str();
-  } catch (...) {
-    LOG_ERR("browser_available: unknown exception");
-    return "{\"ok\":true,\"available\":false,\"error\":\"Unknown internal error\"}";
-  }
+  return context_api::browser_available();
 }
 
-SIDECAR_API const char* browser_navigate(const char* request_json) {
-  LOG_TRACE("browser_navigate called");
-  try {
-    g_browser_navigate_result = browser::browser_navigate(request_json ? request_json : "{}");
-    return g_browser_navigate_result.c_str();
-  } catch (const std::exception& e) {
-    static std::string err_static;
-    err_static = "{\"ok\":false,\"error\":\"" + tools::json_escape(e.what()) + "\"}";
-    LOG_ERR("browser_navigate exception: " + std::string(e.what()));
-    return err_static.c_str();
-  } catch (...) {
-    LOG_ERR("browser_navigate: unknown exception");
-    return "{\"ok\":false,\"error\":\"Unknown internal error\"}";
-  }
+SIDECAR_API const char* browser_navigate(const char* handle, const char* request_json) {
+  return context_api::browser_navigate(handle, request_json);
 }
 
-SIDECAR_API const char* browser_click(const char* request_json) {
-  LOG_TRACE("browser_click called");
-  try {
-    g_browser_click_result = browser::browser_click(request_json ? request_json : "{}");
-    return g_browser_click_result.c_str();
-  } catch (const std::exception& e) {
-    static std::string err_static;
-    err_static = "{\"ok\":false,\"error\":\"" + tools::json_escape(e.what()) + "\"}";
-    LOG_ERR("browser_click exception: " + std::string(e.what()));
-    return err_static.c_str();
-  } catch (...) {
-    LOG_ERR("browser_click: unknown exception");
-    return "{\"ok\":false,\"error\":\"Unknown internal error\"}";
-  }
+SIDECAR_API const char* browser_click(const char* handle, const char* request_json) {
+  return context_api::browser_click(handle, request_json);
 }
 
-SIDECAR_API const char* browser_type(const char* request_json) {
-  LOG_TRACE("browser_type called");
-  try {
-    g_browser_type_result = browser::browser_type(request_json ? request_json : "{}");
-    return g_browser_type_result.c_str();
-  } catch (const std::exception& e) {
-    static std::string err_static;
-    err_static = "{\"ok\":false,\"error\":\"" + tools::json_escape(e.what()) + "\"}";
-    LOG_ERR("browser_type exception: " + std::string(e.what()));
-    return err_static.c_str();
-  } catch (...) {
-    LOG_ERR("browser_type: unknown exception");
-    return "{\"ok\":false,\"error\":\"Unknown internal error\"}";
-  }
+SIDECAR_API const char* browser_type(const char* handle, const char* request_json) {
+  return context_api::browser_type(handle, request_json);
 }
 
-SIDECAR_API const char* browser_snapshot(const char* request_json) {
-  LOG_TRACE("browser_snapshot called");
-  try {
-    g_browser_snapshot_result = browser::browser_snapshot(request_json ? request_json : "{}");
-    return g_browser_snapshot_result.c_str();
-  } catch (const std::exception& e) {
-    static std::string err_static;
-    err_static = "{\"ok\":false,\"error\":\"" + tools::json_escape(e.what()) + "\"}";
-    LOG_ERR("browser_snapshot exception: " + std::string(e.what()));
-    return err_static.c_str();
-  } catch (...) {
-    LOG_ERR("browser_snapshot: unknown exception");
-    return "{\"ok\":false,\"error\":\"Unknown internal error\"}";
-  }
+SIDECAR_API const char* browser_snapshot(const char* handle, const char* request_json) {
+  return context_api::browser_snapshot(handle, request_json);
+}
+
+SIDECAR_API const char* run_command(const char* handle, const char* request_json) {
+  return context_api::run_command(handle, request_json);
+}
+
+SIDECAR_API const char* read_spill(const char* handle, const char* request_json) {
+  return context_api::read_spill(handle, request_json);
 }
 
 } // extern "C"

@@ -16,6 +16,8 @@ import 'package:alias_agent/services/sidecar_bridge.dart';
 /// 用例结束删掉该目录。内容里每个字节都能反推位置，所以"读错了哪一段"能直接看出来。
 void main() {
   final bridge = SidecarBridge.instance;
+  // change add-context-handles：read_spill 只接受**本上下文目录**里的引用。
+  const ctx = 'it-roundtrip';
 
   /// spill 根目录，与产品一致：`~/.aliasagent/spill/`。
   final home = Platform.environment['USERPROFILE'] ??
@@ -23,9 +25,10 @@ void main() {
       '';
   late Directory sessionDir;
 
-  setUpAll(() {
+  setUpAll(() async {
+    await bridge.ensureContext(ctx, defaultWorkspace: '.');
     expect(home.isNotEmpty, isTrue, reason: '拿不到用户主目录就没法定位 spill 根');
-    sessionDir = Directory('$home/.aliasagent/spill/_it_roundtrip_$pid');
+    sessionDir = Directory('$home/.aliasagent/spill/$ctx');
     if (sessionDir.existsSync()) sessionDir.deleteSync(recursive: true);
     sessionDir.createSync(recursive: true);
   });
@@ -57,7 +60,7 @@ void main() {
     print('[read_spill] 引用 = $ref（文件 ${fileBytes.length} 字节），'
         '请求 offset=50000 limit=1000');
 
-    final raw = bridge.readSpill(jsonEncode({
+    final raw = bridge.readSpill(ctx, jsonEncode({
       'ref': ref,
       'offset': 50000,
       'limit': 1000,
@@ -84,7 +87,7 @@ void main() {
     final ref = writeFixture();
     final fileBytes = File(ref).readAsBytesSync();
     final raw =
-        bridge.readSpill(jsonEncode({'ref': ref, 'offset': 100}));
+        bridge.readSpill(ctx, jsonEncode({'ref': ref, 'offset': 100}));
     final r = jsonDecode(raw) as Map<String, dynamic>;
     // ignore: avoid_print
     print('[read_spill] 实测读数（省 limit）: ok=${r['ok']} '

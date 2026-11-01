@@ -10,6 +10,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "context.h"
 #include "subprocess.h"
 
 #ifdef _WIN32
@@ -31,7 +32,6 @@ namespace {
 size_t g_fail_after = kNoInjectedFailure;
 
 std::string g_root_override;
-unsigned g_call_seq = 0;
 
 std::string home_dir() {
 #ifdef _WIN32
@@ -204,22 +204,135 @@ std::string root() {
 
 void set_root_for_tests(const std::string& path) { g_root_override = path; }
 
-void reset_call_seq_for_tests() { g_call_seq = 0; }
+void reset_call_seq_for_tests() {
+  context::Context::current().reset_spill_seq_for_tests();
+}
 
 void set_fail_after_bytes_for_tests(size_t bytes) { g_fail_after = bytes; }
 
 std::string session_dir_name(const std::string& session) {
     if (session.empty()) return "no-session";
+    static const char* kHex = "0123456789ABCDEF";
     std::string out;
     out.reserve(session.size());
     for (const char ch : session) {
         const unsigned char b = static_cast<unsigned char>(ch);
-        const bool keep = (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') ||
-                          b == '.' || b == '_' || b == '-';
-        out += keep ? ch : '_';
+        // 只保留小写字母、数字、下划线与连字符；大写必须编码掉（Windows 不区分
+        // 大小写），`.` 与 `%` 也编码掉（防止 `..` 跑出根目录与二次解码歧义）。
+        const bool keep = (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') ||
+                          b == '_' || b == '-';
+        if (keep) {
+            out += static_cast<char>(b);
+        } else {
+            out += '%';
+            out += kHex[b >> 4];
+            out += kHex[b & 0x0F];
+        }
     }
-    if (out.empty() || out == "." || out == "..") return "no-session";
     return out;
+}
+
+std::string context_dir(const std::string& key) {
+    return join(root(), session_dir_name(key));
+}
+
+namespace {
+
+/// 列一个目录里的普通文件名（不含 `.` / `..`）。目录不存在时返回空。
+std::vector<std::string> list_files(const std::string& dir) {
+    std::vector<std::string> names;
+#ifdef _WIN32
+    const std::string pattern = native(dir + "/*");
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return names;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        names.push_back(fd.cFileName);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR* d = opendir(dir.c_str());
+    if (!d) return names;
+    struct dirent* entry;
+    while ((entry = readdir(d)) != nullptr) {
+        if (std::strcmp(entry->d_name, ".") == 0 || std::strcmp(entry->d_name, "..") == 0)
+            continue;
+        names.push_back(entry->d_name);
+    }
+    closedir(d);
+#endif
+    return names;
+}
+
+bool path_is_file(const std::string& path) {
+#ifdef _WIN32
+    const DWORD attr = GetFileAttributesA(path.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+#endif
+}
+
+/// 解析到绝对路径；不要求目标存在（Windows 用 GetFullPathName，POSIX 先试
+/// realpath，失败时解析父目录再拼文件名）。返回空串表示无法解析。
+std::string normalize_ref(const std::string& ref) {
+#ifdef _WIN32
+    return canonical(ref);
+#else
+    char buf[PATH_MAX];
+    if (realpath(ref.c_str(), buf)) return std::string(buf);
+    const size_t slash = ref.find_last_of('/');
+    if (slash == std::string::npos) {
+        char cwd[4096];
+        if (!getcwd(cwd, sizeof(cwd))) return std::string();
+        return std::string(cwd) + "/" + ref;
+    }
+    const std::string parent = slash == 0 ? std::string("/") : ref.substr(0, slash);
+    const std::string base = ref.substr(slash + 1);
+    if (realpath(parent.c_str(), buf)) {
+        std::string out(buf);
+        if (out.empty() || out.back() != '/') out += '/';
+        return out + base;
+    }
+    return canonical(ref);
+#endif
+}
+
+}  // namespace
+
+void initialize_sequence_for_context(context::Context& ctx) {
+    const std::string dir = context_dir(ctx.name());
+    if (dir.empty()) return;
+    unsigned max_seq = 0;
+    for (const auto& name : list_files(dir)) {
+        // 只认 `<6 位序号>-<流>.txt`：这是本工具自己的命名格式。
+        if (name.size() < 6) continue;
+        bool all_digits = true;
+        unsigned seq = 0;
+        for (size_t i = 0; i < 6; ++i) {
+            if (name[i] < '0' || name[i] > '9') { all_digits = false; break; }
+            seq = seq * 10 + static_cast<unsigned>(name[i] - '0');
+        }
+        if (!all_digits) continue;
+        if (name.size() <= 6 || name[6] != '-') continue;
+        if (seq > max_seq) max_seq = seq;
+    }
+    if (max_seq > 0) ctx.raise_spill_seq_floor(max_seq);
+}
+
+void remove_context_dir(const std::string& key) {
+    const std::string dir = context_dir(key);
+    if (dir.empty()) return;
+    for (const auto& name : list_files(dir)) {
+        std::remove(join(dir, name).c_str());
+    }
+#ifdef _WIN32
+    _rmdir(dir.c_str());
+#else
+    rmdir(dir.c_str());
+#endif
 }
 
 std::string path_for(const std::string& session, const std::string& tag, unsigned seq) {
@@ -244,47 +357,53 @@ bool replace_file(const std::string& tmp, const std::string& dst) {
 #endif
 }
 
-Written write(const std::string& session, const std::string& tag, const std::string& content) {
-    Written w;
-    const std::string dir = join(root(), session_dir_name(session));
-    if (!make_dirs(dir)) {
-        w.error = "无法创建 spill 目录：" + dir + "（" + last_os_error() + "）";
-        return w;
-    }
-    const unsigned seq = ++g_call_seq;
-    const std::string final_path = path_for(session, tag, seq);
-    const std::string tmp_path = final_path + ".tmp";
-
-    FILE* f = std::fopen(tmp_path.c_str(), "wb");
-    if (!f) {
-        w.error = "无法打开 spill 临时文件：" + tmp_path + "（" + last_os_error() + "）";
-        return w;
-    }
-    const size_t budget = (g_fail_after == kNoInjectedFailure)
-                              ? content.size()
-                              : std::min(content.size(), g_fail_after);
-    const size_t written = std::fwrite(content.data(), 1, budget, f);
-    bool ok = (std::fflush(f) == 0);
-    if (std::fclose(f) != 0) ok = false;
-    if (!ok || written != budget || budget != content.size()) {
-        std::remove(tmp_path.c_str());
-        if (budget != content.size() && ok) {
-            w.error = "写入 spill 文件失败：" + tmp_path + "（模拟写盘中断：只写出 " +
-                      std::to_string(written) + " / " + std::to_string(content.size()) + " 字节）";
-        } else {
-            w.error = "写入 spill 文件失败：" + tmp_path + "（" + last_os_error() + "）";
-        }
-        return w;
-    }
-    if (!replace_file(tmp_path, final_path)) {
-        std::remove(tmp_path.c_str());
-        w.error = "无法把 spill 临时文件改名到：" + final_path + "（" + last_os_error() + "）";
-        return w;
-    }
-    w.ok = true;
-    w.path = final_path;
-    w.bytes = content.size();
+Written write_for_context(context::Context& ctx, const std::string& session,
+                          const std::string& tag, const std::string& content) {
+  Written w;
+  const std::string dir = join(root(), session_dir_name(session));
+  if (!make_dirs(dir)) {
+    w.error = "无法创建 spill 目录：" + dir + "（" + last_os_error() + "）";
     return w;
+  }
+  // 取号走该上下文自己的原子计数器：两个线程同时调用也不会拿到同一个序号。
+  const unsigned seq = ctx.next_spill_seq();
+  const std::string final_path = path_for(session, tag, seq);
+  const std::string tmp_path = final_path + ".tmp";
+
+  FILE* f = std::fopen(tmp_path.c_str(), "wb");
+  if (!f) {
+    w.error = "无法打开 spill 临时文件：" + tmp_path + "（" + last_os_error() + "）";
+    return w;
+  }
+  const size_t budget = (g_fail_after == kNoInjectedFailure)
+                            ? content.size()
+                            : std::min(content.size(), g_fail_after);
+  const size_t written = std::fwrite(content.data(), 1, budget, f);
+  bool ok = (std::fflush(f) == 0);
+  if (std::fclose(f) != 0) ok = false;
+  if (!ok || written != budget || budget != content.size()) {
+    std::remove(tmp_path.c_str());
+    if (budget != content.size() && ok) {
+      w.error = "写入 spill 文件失败：" + tmp_path + "（模拟写盘中断：只写出 " +
+                std::to_string(written) + " / " + std::to_string(content.size()) + " 字节）";
+    } else {
+      w.error = "写入 spill 文件失败：" + tmp_path + "（" + last_os_error() + "）";
+    }
+    return w;
+  }
+  if (!replace_file(tmp_path, final_path)) {
+    std::remove(tmp_path.c_str());
+    w.error = "无法把 spill 临时文件改名到：" + final_path + "（" + last_os_error() + "）";
+    return w;
+  }
+  w.ok = true;
+  w.path = final_path;
+  w.bytes = content.size();
+  return w;
+}
+
+Written write(const std::string& session, const std::string& tag, const std::string& content) {
+  return write_for_context(context::Context::current(), session, tag, content);
 }
 
 bool is_valid_utf8(const std::string& s) {
@@ -355,7 +474,7 @@ std::string tail_chars(const std::string& s, size_t n) {
     return s;
 }
 
-std::string read_request(const std::string& request_json) {
+std::string read_request(const context::Context& ctx, const std::string& request_json) {
     json req;
     try {
         req = json::parse(request_json.empty() ? "{}" : request_json);
@@ -378,13 +497,25 @@ std::string read_request(const std::string& request_json) {
     }
 
     // ② 引用必须落在 spill 根目录之内 —— 先规范化再比前缀，不许被 `..` 绕过
-    const std::string want = canonical(ref);
+    const std::string want = normalize_ref(ref);
     if (want.empty()) return fail("引用无法解析为绝对路径：" + ref);
     const std::string base = canonical(root_dir);
     if (base.empty()) return fail("spill 根目录无法解析为绝对路径：" + root_dir);
     if (!is_inside(want, base)) return fail("引用不在 spill 根目录内：" + ref);
 
-    // ③ 引用存在
+    // ③ 而且只能落在**该上下文自己的目录**里。`<乙>/../<甲>/文件` 规范化之后
+    //    落在甲目录，这里必须拒绝 —— 只看根目录前缀会把它放过去。
+    const std::string own_dir = canonical(context_dir(ctx.name()));
+    if (own_dir.empty()) {
+        return fail("spill 上下文目录无法解析为绝对路径：" + context_dir(ctx.name()));
+    }
+    if (!is_inside(want, own_dir)) {
+        return fail("引用不属于该上下文的目录（" + ctx.name() + "）：" + ref);
+    }
+
+    // ④ 引用存在（在根与上下文目录都判定之后再看存在性：不存在的引用要报
+    //    「引用不存在」，不能被规范化失败误报成越界）
+    if (!path_is_file(want)) return fail("引用不存在：" + want);
     FILE* f = std::fopen(want.c_str(), "rb");
     if (!f) return fail("引用不存在：" + want);
     std::string bytes;

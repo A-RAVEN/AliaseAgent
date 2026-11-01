@@ -369,8 +369,9 @@ class ChatScreenState extends State<ChatScreen> {
     }
     String? failure;
     try {
+      if (_currentId == null) await _newChat();
       final raw = _sidecar.readClipboardImage(
-          jsonEncode({'dest_dir': ConfigService.attachmentsDir}));
+          _currentId ?? '', jsonEncode({'dest_dir': ConfigService.attachmentsDir}));
       final parsed = jsonDecode(raw);
       if (parsed is Map && parsed['ok'] == true) {
         final path = parsed['path'];
@@ -423,16 +424,30 @@ class ChatScreenState extends State<ChatScreen> {
   /// 工具清单是否已就绪（只读出口，给测试断言用）。
   bool get toolsReady => _toolsReady;
 
+  /// 当前会话 id（只读出口，给实机测试定位"这一轮的上下文"用）。
+  String? get currentSessionId => _currentId;
+
+  /// 把**当前会话上下文**的工作区改到 `path`（只读出口之外唯一给测试用的写入口）。
+  ///
+  /// 为什么需要它：工作区现在属于上下文，不再有进程级 `set_workspace`；实机测试
+  /// 在 pump 之后要把模型的工作区重定向到夹具目录，必须点名当前会话的句柄，
+  /// 不能像以前那样改一个全局值。
+  Future<String?> setCurrentWorkspace(String path) async {
+    final id = _currentId;
+    if (id == null) return 'no current session';
+    await _ensureContextFor(id);
+    return _sidecar.setWorkspace(id, path);
+  }
+
   @override
   void initState() {
     super.initState();
     _sessionRepo = widget.sessionRepo ?? SessionRepository();
     _msgRepo = widget.msgRepo ?? MessageRepository();
     _sidecar = widget.sidecar ?? SidecarBridge.instance;
-    // Skip sidecar init when in test mode (DI detected)
-    if (widget.sidecar == null && widget.sessionRepo == null) {
-      _sidecar.setWorkspace(ConfigService.homeDir);
-    }
+    // 工作区不再在这里设置（change add-context-handles）：它属于**上下文**，
+    // 由 `ensureContext(..., defaultWorkspace: ConfigService.homeDir)` 在该上下
+    // 文第一次创建时设置；`created:false` 时不得覆盖已有工作区。
     // Seed the guard producer from the ACTIVE agent type's explicit standing
     // requirements (R2-3). Previously _guard was created empty and never seeded,
     // so inject() returned '' on every turn — the non-compressible anchor never
@@ -960,6 +975,21 @@ class ChatScreenState extends State<ChatScreen> {
         _loadMessages();
       }
     });
+    // 启动恢复：把恢复出来的会话的上下文建好（已有则复用），工具调用不会
+    // 因为"本进程还没建过这个上下文"报 unknown_context。
+    for (final s in sessions) {
+      await _ensureContextFor(s.id);
+    }
+  }
+
+  /// 幂等地保证该会话的上下文存在；只有新建时才设缺省工作区。
+  Future<void> _ensureContextFor(String sessionId) async {
+    try {
+      await _sidecar.ensureContext(sessionId,
+          defaultWorkspace: ConfigService.homeDir);
+    } catch (e) {
+      debugPrint('[AliasAgent] ensureContext($sessionId) 失败：$e');
+    }
   }
 
   Future<void> _loadMessages() async {
@@ -1046,6 +1076,27 @@ class ChatScreenState extends State<ChatScreen> {
   int _requestEpoch = 0;
   int _switchEpoch = -1;
 
+  /// 正在跑的那一轮属于哪个会话（取消时用它，而不是当时的 `_currentId`）。
+  String? _streamingHandle;
+
+  /// 每个会话在跑的整轮 Future（模型循环、工具、写库、后台压缩写库）。
+  /// 删除会话前必须 await 这些 Future（change add-context-handles 任务 2.9）。
+  final Map<String, Set<Future<void>>> _roundFutures = {};
+
+  /// 正在删除的会话：拒绝新的发送/回合，避免删库之后还有写落进来。
+  final Set<String> _deletingSessions = {};
+
+  void _registerRound(String sessionId, Future<void> round) {
+    final set = _roundFutures.putIfAbsent(sessionId, () => <Future<void>>{});
+    set.add(round);
+    round.then((_) {}, onError: (_) {}).whenComplete(() {
+      _roundFutures[sessionId]?.remove(round);
+      if (_roundFutures[sessionId]?.isEmpty ?? false) {
+        _roundFutures.remove(sessionId);
+      }
+    });
+  }
+
   void _selectSession(Session s) {
     // 2.6: navigating away invalidates any running/scheduled background fold for
     // the previous session. Bump gen to abort a RUNNING fold (its isAborted closure
@@ -1067,6 +1118,8 @@ class ChatScreenState extends State<ChatScreen> {
       _compactionOwner = null;
     });
     _loadMessages();
+    // 切换到一个本进程还没建过上下文的会话时也先建好。
+    _ensureContextFor(s.id);
   }
 
   Future<void> _newChat() async {
@@ -1079,6 +1132,8 @@ class ChatScreenState extends State<ChatScreen> {
     _foldIdleTimer = null;
     final s = await _sessionRepo.create();
     if (!mounted) return;
+    // 新建会话：先建它的上下文（只有这次是 created:true，缺省工作区在这里设）。
+    await _ensureContextFor(s.id);
     if (_isStreaming) _switchEpoch = _requestEpoch;
     _endStreaming();
     setState(() {
@@ -1098,16 +1153,35 @@ class ChatScreenState extends State<ChatScreen> {
       _foldIdleTimer?.cancel();
       _foldIdleTimer = null;
     }
-    await _sessionRepo.delete(s.id);
-    // spill 随会话删除（规范「工具输出一律先落盘」的最后一条）：该会话留下的
-    // 工具输出文件已经没有引用了，留着只会占磁盘。规则与 C++ 侧同一套
-    // （`lib/services/spill_paths.dart` 是 `sidecar/src/spill.cpp` 的镜像）。
-    try {
-      final removedSpill = deleteSessionSpill(s.id);
-      debugPrint('[AliasAgent] 删除会话 ${s.id}：spill 目录已清理=$removedSpill');
-    } catch (e) {
-      debugPrint('[AliasAgent] 删除会话 ${s.id} 的 spill 目录失败：$e');
+    // ① 停新发送：该会话不再接受新回合。
+    _deletingSessions.add(s.id);
+    // ② 取消该上下文正在跑的模型请求，让整轮 Future 能结束。
+    _sidecar.cancelRequest(s.id);
+    // ③ 等该会话的整轮 Future：模型循环、工具、insert / touch /
+    //    updateToolCalls 与后台压缩写库。桥的 `_chain` 不覆盖这些外层写入。
+    while (_roundFutures[s.id]?.isNotEmpty ?? false) {
+      final rounds = List<Future<void>>.from(_roundFutures[s.id]!);
+      try {
+        await Future.wait(rounds, eagerError: false);
+      } catch (_) {
+        // 单轮失败不影响删除；循环会重新快照剩余 Future。
+      }
     }
+    // ④ 桥内队列与回调结束后，让 C++ 排空在途调用并清理（关浏览器上下文、
+    //    删该上下文的 spill 目录）。spill 的归属键就是会话句柄，所以由同一次
+    //    dispose_context 清理 —— 不再有 Dart 侧的 deleteSessionSpill。
+    try {
+      await _sidecar.disposeContext(s.id);
+    } catch (e) {
+      // 底层没能证明排空（例如毒化上下文）：资源仍被保留，**不许假装删成功**。
+      // 这里如实放弃删除，数据库与列表都不动，用户可重试或重启应用。
+      debugPrint('[AliasAgent] 删除会话 ${s.id} 的上下文失败，已放弃删除：$e');
+      _deletingSessions.remove(s.id);
+      return;
+    }
+    // ⑤ 最后才删数据库与更新列表：数据库删除晚于所有写入。
+    await _sessionRepo.delete(s.id);
+    _deletingSessions.remove(s.id);
     if (!mounted) return;
     if (wasCurrent) {
       if (_isStreaming) _switchEpoch = _requestEpoch;
@@ -1135,7 +1209,9 @@ class ChatScreenState extends State<ChatScreen> {
     // closure), cancel the slot if a fold is mid-model-call, and clear the timer.
     if (_foldInFlight || _foldIdleTimer != null) {
       _foldGen++;
-      _sidecar.cancelRequest();
+      // 取消只打当前会话自己的请求（请求 id 定向 + 上下文句柄）。
+      final foldSession = _currentId;
+      if (foldSession != null) _sidecar.cancelRequest(foldSession);
       _foldIdleTimer?.cancel();
       _foldIdleTimer = null;
     }
@@ -1144,13 +1220,23 @@ class ChatScreenState extends State<ChatScreen> {
       await _newChat();
     }
     if (_currentId == null) return;
-
-    // 17.5 (FINAL-R10-01): capture session + epoch BEFORE any async gap —
-    // a session switch during the inserts below must not redirect this
-    // message to the new session (user message persisted into the wrong
-    // session) or lose the epoch association. A switch after this point
-    // invalidates the call via _switchEpoch and the loop-top abort check.
     final sessionId = _currentId!;
+    if (_deletingSessions.contains(sessionId)) return;
+
+    // 整轮 Future 按会话登记（change add-context-handles 任务 2.9）：删除会话时
+    // 必须等它结束 —— 它覆盖模型循环、工具执行、insert / touch / updateToolCalls
+    // 这些**外层写库**，桥的 `_chain` 只包住 sendMessage 那一段，等它不够。
+    final round = _sendMessageRound(
+        sessionId: sessionId, text: text, attachments: attachments);
+    _registerRound(sessionId, round);
+    await round;
+  }
+
+  Future<void> _sendMessageRound({
+    required String sessionId,
+    required String text,
+    required List<String> attachments,
+  }) async {
     final epoch = ++_requestEpoch;
 
     // Insert user message
@@ -1166,6 +1252,7 @@ class ChatScreenState extends State<ChatScreen> {
       _chatItems.add(ChatMessageItem(userMsg));
       _isStreaming = true;
     });
+    _streamingHandle = sessionId;
 
     // Auto-title: update "New Chat" from first user message
     final titleUpdated = await _sessionRepo.updateTitleIfDefault(sessionId, text);
@@ -1439,6 +1526,7 @@ class ChatScreenState extends State<ChatScreen> {
       }
 
       await _sidecar.sendMessage(
+        handle: sessionId,
         apiKey: provider.apiKey,
         baseUrl: baseUrl,
         model: agentType.model,
@@ -1730,7 +1818,7 @@ class ChatScreenState extends State<ChatScreen> {
         // batch so side-effect tools (write_file/edit_file) don't run after
         // the user switched away.
         if (_switchEpoch >= epoch) break;
-        final result = await _executeTool(tc);
+        final result = await _executeTool(tc, sessionId: sessionId);
         final resultContent = result['ok'] == true
             ? (result['content'] as String? ?? '')
             : (result['error'] as String? ?? 'Tool failed');
@@ -1901,7 +1989,8 @@ class ChatScreenState extends State<ChatScreen> {
     }
     try {
       await seamSel.ensure(
-          far: seamInputs.far, k: seamInputs.k, config: agentType);
+          far: seamInputs.far, k: seamInputs.k, config: agentType,
+          sessionId: sessionId);
       return (far, k) => seamSel.memoizedSeams(far: far, k: k) ?? const [];
     } catch (e) {
       debugPrint('[AliasAgent] seam selection failed, using arithmetic skeleton: $e');
@@ -1924,7 +2013,8 @@ class ChatScreenState extends State<ChatScreen> {
     _foldIdleTimer = Timer(const Duration(seconds: 2), () {
       _foldIdleTimer = null;
       if (mounted && !_isStreaming && !_foldInFlight) {
-        _runBackgroundFold(sessionId);
+        // 后台压缩写库也算该会话的整轮 Future：删会话前必须等它写完。
+        _registerRound(sessionId, _runBackgroundFold(sessionId));
       }
     });
   }
@@ -2158,7 +2248,8 @@ class ChatScreenState extends State<ChatScreen> {
     if (isAborted?.call() ?? false) {
       throw const _BackgroundFoldCancelled('background fold aborted during L1 sub-span');
     }
-    final s = await _summaryProvider.summarize(folded: msgs, config: agentType);
+    final s = await _summaryProvider.summarize(
+        folded: msgs, config: agentType, sessionId: sessionId);
     if (dbOpen && minSeq != null && maxSeq != null) {
       try {
         await _summaryNodeRepo.materialize(
@@ -2200,7 +2291,8 @@ class ChatScreenState extends State<ChatScreen> {
   /// 调用方据此不消费脏水位（R8-c）—— 否则下一趟会复用一条陈旧的缓存摘要。
   Future<List<({CompactionSegment seg, String text, int tokens, bool isClosed})>>
       _resolveOpenLevel1(List<Message> msgs, AgentTypeConfig agentType,
-          {bool Function()? isAborted,
+          {required String sessionId,
+          bool Function()? isAborted,
           void Function(int minSeq, int maxSeq)? onNotResummarized,
           List<SummaryReference> reference = const []}) async {
     // 2.6 abort gate: a preempted background fold must stop at the next model call
@@ -2212,7 +2304,8 @@ class ChatScreenState extends State<ChatScreen> {
     if (msgs.isEmpty) return const [];
     final raw = CompactionEngine.rawTokens(msgs);
     final summary = await _summaryProvider.summarize(
-        folded: msgs, config: agentType, reference: reference);
+        folded: msgs, config: agentType, reference: reference,
+        sessionId: sessionId);
     if (CompactionEngine.summarySideWins(raw, summary.tokens)) {
       return [
         (seg: CompactionSegment(messages: msgs, summary: true, level: 1),
@@ -2385,7 +2478,8 @@ class ChatScreenState extends State<ChatScreen> {
                   isAborted: isAborted));
         }
         final summary = await _summaryProvider.summarizeText(
-            text: l1Texts.join('\n\n'), config: agentType);
+            text: l1Texts.join('\n\n'), config: agentType,
+            sessionId: sessionId);
         if (dbOpen && minSeq != null && maxSeq != null) {
           debugPrint('[AliasAgent] folding ${seg.messages.length} messages '
               '(seq $minSeq..$maxSeq) into a level-${seg.level} summary');
@@ -2421,6 +2515,7 @@ class ChatScreenState extends State<ChatScreen> {
       // 就用摘要；否则这一级的内容就是这批原文本身（`verbatimAtLevel`），渲染走原文
       // 路径、一个块不少。压不短不再丢任何东西。
       final leafEntries = await _resolveOpenLevel1(seg.messages, agentType,
+          sessionId: sessionId,
           // 参考上下文：最多两条、只取覆盖范围严格早于这一批的（挑选规则见
           // selectSummaryReferences）。
           reference: selectSummaryReferences(
@@ -2623,7 +2718,8 @@ class ChatScreenState extends State<ChatScreen> {
           segment: rollUpNo, background: background),
           owner: statusOwner, sessionId: sessionId);
       final l2 = await _summaryProvider.summarizeText(
-          text: candGroup.map((e) => e.text).join('\n\n'), config: agentType);
+          text: candGroup.map((e) => e.text).join('\n\n'), config: agentType,
+          sessionId: sessionId);
       // 取小者（用户 2026-10-05，两级同一条）：压缩后的实测 token 真的更小，就用模型
       // 给的那条；否则**这一级的正文就是那几条一级的文本拼接**（压缩前那一侧）。
       //
@@ -3266,7 +3362,15 @@ class ChatScreenState extends State<ChatScreen> {
 
   /// Execute a tool call. Returns a JSON-like result map.
   /// Async because web_search/web_fetch run on worker isolates (tasks 8.3a, 8.5).
-  Future<Map<String, dynamic>> _executeTool(Map<String, dynamic> toolCall) async {    final name = toolCall['name'] as String?;
+  ///
+  /// `sessionId` 是**本轮所属会话**，由 `_callModel` 显式传入（change
+  /// add-context-handles 任务 2.6）。这里不读 `_currentId`：用户可能在本轮执行
+  /// 期间切到别的会话，读当前值会把甲的工具调用发到乙的上下文。
+  Future<Map<String, dynamic>> _executeTool(
+      Map<String, dynamic> toolCall, {
+      required String sessionId,
+    }) async {
+    final name = toolCall['name'] as String?;
     final input = (toolCall['input'] as Map<String, dynamic>?) ?? {};
     final path = (input['path'] as String?) ?? '';
 
@@ -3279,9 +3383,9 @@ class ChatScreenState extends State<ChatScreen> {
         final limit = input['limit'];
         if (offset is int) readReq['offset'] = offset;
         if (limit is int) readReq['limit'] = limit;
-        resultJson = _sidecar.readFile(jsonEncode(readReq));
+        resultJson = _sidecar.readFile(sessionId, jsonEncode(readReq));
       case 'write_file':
-        resultJson = _sidecar.writeFile(jsonEncode({
+        resultJson = _sidecar.writeFile(sessionId, jsonEncode({
           'path': path,
           'content': input['content'] ?? '',
         }));
@@ -3290,17 +3394,18 @@ class ChatScreenState extends State<ChatScreen> {
         if (edits is! List || edits.isEmpty) {
           resultJson = '{"ok":false,"error":"edits must contain at least one replacement"}';
         } else {
-          resultJson = _sidecar.editFile(jsonEncode({'path': path, 'edits': edits}));
+          resultJson = _sidecar.editFile(
+              sessionId, jsonEncode({'path': path, 'edits': edits}));
         }
       case 'list_dir':
-        resultJson = _sidecar.listDir(path);
+        resultJson = _sidecar.listDir(sessionId, path);
       case 'glob_file':
-        resultJson = _sidecar.globFile(jsonEncode({
+        resultJson = _sidecar.globFile(sessionId, jsonEncode({
           'pattern': input['pattern'] ?? '',
           'max_results': input['max_results'] ?? 200,
         }));
       case 'grep_file':
-        resultJson = _sidecar.grepFile(jsonEncode({
+        resultJson = _sidecar.grepFile(sessionId, jsonEncode({
           'pattern': input['pattern'] ?? '',
           'glob': input['glob'] ?? '',
           'ignore_case': input['ignore_case'] ?? false,
@@ -3313,32 +3418,32 @@ class ChatScreenState extends State<ChatScreen> {
           'depth': input['depth'] ?? 'basic',
           'max_results': input['max_results'] ?? 5,
         });
-        resultJson = await _sidecar.webSearch(request);
+        resultJson = await _sidecar.webSearch(sessionId, request);
       case 'web_fetch':
         final request = jsonEncode({
           'url': input['url'] ?? '',
         });
-        resultJson = await _sidecar.webFetch(request);
+        resultJson = await _sidecar.webFetch(sessionId, request);
       case 'browser_navigate':
-        resultJson = await _sidecar.browserNavigate(jsonEncode({
+        resultJson = await _sidecar.browserNavigate(sessionId, jsonEncode({
           'url': input['url'] ?? '',
         }));
       case 'browser_click':
-        resultJson = await _sidecar.browserClick(jsonEncode({
+        resultJson = await _sidecar.browserClick(sessionId, jsonEncode({
           'selector': input['selector'] ?? '',
         }));
       case 'browser_type':
-        resultJson = await _sidecar.browserType(jsonEncode({
+        resultJson = await _sidecar.browserType(sessionId, jsonEncode({
           'selector': input['selector'] ?? '',
           'text': input['text'] ?? '',
         }));
       case 'browser_snapshot':
-        resultJson = await _sidecar.browserSnapshot(jsonEncode({}));
+        resultJson = await _sidecar.browserSnapshot(sessionId, jsonEncode({}));
       case 'run_command':
         // 命令工具：配置值随每次调用一起传到执行侧，执行侧不读配置文件
-        // （design 决策 7）。`spill.preview_chars` 的缺省值在这里补一份，与 C++ 侧一致；
-        // `spill_session` 决定 spill 子目录 —— 为了"删会话 ⇒ 删该会话 spill 目录"
-        // 能对上，目录名必须与库里的会话 id 同源（C++ 侧只做路径安全字符映射）。
+        // （design 决策 7）。`spill.preview_chars` 的缺省值在这里补一份，与 C++ 侧一致。
+        // spill 的归属键就是首参上下文句柄（change add-context-handles）：请求里
+        // 不再有会话字段，目录名由 C++ 侧按句柄无损编码。
         final cmdCfg = registry.lookup('general');
         final request = <String, dynamic>{
           'command': input['command'] ?? '',
@@ -3351,12 +3456,11 @@ class ChatScreenState extends State<ChatScreen> {
             (input['timeout_ms'] as int?) ?? cmdCfg?.commandTimeoutMs ?? 120000;
         request['max_timeout_ms'] = cmdCfg?.commandMaxTimeoutMs ?? 600000;
         request['preview_chars'] = widget.config.spillPreviewChars;
-        request['spill_session'] = _currentId ?? '';
-        resultJson = await _sidecar.runCommand(jsonEncode(request));
+        resultJson = await _sidecar.runCommand(sessionId, jsonEncode(request));
       case 'read_spill':
         // 引用 + 字节区间。`preview_chars` 一起带上，好让 C++ 侧在缺 `limit` 时
-        // 用与内联预览同一个数（不另造一个默认值）。
-        resultJson = _sidecar.readSpill(jsonEncode({
+        // 用与内联预览同一个数（不另造一个默认值）。C++ 只接受本上下文目录的引用。
+        resultJson = _sidecar.readSpill(sessionId, jsonEncode({
           'ref': input['ref'] ?? '',
           if (input['offset'] is int) 'offset': input['offset'],
           if (input['limit'] is int) 'limit': input['limit'],
@@ -3388,7 +3492,7 @@ class ChatScreenState extends State<ChatScreen> {
                 'declare image input (input_modalities)',
           });
         } else {
-          resultJson = _sidecar.readImage(jsonEncode({'path': path}));
+          resultJson = _sidecar.readImage(sessionId, jsonEncode({'path': path}));
         }
       default:
         resultJson = '{"ok":false,"error":"Unknown tool: $name"}';
@@ -3590,7 +3694,11 @@ class ChatScreenState extends State<ChatScreen> {
   /// later turn's thinking_delta with the same index would match the stale
   /// card (cross-turn index collision violating the chat-ui spec).
   void _endStreaming() {
-    _sidecar.cancelRequest();
+    // 取消只打**这一轮所属会话**的请求：切会话/删会话/超时都不许把别的上下文的
+    // 请求一起取消（change add-context-handles 任务 2.7）。
+    final handle = _streamingHandle;
+    if (handle != null) _sidecar.cancelRequest(handle);
+    _streamingHandle = null;
     if (!mounted) return;
     setState(() {
       _isStreaming = false;

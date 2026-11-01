@@ -364,7 +364,12 @@ void main() {
       expect(sent, isNot(contains('"max_output_chars"')));
       expect(sent, isNot(contains('"full_output_chars"')));
       expect(sent, contains('"preview_chars":1000'));
-      expect(sent, contains('"spill_session"'));
+      // change add-context-handles：spill 的归属键改成**首参上下文句柄**，请求里
+      // 不再有 `spill_session`。这一条同时钉住两件事：旧字段不许回来，
+      // 而且这次调用带的句柄就是本轮所属会话。
+      expect(sent, isNot(contains('"spill_session"')));
+      expect(sidecar.toolHandles.last, sessions.first.id,
+          reason: '工具调用必须带本轮所属会话的句柄');
 
       expect(find.byType(ToolCallCard), findsOneWidget);
       expect(find.textContaining('COMMAND-OK'), findsWidgets);

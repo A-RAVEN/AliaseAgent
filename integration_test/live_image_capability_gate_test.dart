@@ -197,7 +197,8 @@ void main() {
         await tester.pumpWidget(
             RepaintBoundary(key: captureKey, child: const MyApp()));
         await tester.pump(const Duration(seconds: 2));
-        expect(SidecarBridge.instance.setWorkspace(tempDir.path), isNull);
+        final chatState = tester.state<ChatScreenState>(find.byType(ChatScreen));
+        expect(await chatState.setCurrentWorkspace(tempDir.path), isNull);
 
         // 贴图：Windows 的剪贴板是独占资源，可能被别的程序短暂占着（这时 C++ 回
         // `clipboard is busy …` 而不是"没有图"）。所以点几次、每次都把结果打出来 ——

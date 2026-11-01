@@ -92,6 +92,7 @@ class _FixedSummaryProvider implements SummaryProvider {
     required List<Message> folded,
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
+    String? sessionId,
   }) async {
     l1Inputs.add(folded.length);
     return SummaryResult(text: 'L1(${folded.length})', tokens: tokens);
@@ -101,6 +102,7 @@ class _FixedSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarizeText({
     required String text,
     required AgentTypeConfig config,
+    String? sessionId,
   }) async {
     l2InputChars.add(text.length);
     return SummaryResult(text: 'L2', tokens: tokens);

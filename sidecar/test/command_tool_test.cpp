@@ -18,6 +18,7 @@
 #include <nlohmann/json.hpp>
 
 #include "command_tool.h"
+#include "context.h"
 #include "spill.h"
 #include "subprocess.h"
 #include "temp_dir.h"
@@ -31,10 +32,15 @@ using nlohmann::json;
 
 namespace {
 
-/// 递归删掉一个目录，用例结束把 `cpp-test` 这个会话目录清掉（不往用户主目录留垃圾）。
+/// 递归删掉一个目录，用例结束把当前上下文的 spill 目录清掉（不往用户主目录留垃圾）。
 void remove_dir_recursive(const std::string& dir) {
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
+}
+
+/// 当前上下文在 spill 根下的目录（`run_command` 用首参句柄当键）。
+std::string current_context_dir() {
+    return spill::context_dir(context::Context::current().name());
 }
 
 json run_req(const std::string& request) {
@@ -180,7 +186,7 @@ TEST_CASE("run_command: 超长输出头尾都进结果、并给出 spill 引用"
         "[Console]::Out.Write(\"error C2065: 'foo': undeclared identifier`n\")\n"
         "[Console]::Out.Write('A' * 199950)\n"
         "[Console]::Out.Write(\"`nBuild FAILED.`n\")\n";
-    const json r = run_req(json{{"command", cmd}, {"spill_session", "cpp-test"}}.dump());
+    const json r = run_req(json{{"command", cmd}}.dump());
     INFO("r 摘要: ok=" << r["ok"] << " exit=" << r["exit_code"]
                        << " stdout_chars=" << r["stdout"].get<std::string>().size());
     REQUIRE(r["ok"] == true);
@@ -224,7 +230,7 @@ TEST_CASE("run_command: 超长输出头尾都进结果、并给出 spill 引用"
     REQUIRE(full_output_files() == before);
 
     // 用例自己建的会话目录自己清掉（别往用户主目录里留测试垃圾）
-    remove_dir_recursive(spill::root() + "\\cpp-test");
+    remove_dir_recursive(current_context_dir());
 }
 
 TEST_CASE("run_command: 两条流同时超限时各给一个引用", "[spill]") {
@@ -233,7 +239,7 @@ TEST_CASE("run_command: 两条流同时超限时各给一个引用", "[spill]") 
     const std::string cmd =
         "[Console]::Out.Write('X' * 200000); "
         "[Console]::Error.Write('Y' * 200000)";
-    const json r = run_req(json{{"command", cmd}, {"spill_session", "cpp-test"}}.dump());
+    const json r = run_req(json{{"command", cmd}}.dump());
     INFO("r 摘要: ok=" << r["ok"] << " truncated=" << r["truncated"].dump());
     REQUIRE(r["ok"] == true);
     REQUIRE(r["truncated"]["stdout"] == true);
@@ -261,7 +267,7 @@ TEST_CASE("run_command: 两条流同时超限时各给一个引用", "[spill]") 
     REQUIRE(out.find("bytes omitted") != std::string::npos);
     REQUIRE(err.find("bytes omitted") != std::string::npos);
 
-    remove_dir_recursive(spill::root() + "\\cpp-test");
+    remove_dir_recursive(current_context_dir());
 }
 
 TEST_CASE("run_command: 未超限时也落盘、内联全文、临时目录不新增文件", "[command_tool]") {

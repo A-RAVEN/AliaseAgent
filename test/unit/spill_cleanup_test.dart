@@ -4,92 +4,56 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:alias_agent/services/spill_paths.dart';
 
-/// 删会话时连带删掉该会话的 spill 目录（change `spill-large-tool-output`，tasks 5.1）。
+/// spill 目录名映射与启动清理（change `spill-large-tool-output`，
+/// change `add-context-handles` 改写）。
 ///
-/// 夹具用 `_it_` 前缀的会话名，落在真实的 spill 根下（产品就是这么建的），
-/// 用例结束删掉，不往用户主目录留垃圾。
+/// 目录的创建/删除现在都在 C++ 侧按上下文句柄完成（`run_command` 建、
+/// `dispose_context` 删），Dart 只剩「启动时清无主目录」这一件事。
+/// 目录名映射仍是两侧各一份实现，必须逐字一致。
 void main() {
   final root = Directory(spillRoot());
+
+  String dirFor(String id) =>
+      '${spillRoot()}${Platform.pathSeparator}${spillSessionDirName(id)}';
 
   setUpAll(() {
     if (!root.existsSync()) root.createSync(recursive: true);
   });
 
   tearDown(() {
-    for (final id in ['_it_keep_1', '_it_drop_1']) {
-      final d = Directory(spillSessionDir(id));
+    for (final id in ['_it_keep_1', '_it_drop_1', '_it_orphan_probe']) {
+      final d = Directory(dirFor(id));
       if (d.existsSync()) d.deleteSync(recursive: true);
     }
   });
 
-  test('删掉一个会话的目录，别的会话目录仍在', () {
-    final keepDir = Directory(spillSessionDir('_it_keep_1'))
-      ..createSync(recursive: true);
-    final dropDir = Directory(spillSessionDir('_it_drop_1'))
-      ..createSync(recursive: true);
-    // 每个目录里放一个文件，模拟真的写过 spill
-    File('${keepDir.path}${Platform.pathSeparator}000001-stdout.txt')
-        .writeAsStringSync('keep');
-    File('${dropDir.path}${Platform.pathSeparator}000001-stdout.txt')
-        .writeAsStringSync('drop');
-
-    // ignore: avoid_print
-    print('[spill 清理] 删之前: keep=${keepDir.existsSync()} '
-        'drop=${dropDir.existsSync()}');
-
-    final removed = deleteSessionSpill('_it_drop_1');
-    // ignore: avoid_print
-    print('[spill 清理] 删除返回=$removed；删之后 keep=${keepDir.existsSync()} '
-        'drop=${dropDir.existsSync()}');
-
-    expect(removed, isTrue, reason: '目录存在时必须真的删掉');
-    expect(dropDir.existsSync(), isFalse, reason: '被删会话的 spill 目录必须消失');
-    expect(keepDir.existsSync(), isTrue, reason: '别的会话目录不许受影响');
-    expect(
-        File('${keepDir.path}${Platform.pathSeparator}000001-stdout.txt')
-            .readAsStringSync(),
-        'keep');
-  });
-
-  test('目录本来就不存在时什么都不做，也不去建它', () {
-    final dir = Directory(spillSessionDir('_it_never_created'));
-    if (dir.existsSync()) dir.deleteSync(recursive: true);
-
-    final removed = deleteSessionSpill('_it_never_created');
-    // ignore: avoid_print
-    print('[spill 清理] 不存在的会话: 返回=$removed 目录存在=${dir.existsSync()}');
-
-    expect(removed, isFalse);
-    expect(dir.existsSync(), isFalse, reason: '不存在的目录不许被"顺手建出来"');
-  });
-
-  test('目录名映射与 C++ 侧一致：只留字母数字与 . _ -，其余换下划线', () {
-    expect(spillSessionDirName('abc-123_DEF.4'), 'abc-123_DEF.4');
-    expect(spillSessionDirName('a/b\\c:d*e'), 'a_b_c_d_e');
+  test('目录名映射与 C++ 侧一致：只留 [a-z0-9_-]，其余 %XX（大写十六进制）', () {
+    expect(spillSessionDirName('abc-123_def-4'), 'abc-123_def-4');
+    expect(spillSessionDirName('abc-123_DEF.4'), 'abc-123_%44%45%46%2E4');
+    expect(spillSessionDirName('a/b\\c:d*e'), 'a%2Fb%5Cc%3Ad%2Ae');
     expect(spillSessionDirName(''), 'no-session');
-    expect(spillSessionDirName('..'), 'no-session');
-    // "中文会话" 是 4 个字符 / 12 个 UTF-8 字节 ⇒ 12 个下划线（与 C++ 侧同口径）
-    expect(spillSessionDirName('中文会话'), '____________');
+    // `..` 必须编码掉，否则目录会跑到 spill 根目录之外。
+    expect(spillSessionDirName('..'), '%2E%2E');
+    // 「会话甲」是 3 个字符 / 9 个 UTF-8 字节 ⇒ 9 组 %XX（与 C++ 侧同口径）。
+    expect(spillSessionDirName('会话甲'), '%E4%BC%9A%E8%AF%9D%E7%94%B2');
+    // 只差大小写的两个名字必须不同目录（Windows 不区分大小写）。
+    expect(spillSessionDirName('Agent-7'),
+        isNot(spillSessionDirName('agent-7')));
     // ignore: avoid_print
     print('[spill 清理] 映射样例: a/b:c ⇒ ${spillSessionDirName('a/b:c')}，'
-        '中文会话 ⇒ ${spillSessionDirName('中文会话')}');
-    // 这四条与 `sidecar/test/spill_write_test.cpp` 的
-    // "目录名映射与 Dart 侧一致" 用例逐字对应 —— 两边漂移必有一边红。
+        '会话甲 ⇒ ${spillSessionDirName('会话甲')}');
   });
 
-  test('启动清理只删无主目录：no-session 与 _it_* 删，真实会话目录留着', () {
-    // 这一条钉的是 tasks 10.1：删会话只删 <会话 id>/，而 no-session 对应不到任何
-    // 会话 —— 没有这条清理，它就只增不减。
-    final orphan = Directory(spillSessionDir(''))..createSync(recursive: true);
+  test('启动清理只删无主目录：no-session 与 _it_* 删，有主目录留着', () {
+    final orphan = Directory(dirFor(''))..createSync(recursive: true);
     expect(orphan.path.endsWith('no-session'), isTrue);
     File('${orphan.path}${Platform.pathSeparator}000001-stdout.txt')
         .writeAsStringSync('orphan');
-    final testDir = Directory(spillSessionDir('_it_orphan_probe'))
+    final testDir = Directory(dirFor('_it_orphan_probe'))
       ..createSync(recursive: true);
     // 一个真实会话（UUID 形状）的目录：清理不许动它
     const realSession = '3f2b1c4d-0000-4000-8000-000000000001';
-    final realDir = Directory(spillSessionDir(realSession))
-      ..createSync(recursive: true);
+    final realDir = Directory(dirFor(realSession))..createSync(recursive: true);
     File('${realDir.path}${Platform.pathSeparator}000001-stdout.txt')
         .writeAsStringSync('keep me');
 
@@ -103,7 +67,7 @@ void main() {
     expect(removed, contains('no-session'));
     expect(orphan.existsSync(), isFalse, reason: '无主目录必须被删掉');
     expect(testDir.existsSync(), isFalse, reason: '测试目录也属于无主');
-    expect(realDir.existsSync(), isTrue, reason: '真实会话的 spill 不许被启动清理误删');
+    expect(realDir.existsSync(), isTrue, reason: '有主目录不许被启动清理误删');
     expect(
         File('${realDir.path}${Platform.pathSeparator}000001-stdout.txt')
             .readAsStringSync(),

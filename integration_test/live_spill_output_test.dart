@@ -23,9 +23,12 @@ void main() {
 
   final bridge = SidecarBridge.instance;
   Directory? projectDir;
+  // change add-context-handles：spill 目录按上下文句柄归属。
+  const ctx = 'live-spill';
 
-  setUpAll(() {
-    final ws = bridge.setWorkspace('.');
+  setUpAll(() async {
+    await bridge.ensureContext(ctx, defaultWorkspace: '.');
+    final ws = bridge.setWorkspace(ctx, '.');
     expect(ws == null || ws.isEmpty, isTrue, reason: 'set_workspace 应当成功');
   });
 
@@ -72,10 +75,9 @@ void main() {
     // ignore: avoid_print
     print('[live spill] 实际执行的命令: $command');
 
-    final raw = await bridge.runCommand(jsonEncode({
+    final raw = await bridge.runCommand(ctx, jsonEncode({
       'command': command,
       'timeout_ms': 180000,
-      'spill_session': 'live-spill',
     }));
     final r = jsonDecode(raw) as Map<String, dynamic>;
     final inline = (r['stdout'] as String? ?? '') + (r['stderr'] as String? ?? '');
@@ -119,7 +121,7 @@ void main() {
     // 于是"读回了被省略的中间段"这句话就是假的（tasks 11.3）。
     final offset = utf8.encode(head).length;
     final limit = omitted < 2000 ? omitted : 2000;
-    final rawRead = await Future.value(bridge.readSpill(jsonEncode({
+    final rawRead = await Future.value(bridge.readSpill(ctx, jsonEncode({
       'ref': ref,
       'offset': offset,
       'limit': limit,

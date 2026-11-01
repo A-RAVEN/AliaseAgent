@@ -302,6 +302,7 @@ void main() {
         ..queueDone(stopReason: 'end_turn');
 
       await sidecar.sendMessage(
+        handle: 'thinking-test',
         apiKey: 'test-key',
         baseUrl: 'https://test.example.com',
         model: 'claude-sonnet-4-6',

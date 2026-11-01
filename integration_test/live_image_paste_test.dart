@@ -182,8 +182,11 @@ void main() {
         //    这一步把"剪贴板读不出来"和"界面没反应"分开 —— 否则失败时说不清卡在哪。
         //    同时它也是 13.4 的判据：**落盘文件的宽高必须等于放进去那张图的宽高**。
         String direct = '';
+        final chatState =
+            tester.state<ChatScreenState>(find.byType(ChatScreen));
         for (var attempt = 1; attempt <= 3; attempt++) {
           direct = SidecarBridge.instance.readClipboardImage(
+              chatState.currentSessionId ?? '',
               jsonEncode({'dest_dir': tempDir.path}));
           // ignore: avoid_print
           print('  [OBS] 第 $attempt 次直接调 read_clipboard_image => $direct');

@@ -24,10 +24,13 @@ import 'package:alias_agent/services/sidecar_bridge.dart';
 void main() {
   late SidecarBridge bridge;
   late Directory tmp;
+  // change add-context-handles：命令工具也按上下文归属（spill 目录键 = 句柄）。
+  const ctx = 'cmd-tool-it';
 
-  setUpAll(() {
+  setUpAll(() async {
     bridge = SidecarBridge.instance;
-    final ws = bridge.setWorkspace('.');
+    await bridge.ensureContext(ctx, defaultWorkspace: '.');
+    final ws = bridge.setWorkspace(ctx, '.');
     expect(ws == null || ws.isEmpty, isTrue,
         reason: 'set_workspace 应当成功（返回空或 null）');
   });
@@ -49,7 +52,7 @@ void main() {
         "[Console]::Error.Write('ERR-TOKEN'); exit 3";
     // ignore: avoid_print
     print('[命令工具] 实际执行的命令: $command');
-    final r = await bridge.runCommand(jsonEncode({'command': command})).then(jsonDecode);
+    final r = await bridge.runCommand(ctx, jsonEncode({'command': command})).then(jsonDecode);
     // ignore: avoid_print
     print('[命令工具] 实测读数: ok=${r['ok']} exit=${r['exit_code']} '
         'stdout长度=${(r['stdout'] as String).length} '
@@ -70,7 +73,7 @@ void main() {
     // ignore: avoid_print
     print('[命令工具] 实际执行的命令: Write-Output \'$text\'');
     final r = await bridge
-        .runCommand(jsonEncode({'command': "Write-Output '$text'"}))
+        .runCommand(ctx, jsonEncode({'command': "Write-Output '$text'"}))
         .then(jsonDecode);
     // ignore: avoid_print
     print('[命令工具] 实测读数: stdout=${jsonEncode(r['stdout'])}');
@@ -92,7 +95,7 @@ void main() {
     // ignore: avoid_print
     print('[命令工具] 实际执行的命令: $command（超时 2500 毫秒）');
     final r = await bridge
-        .runCommand(jsonEncode({'command': command, 'timeout_ms': 2500}))
+        .runCommand(ctx, jsonEncode({'command': command, 'timeout_ms': 2500}))
         .then(jsonDecode);
     // ignore: avoid_print
     print('[命令工具] 实测读数: timed_out=${r['timed_out']} '
@@ -110,7 +113,7 @@ void main() {
     // ignore: avoid_print
     print('[命令工具] 实际执行的命令: $command（workdir 指到工作区之外）');
     final r = await bridge
-        .runCommand(jsonEncode({'command': command, 'workdir': tmp.path}))
+        .runCommand(ctx, jsonEncode({'command': command, 'workdir': tmp.path}))
         .then(jsonDecode);
     // ignore: avoid_print
     print('[命令工具] 实测读数: ok=${r['ok']} error=${r['error']} '
@@ -121,13 +124,13 @@ void main() {
 
   test('workdir 生效与 cd 不跨调用（覆盖 6、7）', () async {
     final sub = Directory('${tmp.path}\\sub工作目录')..createSync();
-    final ws = bridge.setWorkspace(tmp.path);
+    final ws = bridge.setWorkspace(ctx, tmp.path);
     expect(ws == null || ws.isEmpty, isTrue);
 
     // ignore: avoid_print
     print('[命令工具] 实际执行的命令: (Get-Location).Path（workdir=sub工作目录）');
     final r1 = await bridge
-        .runCommand(jsonEncode({
+        .runCommand(ctx, jsonEncode({
           'command': '(Get-Location).Path',
           'workdir': 'sub工作目录',
         }))
@@ -139,9 +142,9 @@ void main() {
     expect(r1['stdout'], contains('sub工作目录'));
 
     // cd 不跨调用：先 cd 到别处，下一次调用仍应落在 tmp
-    await bridge.runCommand(jsonEncode({'command': 'cd C:\\'})).then(jsonDecode);
+    await bridge.runCommand(ctx, jsonEncode({'command': 'cd C:\\'})).then(jsonDecode);
     final r2 = await bridge
-        .runCommand(jsonEncode({'command': '(Get-Location).Path'}))
+        .runCommand(ctx, jsonEncode({'command': '(Get-Location).Path'}))
         .then(jsonDecode);
     // ignore: avoid_print
     print('[命令工具] 实测读数（第二次）: stdout=${jsonEncode(r2['stdout'])}');
@@ -150,7 +153,7 @@ void main() {
         reason: '第二次调用应当回到工作区，而不是 C:\\');
 
     expect(sub.existsSync(), isTrue);
-    bridge.setWorkspace('.');
+    bridge.setWorkspace(ctx, '.');
   });
 
   test('预览长度改小后同一条命令的预览真的变短（覆盖 8）', () async {
@@ -162,10 +165,10 @@ void main() {
     // ignore: avoid_print
     print('[命令工具] 实际执行的命令: $command（先按 preview_chars=500，再按缺省 1000）');
     final small = await bridge
-        .runCommand(jsonEncode({'command': command, 'preview_chars': 500}))
+        .runCommand(ctx, jsonEncode({'command': command, 'preview_chars': 500}))
         .then(jsonDecode);
     final plain = await bridge
-        .runCommand(jsonEncode({'command': command}))
+        .runCommand(ctx, jsonEncode({'command': command}))
         .then(jsonDecode);
     // ignore: avoid_print
     print('[命令工具] 实测读数: 小预览长度=${(small['stdout'] as String).length} '

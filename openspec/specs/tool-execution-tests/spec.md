@@ -5,27 +5,27 @@
 ## Requirements
 
 ### Requirement: set_workspace configures the workspace root
-The C++ Sidecar SHALL validate and set the workspace directory, returning an error message on failure or empty string on success.
+The C++ Sidecar SHALL validate and set **the given context's** workspace directory, returning an error message on failure or empty string on success. Setting one context SHALL NOT change another context's workspace.
 
 #### Scenario: Valid directory
-- **WHEN** set_workspace is called with an existing directory path
-- **THEN** returns empty string ""
-- **AND** g_workspace is set to the canonical path
+- **WHEN** set_workspace is called on a context with an existing directory path
+- **THEN** it returns empty string ""
+- **AND** that context's workspace is set to the canonical path
 
 #### Scenario: Empty path
-- **WHEN** set_workspace is called with an empty string
-- **THEN** returns "Workspace path is empty"
-- **AND** g_workspace is cleared
+- **WHEN** set_workspace is called on a context with an empty string
+- **THEN** it returns "Workspace path is empty"
+- **AND** that context's workspace is cleared
 
 #### Scenario: Invalid path
 - **WHEN** set_workspace is called with a path that cannot be canonicalized
-- **THEN** returns "Invalid workspace path: <path>"
-- **AND** g_workspace is cleared
+- **THEN** it returns "Invalid workspace path: <path>"
+- **AND** that context's workspace is cleared
 
 #### Scenario: Path is not a directory
 - **WHEN** set_workspace is called with a path to a file
-- **THEN** returns "Workspace is not a directory: <path>"
-- **AND** g_workspace is cleared
+- **THEN** it returns "Workspace is not a directory: <path>"
+- **AND** that context's workspace is cleared
 
 ### Requirement: read_file returns file content
 The C++ Sidecar SHALL return JSON `{"ok":true,"content":"..."}` for a valid text file within the workspace.
@@ -67,10 +67,10 @@ The C++ Sidecar SHALL reject paths that point to directories.
 - **THEN** returns JSON with ok:false and error "Path is a directory, not a file: <path>"
 
 ### Requirement: read_file handles no workspace set
-The C++ Sidecar SHALL return an error when no workspace has been configured.
+The C++ Sidecar SHALL return an error when the **current context's** workspace has not been configured.
 
 #### Scenario: No workspace set
-- **WHEN** read_file is called but g_workspace is empty
+- **WHEN** read_file is called on a context whose workspace is empty
 - **THEN** returns JSON with ok:false and error "No workspace set"
 
 ### Requirement: read_file handles unresolvable path
@@ -112,7 +112,7 @@ The C++ Sidecar SHALL reject paths outside the workspace.
 - **THEN** returns JSON with ok:false and error "Access denied: path outside workspace"
 
 ### Requirement: list_dir handles cannot-read and no-workspace
-The C++ Sidecar SHALL return appropriate errors for unreadable directories and missing workspace.
+The C++ Sidecar SHALL return appropriate errors for unreadable directories and a missing workspace on the current context.
 
 #### Scenario: Cannot read directory (permissions) *(best-effort)*
 - **WHEN** list_dir is called on a directory that passes path_exists/is_dir but cannot be opened (OS-level permissions)
@@ -120,7 +120,7 @@ The C++ Sidecar SHALL return appropriate errors for unreadable directories and m
 - **NOTE**: Requires OS-level permission restriction (e.g., ACLs on Windows, chmod on Unix). Best-effort — skip with `WARN` if test environment cannot set up the precondition.
 
 #### Scenario: No workspace set
-- **WHEN** list_dir is called but g_workspace is empty
+- **WHEN** list_dir is called on a context whose workspace is empty
 - **THEN** returns JSON with ok:false and error "No workspace set"
 
 #### Scenario: Cannot resolve path *(best-effort)*
@@ -130,11 +130,11 @@ The C++ Sidecar SHALL return appropriate errors for unreadable directories and m
 
 ### Requirement: run_command 的结果头尾都留，且引用可读
 
-`run_command` SHALL 按 `tool-output-spill` 的契约交付结果：stdout 与 stderr 的完整输出各先落盘（`<会话>/<6 位序号>-<流>.txt`），超限时内联头尾各 `preview_chars` 个字符（缺省 1000）并给出引用。
+`run_command` SHALL 按 `tool-output-spill` 的契约交付结果：stdout 与 stderr 的完整输出各先落盘（`<上下文句柄的无损编码>/<6 位序号>-<流>.txt`），超限时内联头尾各 `preview_chars` 个字符（缺省 1000）并给出引用。`read_spill` SHALL 只允许读取本上下文目录内的引用，并 SHALL 有一条用例证明用另一个上下文的句柄读取会被拒绝。
 
 SHALL NOT 再保留"只截到尾部 + 系统临时文件路径"的旧行为。
 
-> **2026-10-25 修改（对抗验证后）**：初稿这里写的是"也 SHALL NOT 在 Dart 侧对结果做第二次截断"，那条与实现正好相反 —— `lib/main.dart` 的 `elideOversizedToolResult` 对**每个**工具结果（含 `run_command`）都生效，正文超过 8000 字符就保头保尾砍中段。本变更真正保证的是：**引用与省略量留在正文最后一行，所以那道通用截断掐不到它们**（判据见 `tasks.md` 的 3.2 / 9.1 / 9.2），而不是"不截"。
+> **2026-10-25 修改（对抗验证后）**：初稿这里写的是"也 SHALL NOT 在 Dart 侧对结果做第二次截断"，那条与实现正好相反 —— `lib/main.dart` 的 `elideOversizedToolResult` 对**每个**工具结果（含 `run_command`）都生效，正文超过 8000 字符就保头保尾砍中段。本变更真正保证的是：**引用与省略量留在正文尾部区域，所以那道通用截断掐不到它们**，而不是"不截"。引用行之后还可能追加 `[timed out …]` / `[exit code: …]`，所以规范不要求它是最后一行。原先判据在 `spill-large-tool-output` 归档的 tasks 3.2 / 9.1 / 9.2；本次把路径归属改为上下文句柄，并补上跨上下文引用拒绝。
 
 #### Scenario: 构建失败的头一条错误可见
 - **WHEN** 执行一条先打印 500 行日志、再在头部第 2 行打出 `error C2065` 的命令
@@ -146,9 +146,17 @@ SHALL NOT 再保留"只截到尾部 + 系统临时文件路径"的旧行为。
 
 #### Scenario: 通用截断发生时引用仍可见
 - **WHEN** 把 `preview_chars` 配到 4000（头尾合计 8000），使整段结果必然超过 `kToolResultElisionThreshold`
-- **THEN** 结果的最后一行 SHALL 仍含 spill 引用与省略量（它们不落在被砍掉的中段里），且 `read_spill` 能按该引用读回文件里的任意合法区间
+- **THEN** 截断后的尾部区域 SHALL 仍含 spill 引用与省略量（它们不落在被砍掉的中段里），且 `read_spill` 能按该引用读回文件里的任意合法区间；引用之后是否还有超时/退出码行不影响判定
+
+#### Scenario: 超时或非零退出码之后引用仍在尾部
+- **WHEN** 一条命令超时或退出码非零，结果里因此追加了 `[timed out …]` 或 `[exit code: …]`
+- **THEN** spill 引用与省略量 SHALL 仍位于尾部可见区域，SHALL NOT 因为「不再最后一行」丢失
 
 #### Scenario: 两条流同时超限时各给一个引用
 - **WHEN** 一条命令的 stdout 与 stderr 都远超预览阈值
 - **THEN** 两条流的截断字段 SHALL 都为真，且 SHALL 各给一个引用；两个引用 SHALL 指向**不同**文件，两个文件 SHALL 各自等于该条流的完整输出字节数
+
+#### Scenario: 另一个上下文不能读这份引用
+- **WHEN** 甲产生一份 spill 文件后，用乙的句柄调用 `read_spill` 读取甲返回的绝对路径引用
+- **THEN** 结果 SHALL 是 `ok:false`，且错误 SHALL 指出引用不属于乙的上下文，SHALL NOT 返回甲文件内容
 

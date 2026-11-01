@@ -7,10 +7,13 @@ import 'package:alias_agent/services/sidecar_bridge.dart';
 /// Verifies end-to-end FFI call sequences with real file I/O.
 void main() {
   late SidecarBridge bridge;
+  // change add-context-handles：上下文接口的首参是句柄。
+  const ctx = 'real-sidecar';
 
-  setUpAll(() {
+  setUpAll(() async {
     bridge = SidecarBridge.instance;
-    bridge.setWorkspace('.');
+    await bridge.ensureContext(ctx, defaultWorkspace: '.');
+    bridge.setWorkspace(ctx, '.');
     // Clean up test files from previous runs
     for (final f in ['_test_write_new.txt', '_test_edit.txt', '_test_edit2.txt', '_test_edit3.txt']) {
       try { File(f).deleteSync(); } catch (_) {}
@@ -27,7 +30,7 @@ void main() {
   // 3.1 read_file integration
   // =========================================================================
   test('read_file returns correct content for a real file', () {
-    final result = bridge.readFile('pubspec.yaml');
+    final result = bridge.readFile(ctx, 'pubspec.yaml');
     final parsed = jsonDecode(result);
     expect(parsed['ok'], isTrue);
 
@@ -40,7 +43,7 @@ void main() {
   // 3.2 list_dir integration
   // =========================================================================
   test('list_dir returns files and directories with correct format', () {
-    final result = bridge.listDir('lib');
+    final result = bridge.listDir(ctx, 'lib');
     final parsed = jsonDecode(result);
     expect(parsed['ok'], isTrue);
 
@@ -58,21 +61,21 @@ void main() {
   // =========================================================================
   test('set_workspace → read_file → list_dir work in sequence without corruption', () {
     // Re-set workspace
-    final wsResult = bridge.setWorkspace('.');
+    final wsResult = bridge.setWorkspace(ctx, '.');
     expect(wsResult, anyOf(isNull, isEmpty));
 
     // read_file
-    final readResult = bridge.readFile('pubspec.yaml');
+    final readResult = bridge.readFile(ctx, 'pubspec.yaml');
     final readParsed = jsonDecode(readResult);
     expect(readParsed['ok'], isTrue);
 
     // list_dir
-    final listResult = bridge.listDir('test');
+    final listResult = bridge.listDir(ctx, 'test');
     final listParsed = jsonDecode(listResult);
     expect(listParsed['ok'], isTrue);
 
     // Verify no state corruption — read_file still works after list_dir
-    final readAgain = bridge.readFile('pubspec.yaml');
+    final readAgain = bridge.readFile(ctx, 'pubspec.yaml');
     final readAgainParsed = jsonDecode(readAgain);
     expect(readAgainParsed['ok'], isTrue);
     expect(readAgainParsed['content'], contains('alias_agent'));
@@ -82,7 +85,7 @@ void main() {
   // 3.4 write_file integration
   // =========================================================================
   test('write_file creates a new file and returns created:true', () {
-    final result = bridge.writeFile('{"path":"_test_write_new.txt","content":"hello from write_file"}');
+    final result = bridge.writeFile(ctx, '{"path":"_test_write_new.txt","content":"hello from write_file"}');
     final parsed = jsonDecode(result);
     expect(parsed['ok'], isTrue);
     expect(parsed['created'], isTrue);
@@ -90,7 +93,7 @@ void main() {
   });
 
   test('write_file overwrites existing file and returns created:false', () {
-    final result = bridge.writeFile('{"path":"_test_write_new.txt","content":"overwritten content"}');
+    final result = bridge.writeFile(ctx, '{"path":"_test_write_new.txt","content":"overwritten content"}');
     final parsed = jsonDecode(result);
     expect(parsed['ok'], isTrue);
     expect(parsed['created'], isFalse);
@@ -101,23 +104,23 @@ void main() {
   // =========================================================================
   test('edit_file exact match replaces text and returns replacements:1', () {
     // First create a file to edit
-    bridge.writeFile('{"path":"_test_edit.txt","content":"line one\\nline two\\nline three\\n"}');
-    final result = bridge.editFile(
+    bridge.writeFile(ctx, '{"path":"_test_edit.txt","content":"line one\\nline two\\nline three\\n"}');
+    final result = bridge.editFile(ctx, 
         '{"path":"_test_edit.txt","edits":[{"old_text":"line two","new_text":"line TWO"}]}');
     final parsed = jsonDecode(result);
     expect(parsed['ok'], isTrue);
     expect(parsed['replacements'], 1);
 
     // Verify the edit
-    final readResult = bridge.readFile('{"path":"_test_edit.txt"}');
+    final readResult = bridge.readFile(ctx, '{"path":"_test_edit.txt"}');
     final readParsed = jsonDecode(readResult);
     expect(readParsed['content'], contains('line TWO'));
     expect(readParsed['content'], isNot(contains('line two')));
   });
 
   test('edit_file rejects empty old_text', () {
-    bridge.writeFile('{"path":"_test_edit2.txt","content":"some content\\n"}');
-    final result = bridge.editFile(
+    bridge.writeFile(ctx, '{"path":"_test_edit2.txt","content":"some content\\n"}');
+    final result = bridge.editFile(ctx, 
         '{"path":"_test_edit2.txt","edits":[{"old_text":"","new_text":"replacement"}]}');
     final parsed = jsonDecode(result);
     expect(parsed['ok'], isFalse);
@@ -125,8 +128,8 @@ void main() {
   });
 
   test('edit_file returns diagnostic when no match found', () {
-    bridge.writeFile('{"path":"_test_edit3.txt","content":"hello world\\n"}');
-    final result = bridge.editFile(
+    bridge.writeFile(ctx, '{"path":"_test_edit3.txt","content":"hello world\\n"}');
+    final result = bridge.editFile(ctx, 
         '{"path":"_test_edit3.txt","edits":[{"old_text":"nonexistent text","new_text":"replacement"}]}');
     final parsed = jsonDecode(result);
     expect(parsed['ok'], isFalse);
@@ -143,10 +146,10 @@ void main() {
       File(path).deleteSync();
     } catch (_) {}
 
-    bridge.writeFile('{"path":"$path","content":"alpha\\nbeta\\ngamma\\n"}');
-    expect(jsonDecode(bridge.readFile('{"path":"$path"}'))['ok'], isTrue);
+    bridge.writeFile(ctx, '{"path":"$path","content":"alpha\\nbeta\\ngamma\\n"}');
+    expect(jsonDecode(bridge.readFile(ctx, '{"path":"$path"}'))['ok'], isTrue);
 
-    final edited = jsonDecode(bridge.editFile(
+    final edited = jsonDecode(bridge.editFile(ctx, 
         '{"path":"$path","edits":[{"old_text":"beta","new_text":"BETA"}]}'));
     expect(edited['ok'], isTrue);
     expect(edited['hunks'], isA<List<dynamic>>());
@@ -159,7 +162,7 @@ void main() {
 
     // 外部改动（内容与大小都变）之后，再改必须报 stale 且不动文件
     File(path).writeAsStringSync('completely different content\n');
-    final stale = jsonDecode(bridge.editFile(
+    final stale = jsonDecode(bridge.editFile(ctx, 
         '{"path":"$path","edits":[{"old_text":"alpha","new_text":"ALPHA"}]}'));
     expect(stale['ok'], isFalse);
     expect(stale['code'], 'stale');

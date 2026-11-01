@@ -1,0 +1,14 @@
+# 上下文名字 → spill 目录名 的共享样例（C++ 与 Dart 两侧共读这一份）
+# 列：名字 <TAB> 目录名 <TAB> 说明
+# 编码规则：只保留 [a-z0-9_-]，其余字节写成 %XX（大写十六进制）；空名字落到 no-session。
+# 行首的 # 是注释。空名字那一行的第一列是空字符串。
+abc-123_def-4	abc-123_def-4	保留集内的字符原样保留
+Agent-7	%41gent-7	大写字母必须编码，否则 Windows 上和不区分大小写的名字撞目录
+agent-7	agent-7	与 Agent-7 必须不同目录
+会话甲	%E4%BC%9A%E8%AF%9D%E7%94%B2	非 ASCII 逐字节 %XX
+..	%2E%2E	点号编码掉，不能跑出 spill 根目录
+.	%2E	单个点同样编码
+	no-session	空名字（第一列为空）
+a/b:c	a%2Fb%3Ac	路径分隔符与冒号都编码
+中文 会话	%E4%B8%AD%E6%96%87%20%E4%BC%9A%E8%AF%9D	空格是 0x20
+8f14e45f-ceea-467a-9b3e-1f4c7a9d2e11	8f14e45f-ceea-467a-9b3e-1f4c7a9d2e11	UUID v4 前后不变（生产会话 id 都是这个形状）

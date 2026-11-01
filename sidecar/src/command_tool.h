@@ -12,7 +12,8 @@
 /// `openspec/changes/spill-large-tool-output/`）：
 ///   1. 命令字符串作为 `-Command` 的**单个** argv 元素交出去，外层不再套一层解析；
 ///   2. 对子进程**额外注入**环境变量而不是替换（PATH 必须留给子进程）；
-///   3. 每条流的**完整输出先落盘**到 `~/.aliasagent/spill/<会话>/<序号>-<流>.txt`
+///   3. 每条流的**完整输出先落盘**到
+///      `~/.aliasagent/spill/<上下文句柄的无损编码>/<序号>-<流>.txt`
 ///      （原子写），内存里保留头尾各 `preview_chars` 个字符并给出可取回的引用。
 ///
 /// 请求 JSON：
@@ -20,8 +21,9 @@
 ///    "workdir":"...",            // 可选，缺省为当前工作区；越界拒绝
 ///    "timeout_ms":120000,        // 可选，毫秒；非法值回落缺省；超过上限按上限
 ///    "max_timeout_ms":600000,    // 可选，超时上限
-///    "preview_chars":1000,       // 可选，头尾各留多少字符（配置键 spill.preview_chars）
-///    "spill_session":"<会话 id>"} // 可选，决定 spill 子目录；缺省 no-session
+///    "preview_chars":1000}       // 可选，头尾各留多少字符（配置键 spill.preview_chars）
+///
+/// spill 的归属键是**调用方首参上下文句柄**，请求 JSON 里没有目录键字段。
 ///
 /// 返回 JSON（成功执行，无论命令自身退出码是否为 0）：
 ///   {"ok":true,"exit_code":N,"timed_out":bool,"duration_ms":N,

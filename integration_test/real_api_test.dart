@@ -312,10 +312,13 @@ void main() {
     final testFilePath = '$homeDir${Platform.pathSeparator}_aliasagent_live_test.txt';
     final testFileRelPath = '_aliasagent_live_test.txt';
 
-    // Create the test file outside of the widget tree using real SidecarBridge
+    // Create the test file outside of the widget tree using real SidecarBridge.
+    // change add-context-handles：写文件必须点名一个上下文句柄。
     final bridge = SidecarBridge.instance;
-    bridge.setWorkspace(homeDir);
-    final writeResult = bridge.writeFile(jsonEncode({
+    const ctx = 'live-real-api';
+    await bridge.ensureContext(ctx, defaultWorkspace: homeDir);
+    bridge.setWorkspace(ctx, homeDir);
+    final writeResult = bridge.writeFile(ctx, jsonEncode({
       'path': testFileRelPath,
       'content': 'hello from AliasAgent live test\nline two\nline three\n',
     }));

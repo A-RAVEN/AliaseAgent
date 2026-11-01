@@ -23,13 +23,16 @@ void main() {
 
   /// 本文件的会话名。**必须传**：不传就会落到真实的 `no-session` 目录，
   /// 于是每跑一次测试就往用户主目录里留一堆 spill 文件（tasks 10.2）。
-  const testSession = '_it_envelope';
+  const testSession = 'it-envelope';
   final spillRoot = Directory('${Platform.environment['USERPROFILE']}'
       '${Platform.pathSeparator}.aliasagent${Platform.pathSeparator}spill');
   int noSessionFilesBefore = 0;
 
-  setUpAll(() {
-    final ws = bridge.setWorkspace('.');
+  setUpAll(() async {
+    // change add-context-handles：spill 目录的键是上下文句柄，不再用会话名，
+    // 也不能用测试保留前缀 `_it_`（create_context 会拒绝它）。
+    await bridge.ensureContext(testSession, defaultWorkspace: '.');
+    final ws = bridge.setWorkspace(testSession, '.');
     expect(ws == null || ws.isEmpty, isTrue, reason: 'set_workspace 应当成功');
     // 记下"跑之前 no-session 里有几个文件"，跑完对照 —— 本文件不许往里加东西
     final orphan = Directory('${spillRoot.path}${Platform.pathSeparator}no-session');
@@ -60,7 +63,7 @@ void main() {
     // ignore: avoid_print
     print('[spill 信封] 实际执行的命令: $longCommand（外部真值 = $longBytes 字节）');
     final r = await bridge
-        .runCommand(jsonEncode({'command': longCommand, 'spill_session': testSession}))
+        .runCommand(testSession, jsonEncode({'command': longCommand}))
         .then((s) => jsonDecode(s) as Map<String, dynamic>);
     // ignore: avoid_print
     print('[spill 信封] 实测读数: ok=${r['ok']} '
@@ -117,7 +120,7 @@ void main() {
     // ignore: avoid_print
     print('[spill 信封] 实际执行的命令: $command（外部真值 = 5 字节）');
     final r = await bridge
-        .runCommand(jsonEncode({'command': command, 'spill_session': testSession}))
+        .runCommand(testSession, jsonEncode({'command': command}))
         .then((s) => jsonDecode(s) as Map<String, dynamic>);
     // ignore: avoid_print
     print('[spill 信封] 实测读数: ok=${r['ok']} stdout=${jsonEncode(r['stdout'])} '
@@ -141,7 +144,7 @@ void main() {
     // ignore: avoid_print
     print('[spill 信封] 实际执行的命令: $longCommand（preview_chars=4000）');
     final parsed = await bridge
-        .runCommand(jsonEncode({'command': longCommand, 'preview_chars': 4000, 'spill_session': testSession}))
+        .runCommand(testSession, jsonEncode({'command': longCommand, 'preview_chars': 4000}))
         .then((s) => jsonDecode(s) as Map<String, dynamic>);
     final env =
         Map<String, dynamic>.from((parsed['spill'] as Map)['stdout'] as Map);
@@ -168,7 +171,7 @@ void main() {
     // 结果超过 8000 字符时会被通用截断，尾注原本固定写「本篇无法自动再取…」，
     // 而它上面一行就是 spill 引用 —— 自相矛盾。正文里带 spill 引用时必须改口径。
     final parsed = await bridge
-        .runCommand(jsonEncode({'command': longCommand, 'preview_chars': 4000, 'spill_session': testSession}))
+        .runCommand(testSession, jsonEncode({'command': longCommand, 'preview_chars': 4000}))
         .then((s) => jsonDecode(s) as Map<String, dynamic>);
     final content = ChatScreenState.composeCommandResultText(parsed);
     final elided = ChatScreenState.elideOversizedToolResult(
@@ -192,10 +195,10 @@ void main() {
     // 通用截断阈值（8000）—— 否则"截断后没超阈值"这条断言是空的（缺省 1000 时
     // 拼装只有 4652 字符，根本不会触发截断）。
     final parsed = await bridge
-        .runCommand(jsonEncode({
+        .runCommand(testSession, jsonEncode({
           'command': cmd,
           'preview_chars': 4000,
-          'spill_session': testSession,
+          
         }))
         .then((s) => jsonDecode(s) as Map<String, dynamic>);
     final spill = parsed['spill'] as Map;
@@ -243,7 +246,7 @@ void main() {
     // ignore: avoid_print
     print('[spill 信封] 10.2 no-session 文件数：跑前=$noSessionFilesBefore 跑后=$after');
     expect(after, noSessionFilesBefore,
-        reason: '用例必须传 spill_session，不许把文件落进无主的 no-session');
+        reason: '用例必须按上下文句柄落盘，不许把文件落进无主的 no-session');
   });
 
   test('「正文里有没有 spill 引用」的判断收在一处（tasks 10.4）', () {

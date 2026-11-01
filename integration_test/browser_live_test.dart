@@ -191,7 +191,8 @@ void main() {
       try {
         // Redirect the workspace to the fixture AFTER pump (initState resets to
         // homeDir), so a model that touches files never hits the user's home.
-        expect(SidecarBridge.instance.setWorkspace(ws.path), isNull,
+        final chatState = tester.state<ChatScreenState>(find.byType(ChatScreen));
+      expect(await chatState.setCurrentWorkspace(ws.path), isNull,
             reason: 'setWorkspace(fixture) must succeed');
 
         // Scope the browser-record channel to THIS run (append-only shared log).

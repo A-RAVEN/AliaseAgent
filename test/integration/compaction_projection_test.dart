@@ -210,6 +210,7 @@ class _SizedFakeSummaryProvider implements SummaryProvider {
     required List<Message> folded,
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
+    String? sessionId,
   }) async {
     summarizeCalls++;
     return SummaryResult(
@@ -220,6 +221,7 @@ class _SizedFakeSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarizeText({
     required String text,
     required AgentTypeConfig config,
+    String? sessionId,
   }) async {
     summarizeTextCalls++;
     // 一条"这一趟不许调太多次"的守卫。收拢循环的推进规则一旦被破坏（例如"被拒即不再
@@ -265,6 +267,7 @@ class _EchoSummaryProvider implements SummaryProvider {
     required List<Message> folded,
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
+    String? sessionId,
   }) async {
     summarizeCalls++;
     referencesPerCall.add(List.of(reference));
@@ -277,6 +280,7 @@ class _EchoSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarizeText({
     required String text,
     required AgentTypeConfig config,
+    String? sessionId,
   }) async {
     summarizeTextCalls++;
     // The rolled-up summary keeps the labels of its inputs, in the order given.
@@ -295,6 +299,7 @@ class _RecordingSummaryProvider implements SummaryProvider {
     required List<Message> folded,
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
+    String? sessionId,
   }) async {
     foldedCalls.add(List.of(folded));
     return SummaryResult(
@@ -305,6 +310,7 @@ class _RecordingSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarizeText({
     required String text,
     required AgentTypeConfig config,
+    String? sessionId,
   }) async {
     return SummaryResult(text: text, tokens: ContextEstimator.estimateTokens(text));
   }
@@ -2794,6 +2800,7 @@ class _GatedSummaryProvider implements SummaryProvider {
     required List<Message> folded,
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
+    String? sessionId,
   }) {
     summarizeCalls++;
     final g = gate;
@@ -2805,6 +2812,7 @@ class _GatedSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarizeText({
     required String text,
     required AgentTypeConfig config,
+    String? sessionId,
   }) {
     summarizeTextCalls++;
     final g = gate;
@@ -2826,6 +2834,7 @@ class _GatedSeamSelector implements SeamSelector {
     required List<Message> far,
     required int k,
     required AgentTypeConfig config,
+    String? sessionId,
   }) async {
     ensures++;
     final g = gate;
@@ -2851,6 +2860,7 @@ class _WarmSeamSelector implements SeamSelector {
     required List<Message> far,
     required int k,
     required AgentTypeConfig config,
+    String? sessionId,
   }) async {
     ensures++;
   }
@@ -2872,6 +2882,7 @@ class _ThrowingSummaryProvider implements SummaryProvider {
     required List<Message> folded,
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
+    String? sessionId,
   }) async {
     throw StateError('summarization failed (simulated done!=0/empty)');
   }
@@ -2880,6 +2891,7 @@ class _ThrowingSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarizeText({
     required String text,
     required AgentTypeConfig config,
+    String? sessionId,
   }) async {
     throw StateError('summarization failed (simulated done!=0/empty)');
   }

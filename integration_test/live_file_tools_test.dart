@@ -260,7 +260,8 @@ void main() {
       // 3. Redirect the workspace to the fixture AFTER pump (design D2).
       //    Null return = success; non-null would mean the model could touch the
       //    user's homeDir — a serious safety hazard (design Risks).
-      expect(SidecarBridge.instance.setWorkspace(ws.path), isNull,
+      final chatState = tester.state<ChatScreenState>(find.byType(ChatScreen));
+      expect(await chatState.setCurrentWorkspace(ws.path), isNull,
           reason: 'setWorkspace(fixture) must succeed — never fall back to homeDir');
 
       // 4. Drive the real model via the chat input.
@@ -363,7 +364,8 @@ void main() {
       // fires after the tree reset and would break the pass path). Capture runs
       // in finally.
       try {
-      expect(SidecarBridge.instance.setWorkspace(ws.path), isNull,
+      final chatState = tester.state<ChatScreenState>(find.byType(ChatScreen));
+      expect(await chatState.setCurrentWorkspace(ws.path), isNull,
           reason: 'setWorkspace(fixture) must succeed — never fall back to homeDir');
 
       final textField = find.byType(TextField);
@@ -477,7 +479,8 @@ void main() {
       // fires after the tree reset and would break the pass path). Capture runs
       // in finally.
       try {
-      expect(SidecarBridge.instance.setWorkspace(ws.path), isNull,
+      final chatState = tester.state<ChatScreenState>(find.byType(ChatScreen));
+      expect(await chatState.setCurrentWorkspace(ws.path), isNull,
           reason: 'setWorkspace(fixture) must succeed — never fall back to homeDir');
 
       final textField = find.byType(TextField);
@@ -615,7 +618,8 @@ void main() {
       // fires after the tree reset and would break the pass path). Capture runs
       // in finally.
       try {
-      expect(SidecarBridge.instance.setWorkspace(ws.path), isNull,
+      final chatState = tester.state<ChatScreenState>(find.byType(ChatScreen));
+      expect(await chatState.setCurrentWorkspace(ws.path), isNull,
           reason: 'setWorkspace(fixture) must succeed — never fall back to homeDir');
 
       final textField = find.byType(TextField);

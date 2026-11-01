@@ -150,6 +150,7 @@ class _AccumulatingSummaryProvider implements SummaryProvider {
     required List<Message> folded,
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
+    String? sessionId,
   }) async {
     totalFoldedRaw += ContextEstimator.estimateConversation(folded);
     final tokens = ContextEstimator.estimateTokens(text);
@@ -161,6 +162,7 @@ class _AccumulatingSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarizeText({
     required String text,
     required AgentTypeConfig config,
+    String? sessionId,
   }) async {
     final tokens = ContextEstimator.estimateTokens(text);
     totalSummaryTokens += tokens;

@@ -32,6 +32,10 @@ void main() {
   final sentLines = <String>[];
   final pendingReads = <Completer<String>>[];
   final records = <Map<String, dynamic>>[];
+  // 每个上下文要在 worker 里显式 open 一次（change add-context-handles：未知
+  // 上下文不再被隐式创建）。测试体里的命令不带 ctx 时用这个缺省上下文。
+  final openedCtxs = <String>{};
+  const defaultCtx = 'test-ctx';
   var unavailable = false;
 
   setUp(() async {
@@ -75,9 +79,10 @@ void main() {
     records.clear();
     pendingReads.clear();
     sentLines.clear();
+    openedCtxs.clear();
   });
 
-  Future<String> send(Map<String, dynamic> cmd) async {
+  Future<String> sendRaw(Map<String, dynamic> cmd) async {
     // [OBS] emit the actual command before asserting, so a failure is attributable.
     debugPrint('[OBS] worker cmd -> ${jsonEncode(cmd)}');
     proc!.stdin.writeln(jsonEncode(cmd));
@@ -86,6 +91,18 @@ void main() {
     pendingReads.add(completer);
     return completer.future.timeout(const Duration(seconds: 45),
         onTimeout: () => '{"ok":false,"error":"worker response timeout"}');
+  }
+
+  /// 发一条命令；需要上下文的命令会先为这个 ctx 发一次显式 `open`（C++ 侧做的是
+  /// 同一件事：每个上下文的首次命令之前先发 open，未知 ctx 不隐式创建）。
+  Future<String> send(Map<String, dynamic> cmd, {String ctx = defaultCtx}) async {
+    const needsCtx = {'navigate', 'click', 'type', 'snapshot', 'relaunch'};
+    if (needsCtx.contains(cmd['cmd']) && !openedCtxs.contains(ctx)) {
+      openedCtxs.add(ctx);
+      final openResp = await sendRaw({'cmd': 'open', 'ctx': ctx});
+      debugPrint('[OBS] worker open($ctx) -> $openResp');
+    }
+    return sendRaw({...cmd, 'ctx': ctx});
   }
 
   test('browser_worker: available probe reports present', () async {
@@ -97,6 +114,53 @@ void main() {
     debugPrint('[OBS] worker available -> ${jsonEncode(resp)}');
     expect(resp['ok'], isTrue);
     expect(resp['available'], isTrue);
+  });
+
+  // change add-context-handles 任务 1.8 的验收：一个 browser 进程 + 每个上下文
+  // 一个 BrowserContext；stats 能证明两页共用一个浏览器进程；未知 ctx 不得被
+  // 隐式创建。
+  test('browser_worker: 两个上下文各读各页，stats 报告同一个 browser_pid', () async {
+    if (unavailable) {
+      markTestSkipped('python/browser_worker.py unavailable');
+      return;
+    }
+    final urlA = 'data:text/html,${Uri.encodeComponent("<h1>PAGE-ALPHA</h1>")}';
+    final urlB = 'data:text/html,${Uri.encodeComponent("<h1>PAGE-BETA</h1>")}';
+
+    final navA = jsonDecode(await send({'cmd': 'navigate', 'url': urlA}, ctx: 'ctx-alpha'));
+    final navB = jsonDecode(await send({'cmd': 'navigate', 'url': urlB}, ctx: 'ctx-beta'));
+    debugPrint('[OBS] alpha -> ${jsonEncode(navA)}');
+    debugPrint('[OBS] beta  -> ${jsonEncode(navB)}');
+    expect(navA['ok'], isTrue);
+    expect(navB['ok'], isTrue);
+    expect((navA['snapshot'] as String).contains('PAGE-ALPHA'), isTrue);
+    expect((navB['snapshot'] as String).contains('PAGE-BETA'), isTrue);
+
+    // 乙的导航没有移动甲的页面。
+    final snapA = jsonDecode(await send({'cmd': 'snapshot'}, ctx: 'ctx-alpha'));
+    debugPrint('[OBS] alpha snapshot -> ${jsonEncode(snapA)}');
+    expect((snapA['snapshot'] as String).contains('PAGE-ALPHA'), isTrue);
+    expect((snapA['snapshot'] as String).contains('PAGE-BETA'), isFalse);
+
+    final stats1 = jsonDecode(await send({'cmd': 'stats'}));
+    final stats2 = jsonDecode(await send({'cmd': 'stats'}));
+    debugPrint('[OBS] stats1 -> ${jsonEncode(stats1)} stats2 -> ${jsonEncode(stats2)}');
+    expect(stats1['ok'], isTrue);
+    expect(stats1['browser_pid'] as int, greaterThan(0),
+        reason: 'stats must report a real browser process id');
+    expect(stats2['browser_pid'], equals(stats1['browser_pid']),
+        reason: '两个上下文必须共用一个浏览器进程');
+    expect(stats1['contexts'] as int, greaterThanOrEqualTo(2));
+
+    // 未 open 的 ctx：navigate 必须失败，且上下文数不增加。
+    final unknown = jsonDecode(await sendRaw(
+        {'cmd': 'navigate', 'ctx': 'never-opened', 'url': urlA}));
+    debugPrint('[OBS] unknown ctx -> ${jsonEncode(unknown)}');
+    expect(unknown['ok'], isFalse);
+    expect(unknown['dead'], isTrue);
+    final stats3 = jsonDecode(await send({'cmd': 'stats'}));
+    expect(stats3['contexts'], equals(stats1['contexts']),
+        reason: 'unknown ctx must not create a BrowserContext');
   });
 
   test('browser_worker: navigate/click/type/snapshot persist + stay-hidden', () async {

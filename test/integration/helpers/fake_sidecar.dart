@@ -125,6 +125,34 @@ class FakeSidecar implements ISidecar {
   /// Records cancelRequest() invocations (for tests asserting the cancel path).
   int cancelCount = 0;
 
+  /// 每个上下文接口收到的句柄（change add-context-handles）：用例据此断言
+  /// "轮次属甲时工具调用仍带甲"，而不是读当时的 `_currentId`。
+  final List<String> ensureContextCalls = [];
+  final List<String> disposeContextCalls = [];
+  final List<String> sendHandles = [];
+  final List<String> cancelHandles = [];
+  final List<String> toolHandles = [];
+  final Map<String, bool> _createdByEnsure = {};
+  final Set<String> _ensured = {};
+
+  /// 可选：让 ensureContext 对某个句柄返回 created:true/false（默认首次 true）。
+  void stubCreated(String sessionId, bool created) {
+    _createdByEnsure[sessionId] = created;
+  }
+
+  @override
+  Future<bool> ensureContext(String sessionId, {String? defaultWorkspace}) async {
+    ensureContextCalls.add(sessionId);
+    final created = _createdByEnsure[sessionId] ?? !_ensured.contains(sessionId);
+    _ensured.add(sessionId);
+    return created;
+  }
+
+  @override
+  Future<void> disposeContext(String sessionId) async {
+    disposeContextCalls.add(sessionId);
+  }
+
   /// The last request's JSON + profile (for asserting the compaction projection
   /// and the summary profile mode are actually sent).
   String? lastMessagesJson;
@@ -133,6 +161,8 @@ class FakeSidecar implements ISidecar {
   String? lastBaseUrl;
   String? lastModel;
   String? lastToolsJson;
+  /// 最近一次 sendMessage 的上下文句柄（2.7 / 2.8 的验收用它核对归属）。
+  String? lastSendHandle;
 
   /// Suspends the NEXT sendMessage's event delivery until [releaseGate] is
   /// called — lets tests interleave a mid-stream session switch (11.4).
@@ -158,12 +188,14 @@ class FakeSidecar implements ISidecar {
   bool get hasQueuedEvents => _events.isNotEmpty;
 
   @override
-  void cancelRequest() {
+  void cancelRequest(String handle) {
     cancelCount++;
+    cancelHandles.add(handle);
   }
 
   @override
   Future<void> sendMessage({
+    required String handle,
     required String apiKey,
     required String baseUrl,
     required String model,
@@ -178,6 +210,8 @@ class FakeSidecar implements ISidecar {
     required OnDoneCallback onDone,
   }) async {
     // Record the request for assertion (compaction projection / summary profile).
+    lastSendHandle = handle;
+    sendHandles.add(handle);
     lastMessagesJson = messagesJson;
     lastSystemPrompt = systemPrompt;
     lastThinkingMode = thinkingMode;
@@ -220,15 +254,23 @@ class FakeSidecar implements ISidecar {
   }
 
   @override
-  String? setWorkspace(String path) => null;
+  String? setWorkspace(String handle, String path) {
+    toolHandles.add(handle);
+    return null;
+  }
 
   @override
-  String readFile(String requestJson) =>
-      _readFileResult ?? '{"ok":true,"content":"fake content","total_lines":1,"start_line":1,"end_line":1}';
+  String readFile(String handle, String requestJson) {
+    toolHandles.add(handle);
+    return _readFileResult ??
+        '{"ok":true,"content":"fake content","total_lines":1,"start_line":1,"end_line":1}';
+  }
 
   @override
-  String listDir(String path) =>
-      _listDirResult ?? '{"ok":true,"content":"[]"}';
+  String listDir(String handle, String path) {
+    toolHandles.add(handle);
+    return _listDirResult ?? '{"ok":true,"content":"[]"}';
+  }
 
   @override
   String ensureSearchInfra(String configJson) {
@@ -240,10 +282,16 @@ class FakeSidecar implements ISidecar {
   String getSearchProviders() => _searchProvidersResult;
 
   @override
-  Future<String> webSearch(String requestJson) async => _webSearchResult;
+  Future<String> webSearch(String handle, String requestJson) async {
+    toolHandles.add(handle);
+    return _webSearchResult;
+  }
 
   @override
-  Future<String> webFetch(String requestJson) async => _webFetchResult;
+  Future<String> webFetch(String handle, String requestJson) async {
+    toolHandles.add(handle);
+    return _webFetchResult;
+  }
 
   @override
   Future<String> browserAvailable() async {
@@ -254,22 +302,35 @@ class FakeSidecar implements ISidecar {
   }
 
   @override
-  Future<String> browserNavigate(String requestJson) async => _browserNavigateResult;
+  Future<String> browserNavigate(String handle, String requestJson) async {
+    toolHandles.add(handle);
+    return _browserNavigateResult;
+  }
 
   @override
-  Future<String> browserClick(String requestJson) async => _browserClickResult;
+  Future<String> browserClick(String handle, String requestJson) async {
+    toolHandles.add(handle);
+    return _browserClickResult;
+  }
 
   @override
-  Future<String> browserType(String requestJson) async => _browserTypeResult;
+  Future<String> browserType(String handle, String requestJson) async {
+    toolHandles.add(handle);
+    return _browserTypeResult;
+  }
 
   @override
-  Future<String> browserSnapshot(String requestJson) async => _browserSnapshotResult;
+  Future<String> browserSnapshot(String handle, String requestJson) async {
+    toolHandles.add(handle);
+    return _browserSnapshotResult;
+  }
 
   /// 命令工具：返回用例设定的结果，并把最后一次请求记下来（用例可以核对
   /// "组装进请求的四个配置值"到底传了什么）。
   String? lastRunCommandRequest;
   @override
-  Future<String> runCommand(String requestJson) async {
+  Future<String> runCommand(String handle, String requestJson) async {
+    toolHandles.add(handle);
     lastRunCommandRequest = requestJson;
     return _runCommandResult;
   }
@@ -280,32 +341,47 @@ class FakeSidecar implements ISidecar {
   void stubReadSpill(String json) { _readSpillResult = json; }
 
   @override
-  String readSpill(String requestJson) {
+  String readSpill(String handle, String requestJson) {
+    toolHandles.add(handle);
     lastReadSpillRequest = requestJson;
     return _readSpillResult;
   }
 
   @override
-  String writeFile(String requestJson) => _writeFileResult;
+  String writeFile(String handle, String requestJson) {
+    toolHandles.add(handle);
+    return _writeFileResult;
+  }
 
   @override
-  String editFile(String requestJson) => _editFileResult;
+  String editFile(String handle, String requestJson) {
+    toolHandles.add(handle);
+    return _editFileResult;
+  }
 
   @override
-  String globFile(String requestJson) => _globFileResult;
+  String globFile(String handle, String requestJson) {
+    toolHandles.add(handle);
+    return _globFileResult;
+  }
 
   @override
-  String grepFile(String requestJson) => _grepFileResult;
+  String grepFile(String handle, String requestJson) {
+    toolHandles.add(handle);
+    return _grepFileResult;
+  }
 
   @override
-  String readImage(String requestJson) {
+  String readImage(String handle, String requestJson) {
+    toolHandles.add(handle);
     readImageCallCount++;
     lastReadImageRequest = requestJson;
     return _readImageResult;
   }
 
   @override
-  String readClipboardImage(String requestJson) {
+  String readClipboardImage(String handle, String requestJson) {
+    toolHandles.add(handle);
     readClipboardImageCallCount++;
     lastReadClipboardImageRequest = requestJson;
     return _readClipboardImageResult;

@@ -26,6 +26,9 @@ abstract class SeamSelector {
     required List<Message> far,
     required int k,
     required AgentTypeConfig config,
+    /// 被压缩会话的上下文句柄（change add-context-handles）：分缝请求也必须落在
+    /// 这个会话自己的上下文上。
+    String? sessionId,
   });
 
   /// Synchronously read the memoized seam indices (k-1 interior starts) for
@@ -77,6 +80,7 @@ class ModelSeamSelector implements SeamSelector {
     required List<Message> far,
     required int k,
     required AgentTypeConfig config,
+    String? sessionId,
   }) async {
     final key = _key(far, k);
     // Warm memo → no LLM call.
@@ -124,6 +128,7 @@ class ModelSeamSelector implements SeamSelector {
     int doneCode = 0;
     try {
       await _sidecar.sendMessage(
+        handle: sessionId ?? '',
         apiKey: provider.apiKey,
         baseUrl: provider.baseUrl,
         model: config.model,
@@ -206,6 +211,7 @@ class FakeSeamSelector implements SeamSelector {
     required List<Message> far,
     required int k,
     required AgentTypeConfig config,
+    String? sessionId,
   }) async {
     final key = ModelSeamSelector._key(far, k);
     // Short-circuit a warm memo so llmCallCount counts CACHE-MISS builds only

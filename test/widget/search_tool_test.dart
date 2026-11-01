@@ -100,13 +100,13 @@ void main() {
       expect(tester.takeException(), isNull);
 
       // Verify unconditional tools are callable via FakeSidecar
-      final wf = sidecar.writeFile('{"path":"x","content":"y"}');
+      final wf = sidecar.writeFile('widget-test', '{"path":"x","content":"y"}');
       expect(jsonDecode(wf)['ok'], isTrue);
-      final ef = sidecar.editFile('{"path":"x","edits":[{"old_text":"a","new_text":"b"}]}');
+      final ef = sidecar.editFile('widget-test', '{"path":"x","edits":[{"old_text":"a","new_text":"b"}]}');
       expect(jsonDecode(ef)['ok'], isTrue);
-      final gf = sidecar.globFile('{"pattern":"lib/**/*.dart"}');
+      final gf = sidecar.globFile('widget-test', '{"pattern":"lib/**/*.dart"}');
       expect(jsonDecode(gf)['ok'], isTrue);
-      final grf = sidecar.grepFile('{"pattern":"TODO"}');
+      final grf = sidecar.grepFile('widget-test', '{"pattern":"TODO"}');
       expect(jsonDecode(grf)['ok'], isTrue);
     });
 

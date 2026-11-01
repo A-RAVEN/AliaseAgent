@@ -72,6 +72,7 @@ class ModelSummaryProvider implements SummaryProvider {
     required List<Message> folded,
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
+    String? sessionId,
   }) async {
     final provider = _resolver.resolve(config.provider);
     if (provider == null) {
@@ -128,6 +129,7 @@ class ModelSummaryProvider implements SummaryProvider {
     int outTokens = 0;
     int inTokens = 0;
     await _sidecar.sendMessage(
+      handle: sessionId ?? '',
       apiKey: apiKey,
       baseUrl: baseUrl,
       model: config.model,
@@ -213,6 +215,7 @@ class ModelSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarizeText({
     required String text,
     required AgentTypeConfig config,
+    String? sessionId,
   }) async {
     final provider = _resolver.resolve(config.provider);
     if (provider == null) {
@@ -233,6 +236,7 @@ class ModelSummaryProvider implements SummaryProvider {
     int outTokens = 0;
     int inTokens = 0;
     await _sidecar.sendMessage(
+      handle: sessionId ?? '',
       apiKey: provider.apiKey,
       baseUrl: provider.baseUrl,
       model: config.model,
@@ -341,6 +345,7 @@ class FakeSummaryProvider implements SummaryProvider {
     required List<Message> folded,
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
+    String? sessionId,
   }) async {
     lastFolded = List.of(folded);
     referencesPerCall.add(List.of(reference));
@@ -351,6 +356,7 @@ class FakeSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarizeText({
     required String text,
     required AgentTypeConfig config,
+    String? sessionId,
   }) async {
     summarizeTextCalls++;
     lastSummarizeText = text;

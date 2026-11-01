@@ -42,6 +42,9 @@ abstract class SummaryProvider {
     required List<Message> folded,
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
+    /// 被压缩会话的上下文句柄（change add-context-handles）：摘要请求必须落在
+    /// **这个会话自己的**上下文上，不能读全局的"当前会话"。
+    String? sessionId,
   });
 
   /// Produce a 2-pass "summary of summaries": summarize the already-produced
@@ -49,6 +52,7 @@ abstract class SummaryProvider {
   Future<SummaryResult> summarizeText({
     required String text,
     required AgentTypeConfig config,
+    String? sessionId,
   });
 }
 

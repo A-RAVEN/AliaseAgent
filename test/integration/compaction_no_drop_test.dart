@@ -160,6 +160,7 @@ class _AlwaysBiggerSummaryProvider implements SummaryProvider {
     required List<Message> folded,
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
+    String? sessionId,
   }) async {
     summarizeCalls++;
     final lo = folded.isEmpty ? 0 : (folded.first.seq ?? 0);
@@ -171,6 +172,7 @@ class _AlwaysBiggerSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarizeText({
     required String text,
     required AgentTypeConfig config,
+    String? sessionId,
   }) async {
     summarizeTextCalls++;
     return SummaryResult(

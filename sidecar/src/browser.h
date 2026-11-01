@@ -3,6 +3,10 @@
 
 #include <string>
 
+namespace context {
+class Context;
+}
+
 // ============================================================================
 // browser — a persistent Playwright-headed browser tool
 //
@@ -54,6 +58,11 @@ std::string browser_snapshot(const std::string& request_json);
 ///   was_started=false -> fresh state (next op is a session startup).
 ///   was_started=true  -> session HAD started then died (next op is a dead-detection).
 void reset_session(bool was_started = false);
+
+/// Dispose hook (change add-context-handles): close `ctx`'s browser session.
+/// If the worker is already dead, only local state is cleared -- cleanup never
+/// starts a new worker just to close a page that is already gone.
+void close_context(context::Context& ctx);
 
 } // namespace browser
 

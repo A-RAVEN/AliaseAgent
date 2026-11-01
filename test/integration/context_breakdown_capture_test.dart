@@ -88,6 +88,7 @@ class _EchoSummaryProvider implements SummaryProvider {
     required List<Message> folded,
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
+    String? sessionId,
   }) async {
     final lo = folded.isEmpty ? 0 : (folded.first.seq ?? 0);
     final hi = folded.isEmpty ? 0 : (folded.last.seq ?? 0);
@@ -98,6 +99,7 @@ class _EchoSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarizeText({
     required String text,
     required AgentTypeConfig config,
+    String? sessionId,
   }) async =>
       SummaryResult(text: 'L2 rolled up', tokens: l1Tokens);
 }

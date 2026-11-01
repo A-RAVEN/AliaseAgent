@@ -48,6 +48,7 @@ class _GatedSummaryProvider implements SummaryProvider {
     required List<Message> folded,
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
+    String? sessionId,
   }) async {
     summarizeCalls++;
     final g = gate;
@@ -62,6 +63,7 @@ class _GatedSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarizeText({
     required String text,
     required AgentTypeConfig config,
+    String? sessionId,
   }) async {
     final g = gate;
     if (g == null) {
@@ -623,6 +625,7 @@ class _PerCallGatedSummaryProvider implements SummaryProvider {
     required List<Message> folded,
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
+    String? sessionId,
   }) {
     calls++;
     if (!_gated()) return Future.value(SummaryResult(text: 'L1', tokens: 1));
@@ -635,6 +638,7 @@ class _PerCallGatedSummaryProvider implements SummaryProvider {
   Future<SummaryResult> summarizeText({
     required String text,
     required AgentTypeConfig config,
+    String? sessionId,
   }) {
     calls++;
     if (!_gated()) return Future.value(SummaryResult(text: 'L2', tokens: 1));
