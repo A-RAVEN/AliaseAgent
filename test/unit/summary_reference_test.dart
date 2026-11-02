@@ -105,8 +105,10 @@ void main() {
           isFalse,
           reason: 'summarizeText（二级合一）不该有参考参数');
 
-      final mainSrc = File('lib/main.dart').readAsStringSync();
-      final callAt = mainSrc.indexOf('_l1SummaryText(sessionId');
+      // 执行代码已迁入 Agent（change add-agent-object-and-templates 任务 2.2），
+      // 扫描对象跟着换文件；判据不变：保底路径调 _l1SummaryText 时不许传参考。
+      final mainSrc = File('lib/services/agent.dart').readAsStringSync();
+      final callAt = mainSrc.indexOf('_l1SummaryText(dbOpen');
       expect(callAt, isNot(-1), reason: '保底路径的调用点必须还在（否则这条扫描指错了对象）');
       final callSite = mainSrc.substring(callAt, callAt + 200);
       expect(callSite.contains('reference'),

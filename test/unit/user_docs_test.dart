@@ -48,7 +48,10 @@ const _mainDartPath = 'lib/main.dart';
 
 /// 工具定义那一段的起止标记（用标记而不是行号，行号会被后续编辑顶偏）。
 const _toolRegionStart = 'final base = <String, Map<String, dynamic>>{';
-const _toolRegionEnd = '_toolDefs = base;';
+
+/// 工具定义写完、注册进唯一目录的那一刻（change `add-agent-object-and-templates`
+/// 任务 1.3 之后，终点从私有 `_toolDefs` 改成 `ToolCatalog`）。
+const _toolRegionEnd = 'ToolCatalog.instance.seed(base);';
 
 /// 文档里允许出现的、既不是配置键也不是工具/参数名，但确实是代码里存在的名字。
 /// 每条都要写清"它在哪个文件里出现"，测试会逐条去该文件里核对 —— 核对不上的条目

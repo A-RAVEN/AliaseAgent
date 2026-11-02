@@ -28,6 +28,12 @@ class InputBar extends StatefulWidget {
   /// （不是静默排队 —— 排队在用户看来还是"发出去了"）。
   final bool toolsReady;
 
+  /// 该会话正在切换 Agent 模板（或正在删除）。
+  ///
+  /// 切换中旧 Agent 对象正在退役、新实例还没建好：按钮、回车与提交入口都必须服从
+  /// 这个状态，不能只禁用按钮（回车与直接调用提交入口是另外两条路径）。
+  final bool switching;
+
   /// 排在发送按钮**左侧**的附件（今天就是上下文占用环）。
   final Widget? accessory;
 
@@ -54,6 +60,7 @@ class InputBar extends StatefulWidget {
     required this.controller,
     required this.onSubmit,
     this.toolsReady = true,
+    this.switching = false,
     this.accessory,
     this.pendingImagePaths = const [],
     this.onPasteImage,
@@ -80,6 +87,8 @@ class _InputBarState extends State<InputBar> {
       if (HardwareKeyboard.instance.isShiftPressed) {
         return KeyEventResult.ignored; // let TextField handle newline
       }
+      // 切换中回车也不能发送：只禁用按钮挡不住这条路径。
+      if (widget.switching) return KeyEventResult.handled;
       _submit();
       return KeyEventResult.handled;
     }
@@ -92,6 +101,7 @@ class _InputBarState extends State<InputBar> {
   /// 但"空"只看文字已经不够（add-image-input）：贴了一张图、一个字没写，这条消息
   /// 是**合法**的，必须发得出去。所以判据是「没有文字**且**没有待发图片」。
   void _submit() {
+    if (widget.switching) return;
     final hasText = widget.controller.text.trim().isNotEmpty;
     final hasImages = widget.pendingImagePaths.isNotEmpty;
     if (!hasText && !hasImages) return;
@@ -154,9 +164,12 @@ class _InputBarState extends State<InputBar> {
                     const SizedBox(width: 6),
                   ],
                   IconButton.filled(
-                    onPressed: widget.toolsReady ? _submit : null,
+                    onPressed:
+                        widget.toolsReady && !widget.switching ? _submit : null,
                     icon: const Icon(Icons.send, size: 20),
-                    tooltip: widget.toolsReady ? 'Send' : '正在准备工具…',
+                    tooltip: widget.switching
+                        ? '正在切换 Agent 模板…'
+                        : (widget.toolsReady ? 'Send' : '正在准备工具…'),
                   ),
                 ],
               ),

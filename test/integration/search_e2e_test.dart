@@ -7,7 +7,6 @@ import 'package:alias_agent/models/agent_type_config.dart';
 import 'package:alias_agent/models/app_config.dart';
 import 'package:alias_agent/models/provider_config.dart';
 import 'package:alias_agent/services/provider_resolver.dart';
-import 'package:alias_agent/ui/tool_call_card.dart';
 
 import '../widget/helpers/fakes.dart';
 import '../widget/helpers/test_utils.dart';
@@ -21,6 +20,7 @@ void _setupSearchAgentRegistry() {
     provider: 'test',
     model: 'test-model',
     systemPrompt: 'You are a helpful assistant with search capabilities.',
+    maxContextTokens: 100000,
     tools: ['read_file', 'list_dir', 'web_search', 'web_fetch'],
   ));
   resolver = ProviderResolver(const AppConfig(

@@ -20,10 +20,10 @@ import 'helpers/fakes.dart';
 import 'helpers/test_utils.dart';
 import '../integration/helpers/fake_sidecar.dart';
 
-/// Register the `general` agent the test drives. [maxContextTokens] of 0/none
-/// leaves compaction off (a full-history send); a positive value triggers the
-/// over-budget fold path.
-void _setupAgentRegistry({int maxContextTokens = 0}) {
+/// Register the `general` agent the test drives. `maxContextTokens` is a REQUIRED
+/// positive integer since change `add-agent-object-and-templates`: a missing/zero
+/// window now refuses to create the Agent instead of silently sending verbatim.
+void _setupAgentRegistry({int maxContextTokens = 100000}) {
   registry.clear();
   registry.register(AgentTypeConfig(
     name: 'general',
@@ -147,8 +147,16 @@ void main() {
       print('  [OBS] contextSnapshot: ${snap == null ? 'null' : snap.messages.length} msgs — '
           'systemPrompt chars=${snap?.systemPrompt.length ?? 0}');
       expect(snap, isNotNull, reason: 'a send must capture a snapshot');
+      // 任务 3.4：快照记录产生它的实例模板与创建时窗口，环的分母来自这里，
+      // 不是绘制时回读的模板值。
+      // ignore: avoid_print
+      print('  [OBS] 快照实例窗口=${snap!.windowTokens} 模板=${snap.agentType}；'
+          '拆分窗口=${snap.breakdown?.windowTokens}');
+      expect(snap.windowTokens, 100000);
+      expect(snap.agentType, 'general');
+      expect(snap.breakdown?.windowTokens, 100000);
       final sent = jsonDecode(sidecar.lastMessagesJson!) as List<dynamic>;
-      expect(snap!.messages, sent,
+      expect(snap.messages, sent,
           reason: 'contextSnapshot.messages must equal the exact messagesJson '
               'actually handed to the gateway (deep copy, not a live reference)');
 

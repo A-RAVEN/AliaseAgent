@@ -33,6 +33,15 @@ void main() {
       provider: 'test',
       model: 'test-model',
       systemPrompt: '',
+      // 模板工具清单现在决定实际发送哪些工具：要验浏览器四件套，就得允许它们。
+      tools: [
+        'read_file',
+        'browser_navigate',
+        'browser_click',
+        'browser_type',
+        'browser_snapshot',
+      ],
+      maxContextTokens: 100000,
     ));
     resolver = ProviderResolver(const AppConfig(
       version: 1,

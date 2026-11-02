@@ -20,6 +20,7 @@ void _setupAgentRegistry() {
     provider: 'test',
     model: 'test-model',
     systemPrompt: '',
+    maxContextTokens: 100000,
   ));
   resolver = ProviderResolver(const AppConfig(
     version: 1,

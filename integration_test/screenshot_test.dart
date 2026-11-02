@@ -8,7 +8,6 @@ import 'package:alias_agent/main.dart';
 import 'package:alias_agent/models/agent_type_config.dart';
 import 'package:alias_agent/models/app_config.dart';
 import 'package:alias_agent/models/provider_config.dart';
-import 'package:alias_agent/services/agent_type_registry.dart';
 import 'package:alias_agent/services/provider_resolver.dart';
 
 import '../test/integration/helpers/fake_sidecar.dart';
@@ -26,6 +25,7 @@ void _setupAgentRegistry() {
     provider: 'test',
     model: 'test-model',
     systemPrompt: '',
+    maxContextTokens: 100000,
   ));
   resolver = ProviderResolver(const AppConfig(
     version: 1,

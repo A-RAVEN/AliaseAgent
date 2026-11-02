@@ -105,9 +105,14 @@ The system SHALL provide a `grep_file` tool that searches file contents within t
 - **AND** 返回文本 SHALL NOT 声称"总共多少条" —— C++ 侧收满 `max_results` 就掐断了搜索进程，此刻拿到的条数**就是**已收集的条数，写成 `showing 3 of 3` 等于编一个总数
 
 ### Requirement: Search tools registration
-The `glob_file` and `grep_file` tools SHALL be registered in the tool definitions sent to the AI, alongside the existing file tools, unconditionally (independent of search-provider configuration). Their descriptions SHALL state the sandbox scope (workspace-relative paths), the glob syntax, and the result limits.
 
-#### Scenario: 两个工具无条件出现且与搜索配置无关
-- **WHEN** 界面把工具清单交给模型（无论搜索后端配没配）
+The `glob_file` and `grep_file` tools SHALL be registered independently of search-provider configuration. They SHALL appear for an Agent when that Agent's resolved configuration includes them, alongside the other file tools allowed by that configuration; they SHALL NOT be sent to an Agent whose resolved configuration excludes them. Their descriptions SHALL state the sandbox scope (workspace-relative paths), the glob syntax, and the result limits.
+
+#### Scenario: 两个工具与搜索配置无关但受模板约束
+- **WHEN** 界面把工具清单交给模型（无论搜索后端配没配），且 Agent 的实例生效配置包含 `glob_file` 与 `grep_file`
 - **THEN** 清单里 SHALL 同时含 `glob_file` 与 `grep_file`；把搜索配置整个去掉 SHALL NOT 让它们消失
+
+#### Scenario: 模板未允许的工具不出现
+- **WHEN** 一个 Agent 的实例生效配置不包含 `glob_file` 或 `grep_file`
+- **THEN** 未包含的工具 SHALL NOT 出现在该 Agent 的请求工具定义里，不影响其它允许这些工具的 Agent
 

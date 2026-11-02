@@ -9,6 +9,10 @@ class SessionSidebar extends StatelessWidget {
   final ValueChanged<Session> onSelect;
   final ValueChanged<Session> onDelete;
 
+  /// 打开 Agent 模板菜单（change `add-agent-object-and-templates` 任务 3.1）。
+  /// 为 null 时不显示入口（既有只读用例不需要它）。
+  final VoidCallback? onAgents;
+
   const SessionSidebar({
     super.key,
     required this.sessions,
@@ -16,6 +20,7 @@ class SessionSidebar extends StatelessWidget {
     required this.onNewChat,
     required this.onSelect,
     required this.onDelete,
+    this.onAgents,
   });
 
   @override
@@ -29,10 +34,24 @@ class SessionSidebar extends StatelessWidget {
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
-            child: FilledButton.icon(
-              onPressed: onNewChat,
-              icon: const Icon(Icons.add, size: 18),
-              label: const Text('New Chat'),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                FilledButton.icon(
+                  onPressed: onNewChat,
+                  icon: const Icon(Icons.add, size: 18),
+                  label: const Text('New Chat'),
+                ),
+                if (onAgents != null) ...[
+                  const SizedBox(height: 6),
+                  OutlinedButton.icon(
+                    key: const ValueKey('agents-entry'),
+                    onPressed: onAgents,
+                    icon: const Icon(Icons.smart_toy_outlined, size: 18),
+                    label: const Text('Agents'),
+                  ),
+                ],
+              ],
             ),
           ),
           const Divider(height: 1),

@@ -3,6 +3,27 @@ import 'package:uuid/uuid.dart';
 import '../models/session.dart';
 import 'database_service.dart';
 
+/// 把会话改到另一个 Agent 模板时，**没有更新到唯一既有行**。
+///
+/// 三种情况都会到这里：会话不存在 / 已被删除（0 行）、主键重复导致多行（>1 行），
+/// 以及写入之后重新读取拿不到新值。调用方必须据此失败，不得创建新实例。
+class SessionAgentTypeUpdateException implements Exception {
+  final String sessionId;
+  final String agentType;
+  final int updatedRows;
+  final String message;
+
+  const SessionAgentTypeUpdateException({
+    required this.sessionId,
+    required this.agentType,
+    required this.updatedRows,
+    required this.message,
+  });
+
+  @override
+  String toString() => message;
+}
+
 class SessionRepository {
   static const _uuid = Uuid();
 
@@ -59,5 +80,45 @@ class SessionRepository {
     final now = DateTime.now().millisecondsSinceEpoch;
     await db.update('sessions', {'updated_at': now},
         where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// 把会话的 `agent_type` 改成 [agentType]，**重新读取该行**并返回。
+  ///
+  /// 必须确认实际更新了**恰好一行**：0 行（会话不存在或已被删除）或多行（主键
+  /// 重复）都显式抛 [SessionAgentTypeUpdateException]。写入后重新读取仍是旧值、
+  /// 或者读不到该行，同样算失败 —— 调用方据此不创建新实例，也不假装切换成功。
+  Future<Session> updateAgentType(String id, String agentType) async {
+    final db = await DatabaseService.database;
+    final updated = await db.update('sessions', {'agent_type': agentType},
+        where: 'id = ?', whereArgs: [id]);
+    if (updated != 1) {
+      throw SessionAgentTypeUpdateException(
+        sessionId: id,
+        agentType: agentType,
+        updatedRows: updated,
+        message: '会话 "$id" 的 agent_type 没有更新到唯一既有行'
+            '（实际更新 $updated 行，期望 1 行）：不会创建新的 Agent 实例。',
+      );
+    }
+    final reread = await get(id);
+    if (reread == null) {
+      throw SessionAgentTypeUpdateException(
+        sessionId: id,
+        agentType: agentType,
+        updatedRows: updated,
+        message: '会话 "$id" 写入 agent_type 后重新读取不到该行'
+            '（可能已被删除）：不会创建新的 Agent 实例。',
+      );
+    }
+    if (reread.agentType != agentType) {
+      throw SessionAgentTypeUpdateException(
+        sessionId: id,
+        agentType: agentType,
+        updatedRows: updated,
+        message: '会话 "$id" 写入后重新读取的 agent_type 仍是 '
+            '"${reread.agentType}"，不是 "$agentType"：不会创建新的 Agent 实例。',
+      );
+    }
+    return reread;
   }
 }

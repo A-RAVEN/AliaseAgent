@@ -4,12 +4,24 @@ import '../models/agent_type_config.dart';
 import '../models/app_config.dart';
 import '../models/provider_config.dart';
 import '../services/config_service.dart';
+import '../services/tool_catalog.dart';
 
 class SetupDialog extends StatefulWidget {
   final VoidCallback onComplete;
   final void Function(AppConfig)? saveConfig;
 
-  const SetupDialog({super.key, required this.onComplete, this.saveConfig});
+  /// 已经加载到的现有配置（首启补问时非空）。
+  ///
+  /// 补问只缺 `general.max_context_tokens`（或密钥），**不许**拿一份新的缺省配置
+  /// 整份覆盖：providers、search、spill 与其它模板都要合并保留。首启时传 null。
+  final AppConfig? existingConfig;
+
+  const SetupDialog({
+    super.key,
+    required this.onComplete,
+    this.saveConfig,
+    this.existingConfig,
+  });
 
   @override
   State<SetupDialog> createState() => _SetupDialogState();
@@ -44,7 +56,7 @@ class _SetupDialogState extends State<SetupDialog> {
 
     setState(() => _saving = true);
 
-    final config = _buildDefaultConfig(key, maxContextTokens);
+    final config = _mergeConfig(key, maxContextTokens);
     if (widget.saveConfig != null) {
       widget.saveConfig!(config);
     } else {
@@ -54,29 +66,69 @@ class _SetupDialogState extends State<SetupDialog> {
     widget.onComplete();
   }
 
-  AppConfig _buildDefaultConfig(String apiKey, int maxContextTokens) {
-    return AppConfig(
-      version: 1,
-      providers: {
-        'anthropic': ProviderConfig(
-          apiKey: apiKey,
-          baseUrl: 'https://api.anthropic.com',
-        ),
-      },
-      agentTypes: {
-        'general': AgentTypeConfig(
-          name: 'general',
-          provider: 'anthropic',
-          model: 'claude-sonnet-4-6',
-          systemPrompt: 'You are a helpful assistant.',
-          tools: ['read_file', 'list_dir'],
-          maxContextTokens: maxContextTokens,
-          // 默认只有文本，图片不发（模型能不能看图由这一项声明，见
-          // Docs/user-guide/configuration.md 的 input_modalities）。
-          inputModalities: AgentTypeConfig.kDefaultInputModalities,
-        ),
-      },
+  /// 把这次输入**合并**到现有配置上：只替换密钥与窗口，其余原样保留。
+  ///
+  /// 首启（没有现有配置）才生成一条 `general`；补问时沿用现有 `general` 的模型、
+  /// 系统提示词、工具、图片模态、命令超时、压缩参数和不可压缩要求。
+  AppConfig _mergeConfig(String apiKey, int maxContextTokens) {
+    final existing = widget.existingConfig;
+    final providers = <String, ProviderConfig>{};
+    if (existing == null) {
+      // 首启写出的供应商键名固定是 anthropic（与用户文档里的示例一致）。
+      providers['anthropic'] = ProviderConfig(
+        apiKey: apiKey,
+        baseUrl: 'https://api.anthropic.com',
+      );
+    }
+    providers.addAll(existing?.providers ?? const {});
+    final types =
+        Map<String, AgentTypeConfig>.from(existing?.agentTypes ?? const {});
+
+    final general = types['general'];
+    // 补问时把密钥写给它实际在用的 provider；首启用 anthropic。
+    final providerName =
+        (general != null && general.provider.isNotEmpty) ? general.provider : 'anthropic';
+    final previousProvider = providers[providerName];
+    providers[providerName] = ProviderConfig(
+      apiKey: apiKey,
+      baseUrl: (previousProvider != null && previousProvider.baseUrl.isNotEmpty)
+          ? previousProvider.baseUrl
+          : 'https://api.anthropic.com',
     );
+
+    if (general != null) {
+      types['general'] = AgentTypeConfig(
+        name: general.name,
+        provider: providerName,
+        model: general.model,
+        systemPrompt: general.systemPrompt,
+        tools: general.tools,
+        thinkingEffort: general.thinkingEffort,
+        maxContextTokens: maxContextTokens,
+        compactionThresholdPercent: general.compactionThresholdPercent,
+        compactionWaitThresholdPercent: general.compactionWaitThresholdPercent,
+        inputModalities: general.inputModalities,
+        commandTimeoutMs: general.commandTimeoutMs,
+        commandMaxTimeoutMs: general.commandMaxTimeoutMs,
+        standingRequirements: general.standingRequirements,
+      );
+    } else {
+      types['general'] = AgentTypeConfig(
+        name: 'general',
+        provider: providerName,
+        model: 'claude-sonnet-4-6',
+        systemPrompt: 'You are a helpful assistant.',
+        // 首启默认清单覆盖当前基础工具（不是旧版那两项）。
+        tools: ToolCatalog.kBaseToolNames,
+        maxContextTokens: maxContextTokens,
+        // 默认只有文本，图片不发（模型能不能看图由这一项声明，见
+        // Docs/user-guide/configuration.md 的 input_modalities）。
+        inputModalities: AgentTypeConfig.kDefaultInputModalities,
+      );
+    }
+
+    return (existing ?? const AppConfig(version: 1))
+        .copyWith(providers: providers, agentTypes: types);
   }
 
   @override

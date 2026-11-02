@@ -56,6 +56,21 @@ class FakeSessionRepository implements SessionRepository {
 
   @override
   Future<void> touch(String id) async {}
+
+  @override
+  Future<Session> updateAgentType(String id, String agentType) async {
+    final i = sessions.indexWhere((s) => s.id == id);
+    if (i < 0) {
+      throw SessionAgentTypeUpdateException(
+        sessionId: id,
+        agentType: agentType,
+        updatedRows: 0,
+        message: '会话 "$id" 不存在：没有更新到唯一既有行（假仓库）。',
+      );
+    }
+    sessions[i] = sessions[i].copyWith(agentType: agentType);
+    return sessions[i];
+  }
 }
 
 class FakeMessageRepository implements MessageRepository {

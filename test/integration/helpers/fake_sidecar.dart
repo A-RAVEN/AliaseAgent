@@ -129,6 +129,16 @@ class FakeSidecar implements ISidecar {
   /// "轮次属甲时工具调用仍带甲"，而不是读当时的 `_currentId`。
   final List<String> ensureContextCalls = [];
   final List<String> disposeContextCalls = [];
+
+  /// `ensureContext` 收到的 `defaultWorkspace`（change
+  /// add-agent-object-and-templates 任务 2.1）：逐个记录，用例据此断言"缺省工作区
+  /// 只在 created:true 时由工厂交下去"。
+  final List<String?> ensureContextDefaultWorkspaces = [];
+  final Map<String, String?> defaultWorkspaceByHandle = {};
+
+  /// `setWorkspace` 收到的句柄与路径（同上）。
+  final List<({String handle, String path})> setWorkspaceCalls = [];
+
   final List<String> sendHandles = [];
   final List<String> cancelHandles = [];
   final List<String> toolHandles = [];
@@ -143,6 +153,8 @@ class FakeSidecar implements ISidecar {
   @override
   Future<bool> ensureContext(String sessionId, {String? defaultWorkspace}) async {
     ensureContextCalls.add(sessionId);
+    ensureContextDefaultWorkspaces.add(defaultWorkspace);
+    defaultWorkspaceByHandle[sessionId] = defaultWorkspace;
     final created = _createdByEnsure[sessionId] ?? !_ensured.contains(sessionId);
     _ensured.add(sessionId);
     return created;
@@ -158,6 +170,7 @@ class FakeSidecar implements ISidecar {
   String? lastMessagesJson;
   String? lastSystemPrompt;
   String? lastThinkingMode;
+  String? lastThinkingEffort;
   String? lastBaseUrl;
   String? lastModel;
   String? lastToolsJson;
@@ -215,6 +228,7 @@ class FakeSidecar implements ISidecar {
     lastMessagesJson = messagesJson;
     lastSystemPrompt = systemPrompt;
     lastThinkingMode = thinkingMode;
+    lastThinkingEffort = thinkingEffort;
     lastBaseUrl = baseUrl;
     lastModel = model;
     lastToolsJson = toolsJson;
@@ -256,6 +270,7 @@ class FakeSidecar implements ISidecar {
   @override
   String? setWorkspace(String handle, String path) {
     toolHandles.add(handle);
+    setWorkspaceCalls.add((handle: handle, path: path));
     return null;
   }
 

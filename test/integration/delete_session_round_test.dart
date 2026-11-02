@@ -10,6 +10,10 @@ import 'package:alias_agent/models/message.dart';
 import 'package:alias_agent/models/provider_config.dart';
 import 'package:alias_agent/models/session.dart';
 import 'package:alias_agent/models/summary_node.dart';
+import 'package:alias_agent/services/agent.dart';
+import 'package:alias_agent/services/agent_factory.dart';
+import 'package:alias_agent/services/agent_registry.dart';
+import 'package:alias_agent/services/agent_session_controller.dart';
 import 'package:alias_agent/services/compaction/model_summary_provider.dart';
 import 'package:alias_agent/services/message_repository.dart';
 import 'package:alias_agent/services/provider_resolver.dart';
@@ -82,6 +86,22 @@ class _RecordingSessionRepo implements SessionRepository {
   @override
   Future<void> touch(String id) async {
     ledger.record('session-touch');
+  }
+
+  @override
+  Future<Session> updateAgentType(String id, String agentType) async {
+    final i = sessions.indexWhere((s) => s.id == id);
+    if (i < 0) {
+      throw SessionAgentTypeUpdateException(
+        sessionId: id,
+        agentType: agentType,
+        updatedRows: 0,
+        message: '会话 "$id" 不存在：没有更新到唯一既有行。',
+      );
+    }
+    sessions[i] = sessions[i].copyWith(agentType: agentType);
+    ledger.record('session-update-agent-type');
+    return sessions[i];
   }
 }
 
@@ -505,5 +525,96 @@ void main() {
                 e.startsWith('session-') ||
                 e.startsWith('summary-')),
         isEmpty);
+  });
+
+  test('切换进行中删除：等切换结束并重读 Session；删除中切换被拒绝', () async {
+    final ledger = _Ledger();
+    final sessions = [_session('s1')];
+    final msgRepo = _RecordingMessageRepo(ledger);
+    final sessionRepo = _RecordingSessionRepo(ledger, sessions);
+    final sidecar = _GatedSidecar();
+    final agents = AgentRegistry();
+    registry.register(const AgentTypeConfig(
+      name: 'reviewer',
+      provider: 'test',
+      model: 'reviewer-model',
+      systemPrompt: 'REVIEWER',
+      maxContextTokens: 50000,
+    ));
+    final factory = AgentFactory(
+      templates: registry,
+      providerResolver: () => resolver,
+      config: const AppConfig(version: 1),
+      sidecar: sidecar,
+      sessionRepo: sessionRepo,
+      messageRepo: msgRepo,
+      summaryNodeRepo: SummaryNodeRepository(),
+      registry: agents,
+      summaryProvider: FakeSummaryProvider(),
+      backgroundFoldEnabled: false,
+      summaryStoreOpen: () => false,
+    );
+    await factory.create(sessions.first);
+
+    final gate = Completer<void>();
+    final started = Completer<void>();
+    final controller = AgentSessionController(
+      factory: factory,
+      sessionRepo: sessionRepo,
+      retireAgent: (agent) async {
+        started.complete();
+        await gate.future;
+        await agent.retire();
+      },
+    );
+
+    final switchFuture = controller.switchTemplate(sessions.first, 'reviewer',
+        callbacks: const AgentCallbacks());
+    await started.future;
+
+    Session? reread;
+    var deleteReturned = false;
+    final deleteFuture = controller.beginDelete('s1').then((s) {
+      reread = s;
+      deleteReturned = true;
+    });
+    await Future<void>.delayed(Duration.zero);
+    // ignore: avoid_print
+    print('  [OBS] 切换进行中删除：deleteReturned=$deleteReturned '
+        '台账=${ledger.events}');
+    expect(deleteReturned, isFalse, reason: '切换还没结束，删除不得先返回');
+    expect(ledger.events, isNot(contains('session-delete')));
+
+    // 删除登记之后，同一会话的切换一律被拒。
+    var deletingError = '';
+    try {
+      await controller.switchTemplate(sessions.first, 'general',
+          callbacks: const AgentCallbacks());
+      fail('删除进行中切换必须被拒绝');
+    } on AgentSwitchException catch (e) {
+      deletingError = e.toString();
+      expect(e.stage, AgentSwitchStage.deleting);
+    }
+    // ignore: avoid_print
+    print('  [OBS] 删除中切换报错：$deletingError');
+    expect(deletingError, contains('删除'));
+
+    gate.complete();
+    await switchFuture;
+    await deleteFuture;
+    // ignore: avoid_print
+    print('  [OBS] 删除前重读：agentType=${reread?.agentType} '
+        '台账=${ledger.events}');
+    expect(reread, isNotNull);
+    expect(reread!.agentType, 'reviewer', reason: '删除必须重读到切换后的值');
+    expect(ledger.events, contains('session-update-agent-type'));
+
+    await sessionRepo.delete('s1');
+    expect(ledger.events.last, 'session-delete');
+    expect(ledger.events.indexOf('session-update-agent-type'),
+        lessThan(ledger.events.indexOf('session-delete')),
+        reason: '删库晚于切换的持久化');
+    controller.endDelete('s1');
+    expect(controller.isDeleting('s1'), isFalse);
   });
 }

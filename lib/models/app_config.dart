@@ -73,4 +73,24 @@ class AppConfig {
     }
     return m;
   }
+
+  /// 复制一份只替换指定字段的配置。
+  ///
+  /// 模板保存与首启补问都必须走"在现有配置上换掉必要字段"，而不是拿一份新的缺省
+  /// 配置整份覆盖 —— 后者会静默丢掉 providers / search / spill / 其它模板。
+  AppConfig copyWith({
+    int? version,
+    Map<String, ProviderConfig>? providers,
+    Map<String, AgentTypeConfig>? agentTypes,
+    Map<String, dynamic>? search,
+    int? spillPreviewChars,
+  }) {
+    return AppConfig(
+      version: version ?? this.version,
+      providers: providers ?? this.providers,
+      agentTypes: agentTypes ?? this.agentTypes,
+      search: search ?? this.search,
+      spillPreviewChars: spillPreviewChars ?? this.spillPreviewChars,
+    );
+  }
 }

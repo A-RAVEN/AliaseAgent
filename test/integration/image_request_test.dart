@@ -38,6 +38,7 @@ void main() {
       provider: 'test',
       model: 'test-model',
       systemPrompt: '',
+      maxContextTokens: 100000,
       tools: ['read_file', 'list_dir'],
       // 声明能收图：这条路 9.1 要验的是"能发就发"，能力门是 9.3 的事
       inputModalities: ['text', 'image'],
@@ -194,6 +195,7 @@ void main() {
       provider: 'test',
       model: 'text-only-model',
       systemPrompt: '',
+      maxContextTokens: 100000,
       tools: ['read_file', 'list_dir'],
       // 不写 input_modalities ⇒ 只有 text
     ));

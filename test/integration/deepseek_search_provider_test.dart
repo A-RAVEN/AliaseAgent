@@ -116,6 +116,9 @@ void main() {
         provider: 'test',
         model: 'test-model',
         systemPrompt: '',
+        // 模板工具清单决定实际请求：要验 web_search，就必须在清单里允许它。
+        tools: ['read_file', 'web_search', 'web_fetch'],
+        maxContextTokens: 100000,
       ));
       resolver = ProviderResolver(const AppConfig(
         version: 1,

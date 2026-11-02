@@ -60,6 +60,7 @@ Windows 上还有仓库根的 `run.bat`：一键 `flutter build windows --debug`
 | 功能 | 一句话说明 |
 |------|-----------|
 | [配置](Docs/user-guide/configuration.md) | 配置文件在哪、每个键什么意思、缺 key 或写错 JSON 会看到什么；`input_modalities` 决定模型能不能收图 |
+| [Agent 模板](Docs/user-guide/agent-templates.md) | 侧栏 `Agents` 菜单：列出、添加、修改模板；模板名创建后不可改，修改只对之后创建或恢复的实例生效 |
 | [对话](Docs/user-guide/chat.md) | 新建/删除会话、发消息、**贴图片给模型看**、工具卡片与思考卡片、会话标题 |
 | [真实上下文视图](Docs/user-guide/real-context-view.md) | 看模型这一步**实际**收到了什么（系统提示词、工具、每条消息） |
 | [上下文压缩](Docs/user-guide/context-compaction.md) | 对话变长后什么时候压、怎么认出来、阈值怎么调 |

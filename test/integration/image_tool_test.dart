@@ -32,6 +32,7 @@ void _registerAgent({required bool images}) {
     provider: 'test',
     model: images ? 'vision-model' : 'text-only-model',
     systemPrompt: '',
+    maxContextTokens: 100000,
     tools: const ['read_file', 'list_dir'],
     inputModalities: images ? const ['text', 'image'] : const ['text'],
   ));

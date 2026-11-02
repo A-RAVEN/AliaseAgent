@@ -21,6 +21,15 @@ class ContextSnapshot {
   final String thinkingEffort;
   final DateTime capturedAt;
 
+  /// 产生这份快照的 Agent 实例的上下文窗口（创建时冻结的生效配置）。
+  ///
+  /// 占用环的整圈就是它；绘制时**不许**再回读 `agent_types.<名字>.max_context_tokens`
+  /// —— 模板后续改窗口不能改变已创建实例的环（任务 3.4）。
+  final int windowTokens;
+
+  /// 产生这份快照的模板名（实例生效配置里的 `templateName`）。
+  final String agentType;
+
   /// 这一份请求的占用拆分（二级摘要 / 一级摘要 / 原文 + 固定开销）。
   ///
   /// 与快照在**同一次** `setState` 里写入，所以它和上面那几个字段描述的是同一份请求；
@@ -37,6 +46,8 @@ class ContextSnapshot {
     required this.thinkingMode,
     required this.thinkingEffort,
     required this.capturedAt,
+    this.windowTokens = 0,
+    this.agentType = '',
     this.breakdown,
   });
 

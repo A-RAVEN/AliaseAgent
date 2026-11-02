@@ -19,6 +19,7 @@ void _setupAgentRegistry() {
     provider: 'test',
     model: 'test-model',
     systemPrompt: '',
+    maxContextTokens: 100000,
   ));
   resolver = ProviderResolver(const AppConfig(
     version: 1,
@@ -80,8 +81,10 @@ void main() {
       expect(find.text('Error: Authentication failed'), findsOneWidget);
     });
 
-    testWidgets('unknown agent type shows error', (tester) async {
-      // Don't register any agent type — _callModel will fail
+    testWidgets('unknown agent type shows a distinguishable error (no fallback)',
+        (tester) async {
+      // Don't register any agent type — Agent creation must fail with the template
+      // name and must NOT silently fall back to a fabricated configuration.
       registry.clear();
       resolver = ProviderResolver(const AppConfig(version: 1));
 
@@ -106,7 +109,18 @@ void main() {
       await tester.pump();
       await tester.pump();
 
-      expect(find.text('Error: No agent type configured.'), findsOneWidget);
+      // ignore: avoid_print
+      print('  [OBS] 顶部错误提示=${find.byKey(const ValueKey('agent-error-notice')).evaluate().length} 处；'
+          '发出的请求=${sidecar.lastMessagesJson == null ? "无" : "有"}；'
+          '旧错误卡片=${find.textContaining('No agent type configured').evaluate().length} 处');
+      expect(find.byKey(const ValueKey('agent-error-notice')), findsOneWidget);
+      expect(find.textContaining('Agent 模板 "general" 不存在'), findsOneWidget,
+          reason: '错误必须点名缺失的模板，不能只说一句"没有 agent 类型"');
+      expect(find.textContaining('不会退回 general'), findsOneWidget);
+      expect(sidecar.lastMessagesJson, isNull,
+          reason: '模板缺失时一个模型请求都不许发');
+      expect(find.textContaining('No agent type configured'), findsNothing,
+          reason: '旧文案已被"点名模板的可区分错误"取代');
     });
   });
 }

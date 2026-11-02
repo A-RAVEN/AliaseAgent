@@ -24,7 +24,8 @@ void _setupAgentRegistry() {
     provider: 'test',
     model: 'test-model',
     systemPrompt: '',
-    tools: ['read_file', 'list_dir'],
+    maxContextTokens: 100000,
+    tools: ['read_file', 'list_dir', 'read_spill'],
   ));
   resolver = ProviderResolver(const AppConfig(
     version: 1,
@@ -321,7 +322,8 @@ void main() {
         provider: 'test',
         model: 'test-model',
         systemPrompt: '',
-        tools: ['read_file', 'list_dir'],
+        maxContextTokens: 100000,
+        tools: ['read_file', 'list_dir', 'read_spill'],
       ));
       resolver = ProviderResolver(const AppConfig(
         version: 1,

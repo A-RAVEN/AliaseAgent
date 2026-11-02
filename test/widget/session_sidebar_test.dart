@@ -110,5 +110,42 @@ void main() {
       await tester.tap(find.text('Session 1'));
       expect(selected?.id, 's1');
     });
+
+    // change add-agent-object-and-templates 任务 3.1：侧栏的 Agents 入口。
+    testWidgets('Agents 入口调用回调；没有回调时不显示入口', (tester) async {
+      var opened = 0;
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: SessionSidebar(
+            sessions: testSessions(1),
+            currentId: null,
+            onNewChat: () {},
+            onSelect: (_) {},
+            onDelete: (_) {},
+            onAgents: () => opened++,
+          ),
+        ),
+      ));
+      // ignore: avoid_print
+      print('  [OBS] Agents 入口数量=${find.text('Agents').evaluate().length}；'
+          '点一下回调次数（点前）=$opened');
+      expect(find.text('Agents'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('agents-entry')));
+      expect(opened, 1);
+
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: SessionSidebar(
+            sessions: testSessions(1),
+            currentId: null,
+            onNewChat: () {},
+            onSelect: (_) {},
+            onDelete: (_) {},
+          ),
+        ),
+      ));
+      expect(find.text('Agents'), findsNothing,
+          reason: '没提供回调时不显示一个点了没反应的入口');
+    });
   });
 }

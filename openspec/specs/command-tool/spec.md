@@ -181,8 +181,8 @@ TBD - created by archiving change add-command-tool. Update Purpose after archive
 > **2026-10-25 修改**：本条由 `spill-large-tool-output` 改写。标题沿用原句是因为解析器要求 MODIFIED 的标题与主规范**逐字一致**；正文已从"四个配置项"变成三个 —— 两个输出上限键废弃，改由 `spill.preview_chars` 一项决定头尾预览。
 
 - `command_max_output_chars` 与 `command_output_full_chars` SHALL 视为**已废弃**：读到它们 SHALL 打一行告警并忽略，行为 SHALL NOT 受其影响（它们原本描述的是"只留尾部 + 写系统临时文件"，那条交付方式已被 `tool-output-spill` 取代）。
-- 这三个值 SHALL 由发起调用的那一侧在每次调用时随请求一起交给执行侧（执行侧不读配置文件）；请求里缺失或非法的字段 SHALL 在两侧得到同一套缺省值（`preview_chars` 为非正值时回落到 1000）。
-- 工具 SHALL 无条件出现在发给模型的工具定义里，SHALL NOT 依赖搜索服务或浏览器栈的可用性。
+- 这三个值 SHALL 由发起调用的 Agent 的实例生效配置在每次调用时随请求一起交给执行侧（执行侧不读配置文件，也不读取随后可能修改的模板）；请求里缺失或非法的字段 SHALL 在两侧得到同一套缺省值（`preview_chars` 为非正值时回落到 1000）。
+- 命令工具是否可用 SHALL NOT 依赖搜索服务或浏览器栈；当 Agent 的实例生效配置包含 `run_command` 时，工具 SHALL 出现在该 Agent 的请求工具定义里，模板明确未包含时 SHALL NOT 出现在该 Agent 的请求里。
 
 #### Scenario: 没有配置项时用缺省值
 
@@ -209,5 +209,15 @@ TBD - created by archiving change add-command-tool. Update Purpose after archive
 
 - **WHEN** 分别给一个小于上限的调用超时与一个大于上限的调用超时
 - **THEN** 生效的超时 SHALL 分别等于前者与上限值 —— 这条在单测层断言"生效值怎么算出来的"，SHALL NOT 以"真的等到超时"作为判据（缺省上限是 10 分钟，那样跑不起）
+
+#### Scenario: 模板未允许时不发送
+
+- **WHEN** 一个 Agent 的实例生效配置不含 `run_command`
+- **THEN** 该 Agent 的请求工具定义不包含 `run_command`，但其它包含它的 Agent 仍可使用该工具
+
+#### Scenario: 模板允许时不依赖搜索或浏览器
+
+- **WHEN** 搜索服务与浏览器栈不可用，而 Agent 的实例生效配置包含 `run_command`
+- **THEN** 该 Agent 的请求工具定义仍包含 `run_command`
 
 

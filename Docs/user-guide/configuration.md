@@ -16,10 +16,13 @@ C:\Users\你的名字\.aliasagent\config.json
 
 这个文件分三块：**供应商**（连哪个模型服务、用什么 key）、**agent 类型**（用哪个模型、带哪些工具、上下文多大）、**搜索服务**（联网搜索用哪家）。
 
+Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单可以列出、添加和修改模板，改完会写回这个文件的 `agent_types` 段。怎么用见 [Agent 模板](agent-templates.md)。
+
 ## 在哪用
 
 - **第一次启动**：应用发现没有配置文件，会弹出欢迎对话框，只问两件事。
-- **以后改配置**：直接用文本编辑器改上面那个文件，然后**重启应用**（配置在启动时读一次）。
+- **改 Agent 模板**：用侧栏的 `Agents` 菜单（不用重启；保存后**之后创建或恢复**的实例才用新配置）。
+- **改供应商、搜索、spill 或没有界面入口的模板字段**：直接用文本编辑器改上面那个文件，然后**重启应用**（这些段只在启动时读一次）。
 
 ## 怎么操作
 
@@ -31,7 +34,7 @@ C:\Users\你的名字\.aliasagent\config.json
 | `Max Context Tokens`（提示 `e.g. 200000`，下面一行小字 `Compaction threshold (one-time setting)`） | 模型能装下多少 token；它决定"什么时候开始压缩"（见 [上下文压缩](context-compaction.md)） |
 | `Start` 按钮 | 保存并进入界面 |
 
-按 `Start` 之后，应用会写出这样一份配置（供应商固定叫 `anthropic`，模型写死为 `claude-sonnet-4-6`，工具给 `read_file` 和 `list_dir`）：
+按 `Start` 之后，应用会写出这样一份配置（供应商固定叫 `anthropic`，模型写死为 `claude-sonnet-4-6`，工具给当前**十项基础工具**）：
 
 ```json
 {
@@ -47,12 +50,14 @@ C:\Users\你的名字\.aliasagent\config.json
       "provider": "anthropic",
       "model": "claude-sonnet-4-6",
       "system_prompt": "You are a helpful assistant.",
-      "tools": ["read_file", "list_dir"],
+      "tools": ["read_file", "write_file", "edit_file", "list_dir", "get_current_time", "glob_file", "grep_file", "read_image", "run_command", "read_spill"],
       "max_context_tokens": 200000
     }
   }
 }
 ```
+
+> 如果你以前用旧版首启生成过 `["read_file", "list_dir"]` 这两项默认清单，启动时会看到一行**迁移提示**：它会被升级成上面这十项基础工具。你自己收窄或扩展过的清单不会被改动。
 
 ### 手写一份完整配置
 
@@ -108,13 +113,13 @@ C:\Users\你的名字\.aliasagent\config.json
 | `providers` | 顶层 | 供应商表，键名随便起（上面用了 `anthropic`） | 没有可用供应商，发消息会报错 |
 | `api_key` | 每个供应商 | 模型服务的 key | 必填，缺了会报数据结构错误 |
 | `base_url` | 每个供应商 | 服务地址 | 空字符串 |
-| `agent_types` | 顶层 | agent 表，应用只找名字叫 `general` 的那个 | 没有 `general`，发消息时报 `No agent type configured.` |
-| `provider` | 每个 agent | 用哪个供应商（对应 `providers` 里的键名） | 必填 |
+| `agent_types` | 顶层 | agent 模板表；每个会话按自己保存的模板名选一个（历史会话没有记录时用 `general`）。每个会话用的模板名保存在数据库 `sessions.agent_type` 列里 | 会话引用的模板不存在时，创建 Agent 失败并显示模板名，不会悄悄改用 `general` |
+| `provider` | 每个 agent | 用哪个供应商（对应 `providers` 里的键名） | 必填；引用了未定义的 provider 会拒绝创建实例 |
 | `model` | 每个 agent | 模型名 | 必填 |
 | `system_prompt` | 每个 agent | 系统提示词 | 空字符串 |
-| `tools` | 每个 agent | 允许模型调用的工具名清单 | 空清单（模型没有工具可用） |
-| `thinking_effort` | 每个 agent | 思考强度 | 不传（用服务端默认） |
-| `max_context_tokens` | 每个 agent | 模型能吃下多少 token | 不写就再弹一次欢迎对话框问你要 |
+| `tools` | 每个 agent | 允许模型调用的工具名清单；只能写工具目录里存在的名字 | 空清单（模型没有工具可用）；写了不存在的工具会拒绝创建实例并列出名字 |
+| `thinking_effort` | 每个 agent | 思考强度：low、medium、high、xhigh、max 之一；其它值按"关闭"处理 | 关闭（不传） |
+| `max_context_tokens` | 每个 agent | 模型能吃下多少 token；**必须是正整数** | 缺失、为零或负数时拒绝创建 Agent 并显示模板名（不会再按 0 继续发送全文）；`general` 缺这个值时会弹一次欢迎对话框问你要 |
 | `compaction_threshold_percent` | 每个 agent | 压缩阈值百分比，1 到 100 的整数 | 用 25 |
 | `compaction_wait_threshold_percent` | 每个 agent | **等待**阈值百分比，1 到 100 的整数：这一轮要发出去的内容占模型总上下文超过这个比例时，才等压缩做完再发（见 [上下文压缩](context-compaction.md)） | 用 75 |
 | `standing_requirements` | 每个 agent | 你写死的目标，压缩时不许丢掉 | 空清单 |
@@ -130,6 +135,8 @@ C:\Users\你的名字\.aliasagent\config.json
 
 > 关于搜索：**`web_search` 工具只有在至少配了一家搜索服务时才会出现**。目前这一版里 `searxng` 在启动时被直接标记为不可用，所以实际能生效的是 `deepseek`、`zhipuai` 和 `kimi` 三家（前一家不用另外买 key，后两家要付费 key）。详见 [联网工具](tools-web.md)。
 
+> 关于"把会话改到已有模板"：用当前会话工具栏（`对话视图` / `真实上下文` 同一行）右侧的模板下拉框，见 [Agent 模板](agent-templates.md)。切换会替换该会话运行中的 Agent 实例，并把数据库 `sessions.agent_type` 更新成新模板名；重启应用后仍按这个值重建实例。改 `agent_types` 里的模板定义本身不会改任何会话的引用。
+
 > 关于 `deepseek` 的一条安全规矩：**只有地址确实指向 DeepSeek（含 `api.deepseek.com`）时才会复用 `providers` 里那把密钥**；地址指向别处时这个后端直接不可用、一个请求都不发（那把密钥可能是别家的，不能发到别的地址上）。
 
 ## 出错时会看到什么
@@ -141,6 +148,9 @@ C:\Users\你的名字\.aliasagent\config.json
 | 整屏 `Configuration Error`，下面一行 `Invalid JSON in <路径>: ...` | 配置文件不是合法 JSON（少逗号、多逗号、引号没配对） | 按提示的路径打开文件修好，重启应用 |
 | 整屏 `Configuration Error`，下面一行 `Unexpected data structure in <路径>: ...` | JSON 合法但结构不对（例如某个供应商少了 `api_key`，或 `agent_types` 里少了 `general`） | 按上面的完整示例补全 |
 | 又弹一次欢迎对话框 | 配置文件不存在，或者 `general` 里没有可用的 `max_context_tokens` | 按对话框填；也可以直接改文件补上这个键 |
+| 界面顶部红条 `Agent 模板 "<名字>" 的 max_context_tokens 无效（...）：必须是正整数。拒绝创建实例...` | 某个模板的窗口缺失、为零或负数 | 用 `Agents` 菜单改这个模板的上下文窗口，或直接改文件；修好前这个模板不能创建实例 |
+| 界面顶部红条 `Agent 模板 "<名字>" 不存在：拒绝创建实例，也不会退回 general` | 会话保存的模板名在 `agent_types` 里找不到 | 用 `Agents` 菜单添加一个同名模板，或用当前会话工具栏的模板下拉把它换到一个已存在的模板（切换后数据库 `sessions.agent_type` 会更新；本版没有改名入口） |
+| 界面顶部红条 `未知工具：<名字>（模板 "<名字>"）：不在 ToolCatalog 中。不会静默丢弃...` | 模板的 `tools` 里写了工具目录中不存在的名字 | 用 `Agents` 菜单改工具集合；不会静默删掉这个名字继续跑 |
 | 日志里多一行 `compaction_threshold_percent=... is absent or not an integer in 1..100 — using the default 25% ...` | 这个键写了小数、`0`、负数、大于 `100`、或者写成了字符串 | 改成 1 到 100 的整数；不改也能用（按 25% 走） |
 | 日志里多一行 `compaction_wait_threshold_percent=... is absent or not an integer in 1..100 — using the default 75% ...` | `compaction_wait_threshold_percent` 写了小数、`0`、负数、大于 `100`、或者写成了字符串 | 改成 1 到 100 的整数；不改也能用（按 75% 走） |
 
@@ -148,7 +158,7 @@ C:\Users\你的名字\.aliasagent\config.json
 
 ## 限制
 
-- **改完要重启应用**：配置只在启动时读一次，运行中改文件不生效。
-- **没有图形化设置界面**：除了第一次启动那个对话框，其余都得手改 JSON。
-- **应用只认名字叫 `general` 的 agent**：`agent_types` 里可以放别的名字，但界面上不会用到。
-- **首启对话框写死的那份配置里只有两个文件工具**（`read_file`、`list_dir`）；想要别的工具得自己往 `tools` 里加。
+- **供应商、搜索、spill 改完要重启应用**：配置只在启动时读一次，运行中改这些段不生效。
+- **Agent 模板用 `Agents` 菜单改，不用重启**：保存只影响**之后创建或恢复**的实例；已经运行的会话继续使用创建时的配置。要让当前会话立刻用上新模板，用工具栏的模板下拉显式切换（它会替换运行实例并更新数据库 `sessions.agent_type`）；只在会话列表里重新选中它不会重建实例。
+- **模板没有删除入口、也不能改名**：模板名是会话的持久化引用键，创建后只读；本版只支持添加与修改。
+- **本版不编辑 provider 密钥**：没有图形化的密钥输入框，密钥仍然只能改配置文件里的 `api_key`（第一次启动对话框除外）。

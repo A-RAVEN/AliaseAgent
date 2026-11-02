@@ -40,6 +40,23 @@ void main() {
       provider: 'test',
       model: 'test-model',
       systemPrompt: '',
+      // 模板工具清单决定实际发送哪些工具；这里列出"当前应完整出现"的十二项
+      // （十项基础 + 两个搜索工具），就绪后那一轮必须全部出现。
+      tools: [
+        'read_file',
+        'write_file',
+        'edit_file',
+        'list_dir',
+        'get_current_time',
+        'glob_file',
+        'grep_file',
+        'read_image',
+        'run_command',
+        'read_spill',
+        'web_search',
+        'web_fetch',
+      ],
+      maxContextTokens: 100000,
     ));
     resolver = ProviderResolver(const AppConfig(
       version: 1,

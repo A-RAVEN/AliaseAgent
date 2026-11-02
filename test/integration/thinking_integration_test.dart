@@ -170,6 +170,7 @@ void main() {
         provider: 'a',
         model: 'm',
         systemPrompt: '',
+        maxContextTokens: 100000,
         thinkingEffort: 'max',
       );
       final json = config.toJson();
@@ -182,6 +183,7 @@ void main() {
         provider: 'a',
         model: 'm',
         systemPrompt: '',
+        maxContextTokens: 100000,
       );
       final json = config.toJson();
       expect(json.containsKey('thinking_effort'), isFalse);

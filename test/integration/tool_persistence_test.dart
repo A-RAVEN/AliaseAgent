@@ -26,6 +26,7 @@ void _setupAgentRegistry() {
     provider: 'test',
     model: 'test-model',
     systemPrompt: '',
+    maxContextTokens: 100000,
     tools: ['read_file', 'list_dir'],
   ));
   resolver = ProviderResolver(const AppConfig(
