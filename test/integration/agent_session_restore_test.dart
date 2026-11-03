@@ -284,10 +284,12 @@ void main() {
 /// 只用于验证 `SessionRepository.create` 的缺省 agentType（与生产实现同义）。
 class _FakeCreateSessionRepository implements SessionRepository {
   @override
-  Future<Session> create({String? title, String? agentType}) async => Session(
+  Future<Session> create({String? title, String? agentType, String? parentSessionId}) async =>
+      Session(
         id: 'new-default',
         title: title ?? 'New Chat',
         agentType: agentType ?? 'general',
+        parentSessionId: parentSessionId,
         createdAt: 1,
         updatedAt: 1,
       );
@@ -297,6 +299,9 @@ class _FakeCreateSessionRepository implements SessionRepository {
 
   @override
   Future<List<Session>> list() async => [];
+
+  @override
+  Future<List<Session>> listChildren(String parentSessionId) async => [];
 
   @override
   Future<void> delete(String id) async {}

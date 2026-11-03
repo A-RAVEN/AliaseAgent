@@ -76,6 +76,93 @@ void main() {
     });
   });
 
+  group('spawn_subagent 卡片（add-spawn-subagent-tool 6.1）', () {
+    Future<void> pumpCard(WidgetTester tester, ToolCallActivity a) async {
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(body: ToolCallCard(activity: a)),
+      ));
+      await tester.pump();
+    }
+
+    testWidgets('等待中显示任务、模板与 Executing 状态', (tester) async {
+      await pumpCard(
+          tester,
+          ToolCallActivity(
+            id: 't1',
+            toolName: 'spawn_subagent',
+            input: const {
+              'task': '调查子任务-卡片-独特',
+              'agent_type': 'worker',
+            },
+            status: ToolCallStatus.executing,
+          ));
+      // ignore: avoid_print
+      print('  [OBS] 等待态：任务=${find.textContaining('调查子任务-卡片-独特').evaluate().length} '
+          '模板=${find.textContaining('worker').evaluate().length} '
+          '执行中=${find.text('Executing...').evaluate().length}');
+      expect(find.textContaining('调查子任务-卡片-独特'), findsOneWidget,
+          reason: '等待期间也要能读到子任务');
+      expect(find.textContaining('子 Agent 模板：worker'), findsOneWidget);
+      expect(find.text('Executing...'), findsOneWidget);
+      expect(find.byType(CircularProgressIndicator), findsOneWidget);
+      expect(find.text('Expand result'), findsNothing,
+          reason: '还没有结论时没有结果区');
+    });
+
+    testWidgets('成功后展开显示完整结论，模板用实际元数据', (tester) async {
+      final conclusion = '结论头|${'A' * 600}|结论尾-独特';
+      await pumpCard(
+          tester,
+          ToolCallActivity(
+            id: 't2',
+            toolName: 'spawn_subagent',
+            input: const {'task': '子任务', 'agent_type': 'worker'},
+            status: ToolCallStatus.done,
+            result: conclusion,
+            resultPreview: '${conclusion.substring(0, 300)}...',
+            childSessionId: 'child-1',
+            childAgentType: 'worker',
+            childModel: 'worker-model',
+            childMetering: const {'requests': 2},
+          ));
+      // 收起态只显示预览：结尾不在视野里。
+      expect(find.textContaining('结论尾-独特'), findsNothing);
+      await tester.tap(find.text('Expand result'));
+      await tester.pump();
+      // ignore: avoid_print
+      print('  [OBS] 成功后展开：完整结论出现='
+          '${find.textContaining('结论尾-独特').evaluate().length} '
+          '模板=${find.textContaining('子 Agent 模板：worker').evaluate().length}');
+      expect(find.textContaining('结论尾-独特'), findsOneWidget,
+          reason: '展开后必须能看到完整结论（卡片不是只给预览）');
+      expect(find.textContaining('子 Agent 模板：worker'), findsOneWidget);
+    });
+
+    testWidgets('失败时展开显示完整错误，状态是 Error', (tester) async {
+      await pumpCard(
+          tester,
+          ToolCallActivity(
+            id: 't3',
+            toolName: 'spawn_subagent',
+            input: const {'task': '子任务'},
+            status: ToolCallStatus.error,
+            result: 'subagent_failed: 子模型炸了-卡片-独特',
+            resultPreview: 'subagent_failed: 子模型炸了-卡片-独特',
+          ));
+      await tester.tap(find.text('Expand result'));
+      await tester.pump();
+      // ignore: avoid_print
+      print('  [OBS] 失败态：错误出现='
+          '${find.textContaining('子模型炸了-卡片-独特').evaluate().length} '
+          'Error 状态=${find.text('Error').evaluate().length} '
+          '未指定模板时标签=${find.textContaining('继承父模板').evaluate().length}');
+      expect(find.textContaining('子模型炸了-卡片-独特'), findsWidgets);
+      expect(find.text('Error'), findsOneWidget);
+      expect(find.textContaining('子 Agent 模板：继承父模板'), findsOneWidget,
+          reason: '省略 agent_type 时卡片要说明继承父模板');
+    });
+  });
+
   group('edit_file 的差异区块', () {
     ToolCallActivity activityWithHunks(
       List<EditHunk>? hunks, {

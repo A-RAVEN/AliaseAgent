@@ -37,6 +37,7 @@ typedef SendMessageNative = Int32 Function(
 );
 
 typedef SetWorkspaceNative = Pointer<Utf8> Function(Pointer<Utf8> handle, Pointer<Utf8> path);
+typedef GetWorkspaceNative = Pointer<Utf8> Function(Pointer<Utf8> handle);
 /// 机器级的一参接口（ensure_search_infra）：没有句柄，只有配置 JSON。
 typedef OneStringNative = Pointer<Utf8> Function(Pointer<Utf8> value);
 typedef CancelRequestNative = Pointer<Utf8> Function(Pointer<Utf8> handle, Int32 requestId);
@@ -64,6 +65,7 @@ typedef SendMessageDart = int Function(
 typedef OnDoneDart = void Function(int code, Pointer<Utf8> err, Pointer<Utf8> stopReason, int inputTokens, int outputTokens);
 
 typedef SetWorkspaceDart = Pointer<Utf8> Function(Pointer<Utf8> handle, Pointer<Utf8> path);
+typedef GetWorkspaceDart = Pointer<Utf8> Function(Pointer<Utf8> handle);
 typedef ReadFileDart = Pointer<Utf8> Function(Pointer<Utf8> handle, Pointer<Utf8> path);
 typedef ListDirDart = Pointer<Utf8> Function(Pointer<Utf8> handle, Pointer<Utf8> path);
 typedef EnsureSearchInfraDart = Pointer<Utf8> Function(Pointer<Utf8> configJson);
@@ -95,6 +97,70 @@ typedef OnToolCallCallback = void Function(String json);
 typedef OnThinkingCallback = void Function(String thinkingJson);
 typedef OnDoneCallback = void Function(int code, String? error, String? stopReason,
     int? inputTokens, int? outputTokens);
+
+// ---------------------------------------------------------------------------
+// get_workspace 的返回值
+//
+// C++ 侧返回线程本地缓冲里的 JSON，桥必须先立即复制成 Dart 字符串再解析。解析
+// 放在下面这个顶层入口里：生产的 SidecarBridge.getWorkspace 与单元测试共用同一条
+// 路径，测试不需要、也不允许另造一条假的解析逻辑。
+// ---------------------------------------------------------------------------
+
+/// `get_workspace` 的解析结果。成功时 [workspace] 就是该上下文实际保存的值
+/// （空工作区就是空串）；失败时带 C++ 侧的 [code] 与 [error]，桥不会把失败伪装
+/// 成成功空串。
+class WorkspaceQueryResult {
+  const WorkspaceQueryResult.success(this.workspace)
+      : ok = true,
+        code = null,
+        error = null;
+
+  const WorkspaceQueryResult.failure(this.code, this.error)
+      : ok = false,
+        workspace = null;
+
+  final bool ok;
+  final String? workspace;
+  final String? code;
+  final String? error;
+
+  @override
+  String toString() => ok
+      ? 'WorkspaceQueryResult(ok, workspace: "$workspace")'
+      : 'WorkspaceQueryResult(failed, code: $code, error: $error)';
+}
+
+/// 解析 `get_workspace` 的原始 JSON 文本（生产与单元测试共用）。
+///
+/// - `{"ok":true,"workspace":"…"}` → [WorkspaceQueryResult.success]，空串原样保留；
+/// - `{"ok":false,"code":"unknown_context","error":"…"}` → 失败结果，错误码保留；
+/// - 非 JSON、非对象、或声称成功却没有 `workspace` 字符串 → 抛 [StateError]，
+///   消息点名 `get_workspace`，让"返回了看不懂的东西"变成可归因错误而不是空成功。
+WorkspaceQueryResult parseWorkspaceResponse(String raw) {
+  late final Object? decoded;
+  try {
+    decoded = jsonDecode(raw);
+  } on FormatException catch (e) {
+    throw StateError('get_workspace returned non-JSON: $raw (${e.message})');
+  }
+  if (decoded is! Map<String, dynamic>) {
+    throw StateError('get_workspace returned non-object JSON: $raw');
+  }
+  if (decoded['ok'] != true) {
+    final code = decoded['code'];
+    final error = decoded['error'];
+    return WorkspaceQueryResult.failure(
+      code is String && code.isNotEmpty ? code : 'get_workspace_failed',
+      error is String && error.isNotEmpty ? error : 'get_workspace failed: $raw',
+    );
+  }
+  final workspace = decoded['workspace'];
+  if (workspace is! String) {
+    throw StateError(
+        'get_workspace succeeded without a workspace string: $raw');
+  }
+  return WorkspaceQueryResult.success(workspace);
+}
 
 // ---------------------------------------------------------------------------
 // ISidecar — abstract interface for sidecar communication
@@ -130,6 +196,12 @@ abstract class ISidecar {
   void cancelRequest(String handle);
 
   String? setWorkspace(String handle, String path);
+
+  /// 只读读取该上下文当前保存的工作区（C++ `get_workspace`）。成功时
+  /// [WorkspaceQueryResult.workspace] 是实际值，空工作区如实为空串；未知或已
+  /// 销毁的句柄返回 `ok:false` + `unknown_context`，不隐式创建上下文。
+  WorkspaceQueryResult getWorkspace(String handle);
+
   String readFile(String handle, String requestJson);
   String listDir(String handle, String path);
 
@@ -176,6 +248,7 @@ class SidecarBridge implements ISidecar {
   late final CreateContextDart _createContextFn;
   late final DisposeContextDart _disposeContextFn;
   late final SetWorkspaceDart _setWorkspaceFn;
+  late final GetWorkspaceDart _getWorkspaceFn;
   late final ReadFileDart _readFileFn;
   late final ListDirDart _listDirFn;
   late final EnsureSearchInfraDart _ensureSearchInfraFn;
@@ -230,6 +303,8 @@ class SidecarBridge implements ISidecar {
         _lib.lookupFunction<DisposeContextNative, DisposeContextDart>('dispose_context');
     _setWorkspaceFn =
         _lib.lookupFunction<SetWorkspaceNative, SetWorkspaceDart>('set_workspace');
+    _getWorkspaceFn =
+        _lib.lookupFunction<GetWorkspaceNative, GetWorkspaceDart>('get_workspace');
     _readFileFn =
         _lib.lookupFunction<SetWorkspaceNative, ReadFileDart>('read_file');
     _listDirFn =
@@ -662,6 +737,19 @@ class SidecarBridge implements ISidecar {
     } finally {
       malloc.free(handlePtr);
       malloc.free(ptr);
+    }
+  }
+
+  @override
+  WorkspaceQueryResult getWorkspace(String handle) {
+    final handlePtr = handle.toNativeUtf8();
+    try {
+      // C++ 返回的指针由调用线程结果缓冲持有：拿到后立即复制成 Dart 字符串，
+      // 再交给上面那个生产与测试共用的解析入口。
+      final raw = _getWorkspaceFn(handlePtr).toDartString();
+      return parseWorkspaceResponse(raw);
+    } finally {
+      malloc.free(handlePtr);
     }
   }
 

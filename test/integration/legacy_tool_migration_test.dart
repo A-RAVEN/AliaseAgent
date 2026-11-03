@@ -50,7 +50,7 @@ void main() {
     });
   }
 
-  test('旧默认两项清单升级为十项基础工具，并给出可见提示', () {
+  test('旧默认两项清单升级为当前基础工具（十一项），并给出可见提示', () {
     final result = ToolListMigration.migrate(
         configWith(generalTools: const ['read_file', 'list_dir']));
     // ignore: avoid_print
@@ -60,13 +60,57 @@ void main() {
     expect(result.migratedTemplates, ['general']);
     expect(result.notices.single, contains('general'));
     expect(result.notices.single, contains('旧版首启默认'));
+    expect(result.notices.single, contains('11 项'),
+        reason: '提示里的数量必须与当前基础清单一致');
     expect(result.config.agentTypes['general']!.tools,
         ToolCatalog.kBaseToolNames);
-    expect(result.config.agentTypes['general']!.tools.length, 10);
+    expect(result.config.agentTypes['general']!.tools.length, 11);
+    expect(result.config.agentTypes['general']!.tools,
+        contains('spawn_subagent'));
     // 未开放迁移的字段必须原样：图片模态、窗口。
     expect(result.config.agentTypes['general']!.inputModalities,
         ['text', 'image']);
     expect(result.config.agentTypes['general']!.maxContextTokens, 100000);
+  });
+
+  test('旧十项完整形状不自动加回 spawn_subagent（用户删除后重新加载仍保持删除）', () {
+    // 上一版完整默认清单的形状 = 当前十一项里去掉 spawn_subagent。
+    final oldTen = ToolCatalog.kBaseToolNames
+        .where((n) => n != 'spawn_subagent')
+        .toList();
+    expect(oldTen.length, 10);
+    expect(oldTen, isNot(contains('spawn_subagent')));
+
+    final tempDir = Directory.systemTemp.createTempSync('legacy_ten_');
+    addTearDown(() => tempDir.deleteSync(recursive: true));
+    final path = '${tempDir.path}${Platform.pathSeparator}config.json';
+    File(path).writeAsStringSync(
+        jsonEncode(configWith(generalTools: oldTen).toJson()));
+
+    // 真实配置加载 → 迁移：不得仅凭"恰好是旧十项形状"就推断用户想自动升级。
+    final loaded = ConfigService.load(configPath: path).config!;
+    final migrated = ToolListMigration.migrate(loaded);
+    // ignore: avoid_print
+    print('  [OBS] 旧十项迁移 changed=${migrated.changed} '
+        '提示=${migrated.notices} 清单=${migrated.config.agentTypes['general']!.tools}');
+    expect(migrated.changed, isFalse,
+        reason: '旧十项形状与"用户主动删除"在磁盘上相同，不得自动升级');
+    expect(migrated.notices, isEmpty);
+    expect(migrated.config.agentTypes['general']!.tools, oldTen);
+    expect(migrated.config.agentTypes['general']!.tools,
+        isNot(contains('spawn_subagent')));
+
+    // 写回并重新加载：删除仍然保持。
+    ConfigService.save(migrated.config, configPath: path);
+    final reread = ConfigService.load(configPath: path).config!;
+    // ignore: avoid_print
+    print('  [OBS] 重新加载后清单（${reread.agentTypes['general']!.tools.length} 项）='
+        '${reread.agentTypes['general']!.tools}');
+    expect(reread.agentTypes['general']!.tools,
+        isNot(contains('spawn_subagent')),
+        reason: '重新加载后仍保持删除');
+    expect(reread.agentTypes['general']!.tools.toSet(), oldTen.toSet());
+    expect(reread.agentTypes['custom']!.tools, ['read_file', 'run_command']);
   });
 
   test('自定义清单原样保留（收窄与扩展都不迁移）', () {

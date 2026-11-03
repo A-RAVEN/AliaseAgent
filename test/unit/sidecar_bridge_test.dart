@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:ffi';
 import 'package:ffi/ffi.dart';
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:alias_agent/services/sidecar_bridge.dart';
 
@@ -232,6 +233,82 @@ void main() {
       await bridge.disposeContext(id);  // 不抛错
       // 从未建过的名字也同样幂等
       await bridge.disposeContext('bridge-never-created');
+    });
+  });
+
+  // =========================================================================
+  // 3.1-3.3 get_workspace（真实 DLL + 生产与测试共用的解析入口）
+  // =========================================================================
+  group('get_workspace（真实 DLL）', () {
+    test('按句柄读回各自的工作区：句柄原样透传、不落到主目录、互不覆盖', () async {
+      final bridge = SidecarBridge.instance;
+      const root = 'bridge-ws-root';
+      const sub = 'bridge-ws-sub';
+      await bridge.disposeContext(root);  // 幂等：从空状态开始
+      await bridge.disposeContext(sub);
+      await bridge.ensureContext(root, defaultWorkspace: '.');
+      await bridge.ensureContext(sub, defaultWorkspace: 'test');
+
+      final rootRead = bridge.getWorkspace(root);
+      final subRead = bridge.getWorkspace(sub);
+      final rootAgain = bridge.getWorkspace(root);
+      debugPrint('[OBS] get_workspace root=${rootRead.workspace} '
+          'sub=${subRead.workspace} rootAgain=${rootAgain.workspace}');
+      expect(rootRead.ok, isTrue, reason: '新建并设过工作区的句柄必须成功');
+      expect(subRead.ok, isTrue);
+      expect(rootAgain.ok, isTrue);
+      // 句柄被原样透传到 C++：两个句柄读到两份不同的工作区，而不是同一个固定值。
+      expect(rootRead.workspace, endsWith('AliasAgent'),
+          reason: '根上下文的工作区应是项目根，不可能是主目录或空串');
+      expect(subRead.workspace, '${rootRead.workspace}/test',
+          reason: '第二个上下文应读到项目根下的 test 目录，证明句柄透传');
+      expect(subRead.workspace, isNot(rootRead.workspace));
+      // 读另一个句柄之后，第一个句柄的业务值原样保留。
+      expect(rootAgain.workspace, rootRead.workspace);
+
+      await bridge.disposeContext(root);
+      await bridge.disposeContext(sub);
+    });
+
+    test('未知句柄返回 unknown_context，且查询没有隐式创建上下文', () async {
+      final bridge = SidecarBridge.instance;
+      const missing = 'bridge-ws-missing';
+      await bridge.disposeContext(missing);  // 确保从未建过
+
+      final read = bridge.getWorkspace(missing);
+      debugPrint('[OBS] get_workspace missing ok=${read.ok} code=${read.code} '
+          'error=${read.error}');
+      expect(read.ok, isFalse, reason: '未知句柄不许返回成功');
+      expect(read.code, 'unknown_context');
+      expect(read.workspace, isNull, reason: '失败时不得伪造一个工作区');
+
+      // 查询本身没有隐式建出上下文：同名 ensure 仍是 created:true，且工作区为空。
+      expect(await bridge.ensureContext(missing), isTrue,
+          reason: 'get_workspace 不得隐式创建上下文');
+      final created = bridge.getWorkspace(missing);
+      expect(created.ok, isTrue);
+      expect(created.workspace, '',
+          reason: '新建上下文没有工作区，必须如实返回空串');
+      await bridge.disposeContext(missing);
+    });
+
+    test('共用解析入口：非 JSON 抛 StateError，失败码原样保留', () {
+      expect(() => parseWorkspaceResponse('not json at all'),
+          throwsA(isA<StateError>()),
+          reason: '非 JSON 必须报错，不能当成空工作区');
+      expect(() => parseWorkspaceResponse('[]'), throwsA(isA<StateError>()),
+          reason: '非对象 JSON 同样是解析错误');
+      expect(() => parseWorkspaceResponse('{"ok":true}'),
+          throwsA(isA<StateError>()),
+          reason: '声称成功却没有 workspace 字符串也是解析错误');
+      final failed = parseWorkspaceResponse(
+          '{"ok":false,"code":"unknown_context","error":"unknown context: x"}');
+      expect(failed.ok, isFalse);
+      expect(failed.code, 'unknown_context');
+      expect(failed.error, 'unknown context: x');
+      final ok = parseWorkspaceResponse('{"ok":true,"workspace":""}');
+      expect(ok.ok, isTrue);
+      expect(ok.workspace, '');
     });
   });
 }

@@ -231,6 +231,8 @@ void main() {
     print('  [OBS] 迁移后请求工具=${tools.length} 项：$tools');
     expect(tools.length, ToolCatalog.kBaseToolNames.length);
     expect(tools, containsAll(['read_file', 'list_dir', 'run_command']));
+    expect(tools, contains('spawn_subagent'),
+        reason: '旧两项迁移到当前基础清单后，请求必须含新增的 spawn_subagent');
     expect(tools, isNot(contains('web_search')),
         reason: '没注册的搜索工具不能凭空出现');
   });

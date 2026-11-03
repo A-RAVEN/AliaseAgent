@@ -64,6 +64,19 @@ const _otherCodeNames = <String, String>{
   // using cd"（告诉模型别用 cd），用户文档讲"要不要 cd"时也会把这两个字母括起来，
   // 所以文档一致性检查会在产品代码里逐一核到这个记号。
   'cd': 'lib/main.dart',
+  // 子运行的可区分失败码（add-spawn-subagent-tool）：它们不是工具名也不是配置键，
+  // 但会在用户文档与工具结果里原样出现；每个都必须在运行器里真实存在。
+  'invalid_task': 'lib/services/subagent_runner.dart',
+  'invalid_agent_type': 'lib/services/subagent_runner.dart',
+  'workspace_unavailable': 'lib/services/subagent_runner.dart',
+  'child_session_failed': 'lib/services/subagent_runner.dart',
+  'child_create_failed': 'lib/services/subagent_runner.dart',
+  'subagent_failed': 'lib/services/subagent_runner.dart',
+  'subagent_cancelled': 'lib/services/subagent_runner.dart',
+  'empty_final_response': 'lib/services/subagent_runner.dart',
+  'subagent_busy': 'lib/services/subagent_runner.dart',
+  'subagent_exception': 'lib/services/subagent_runner.dart',
+  'cleanup_failed': 'lib/services/subagent_runner.dart',
 };
 
 /// 文档里"允许出现的、既不是配置键也不是工具名、但确实是代码里存在的名字"清单。

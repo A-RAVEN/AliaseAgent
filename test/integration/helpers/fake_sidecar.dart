@@ -274,6 +274,29 @@ class FakeSidecar implements ISidecar {
     return null;
   }
 
+  /// `get_workspace` 桩（add-spawn-subagent-tool 1.2）：按句柄记录每次查询，并返回
+  /// 该句柄自己的工作区。没有为某句柄设值时返回空串 —— 与真实的新建上下文一致，
+  /// 不用应用主目录顶替。
+  final List<String> getWorkspaceCalls = [];
+  final Map<String, String> workspaceByHandle = {};
+
+  /// 非空时所有 `get_workspace` 调用都返回这个错误码（例如 unknown_context）。
+  String? workspaceFailureCode;
+
+  void stubWorkspace(String handle, String workspace) {
+    workspaceByHandle[handle] = workspace;
+  }
+
+  @override
+  WorkspaceQueryResult getWorkspace(String handle) {
+    getWorkspaceCalls.add(handle);
+    final code = workspaceFailureCode;
+    if (code != null) {
+      return WorkspaceQueryResult.failure(code, 'fake: $code ($handle)');
+    }
+    return WorkspaceQueryResult.success(workspaceByHandle[handle] ?? '');
+  }
+
   @override
   String readFile(String handle, String requestJson) {
     toolHandles.add(handle);

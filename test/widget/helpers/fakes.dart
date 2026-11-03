@@ -8,11 +8,12 @@ class FakeSessionRepository implements SessionRepository {
   FakeSessionRepository(this.sessions);
 
   @override
-  Future<Session> create({String? title, String? agentType}) async {
+  Future<Session> create({String? title, String? agentType, String? parentSessionId}) async {
     final s = Session(
       id: 'new-${sessions.length}',
       title: title ?? 'New Chat',
       agentType: agentType ?? 'general',
+      parentSessionId: parentSessionId,
       createdAt: DateTime.now().millisecondsSinceEpoch,
       updatedAt: DateTime.now().millisecondsSinceEpoch,
     );
@@ -31,6 +32,10 @@ class FakeSessionRepository implements SessionRepository {
 
   @override
   Future<List<Session>> list() async => sessions.toList();
+
+  @override
+  Future<List<Session>> listChildren(String parentSessionId) async =>
+      sessions.where((s) => s.parentSessionId == parentSessionId).toList();
 
   @override
   Future<void> delete(String id) async {

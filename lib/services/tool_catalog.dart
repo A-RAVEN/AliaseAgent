@@ -80,7 +80,8 @@ class ToolCatalog {
   ///
   /// 覆盖 `read_file` / `write_file` / `edit_file` / `list_dir` /
   /// `get_current_time` / `glob_file` / `grep_file` / `read_image` /
-  /// `run_command` / `read_spill` —— 这十项都是当前产品无条件提供的基础能力。
+  /// `run_command` / `read_spill` / `spawn_subagent` —— 这十一项都是当前产品
+  /// 无条件提供的基础能力（`spawn_subagent` 的实际执行见 `lib/services/subagent_runner.dart`）。
   static const List<String> kBaseToolNames = [
     'read_file',
     'write_file',
@@ -92,6 +93,7 @@ class ToolCatalog {
     'read_image',
     'run_command',
     'read_spill',
+    'spawn_subagent',
   ];
 
   /// 旧版首启写出的两项默认工具清单（`read_file`、`list_dir`）。

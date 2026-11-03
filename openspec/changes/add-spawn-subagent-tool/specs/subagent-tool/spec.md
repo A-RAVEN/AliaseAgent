@@ -133,3 +133,14 @@
 
 - **WHEN** 子 Agent 已结束但子上下文销毁无法证明排空
 - **THEN** 工具返回带 `child_session_id` 的清理错误，不返回表示资源已正常释放的成功结果
+
+### Requirement: 真实模型调用子 Agent 的过程必须可观察和验收
+
+系统 SHALL 提供 `integration_test/subagent_live_test.dart` 真实模型用例，通过真实 `AppShell`、独立临时数据库和产品配置解析得到的 provider 验证父模型实际调用 `spawn_subagent`。测试 SHALL 使用含该工具的父模板与不含该工具的子模板，并在断言前输出实际工具名、完整输入、状态、结果、最终回复和父子数据库记录。
+
+只有配置不完整或已确认的接口/网络错误 SHALL 按既有 live 规则跳过；真实模型不调用工具、子运行失败、错误模板或结论缺失 SHALL 判失败。用例 SHALL 在所有出口保留 `test/live_visual/subagent_live.png`，主循环 SHALL 读取截图做视觉验收，不得只用测试通过文本或应用启动代替。
+
+#### Scenario: 真实父模型创建子 Agent 并收到结论
+
+- **WHEN** 真实父模型收到必须创建子 Agent 的任务，真实子模型返回本次运行的独特结论
+- **THEN** 父工具卡显示 `spawn_subagent` 已完成并包含该结论，子运行记录关联父会话，父历史不含子中间消息，截图中可见工具结果与最终回复

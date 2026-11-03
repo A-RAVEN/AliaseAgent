@@ -387,4 +387,90 @@ void main() {
       expect(registry.listNames(), ['general']);
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // 4.1 用户删除后恰好呈旧十项形状：编辑器里显式添加 / 移除都必须生效，
+  // 重新打开同一模板时保持用户选择（不因形状像旧默认被自动加回）。
+  // ---------------------------------------------------------------------------
+  const oldTen = [
+    'read_file',
+    'write_file',
+    'edit_file',
+    'list_dir',
+    'get_current_time',
+    'glob_file',
+    'grep_file',
+    'read_image',
+    'run_command',
+    'read_spill',
+  ];
+
+  testWidgets('显式添加 spawn_subagent：保存草稿包含它', (tester) async {
+    // 工具 chip 在表单下方：默认 800x600 视口会把它排到屏幕外，点不到。
+    tester.view.physicalSize = const Size(1200, 1600);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+    AgentTemplateDraft? saved;
+    await tester.pumpWidget(wrap(AgentTemplateEditor(
+      original: AgentTypeConfig(
+        name: 'general',
+        provider: 'anthropic',
+        model: 'claude-sonnet-4-6',
+        systemPrompt: '你是助手',
+        tools: oldTen,
+        maxContextTokens: 100000,
+      ),
+      providers: const ['anthropic'],
+      availableTools: [...oldTen, 'spawn_subagent'],
+      onSave: (draft) async => saved = draft,
+    )));
+    await tester.pump();
+
+    expect(find.byKey(const ValueKey('tool-chip-spawn_subagent')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('tool-chip-spawn_subagent')));
+    await tester.pump();
+    await tester.tap(find.byKey(const ValueKey('save-template')));
+    await tester.pumpAndSettle();
+
+    // ignore: avoid_print
+    print('  [OBS] 显式添加后草稿工具=${saved?.tools}');
+    expect(saved, isNotNull);
+    expect(saved!.tools, contains('spawn_subagent'));
+    expect(saved!.tools.toSet(), {...oldTen, 'spawn_subagent'});
+  });
+
+  testWidgets('显式移除 spawn_subagent：保存后恰好是旧十项形状（不被自动加回）',
+      (tester) async {
+    // 同上：给工具 chip 区留出可见高度。
+    tester.view.physicalSize = const Size(1200, 1600);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+    AgentTemplateDraft? saved;
+    await tester.pumpWidget(wrap(AgentTemplateEditor(
+      original: AgentTypeConfig(
+        name: 'general',
+        provider: 'anthropic',
+        model: 'claude-sonnet-4-6',
+        systemPrompt: '你是助手',
+        tools: [...oldTen, 'spawn_subagent'],
+        maxContextTokens: 100000,
+      ),
+      providers: const ['anthropic'],
+      availableTools: [...oldTen, 'spawn_subagent'],
+      onSave: (draft) async => saved = draft,
+    )));
+    await tester.pump();
+
+    await tester.tap(find.byKey(const ValueKey('tool-chip-spawn_subagent')));
+    await tester.pump();
+    await tester.tap(find.byKey(const ValueKey('save-template')));
+    await tester.pumpAndSettle();
+
+    // ignore: avoid_print
+    print('  [OBS] 显式移除后草稿工具=${saved?.tools}');
+    expect(saved, isNotNull);
+    expect(saved!.tools, isNot(contains('spawn_subagent')));
+    expect(saved!.tools.toList(), oldTen,
+        reason: '用户显式移除后恰好是旧十项形状，保存草稿必须如实反映');
+  });
 }

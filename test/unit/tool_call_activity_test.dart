@@ -182,6 +182,63 @@ void main() {
     });
   });
 
+  // ---------------------------------------------------------------------------
+  // 4.4 子运行元数据：序列化往返，且不含密钥。
+  // ---------------------------------------------------------------------------
+  group('子运行元数据（add-spawn-subagent-tool 4.4）', () {
+    test('child_session_id / 模板 / 模型 / 计量往返后完全一致，老数据读出来是 null', () {
+      const original = ToolCallActivity(
+        id: 'tc-spawn',
+        toolName: 'spawn_subagent',
+        input: {'task': '调查', 'agent_type': 'worker'},
+        status: ToolCallStatus.done,
+        result: '子最终结论',
+        resultPreview: '子最终结论',
+        childSessionId: 'child-1',
+        childAgentType: 'worker',
+        childModel: 'worker-model',
+        childMetering: {
+          'input_tokens': 11,
+          'output_tokens': 6,
+          'total_tokens': 17,
+          'requests': 2,
+          'tool_calls': 1,
+        },
+      );
+      final json = original.toJson();
+      // ignore: avoid_print
+      print('  [OBS] 子运行元数据 toJson=$json');
+      expect(json['child_session_id'], 'child-1');
+      expect(json['child_agent_type'], 'worker');
+      expect(json['child_model'], 'worker-model');
+      expect(json.containsKey('api_key'), isFalse);
+      expect(jsonEncode(json), isNot(contains('sk-')));
+
+      final restored = ToolCallActivity.fromJson(json);
+      expect(restored.childSessionId, 'child-1');
+      expect(restored.childAgentType, 'worker');
+      expect(restored.childModel, 'worker-model');
+      expect(restored.childMetering, original.childMetering);
+      expect(restored.result, '子最终结论');
+
+      final copied = original.copyWith(result: '新结论');
+      expect(copied.childSessionId, 'child-1');
+      expect(copied.childMetering, original.childMetering);
+
+      // 老数据没有这些键：读出来是 null，不凭空造值。
+      final legacy = ToolCallActivity.fromJson(<String, dynamic>{
+        'id': 'tc-old',
+        'toolName': 'read_file',
+        'input': {'path': 'a.txt'},
+        'status': 'done',
+      });
+      expect(legacy.childSessionId, isNull);
+      expect(legacy.childAgentType, isNull);
+      expect(legacy.childModel, isNull);
+      expect(legacy.childMetering, isNull);
+    });
+  });
+
   group('image（add-image-input 10.4 / 11.2）', () {
     test('11.2：imagePath 写进 toJson、能被 fromJson 读回，copyWith 也带得动', () {
       const original = ToolCallActivity(

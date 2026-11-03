@@ -2,15 +2,13 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
-import 'package:sqflite/sqflite.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'package:alias_agent/models/agent_type_config.dart';
 import 'package:alias_agent/models/chat_item.dart';
-import 'package:alias_agent/models/message.dart';
 import 'package:alias_agent/services/database_service.dart';
 import 'package:alias_agent/services/message_repository.dart';
-import 'package:alias_agent/services/sidecar_bridge.dart';
+import 'package:alias_agent/services/session_repository.dart';
 import 'helpers/fake_sidecar.dart';
 
 void main() {
@@ -21,10 +19,18 @@ void main() {
     late Directory tempDir;
     late MessageRepository msgRepo;
 
+    /// 真实创建路径：先建会话行，再写这个会话的消息。
+    ///
+    /// `messages.session_id` 有 `REFERENCES sessions(id)`，生产里消息不会属于一个
+    /// 不存在的会话（先有 `SessionRepository.create`，才有这一轮消息）；旧夹具直接
+    /// 写死一个 `test-session` 属于生产走不到的状态，开启外键后会被真实数据库拒绝。
+    late String sessionId;
+
     setUp(() async {
       tempDir = Directory.systemTemp.createTempSync('think_test_');
       await DatabaseService.openAt(tempDir.path);
       msgRepo = MessageRepository();
+      sessionId = (await SessionRepository().create(title: '思考回环')).id;
     });
 
     tearDown(() async {
@@ -37,8 +43,8 @@ void main() {
     });
 
     test('thinking_json round-trip: insert -> load -> parse', () async {
-      final msg = await msgRepo.insert(
-        sessionId: 'test-session',
+      await msgRepo.insert(
+        sessionId: sessionId,
         role: 'assistant',
         content: 'Here is my answer.',
         thinkingJson: jsonEncode([
@@ -50,7 +56,7 @@ void main() {
         ]),
       );
 
-      final msgs = await msgRepo.queryBySession('test-session');
+      final msgs = await msgRepo.queryBySession(sessionId);
       expect(msgs.length, 1);
       expect(msgs[0].thinkingJson, isNotNull);
 
@@ -132,13 +138,13 @@ void main() {
     });
 
     test('no thinking blocks yields NULL thinking_json', () async {
-      final msg = await msgRepo.insert(
-        sessionId: 'test-session',
+      await msgRepo.insert(
+        sessionId: sessionId,
         role: 'assistant',
         content: 'Simple reply.',
       );
 
-      final msgs = await msgRepo.queryBySession('test-session');
+      final msgs = await msgRepo.queryBySession(sessionId);
       expect(msgs.length, 1);
       expect(msgs[0].thinkingJson, isNull);
     });
@@ -320,7 +326,7 @@ void main() {
             thinkingBlocks.add(jsonDecode(json));
           } catch (_) {}
         },
-        onDone: (_, __, ___, ____, _____) {},
+        onDone: (_, _, _, _, _) {},
       );
 
       expect(thinkingBlocks.length, 1);

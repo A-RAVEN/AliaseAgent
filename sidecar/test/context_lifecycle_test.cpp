@@ -379,6 +379,48 @@ TEST_CASE("context: 未知句柄在每种接口上的错误形状", "[context]")
   context::reset_registry_for_tests();
 }
 
+TEST_CASE("context: get_workspace 对未知与已销毁句柄返回 unknown_context，空工作区如实为空",
+          "[context][get_workspace]") {
+  context::reset_registry_for_tests();
+
+  // 未知句柄：JSON 错误，不隐式创建；失败的时候也不能伪造出一个工作区。
+  const json missing = parse_json(call(context_api::get_workspace("never-created-ws")));
+  INFO("missing -> " << missing.dump());
+  REQUIRE(missing["ok"] == false);
+  REQUIRE(missing["code"] == "unknown_context");
+  REQUIRE(context::Registry::instance().find("never-created-ws") == nullptr);
+
+  // 新建但未设工作区：如实返回空串，不替换成应用主目录或别的上下文的工作区。
+  REQUIRE(parse_json(call(context_api::create_context_json("ws-empty")))["created"] == true);
+  const json empty = parse_json(call(context_api::get_workspace("ws-empty")));
+  INFO("empty -> " << empty.dump());
+  REQUIRE(empty["ok"] == true);
+  REQUIRE(empty["workspace"] == "");
+
+  // 设置后再读：返回的必须就是这一份工作区（规范化后的实际保存值）。
+  TempDir ws;
+  REQUIRE(std::string(context_api::set_workspace("ws-empty", ws.path().c_str())).empty());
+  const json before = parse_json(call(context_api::get_workspace("ws-empty")));
+  INFO("before dispose -> " << before.dump());
+  REQUIRE(before["ok"] == true);
+  REQUIRE(before["workspace"].get<std::string>().find("st_") != std::string::npos);
+
+  // 销毁后：按未知句柄报错，且查询本身没有把同名上下文隐式建回来。
+  REQUIRE(parse_json(call(context_api::dispose_context_json("ws-empty")))["disposed"] == true);
+  const json disposed = parse_json(call(context_api::get_workspace("ws-empty")));
+  INFO("disposed -> " << disposed.dump());
+  REQUIRE(disposed["ok"] == false);
+  REQUIRE(disposed["code"] == "unknown_context");
+  REQUIRE(context::Registry::instance().find("ws-empty") == nullptr);
+  // 同名重建得到的是全新上下文（工作区为空），证明查询没有留下残影。
+  REQUIRE(parse_json(call(context_api::create_context_json("ws-empty")))["created"] == true);
+  const json reborn = parse_json(call(context_api::get_workspace("ws-empty")));
+  INFO("reborn -> " << reborn.dump());
+  REQUIRE(reborn["workspace"] == "");
+
+  context::reset_registry_for_tests();
+}
+
 TEST_CASE("context: 空 api_key 仍走既有早退（返回 1 且 on_done(0)）", "[context]") {
   context::reset_registry_for_tests();
   REQUIRE(parse_json(call(context_api::create_context_json("empty-key")))["created"] == true);

@@ -10,9 +10,10 @@
 // （`const char* handle`）。句柄是不透明的、区分大小写的原始字符串，由
 // `create_context` 返回；**不假设它等于会话 id**。
 //
-// 19 个带句柄的导出（相对上一版全部改了签名）：
+// 20 个带句柄的导出（相对上一版全部改了签名）：
 //   cancel_request(handle, request_id)        send_message(handle, …)
-//   set_workspace(handle, path)               read_file(handle, path)
+//   get_workspace(handle)                     set_workspace(handle, path)
+//   read_file(handle, path)
 //   list_dir(handle, path)                    write_file(handle, request_json)
 //   edit_file(handle, request_json)           glob_file(handle, request_json)
 //   grep_file(handle, request_json)           read_image(handle, request_json)
@@ -130,6 +131,13 @@ SIDECAR_API int send_message(
   OnDoneCallback on_done,
   int request_id
 );
+
+/// Read back the workspace root this context currently holds (read-only).
+/// 成功 {"ok":true,"workspace":"…"}；空工作区如实返回空字符串，不替换成主目录。
+/// 未知/已销毁句柄返回 {"ok":false,"code":"unknown_context","error":"…"}，不隐式创建。
+/// 本接口不修改工作区、文件版本表、spill 序号、模型请求或浏览器状态；返回值遵守
+/// 上面的线程本地寿命。
+SIDECAR_API const char* get_workspace(const char* handle);
 
 /// Set the workspace root for this context's read_file / list_dir tools.
 /// Returns an error message on failure, or empty string on success. 未知句柄返回

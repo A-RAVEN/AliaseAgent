@@ -139,6 +139,14 @@ Dart 桥把原始 JSON 解析放在一个可独立测试的内部入口，生产
 
 迁移不得删除未知工具，也不得把 provider 密钥写进提示或日志。
 
+### 真实模型验收必须观察实际工具调用，不能用假 sidecar 结论代替
+
+假 sidecar 已证明父子执行链路和本地资源行为，但不能证明真实模型愿意按任务调用 `spawn_subagent`。新增 `integration_test/subagent_live_test.dart`，使用真实 `AppShell`、独立临时数据库和产品配置解析得到的真实 provider，分别配置含 `spawn_subagent` 的父模板与不含该工具的子模板。
+
+父提示要求必须创建子 Agent，子任务要求返回一个本次运行可核对的独特结论。测试通过现有 `live_observability.dart` 读取工具卡片、最终回复和实际上下文，在断言前输出完整工具输入、状态、结果和父子数据库记录；随后断言父工具卡为 `spawn_subagent`、子记录关联父会话、最终结论到达父工具结果，且父历史不含子中间消息。真实模型不调用工具、调用错误模板、子运行失败或结论缺失均为失败，只有配置不完整或已确认的接口/网络错误允许按既有 live 规则跳过。
+
+用例复用 `captureLiveShot`，在所有出口保留 `test/live_visual/subagent_live.png`；主循环运行后必须用 `read_image` 检查工具卡片与最终回复可见，不能把 `All tests passed` 或 `run.bat` 启动当成视觉验收。等待、滚动和截图有效性检查复用现有 live 辅助设施，不新增超时或大小界限。
+
 ## Risks / Trade-offs
 
 - [父 Agent 等待期间子 Agent 出错，若发送接口仍只返回 `void`，错误会被伪装成空结论] → 先实现结构化 `AgentRunResult`，集成测试覆盖模型失败、取消、空回复和实例忙。

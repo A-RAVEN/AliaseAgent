@@ -142,6 +142,62 @@ TEST_CASE("context: 甲设工作区、乙不设，乙的读文件与缺省 cwd �
   context::reset_registry_for_tests();
 }
 
+TEST_CASE("context: 两个上下文分别读回自己的工作区，查询不改文件版本表与 spill 序号",
+          "[context][get_workspace]") {
+  context::reset_registry_for_tests();
+  auto a = context_api::ensure_context("ws-read-a", nullptr);
+  auto b = context_api::ensure_context("ws-read-b", nullptr);
+  TempDir dir_a;
+  TempDir dir_b;
+  dir_a.write("a.txt", "ALPHA-ONLY\n");
+  dir_b.write("b.txt", "BETA-ONLY\n");
+  REQUIRE(std::string(context_api::set_workspace(*a, dir_a.path().c_str())).empty());
+  REQUIRE(std::string(context_api::set_workspace(*b, dir_b.path().c_str())).empty());
+
+  // 各自读到的必须是自己的那一份：两个值不同，且各自带着自己目录的独特片段。
+  const json read_a = json::parse(json_text(context_api::get_workspace(*a)));
+  const json read_b = json::parse(json_text(context_api::get_workspace(*b)));
+  INFO("a -> " << read_a.dump());
+  INFO("b -> " << read_b.dump());
+  REQUIRE(read_a["ok"] == true);
+  REQUIRE(read_b["ok"] == true);
+  const std::string path_a = read_a["workspace"].get<std::string>();
+  const std::string path_b = read_b["workspace"].get<std::string>();
+  REQUIRE(path_a != path_b);
+  REQUIRE(path_a == a->workspace());
+  REQUIRE(path_b == b->workspace());
+  // 第二次读取另一份之后，第一份的业务值仍然原样（返回值按线程槽各存各的）。
+  const json read_a_again = json::parse(json_text(context_api::get_workspace(*a)));
+  REQUIRE(read_a_again["workspace"] == path_a);
+
+  // 查询前先让文件版本表与 spill 序号都有内容，查询后必须逐项不变。
+  const std::string read_file = json_text(context_api::read_file(*a, "a.txt"));
+  INFO("read_file -> " << read_file);
+  REQUIRE(read_file.find("ALPHA-ONLY") != std::string::npos);
+  // 版本表的键是**规范化后的绝对路径**（tools.cpp 的 record_observation），
+  // 所以这里用上下文自己的 workspace 拼出同一个键，而不是相对的 "a.txt"。
+  const std::string observed_key = a->workspace() + "/a.txt";
+  context::FileVersion version_before;
+  REQUIRE(a->observed_version(observed_key, version_before));
+  REQUIRE(version_before.size > 0);
+  const unsigned taken = a->next_spill_seq();
+  REQUIRE(taken > 0);
+  REQUIRE(a->peek_spill_seq() == taken);
+
+  REQUIRE(json::parse(json_text(context_api::get_workspace(*a)))["workspace"] == path_a);
+
+  context::FileVersion version_after;
+  REQUIRE(a->observed_version(observed_key, version_after));
+  INFO("version before " << version_before.mtime_ticks << "/" << version_before.size
+                         << " after " << version_after.mtime_ticks << "/"
+                         << version_after.size);
+  REQUIRE(version_after.mtime_ticks == version_before.mtime_ticks);
+  REQUIRE(version_after.size == version_before.size);
+  REQUIRE(a->peek_spill_seq() == taken);
+
+  context::reset_registry_for_tests();
+}
+
 TEST_CASE("context: 两个上下文并发写同一文件，暂存文件互不删除", "[context]") {
   context::reset_registry_for_tests();
   auto a = context_api::ensure_context("stage-a", nullptr);

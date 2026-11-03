@@ -25,6 +25,7 @@ namespace {
 // （导出函数走的那条）共用同一个槽，所以测试碰到的存储就是产品用的那一份。
 enum SlotId {
   kSlotSetWorkspace = 0,
+  kSlotGetWorkspace,
   kSlotReadFile,
   kSlotListDir,
   kSlotWriteFile,
@@ -219,6 +220,17 @@ const char* set_workspace(context::Context& ctx, const char* path) {
   LOG_TRACE("set_workspace: path=" + std::string(path ? path : "null"));
   std::string err = tools::set_workspace(path ? path : "");
   return slot.set(err);
+}
+
+const char* get_workspace(context::Context& ctx) {
+  result_buffer::Slot& slot = op_slot(kSlotGetWorkspace);
+  Lease lease(ctx);
+  // 只读：workspace() 在 state_mutex 内按值返回，不进入写闸门、不碰 spill 序号、
+  // 不碰文件版本表，也不触发模型网关或浏览器会话。
+  const std::string workspace = ctx.workspace();
+  LOG_TRACE("get_workspace: workspace=" + workspace);
+  return slot.set(
+      json_dump(nlohmann::json{{"ok", true}, {"workspace", workspace}}));
 }
 
 const char* read_file(context::Context& ctx, const char* path) {
@@ -489,6 +501,12 @@ const char* set_workspace(const char* handle, const char* path) {
         .set("unknown_context: " + std::string(handle ? handle : ""));
   }
   return set_workspace(*ctx, path);
+}
+
+const char* get_workspace(const char* handle) {
+  auto ctx = resolve_handle(handle);
+  if (!ctx) return op_slot(kSlotGetWorkspace).set(unknown_context_json(handle));
+  return get_workspace(*ctx);
 }
 
 const char* read_file(const char* handle, const char* path) {

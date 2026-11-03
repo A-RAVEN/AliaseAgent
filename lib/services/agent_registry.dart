@@ -30,12 +30,17 @@ class AgentRegistry {
     if (agent != null) await agent.dispose();
   }
 
+  /// 销毁全部实例（应用关闭走这里）。
+  ///
+  /// 必须**先销毁、后清空**：父 Agent 的 `dispose` 要通过本注册表找到并取消它的
+  /// 活动子 Agent；先清空注册表会让子运行既取消不到也清理不到（一次性子运行
+  /// add-spawn-subagent-tool 5.2 实测）。
   Future<void> disposeAll() async {
     final agents = List<Agent>.from(_agents.values);
-    _agents.clear();
     for (final agent in agents) {
       await agent.dispose();
     }
+    _agents.clear();
   }
 
   void clear() => _agents.clear();

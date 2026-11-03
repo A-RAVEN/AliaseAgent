@@ -89,6 +89,10 @@ SIDECAR_API const char* set_workspace(const char* handle, const char* path) {
   return context_api::set_workspace(handle, path);
 }
 
+SIDECAR_API const char* get_workspace(const char* handle) {
+  return context_api::get_workspace(handle);
+}
+
 SIDECAR_API const char* read_file(const char* handle, const char* path) {
   return context_api::read_file(handle, path);
 }

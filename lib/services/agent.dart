@@ -25,6 +25,7 @@ import 'message_repository.dart';
 import 'search_text_assembly.dart';
 import 'session_repository.dart';
 import 'sidecar_bridge.dart';
+import 'subagent_runner.dart';
 import 'summary_node_repository.dart';
 import 'tool_catalog.dart';
 import 'tool_result_text.dart';
@@ -88,6 +89,111 @@ class AgentMetering {
       };
 }
 
+/// 一次 [Agent.send] 的结果类别。现有界面可以忽略返回值；子 Agent 运行器必须
+/// 据此区分成功、失败、取消与"实例正忙"，不得把失败当成空成功。
+enum AgentRunStatus {
+  /// 模型循环自然结束。[AgentRunResult.finalText] 是**没有工具调用的最终模型轮**
+  /// 的文本，可能是空串（完成但没有最终文本）。
+  completed,
+
+  /// 模型返回错误、超过工具轮上限或发生未预期异常。
+  failed,
+
+  /// 本实例的整轮被取消（父取消、切换会话、销毁等）。
+  cancelled,
+
+  /// 实例正忙：本次调用没有开始，也没有产生任何消息。
+  busy,
+}
+
+/// 本实例计量在某一刻的不可变快照。结果里带一份，调用方读到的是发送结束那一刻
+/// 的值，不会被之后的请求改写。
+class AgentMeteringSnapshot {
+  const AgentMeteringSnapshot({
+    required this.inputTokens,
+    required this.outputTokens,
+    required this.requests,
+    required this.toolCalls,
+  });
+
+  factory AgentMeteringSnapshot.of(AgentMetering metering) =>
+      AgentMeteringSnapshot(
+        inputTokens: metering.inputTokens,
+        outputTokens: metering.outputTokens,
+        requests: metering.requests,
+        toolCalls: metering.toolCalls,
+      );
+
+  final int inputTokens;
+  final int outputTokens;
+  final int requests;
+  final int toolCalls;
+
+  int get totalTokens => inputTokens + outputTokens;
+
+  Map<String, dynamic> toJson() => {
+        'input_tokens': inputTokens,
+        'output_tokens': outputTokens,
+        'total_tokens': totalTokens,
+        'requests': requests,
+        'tool_calls': toolCalls,
+      };
+}
+
+/// [Agent.send] 的不可变结构化结果：四类状态 + 最终文本 + 错误 + 计量快照。
+class AgentRunResult {
+  const AgentRunResult._({
+    required this.status,
+    required this.metering,
+    this.finalText,
+    this.error,
+  });
+
+  /// 整轮自然结束；[finalText] 只来自没有工具调用的最终模型轮。
+  const AgentRunResult.completed({
+    required String finalText,
+    required AgentMeteringSnapshot metering,
+  }) : this._(
+          status: AgentRunStatus.completed,
+          metering: metering,
+          finalText: finalText,
+        );
+
+  /// 失败并带可归因错误文本。
+  const AgentRunResult.failed({
+    required String error,
+    required AgentMeteringSnapshot metering,
+  }) : this._(
+          status: AgentRunStatus.failed,
+          metering: metering,
+          error: error,
+        );
+
+  /// 整轮被取消（不携带成功结论）。
+  const AgentRunResult.cancelled({
+    required AgentMeteringSnapshot metering,
+  }) : this._(status: AgentRunStatus.cancelled, metering: metering);
+
+  /// 实例正忙：这次调用没有开始。
+  const AgentRunResult.busy({
+    required AgentMeteringSnapshot metering,
+  }) : this._(status: AgentRunStatus.busy, metering: metering);
+
+  final AgentRunStatus status;
+  final AgentMeteringSnapshot metering;
+  final String? finalText;
+  final String? error;
+
+  bool get isCompleted => status == AgentRunStatus.completed;
+  bool get isFailed => status == AgentRunStatus.failed;
+  bool get isCancelled => status == AgentRunStatus.cancelled;
+  bool get isBusy => status == AgentRunStatus.busy;
+
+  @override
+  String toString() => 'AgentRunResult(${status.name}, '
+      'finalText=${finalText == null ? 'null' : '"$finalText"'}, '
+      'error=$error, metering=${metering.toJson()})';
+}
 /// 异常：实例已销毁还被要求发送。
 class AgentDisposedException implements Exception {
   final String sessionId;
@@ -152,6 +258,10 @@ class Agent {
 
   final List<Message> _history = [];
 
+  /// 一次性子运行服务（add-spawn-subagent-tool）。为 null 时 `spawn_subagent`
+  /// 调用显式失败，不假装执行。
+  final SubagentRunner? subagentRunner;
+
   /// 累计计量（输入 / 输出 token、请求数、工具调用数）。
   final AgentMetering metering = AgentMetering();
 
@@ -195,6 +305,7 @@ class Agent {
     required this.guard,
     required this.backgroundFoldEnabled,
     required this.summaryStoreOpen,
+    this.subagentRunner,
     this.callbacks = const AgentCallbacks(),
   }) : _provider = provider;
 
@@ -231,11 +342,14 @@ class Agent {
   // ---------------------------------------------------------------------------
 
   /// 确保该会话的上下文存在；只有 `created == true` 时才设置缺省工作区。
-  Future<bool> ensureContext() async {
+  ///
+  /// [defaultWorkspace] 缺省是应用主目录；一次性子运行创建时传入父上下文实际
+  /// 保存的工作区，避免把"父子工作区相同"建立在主目录这个默认值上。
+  Future<bool> ensureContext({String? defaultWorkspace}) async {
     if (_disposed) throw AgentDisposedException(sessionId);
     if (_retiring) throw AgentRetiredException(sessionId, agentTypeName);
     final created = await sidecar.ensureContext(sessionId,
-        defaultWorkspace: ConfigService.homeDir);
+        defaultWorkspace: defaultWorkspace ?? ConfigService.homeDir);
     if (created) _workspaceInitialized = true;
     return created;
   }
@@ -269,7 +383,10 @@ class Agent {
   }
 
   /// 停止新调用并取消在途请求；**不**释放上下文（[dispose] 才做）。
+  ///
+  /// 先取消本实例正在运行的活动子 Agent，再取消自己的请求：父不留下仍在跑的子树。
   void cancel() {
+    subagentRunner?.cancelChildrenOf(sessionId);
     _cancelledEpoch = _requestEpoch;
     _foldGen++;
     _foldIdleTimer?.cancel();
@@ -283,6 +400,8 @@ class Agent {
   Future<void> dispose() async {
     if (_disposed) return;
     _disposed = true;
+    // 父销毁先取消活动子 Agent，再等子整轮与清理随父整轮一起结清。
+    subagentRunner?.cancelChildrenOf(sessionId);
     _foldGen++;
     _foldIdleTimer?.cancel();
     _foldIdleTimer = null;
@@ -328,10 +447,17 @@ class Agent {
   // ---------------------------------------------------------------------------
 
   /// 发送一条用户消息并跑完整轮（模型循环 → 工具 → 写库 → 可选的空闲后台压缩）。
-  Future<void> send(String text, {List<String> attachments = const []}) async {
+  ///
+  /// 返回不可变 [AgentRunResult]：界面可以忽略它（消息、流式事件与错误展示照旧），
+  /// 子 Agent 运行器据此区分成功、失败、取消与实例正忙。
+  Future<AgentRunResult> send(String text,
+      {List<String> attachments = const []}) async {
     if (_disposed) throw AgentDisposedException(sessionId);
     if (_retiring) throw AgentRetiredException(sessionId, agentTypeName);
-    if (_streaming) return;
+    if (_streaming) {
+      // 实例正忙：这次调用没有开始，也没有产生任何消息。
+      return AgentRunResult.busy(metering: _meteringSnapshot());
+    }
     // 用户这一轮优先：抢占任何已排期或正在跑的后台压缩（原 `_sendMessage` 的
     // preempt 路径）。bump 代次让折叠里的 isAborted 立刻成立，取消只打本实例
     // 自己的句柄，排期中的空闲定时器也清掉。
@@ -344,10 +470,10 @@ class Agent {
     if (!_restored) await restore();
     final round = _sendMessageRound(text: text, attachments: attachments);
     _registerRound(round);
-    await round;
+    return await round;
   }
 
-  Future<void> _sendMessageRound({
+  Future<AgentRunResult> _sendMessageRound({
     required String text,
     required List<String> attachments,
   }) async {
@@ -371,15 +497,30 @@ class Agent {
 
     final snapshotMessages = List<Message>.from(_history);
     try {
-      await _callModel(messages: snapshotMessages, epoch: epoch);
+      return await _callModel(messages: snapshotMessages, epoch: epoch);
     } catch (e, st) {
-      // 未预期异常（例如写库失败）不许把流式标记永远留在 true。
+      // 未预期异常（例如写库失败）不许把流式标记永远留在 true，也不许当成空成功；
+      // 这里不额外写一条错误消息（界面路径原本也不写，避免同一错误重复写库）。
       debugPrint('[AliasAgent] _callModel error: $e\n$st');
       if (_isActive(epoch)) _endStreaming();
+      return AgentRunResult.failed(
+        error: '未预期异常：$e',
+        metering: _meteringSnapshot(),
+      );
     }
   }
 
   bool _isActive(int epoch) => !_disposed && _cancelledEpoch < epoch;
+
+  /// 本实例当前的计量快照（结果里用不可变副本，不带可变引用出去）。
+  AgentMeteringSnapshot _meteringSnapshot() =>
+      AgentMeteringSnapshot.of(metering);
+
+  AgentRunResult _cancelledRun() =>
+      AgentRunResult.cancelled(metering: _meteringSnapshot());
+
+  AgentRunResult _failedRun(String error) =>
+      AgentRunResult.failed(error: error, metering: _meteringSnapshot());
 
   void _setStreaming(bool value) {
     if (_streaming == value) return;
@@ -391,7 +532,7 @@ class Agent {
   // 模型调用与工具循环（原 `lib/main.dart` 的 `_callModel`）
   // ---------------------------------------------------------------------------
 
-  Future<void> _callModel({
+  Future<AgentRunResult> _callModel({
     required List<Message> messages,
     required int epoch,
   }) async {
@@ -471,7 +612,7 @@ class Agent {
 
     var turn = 0;
     while (true) {
-      if (!_isActive(epoch)) return;
+      if (!_isActive(epoch)) return _cancelledRun();
       final messagesJson = jsonEncode(apiMessages);
 
       var turnText = '';
@@ -591,14 +732,15 @@ class Agent {
       if (doneCode != 0) {
         final switchCancelled = !_isActive(epoch) || doneError == 'cancelled';
         if (!switchCancelled) _endStreaming();
-        if (switchCancelled) return;
-        await _storeError(doneError ?? 'Unknown error');
-        return;
+        if (switchCancelled) return _cancelledRun();
+        final error = doneError ?? 'Unknown error';
+        await _storeError(error);
+        return _failedRun(error);
       }
 
       if (!_isActive(epoch)) {
         _endStreaming();
-        return;
+        return _cancelledRun();
       }
 
       // 这一次模型请求结束了（工具轮后面还会再发一次）：让界面把这一轮的流式
@@ -613,7 +755,8 @@ class Agent {
       metering.outputTokens += lastOutputTokens;
       callbacks.onMeteringChanged?.call();
 
-      // 没有工具调用 ⇒ 最终回复，落库并结束这一轮。
+      // 没有工具调用 ⇒ 最终回复，落库并结束这一轮。只有这一条分支能产生成功
+      // 结果的文本；中间工具轮的文本绝不作为最终结论。
       if (turnToolCalls.isEmpty) {
         if (turnText.isNotEmpty) {
           final toolCallsJson = allTurnToolCalls.isNotEmpty
@@ -632,15 +775,17 @@ class Agent {
           _history.add(assistantMsg);
           callbacks.onAssistantMessage?.call(assistantMsg, true);
         }
-        if (_isActive(epoch)) {
-          _endStreaming();
-          _maybeScheduleBackgroundFold();
-        }
-        return;
+        if (!_isActive(epoch)) return _cancelledRun();
+        _endStreaming();
+        _maybeScheduleBackgroundFold();
+        return AgentRunResult.completed(
+          finalText: turnText,
+          metering: _meteringSnapshot(),
+        );
       }
 
       // 有工具调用 ⇒ 先把中间 assistant 消息落库（工具调用记录在工具执行后补写）。
-      if (!_isActive(epoch)) return;
+      if (!_isActive(epoch)) return _cancelledRun();
       allTurnToolCalls.addAll(turnToolCalls);
       final turnJson = jsonEncode(turnToolCalls);
       final intermediateMsg = await messageRepo.insert(
@@ -698,6 +843,13 @@ class Agent {
           hunks: parseEditHunks(result['hunks']),
           hunksOmitted: result['hunks_omitted'] as String?,
           imagePath: _toolImagePath(result),
+          // 子运行元数据（只有 spawn_subagent 会带；不含密钥，也不进入父模型内容）。
+          childSessionId: result['child_session_id'] as String?,
+          childAgentType: result['agent_type'] as String?,
+          childModel: result['model'] as String?,
+          childMetering: result['metering'] is Map
+              ? Map<String, dynamic>.from(result['metering'] as Map)
+              : null,
         );
         if (_isActive(epoch)) callbacks.onToolResult?.call(activity);
 
@@ -746,7 +898,8 @@ class Agent {
           _maybeScheduleBackgroundFold();
         }
         await sessionRepo.touch(sessionId);
-        return;
+        // 上限已到却没有最终结论：这是失败，不是"完成但文本为空"。
+        return _failedRun('超过最大工具轮次（50），本轮没有最终结论');
       }
       turn++;
     }
@@ -1695,12 +1848,17 @@ class Agent {
             final refetchArg = refetchPath.isNotEmpty
                 ? refetchPath
                 : (refetchUrl.isNotEmpty ? refetchUrl : '');
+            // spawn_subagent 的最终结论**完整**重放：不套通用省略规则。
+            // 其它工具继续沿用既有截断与取回规则（见 tool_result_text.dart）。
+            final body = toolName == 'spawn_subagent'
+                ? rawBody
+                : elideOversizedToolResult(
+                    name: toolName, path: refetchArg, body: rawBody);
             toolResults.add({
               'type': 'tool_result',
               'tool_use_id': tc['id'] ?? '',
               'content': _toolResultContent(
-                text: elideOversizedToolResult(
-                    name: toolName, path: refetchArg, body: rawBody),
+                text: body,
                 imagePath: _toolImagePath(tc),
               ),
             });
@@ -1832,6 +1990,17 @@ class Agent {
           });
         } else {
           resultJson = sidecar.readImage(sessionId, jsonEncode({'path': path}));
+        }
+      case 'spawn_subagent':
+        final runner = subagentRunner;
+        if (runner == null) {
+          resultJson = jsonEncode({
+            'ok': false,
+            'error': 'spawn_subagent 未接入子运行服务：拒绝假装执行',
+          });
+        } else {
+          final subResult = await runner.run(parent: this, input: input);
+          resultJson = jsonEncode(subResult);
         }
       default:
         resultJson = '{"ok":false,"error":"Unknown tool: $name"}';

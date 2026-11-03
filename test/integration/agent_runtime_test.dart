@@ -6,6 +6,7 @@ import 'package:alias_agent/models/app_config.dart';
 import 'package:alias_agent/models/message.dart';
 import 'package:alias_agent/models/provider_config.dart';
 import 'package:alias_agent/models/session.dart';
+import 'package:alias_agent/services/agent.dart';
 import 'package:alias_agent/services/agent_factory.dart';
 import 'package:alias_agent/services/agent_registry.dart';
 import 'package:alias_agent/services/compaction/summary_provider.dart';
@@ -201,6 +202,70 @@ void main() {
     expect(a2.messageHistory.any((m) => m.content == '乙回复'), isTrue);
     expect(a1.messageHistory.any((m) => m.content == '甲回复'), isFalse,
         reason: '被取消的甲这一轮不许落库');
+  });
+
+  // ---------------------------------------------------------------------------
+  // 3.2 普通会话的返回值兼容性：send 改为返回结构化结果后，消息行与回调事件
+  // 仍与旧行为一致（各只出现一次，没有重复错误消息）。
+  // ---------------------------------------------------------------------------
+  test('普通发送自然结束：消息行与回调事件各只出现一次，结果是完成', () async {
+    final userEvents = <Message>[];
+    final assistantEvents = <({Message message, bool isFinal})>[];
+    final streamingEvents = <bool>[];
+    final toolEvents = <String>[];
+    final callbacks = AgentCallbacks(
+      onUserMessage: userEvents.add,
+      onAssistantMessage: (message, isFinal) =>
+          assistantEvents.add((message: message, isFinal: isFinal)),
+      onStreamingChanged: streamingEvents.add,
+      onToolResult: (activity) => toolEvents.add(activity.toolName),
+    );
+    final a1 = await factory().create(session('s1'), callbacks: callbacks);
+    // setUp 为压缩用例种了 80 条长历史：这里只统计本用例新写的行。
+    final baseline = msgRepo.messages.length;
+
+    sidecar.queueChunk('普通回复-独特');
+    sidecar.queueDone();
+    final first = await a1.send('普通问题-独特');
+    final s1Writes = msgRepo.messages.skip(baseline).toList();
+    // ignore: avoid_print
+    print('  [OBS] 第一轮 status=${first.status.name} finalText=${first.finalText} '
+        '消息=${s1Writes.map((m) => '${m.role}:${m.content}').toList()} '
+        '用户事件=${userEvents.length} 助手事件=${assistantEvents.length} '
+        '流式事件=$streamingEvents 工具事件=$toolEvents');
+
+    expect(first.status, AgentRunStatus.completed);
+    expect(first.finalText, '普通回复-独特');
+    expect(s1Writes.length, 2, reason: '普通一轮只写用户 + 助手两条消息');
+    expect(s1Writes.where((m) => m.role == 'user').length, 1);
+    expect(s1Writes.where((m) => m.role == 'assistant').length, 1);
+    expect(s1Writes.any((m) => m.content.startsWith('Error:')), isFalse,
+        reason: '正常结束不得出现错误消息');
+    expect(userEvents.length, 1);
+    expect(assistantEvents.length, 1);
+    expect(assistantEvents.single.isFinal, isTrue);
+    expect(streamingEvents, [true, false], reason: '流式状态只开始一次、结束一次');
+    expect(toolEvents, isEmpty);
+
+    // 第二轮：同样只新增两条消息与一对事件（不累积重复项）。
+    sidecar.queueChunk('普通回复二-独特');
+    sidecar.queueDone();
+    final second = await a1.send('普通问题二-独特');
+    final s1After = msgRepo.messages.skip(baseline).toList();
+    // ignore: avoid_print
+    print('  [OBS] 第二轮 status=${second.status.name} '
+        '消息=${s1After.map((m) => '${m.role}:${m.content}').toList()} '
+        '用户事件=${userEvents.length} 助手事件=${assistantEvents.length} '
+        '流式事件=$streamingEvents');
+    expect(second.status, AgentRunStatus.completed);
+    expect(second.finalText, '普通回复二-独特');
+    expect(s1After.length, 4, reason: '两轮共四条消息，没有重复写入');
+    expect(s1After.where((m) => m.content.startsWith('Error:')), isEmpty);
+    expect(userEvents.length, 2);
+    expect(assistantEvents.length, 2);
+    expect(assistantEvents.last.isFinal, isTrue);
+    expect(streamingEvents, [true, false, true, false]);
+    expect(a1.metering.requests, 2, reason: '两次发送各一次模型请求');
   });
 }
 

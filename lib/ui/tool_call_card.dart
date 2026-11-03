@@ -103,6 +103,35 @@ class _ToolCallCardState extends State<ToolCallCard> {
                 ],
               ),
             ),
+            // 一次性子 Agent（add-spawn-subagent-tool）：任务与可选模板必须直接
+            // 可读 —— 等待期间还没有结论，用户要能看到它在做什么。
+            if (a.toolName == 'spawn_subagent')
+              Padding(
+                padding: const EdgeInsets.fromLTRB(10, 0, 10, 8),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '任务：${(a.input['task'] as String?) ?? ''}',
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      '子 Agent 模板：${_subagentTemplateLabel(a)}',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontFamily: 'monospace',
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             // Result area (collapsible, only when done/error)
             if (hasResultArea) ...[
               const Divider(height: 1),
@@ -145,7 +174,13 @@ class _ToolCallCardState extends State<ToolCallCard> {
 
   /// edit_file / write_file 只显示路径；`read_image` 同理（元数据放正文里，
   /// 不塞进标题）；其余工具沿用整行参数预览。
+  ///
+  /// `spawn_subagent` 的标题只放模板：任务正文在卡片体里完整成列，塞进标题只会
+  /// 被单行省略号截掉。
   String _cardTitle(ToolCallActivity a, String inputPreview) {
+    if (a.toolName == 'spawn_subagent') {
+      return 'spawn_subagent(${_subagentTemplateLabel(a)})';
+    }
     if (a.toolName == 'edit_file' ||
         a.toolName == 'write_file' ||
         a.toolName == 'read_image') {
@@ -156,6 +191,16 @@ class _ToolCallCardState extends State<ToolCallCard> {
           : '${a.toolName}($path) $stat';
     }
     return '${a.toolName}($inputPreview)';
+  }
+
+  /// 子 Agent 模板标签：运行结束后优先用实际模板（元数据），否则用调用参数，
+  /// 都没给就是"继承父模板"。
+  String _subagentTemplateLabel(ToolCallActivity a) {
+    final actual = a.childAgentType;
+    if (actual != null && actual.isNotEmpty) return actual;
+    final requested = a.input['agent_type'];
+    if (requested is String && requested.isNotEmpty) return requested;
+    return '继承父模板';
   }
 
   /// `read_image` 卡片正文里那一行元数据：`image/png · 800×600 · 12345 字节`。

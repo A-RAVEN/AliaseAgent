@@ -86,10 +86,10 @@ void main() {
     expect(ToolCatalog.instance.names, isEmpty);
   });
 
-  test('基础工具名覆盖当前十项基础能力', () {
+  test('基础工具名覆盖当前十一项基础能力（含 spawn_subagent）', () {
     // ignore: avoid_print
     print('  [OBS] 基础工具=${ToolCatalog.kBaseToolNames}');
-    expect(ToolCatalog.kBaseToolNames.length, 10);
+    expect(ToolCatalog.kBaseToolNames.length, 11);
     expect(
         ToolCatalog.kBaseToolNames,
         containsAll([
@@ -103,6 +103,7 @@ void main() {
           'read_image',
           'run_command',
           'read_spill',
+          'spawn_subagent',
         ]));
   });
 

@@ -34,7 +34,7 @@ Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单�
 | `Max Context Tokens`（提示 `e.g. 200000`，下面一行小字 `Compaction threshold (one-time setting)`） | 模型能装下多少 token；它决定"什么时候开始压缩"（见 [上下文压缩](context-compaction.md)） |
 | `Start` 按钮 | 保存并进入界面 |
 
-按 `Start` 之后，应用会写出这样一份配置（供应商固定叫 `anthropic`，模型写死为 `claude-sonnet-4-6`，工具给当前**十项基础工具**）：
+按 `Start` 之后，应用会写出这样一份配置（供应商固定叫 `anthropic`，模型写死为 `claude-sonnet-4-6`，工具给当前**十一项基础工具**）：
 
 ```json
 {
@@ -50,14 +50,16 @@ Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单�
       "provider": "anthropic",
       "model": "claude-sonnet-4-6",
       "system_prompt": "You are a helpful assistant.",
-      "tools": ["read_file", "write_file", "edit_file", "list_dir", "get_current_time", "glob_file", "grep_file", "read_image", "run_command", "read_spill"],
+      "tools": ["read_file", "write_file", "edit_file", "list_dir", "get_current_time", "glob_file", "grep_file", "read_image", "run_command", "read_spill", "spawn_subagent"],
       "max_context_tokens": 200000
     }
   }
 }
 ```
 
-> 如果你以前用旧版首启生成过 `["read_file", "list_dir"]` 这两项默认清单，启动时会看到一行**迁移提示**：它会被升级成上面这十项基础工具。你自己收窄或扩展过的清单不会被改动。
+> 如果你以前用旧版首启生成过 `["read_file", "list_dir"]` 这两项默认清单，启动时会看到一行**迁移提示**：它会被升级成上面这十一项基础工具。你自己收窄或扩展过的清单不会被改动。
+>
+> 上一版的十项完整默认清单（也就是少了 `spawn_subagent` 的那份）**不会**自动升级：它和"你主动删掉了 `spawn_subagent`"在文件里完全一样，应用无法区分。要让某个模板用上子 Agent，请在 `Agents` 菜单里显式勾选（见 [子 Agent](agent-subagents.md)）。
 
 ### 手写一份完整配置
 
@@ -162,3 +164,4 @@ Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单�
 - **Agent 模板用 `Agents` 菜单改，不用重启**：保存只影响**之后创建或恢复**的实例；已经运行的会话继续使用创建时的配置。要让当前会话立刻用上新模板，用工具栏的模板下拉显式切换（它会替换运行实例并更新数据库 `sessions.agent_type`）；只在会话列表里重新选中它不会重建实例。
 - **模板没有删除入口、也不能改名**：模板名是会话的持久化引用键，创建后只读；本版只支持添加与修改。
 - **本版不编辑 provider 密钥**：没有图形化的密钥输入框，密钥仍然只能改配置文件里的 `api_key`（第一次启动对话框除外）。
+- **`spawn_subagent` 不会自动加到既有模板**：新首启配置包含它；旧十项清单与"用户主动删除"形状相同，迁移不会替你加回，需要时在 `Agents` 菜单里显式勾选（见 [子 Agent](agent-subagents.md)）。

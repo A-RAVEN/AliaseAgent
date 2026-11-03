@@ -27,13 +27,20 @@ class SessionAgentTypeUpdateException implements Exception {
 class SessionRepository {
   static const _uuid = Uuid();
 
-  Future<Session> create({String? title, String? agentType}) async {
+  /// 建一条会话记录。普通顶层会话不传 [parentSessionId]（存 NULL）；一次性子
+  /// Agent 的运行记录传入父会话 id。该字段只影响记录归属，不改写父会话。
+  Future<Session> create({
+    String? title,
+    String? agentType,
+    String? parentSessionId,
+  }) async {
     final db = await DatabaseService.database;
     final now = DateTime.now().millisecondsSinceEpoch;
     final session = Session(
       id: _uuid.v4(),
       title: title ?? 'New Chat',
       agentType: agentType ?? 'general',
+      parentSessionId: parentSessionId,
       createdAt: now,
       updatedAt: now,
     );
@@ -48,9 +55,24 @@ class SessionRepository {
     return Session.fromRow(rows.first);
   }
 
+  /// 普通会话列表：只返回顶层会话（`parent_session_id IS NULL`），按最近更新
+  /// 倒序。一次性子 Agent 的运行记录不在侧栏出现，启动恢复也因此不会重建它们；
+  /// 它们只能通过 [listChildren] 按父会话 id 读取。
   Future<List<Session>> list() async {
     final db = await DatabaseService.database;
-    final rows = await db.query('sessions', orderBy: 'updated_at DESC');
+    final rows = await db.query('sessions',
+        where: 'parent_session_id IS NULL', orderBy: 'updated_at DESC');
+    return rows.map(Session.fromRow).toList();
+  }
+
+  /// 按父会话 id 读取子运行记录（只读入口，按最近更新倒序）。第一版没有查看
+  /// 子记录详情的界面，这个入口供测试与后续诊断使用。
+  Future<List<Session>> listChildren(String parentSessionId) async {
+    final db = await DatabaseService.database;
+    final rows = await db.query('sessions',
+        where: 'parent_session_id = ?',
+        whereArgs: [parentSessionId],
+        orderBy: 'updated_at DESC');
     return rows.map(Session.fromRow).toList();
   }
 

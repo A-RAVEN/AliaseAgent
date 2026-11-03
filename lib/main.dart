@@ -29,6 +29,7 @@ import 'services/message_repository.dart';
 import 'services/provider_resolver.dart';
 import 'services/session_repository.dart';
 import 'services/sidecar_bridge.dart';
+import 'services/subagent_runner.dart';
 import 'services/summary_node_repository.dart';
 import 'services/tool_catalog.dart';
 import 'services/tool_result_text.dart' as tool_text;
@@ -267,6 +268,10 @@ class ChatScreenState extends State<ChatScreen> {
 
   /// 按上下文句柄管理运行实例（与模板注册表 `registry` 是两个对象）。
   late final AgentRegistry _agents;
+
+  /// 一次性子运行服务（add-spawn-subagent-tool）：工厂用延迟回调注入，避免
+  /// “工厂创建 Agent、Agent 又需要运行器、运行器再使用工厂”的构造循环。
+  late final SubagentRunner _subagentRunner;
 
   /// 模板保存协调器：校验 → 写回完整配置 → 更新模板注册表。
   late final AgentTemplateController _templateController;
@@ -516,6 +521,10 @@ class ChatScreenState extends State<ChatScreen> {
     // 工作区不再在这里设置（change add-context-handles）：它属于**上下文**，
     // 由 AgentFactory 创建实例时调用 `ensureContext(...)`；`created:false` 时
     // 不覆盖已有工作区。模型执行、摘要与写库都归 Agent，界面只订阅事件。
+    _subagentRunner = SubagentRunner(
+      factory: () => _agentFactory,
+      sidecar: _sidecar,
+    );
     _agentFactory = AgentFactory(
       templates: registry,
       providerResolver: () => resolver,
@@ -531,6 +540,7 @@ class ChatScreenState extends State<ChatScreen> {
       backgroundFoldEnabled: _backgroundFoldEnabled,
       summaryStoreOpen: () =>
           widget.summaryNodeRepo != null || DatabaseService.isOpen,
+      subagentRunner: _subagentRunner,
     );
     _templateController = widget.agentTemplateController ??
         AgentTemplateController(
@@ -1117,6 +1127,41 @@ class ChatScreenState extends State<ChatScreen> {
             },
           },
           'required': ['ref'],
+        },
+      },
+      // 一次性子 Agent（add-spawn-subagent-tool）：同步等待子 Agent 整轮结束，
+      // 只把最终结论作为工具结果送回父对话。子 Agent 看不到父对话，第一版也不能
+      // 再嵌套创建下一层；这些限制必须写在说明里，模型才知道任务要自带背景。
+      'spawn_subagent': const {
+        'name': 'spawn_subagent',
+        'description': 'Create a one-shot sub-agent with its own context, message '
+            'history and metering; give it one complete task and wait for its final '
+            'answer. The sub-agent CANNOT see this conversation, so put every '
+            'necessary background detail and file path into `task`. It inherits the '
+            'current workspace. Only its final answer comes back to you: its '
+            'intermediate messages, thinking and tool output stay in its own '
+            'history and are never added to this conversation. Ask it for a '
+            'self-contained conclusion; do not rely on its read_spill references '
+            '(its context is destroyed when it finishes) — anything that must '
+            'persist should be written into the workspace. Omit `agent_type` to use '
+            "this agent's own template. The call runs synchronously: it waits until "
+            'the sub-agent finishes, so it does not run in parallel with other tool '
+            'calls. A sub-agent cannot create another sub-agent.',
+        'input_schema': {
+          'type': 'object',
+          'properties': {
+            'task': {
+              'type': 'string',
+              'description': 'The complete, self-contained task for the sub-agent. '
+                  'Include the background it needs; it cannot see this conversation.',
+            },
+            'agent_type': {
+              'type': 'string',
+              'description': 'Optional Agent template name for the sub-agent. '
+                  "Defaults to this agent's own template.",
+            },
+          },
+          'required': ['task'],
         },
       },
     };

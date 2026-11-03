@@ -350,6 +350,69 @@ void main() {
     expect(state.currentAgent, isNull, reason: '新实例没创建成功，不能假装它已经在跑');
   });
 
+  test('模板切换等旧实例在途整轮自然结束：不取消请求，发送结果仍是完成', () async {
+    final sessions = [_session('s1')];
+    final sessionRepo = _SwitchSessionRepo(sessions);
+    final msgRepo = FakeMessageRepository();
+    final sidecar = FakeSidecar();
+    final agents = AgentRegistry();
+    final factory = _factory(
+      sidecar: sidecar,
+      sessionRepo: sessionRepo,
+      msgRepo: msgRepo,
+      agents: agents,
+    );
+    final old = await factory.create(sessions.first);
+    sidecar.gateNextSend();
+    sidecar.queueChunk('切换期间的自然回复-独特');
+    sidecar.queueDone();
+    final sendFuture = old.send('切换期间的问题-独特');
+    for (var i = 0; i < 100 && !old.isStreaming; i++) {
+      await Future<void>.delayed(Duration.zero);
+    }
+    expect(old.isStreaming, isTrue,
+        reason: '旧实例必须先真的在途，用例才测得到退役等待');
+
+    final cancelsBefore = sidecar.cancelCount;
+    final controller =
+        AgentSessionController(factory: factory, sessionRepo: sessionRepo);
+    final switchFuture = controller.switchTemplate(sessions.first, 'reviewer',
+        callbacks: const AgentCallbacks());
+    // 让退役路径跑到"等在途整轮"这一步。
+    for (var i = 0; i < 20; i++) {
+      await Future<void>.delayed(Duration.zero);
+    }
+    // ignore: avoid_print
+    print('  [OBS] 退役等待中：旧实例退役=${old.isRetiring} '
+        '取消增量=${sidecar.cancelCount - cancelsBefore} '
+        '仍在切换=${controller.isSwitching('s1')} 注册表=${agents.handles}');
+    expect(old.isRetiring, isTrue, reason: '切换必须已经进到退役步骤');
+    expect(sidecar.cancelCount, cancelsBefore,
+        reason: '退役不得取消在途整轮（那是切换会做的事之外的破坏）');
+    expect(agents.contains('s1'), isTrue,
+        reason: '整轮没结束前旧实例仍在注册表里');
+
+    sidecar.releaseGate();
+    final result = await sendFuture;
+    final fresh = await switchFuture;
+    // ignore: avoid_print
+    print('  [OBS] 自然结束：发送结果=${result.status.name} '
+        'finalText=${result.finalText} 新实例=${fresh.agentTypeName} '
+        '消息=${msgRepo.messages.map((m) => '${m.role}:${m.content}').toList()} '
+        'sendHandles=${sidecar.sendHandles}');
+
+    expect(result.status, AgentRunStatus.completed,
+        reason: '在途整轮必须自然结束为完成，不能因为切换被取消');
+    expect(result.finalText, '切换期间的自然回复-独特');
+    expect(fresh.agentTypeName, 'reviewer');
+    expect(identical(fresh, old), isFalse);
+    expect(old.isRetiring, isTrue);
+    expect(msgRepo.messages.where((m) => m.role == 'assistant').length, 1,
+        reason: '自然结束只写一条助手消息，不重复');
+    expect(sidecar.sendHandles.length, 1,
+        reason: '整个切换过程没有额外模型请求');
+  });
+
   test('真实文件：切换后旧 read_spill 引用仍可读，新溢出文件不覆盖旧引用', () async {
     final bridge = SidecarBridge.instance;
     const ctx = 'it-switch-spill';
@@ -590,12 +653,13 @@ class _TestFactory extends AgentFactory {
 
   @override
   Future<Agent> create(Session session,
-      {AgentCallbacks callbacks = const AgentCallbacks()}) {
+      {AgentCallbacks callbacks = const AgentCallbacks(),
+      ChildRunOptions? child}) {
     if (failNextCreate) {
       failNextCreate = false;
       throw StateError('创建注入失败');
     }
-    return super.create(session, callbacks: callbacks);
+    return super.create(session, callbacks: callbacks, child: child);
   }
 }
 

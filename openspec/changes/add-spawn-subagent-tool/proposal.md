@@ -11,7 +11,7 @@
 - 父 Agent 取消、销毁或所属顶层会话删除时，正在运行的子 Agent 必须同步取消并完成资源清理；子 Agent 的失败、取消和空最终回复均返回可区分错误，不伪装成功。
 - 第一版不允许子 Agent 继续创建下一层子 Agent，不提供并行调度、异步消息、长期驻留或独立子 Agent 界面。
 - `spawn_subagent` 加入首启基础工具目录；既有模板不自动添加该工具，包括与上一版默认清单完全相同的模板，避免把用户主动移除的工具重新加回。旧两项首启清单仍按既有迁移规则升级，用户可在模板编辑器中自行添加或移除该工具。
-- 增加单元、集成和界面测试，并同步用户文档与 README 功能索引。
+- 增加单元、集成、界面和真实模型 live 测试；live 用例验证真实父模型确实调用 `spawn_subagent`、真实子模型返回结论，并留下工具记录与截图。同步用户文档与 README 功能索引。
 
 ## Capabilities
 
@@ -32,5 +32,5 @@
 - 创建与配置：`lib/services/agent_factory.dart`、`lib/models/resolved_agent_config.dart`、`lib/services/tool_catalog.dart` 和 `lib/main.dart`。
 - 持久化：`lib/models/session.dart`、`lib/services/session_repository.dart`、`lib/services/database_service.dart` 增加非破坏性数据库迁移。
 - 工作区接口：`lib/services/sidecar_bridge.dart`、`sidecar/include/sidecar_api.h`、`sidecar/src/sidecar_api.cpp`、`sidecar/src/context_api.cpp` 及相关头文件。
-- 测试与文档：`test/unit/`、`test/integration/`、`test/widget/`、`sidecar/test/`、`Docs/user-guide/` 与 `README.md`。
+- 测试与文档：`test/unit/`、`test/integration/`、`test/widget/`、`integration_test/`、`sidecar/test/`、`Docs/user-guide/` 与 `README.md`。
 - 不引入新进程、命令行程序、外部依赖或模型服务新接口；provider 密钥继续只作为 Agent 私有执行依赖。

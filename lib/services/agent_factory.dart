@@ -15,6 +15,7 @@ import 'message_repository.dart';
 import 'provider_resolver.dart';
 import 'session_repository.dart';
 import 'sidecar_bridge.dart';
+import 'subagent_runner.dart';
 import 'summary_node_repository.dart';
 import 'tool_catalog.dart';
 
@@ -79,6 +80,28 @@ class AgentCandidate {
   });
 }
 
+/// 一次性子运行的创建参数（add-spawn-subagent-tool）。
+///
+/// 普通 `create` 不带它；带上时按子 Agent 的规则创建：上下文用父上下文实际工作区
+/// 初始化、系统提示词附加子角色说明、生效工具清单排除指定名字（第一版排除
+/// `spawn_subagent`，使子 Agent 不能继续嵌套）。父实例与模板都不被改写。
+class ChildRunOptions {
+  const ChildRunOptions({
+    required this.workspace,
+    required this.systemPromptSuffix,
+    this.excludedTools = const {'spawn_subagent'},
+  });
+
+  /// 父上下文在调用时实际保存的工作区（可以是不带路径的空串）。
+  final String workspace;
+
+  /// 附加到子配置系统提示词后面的角色说明。
+  final String systemPromptSuffix;
+
+  /// 只从子配置的工具清单里排除的名字。
+  final Set<String> excludedTools;
+}
+
 /// 统一创建 / 恢复 Agent 实例的工厂。
 ///
 /// 职责：按 `Session.agentType` 找到模板 → 解析不可变生效配置 → 校验工具名与窗口 →
@@ -115,6 +138,9 @@ class AgentFactory {
   /// 所以在创建实例时才求值（这里传一个函数，而不是 initState 那一刻的布尔值）。
   final bool Function() summaryStoreOpen;
 
+  /// 一次性子运行服务；为 null 时 `spawn_subagent` 工具调用显式失败（不假装执行）。
+  final SubagentRunner? subagentRunner;
+
   AgentFactory({
     required this.templates,
     required this.providerResolver,
@@ -129,6 +155,7 @@ class AgentFactory {
     this.guard,
     this.backgroundFoldEnabled = true,
     this.summaryStoreOpen = _neverOpen,
+    this.subagentRunner,
   });
 
   static bool _neverOpen() => false;
@@ -171,11 +198,26 @@ class AgentFactory {
 
   /// 按会话的 `agentType` 创建实例；模板缺失 / provider 缺失 / 窗口非法 / 工具未知
   /// 都抛出**可区分**错误，绝不静默改用 `general` 或按 0 继续发送。
+  ///
+  /// 传了 [child] 时按一次性子运行的规则创建：上下文用父上下文的工作区初始化，
+  /// 系统提示词附加子角色说明，工具清单在**实例配置副本**里排除指定工具。父模板、
+  /// 父实例与共享目录都不被改写。
   Future<Agent> create(Session session,
-      {AgentCallbacks callbacks = const AgentCallbacks()}) async {
+      {AgentCallbacks callbacks = const AgentCallbacks(),
+      ChildRunOptions? child}) async {
     final candidate = resolveCandidate(session.agentType);
     final template = candidate.template;
-    final resolved = candidate.resolved;
+    var resolved = candidate.resolved;
+    if (child != null) {
+      resolved = resolved.copyWith(
+        systemPrompt: '${resolved.systemPrompt}\n\n${child.systemPromptSuffix}'
+            .trim(),
+        tools: List<String>.unmodifiable([
+          for (final name in resolved.tools)
+            if (!child.excludedTools.contains(name)) name,
+        ]),
+      );
+    }
 
     final guardForAgent = guard ?? _guardFrom(template);
     final injectedSummary = summaryProvider != null;
@@ -202,8 +244,9 @@ class AgentFactory {
       backgroundFoldEnabled: backgroundFoldEnabled,
       summaryStoreOpen: summaryStoreOpen(),
       callbacks: callbacks,
+      subagentRunner: subagentRunner,
     );
-    await agent.ensureContext();
+    await agent.ensureContext(defaultWorkspace: child?.workspace);
     await agent.restore();
     registry.register(agent);
     return agent;

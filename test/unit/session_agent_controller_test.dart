@@ -492,11 +492,12 @@ class _FailingCreateFactory extends AgentFactory {
 
   @override
   Future<Agent> create(Session session,
-      {AgentCallbacks callbacks = const AgentCallbacks()}) {
+      {AgentCallbacks callbacks = const AgentCallbacks(),
+      ChildRunOptions? child}) {
     if (failNextCreate) {
       failNextCreate = false;
       throw StateError('创建注入失败');
     }
-    return super.create(session, callbacks: callbacks);
+    return super.create(session, callbacks: callbacks, child: child);
   }
 }

@@ -100,6 +100,15 @@ class ToolCallActivity {
   /// 信封解析，解析不到再读一次文件头 —— 存一份元数据只会在源文件被换掉之后撒谎。
   final String? imagePath;
 
+  /// 一次性子运行的诊断元数据（`spawn_subagent` 才有），**不含任何密钥**。
+  ///
+  /// 父模型可见的 `tool_result.content` 只有子的最终结论；这几项只写进父工具调用的
+  /// 活动与 `toolCallsJson`，供诊断和验收读取。
+  final String? childSessionId;
+  final String? childAgentType;
+  final String? childModel;
+  final Map<String, dynamic>? childMetering;
+
   const ToolCallActivity({
     required this.id,
     required this.toolName,
@@ -111,6 +120,10 @@ class ToolCallActivity {
     this.hunks,
     this.hunksOmitted,
     this.imagePath,
+    this.childSessionId,
+    this.childAgentType,
+    this.childModel,
+    this.childMetering,
   });
 
   ToolCallActivity copyWith({
@@ -124,6 +137,10 @@ class ToolCallActivity {
     List<EditHunk>? hunks,
     String? hunksOmitted,
     String? imagePath,
+    String? childSessionId,
+    String? childAgentType,
+    String? childModel,
+    Map<String, dynamic>? childMetering,
   }) {
     return ToolCallActivity(
       id: id ?? this.id,
@@ -136,6 +153,10 @@ class ToolCallActivity {
       hunks: hunks ?? this.hunks,
       hunksOmitted: hunksOmitted ?? this.hunksOmitted,
       imagePath: imagePath ?? this.imagePath,
+      childSessionId: childSessionId ?? this.childSessionId,
+      childAgentType: childAgentType ?? this.childAgentType,
+      childModel: childModel ?? this.childModel,
+      childMetering: childMetering ?? this.childMetering,
     );
   }
 
@@ -159,6 +180,10 @@ class ToolCallActivity {
           'hunks': hunks!.map((h) => h.toJson()).toList(),
         if (hunksOmitted != null) 'hunksOmitted': hunksOmitted,
         if (imagePath != null) 'image': imageJson,
+        if (childSessionId != null) 'child_session_id': childSessionId,
+        if (childAgentType != null) 'child_agent_type': childAgentType,
+        if (childModel != null) 'child_model': childModel,
+        if (childMetering != null) 'child_metering': childMetering,
       };
 
   factory ToolCallActivity.fromJson(Map<String, dynamic> json) {
@@ -181,6 +206,12 @@ class ToolCallActivity {
       // 只读 `path`：老数据里就算混进了别的键，也不会被带进内存模型。
       imagePath: (json['image'] is Map)
           ? ((json['image'] as Map)['path'] as String?)
+          : null,
+      childSessionId: json['child_session_id'] as String?,
+      childAgentType: json['child_agent_type'] as String?,
+      childModel: json['child_model'] as String?,
+      childMetering: (json['child_metering'] is Map)
+          ? Map<String, dynamic>.from(json['child_metering'] as Map)
           : null,
     );
   }

@@ -6,7 +6,7 @@ import 'package:path/path.dart' as p;
 import 'config_service.dart';
 
 class DatabaseService {
-  static const _schemaVersion = 7;
+  static const _schemaVersion = 8;
   static Database? _db;
 
   /// Whether a database is currently open. Compaction-tree persistence
@@ -27,6 +27,7 @@ class DatabaseService {
     return openDatabase(
       p.join(dir, 'aliasagent.db'),
       version: _schemaVersion,
+      onConfigure: _onConfigure,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
@@ -37,9 +38,17 @@ class DatabaseService {
     _db = await openDatabase(
       p.join(dirPath, 'aliasagent.db'),
       version: _schemaVersion,
+      onConfigure: _onConfigure,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
+  }
+
+  /// 每条连接都要显式打开外键：SQLite 默认关闭，关闭时删除父会话不会级联删除
+  /// 子运行记录、消息与摘要（`REFERENCES … ON DELETE CASCADE` 形同虚设）。
+  /// onConfigure 在 onCreate / onUpgrade 之前执行，生产与测试走同一条路径。
+  static Future<void> _onConfigure(Database db) async {
+    await db.execute('PRAGMA foreign_keys = ON');
   }
 
   /// Create the current schema. Used by both _init and openAt so the test path
@@ -50,6 +59,7 @@ class DatabaseService {
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL DEFAULT 'New Chat',
         agent_type TEXT NOT NULL DEFAULT 'general',
+        parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         tree_version INTEGER NOT NULL DEFAULT 0,
@@ -151,6 +161,12 @@ class DatabaseService {
       // v6 → v7: 图片附件只记路径（add-image-input，用户要求"历史先只存路径"）。
       // 存的是 `[{"path":"…"}]`；旧行保持 NULL，等价于"没有附件"。
       await db.execute('ALTER TABLE messages ADD COLUMN attachments TEXT');
+    }
+    if (oldV <= 7) {
+      // v7 → v8：一次性子 Agent 的运行记录指向父会话（add-spawn-subagent-tool）。
+      // 既有顶层会话保持 NULL；列上的外键让删除父会话时子记录随父删除。
+      await db.execute(
+          'ALTER TABLE sessions ADD COLUMN parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE');
     }
     if (oldV < 1 || oldV > _schemaVersion) {
       await db.execute('DROP TABLE IF EXISTS messages');

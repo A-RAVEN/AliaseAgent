@@ -73,6 +73,31 @@ class ResolvedAgentConfig {
   /// 这个实例能不能接收图片输入。
   bool get acceptsImages => inputModalities.contains('image');
 
+  /// 只改系统提示词 / 工具清单的派生副本（一次性子 Agent 用）。
+  ///
+  /// 共享的参数值全部原样带过来；调用方拿到的是新对象，父实例与模板都不受影响。
+  ResolvedAgentConfig copyWith({
+    String? systemPrompt,
+    List<String>? tools,
+  }) =>
+      ResolvedAgentConfig(
+        templateName: templateName,
+        providerName: providerName,
+        model: model,
+        thinkingMode: thinkingMode,
+        thinkingEffort: thinkingEffort,
+        systemPrompt: systemPrompt ?? this.systemPrompt,
+        tools: tools ?? this.tools,
+        maxContextTokens: maxContextTokens,
+        compactionThresholdPercent: compactionThresholdPercent,
+        compactionWaitThresholdPercent: compactionWaitThresholdPercent,
+        inputModalities: inputModalities,
+        commandTimeoutMs: commandTimeoutMs,
+        commandMaxTimeoutMs: commandMaxTimeoutMs,
+        standingRequirements: standingRequirements,
+        spillPreviewChars: spillPreviewChars,
+      );
+
   /// 压缩阈值 token 数：上下文窗口 × 百分比 ÷ 100。
   ///
   /// 这是**推导值**，不是配置值 —— 用户钉死了"只允许由窗口乘百分比算出的 token

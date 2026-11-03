@@ -57,6 +57,10 @@ const char* dispose_context_json(const char* handle);
 /// 设置 ctx 的工作区。成功返回空串，失败返回错误文本（形状与既有导出一致）。
 const char* set_workspace(context::Context& ctx, const char* path);
 
+/// 读取 ctx 当前保存的工作区（只读）。成功 {"ok":true,"workspace":…}；
+/// 空工作区如实返回空串；不修改工作区、文件版本表、spill 序号或浏览器状态。
+const char* get_workspace(context::Context& ctx);
+
 /// 读文件。`path` 是纯路径（既有导出语义）。
 const char* read_file(context::Context& ctx, const char* path);
 
@@ -92,6 +96,7 @@ const char* browser_available();
 // send_message 返回负数并经 on_done 报错；cancel_request 给 JSON 错误。
 
 const char* set_workspace(const char* handle, const char* path);
+const char* get_workspace(const char* handle);
 const char* read_file(const char* handle, const char* path);
 const char* list_dir(const char* handle, const char* path);
 const char* write_file(const char* handle, const char* request_json);
