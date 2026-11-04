@@ -4,6 +4,8 @@ Flutter 桌面 AI 对话应用，通过 dart:ffi 调用 C++ Sidecar 动态库（
 
 ## 关键规则
 
+- **不许擅自开应用窗口（2026-11-04 用户明令，原话「以后除非我叫你开窗口，你只允许跑test或livetest」）** — 任何时候**禁止**用 `Start-Process alias_agent.exe`、`flutter run` 或别的方式手动启动应用给用户看界面；用户要看窗口会明确说。允许执行的只有测试命令本身（`flutter test`、`flutter analyze`、live 测试等——live 测试流程自带的短暂窗口属测试行为，跑完即走）；验证配置/外部能力一律优先无窗口方式（读产品代码解析路径、按产品请求形态直连探针）。
+
 - **自己看日志** — 排查问题直接读 `%USERPROFILE%\.aliasagent\logs\sidecar.log`（Windows）或 `~/.aliasagent/logs/sidecar.log`，不要叫用户去看。
 
 - **TODO 只有一个载体** — 根目录 `TODO.md`。禁止在别处另建 TODO / 待办文档；新增、更新、勾选一律改这一份。它只装"尚未开始 / 已立项待做"的事项；已确认缺陷放 `Docs/known-bugs.md`。

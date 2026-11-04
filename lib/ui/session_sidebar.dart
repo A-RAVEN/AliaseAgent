@@ -13,6 +13,10 @@ class SessionSidebar extends StatelessWidget {
   /// 为 null 时不显示入口（既有只读用例不需要它）。
   final VoidCallback? onAgents;
 
+  /// 打开 Provider 管理页（change `add-provider-model-discovery` 任务 4.1）。
+  /// 为 null 时不显示入口。
+  final VoidCallback? onProviders;
+
   const SessionSidebar({
     super.key,
     required this.sessions,
@@ -21,6 +25,7 @@ class SessionSidebar extends StatelessWidget {
     required this.onSelect,
     required this.onDelete,
     this.onAgents,
+    this.onProviders,
   });
 
   @override
@@ -49,6 +54,15 @@ class SessionSidebar extends StatelessWidget {
                     onPressed: onAgents,
                     icon: const Icon(Icons.smart_toy_outlined, size: 18),
                     label: const Text('Agents'),
+                  ),
+                ],
+                if (onProviders != null) ...[
+                  const SizedBox(height: 6),
+                  OutlinedButton.icon(
+                    key: const ValueKey('providers-entry'),
+                    onPressed: onProviders,
+                    icon: const Icon(Icons.hub_outlined, size: 18),
+                    label: const Text('Providers'),
                   ),
                 ],
               ],

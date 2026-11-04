@@ -8,7 +8,7 @@ Agent 模板是一份"用哪个模型、带哪些工具、上下文多大"的可
 
 ## 在哪用
 
-在**会话侧栏**，`New Chat` 按钮下面有 `Agents` 入口。
+在**会话侧栏**，`New Chat` 按钮下面有两个入口：`Agents`（模板）与 `Providers`（供应商与模型目录，见 [Provider 与模型目录](provider-models.md)）。
 
 界面文案：`Agents`
 
@@ -22,7 +22,7 @@ Agent 模板是一份"用哪个模型、带哪些工具、上下文多大"的可
 
 1. 点侧栏 `Agents`。
 2. 点 `添加模板`（界面文案：`添加模板`）。
-3. 填写模板名、选 provider、填模型、选推理强度、填系统提示词、勾工具、填上下文窗口。
+3. 填写模板名、选 provider、填模型（可以从右侧目录下拉选，也可以直接手输）、选推理强度、填系统提示词、勾工具与输入模态、填上下文窗口。
 4. 点 `保存`。
 
 模板名只在**添加时**填写；创建之后不能改名。修改模式下模板名输入框是只读的，界面上有这句提示：
@@ -88,12 +88,17 @@ Agent 模板是一份"用哪个模型、带哪些工具、上下文多大"的可
 | 字段 | 填什么 |
 |---|---|
 | 模板名 | 唯一名字；创建后不可改。会话按这个名字引用模板 |
-| provider | 从 `config.json` 的 `providers` 里选一个。**不显示密钥**，密钥也不在编辑界面里改 |
-| 模型 | 模型名，例如 `claude-sonnet-4-6`、`deepseek-v4`；不能为空 |
-| 推理强度 | `关闭` 或 low / medium / high / xhigh / max 之一 |
+| provider | 从 `config.json` 的 `providers` 里选一个（也就是 `Providers` 页里列出的那些名字）。**模板编辑器不显示密钥**；增删改 Provider 与密钥到 `Providers` 页做 |
+| 模型 | 模型名，例如 `claude-sonnet-4-6`、`deepseek-v4`；不能为空。右侧目录下拉来自该 Provider 的模型目录（显示网关给的 `display_name`，值是模型 id），也可以直接手输目录外的名字 |
+| 推理强度 | 有目录时，选项 = 目录档位与执行层合法集合的交集；目录里的 none 映射为"关闭"。没有目录时就是 `关闭` 或 low / medium / high / xhigh / max 之一 |
 | 系统提示词 | 这个 Agent 的角色说明；可以多行 |
 | 工具集合 | 勾选允许模型调用的工具；选项来自当前真实可用的工具目录。勾上 `spawn_subagent` 后这个模板创建的 Agent 才能让子 Agent 干活（见 [子 Agent](agent-subagents.md)） |
+| 输入模态 | text / image 两项：模型能不能收文字与图片。网关目录里的 video 等取值只会记录，不会出现在这两个勾选项里 |
 | 上下文窗口 | 正整数（token 数）；它决定占用环的整圈与压缩阈值（窗口 × 百分比） |
+
+选中目录里的模型后，编辑器会用目录值预填窗口、输入模态与推理强度（详见 [Provider 与模型目录](provider-models.md) 的"在模板里选模型"）：窗口未知时留空并提示"目录未提供窗口，请手填（压缩阈值依赖它）"；目录档位不被执行层支持时会显示一行"目录档位 X 暂不被执行层支持，未列入"，不静默消失。预填只是默认值，改完保存以你填的为准；目录后续刷新**不会**回改已保存的模板。
+
+目录外手输模型时，界面显示中性提示"不在最近一次目录中"，**不会**阻断保存；没有 Provider 时编辑器显示"请先在 Providers 页添加供应商"并禁用保存。
 
 这些字段最终都写进 `config.json`，对应的配置键是 `provider`、`model`、`thinking_effort`、`system_prompt`、`tools`、`max_context_tokens`。模板表本身的键是 `agent_types`。
 
@@ -101,7 +106,7 @@ Agent 模板是一份"用哪个模型、带哪些工具、上下文多大"的可
 {
   "agent_types": {
     "general": {
-      "provider": "anthropic",
+      "provider": "magpie",
       "model": "claude-sonnet-4-6",
       "system_prompt": "You are a helpful assistant.",
       "tools": ["read_file", "write_file"],
@@ -155,7 +160,7 @@ Agent 模板是一份"用哪个模型、带哪些工具、上下文多大"的可
 ## 限制
 
 - 第一版**不支持删除模板**，也**不支持修改模板名**（避免既有会话的引用悬空或撞名覆盖）。
-- 第一版**不编辑 provider 密钥**：`api_key` 只在 `config.json` 里改（第一次启动对话框除外）。
+- Provider（供应商）在 `Providers` 页管理：模板编辑器只选名字、不显示密钥；改 Provider 与探测模型目录见 [Provider 与模型目录](provider-models.md)。
 - 第一版没有"给单个实例覆盖字段"的入口；只能选模板。
 - 没有删除入口意味着模板列表只会变长；如果确实需要清理，本版只能手改 `config.json` 的 `agent_types`。
 - 旧版首启生成的 `["read_file", "list_dir"]` 两项默认清单会在启动时**可见地**升级成当前十一项基础工具；你自己改过的清单不会被迁移。

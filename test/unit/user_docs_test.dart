@@ -77,6 +77,13 @@ const _otherCodeNames = <String, String>{
   'subagent_busy': 'lib/services/subagent_runner.dart',
   'subagent_exception': 'lib/services/subagent_runner.dart',
   'cleanup_failed': 'lib/services/subagent_runner.dart',
+  // 模型目录条目的 JSON 字段名（add-provider-model-discovery）：不是配置键（它们
+  // 只出现在 `providers.<名>.models` 数组的元素里），但用户文档讲解目录字段时
+  // 会用反引号写出来，逐个到解析它们的文件里核对存在性。
+  'display_name': 'lib/models/model_catalog_entry.dart',
+  'context_window': 'lib/models/model_catalog_entry.dart',
+  'native_endpoints': 'lib/models/model_catalog_entry.dart',
+  'pricing': 'lib/models/model_catalog_entry.dart',
 };
 
 /// 文档里"允许出现的、既不是配置键也不是工具名、但确实是代码里存在的名字"清单。

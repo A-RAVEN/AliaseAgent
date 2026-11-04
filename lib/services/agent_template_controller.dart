@@ -23,6 +23,10 @@ class AgentTemplateDraft {
   final List<String> tools;
   final String maxContextTokensText;
 
+  /// 编辑器里勾选的输入模态。null = 旧调用方（未经过编辑器），沿用模板既有值。
+  /// 取值只能是 `text` / `image`；目录里的 `video` 等由编辑器回填时剔除，不进这里。
+  final List<String>? inputModalities;
+
   const AgentTemplateDraft({
     this.originalName,
     required this.name,
@@ -32,6 +36,7 @@ class AgentTemplateDraft {
     required this.systemPrompt,
     required this.tools,
     required this.maxContextTokensText,
+    this.inputModalities,
   });
 
   bool get isNew => originalName == null;
@@ -83,6 +88,12 @@ class AgentTemplateController {
   }) : _config = config;
 
   AppConfig get config => _config;
+
+  /// Providers 管理页改动配置后同步：下次打开模板编辑器时，provider 下拉与目录
+  /// 必须来自新的配置，不能还拿着打开页面时的旧快照。
+  void replaceConfig(AppConfig config) {
+    _config = config;
+  }
 
   /// 只校验，不落盘。编辑器在保存前调它，失败时保留用户输入。
   AgentTypeConfig validate(AgentTemplateDraft draft) {
@@ -149,6 +160,33 @@ class AgentTemplateController {
         ? (_config.agentTypes['general'])
         : existing;
 
+    // 输入模态：编辑器传来的值必须仍只放行 text/image（目录里的 video 等
+    // 在编辑器回填时就已经剔除并打日志，不会到这里）。未传时沿用 base。
+    List<String> modalities;
+    if (draft.inputModalities == null) {
+      modalities = List<String>.from(
+          base?.inputModalities ?? AgentTypeConfig.kDefaultInputModalities);
+    } else {
+      final illegal = [
+        for (final m in draft.inputModalities!)
+          if (!AgentTypeConfig.kAllowedInputModalities.contains(m)) m,
+      ];
+      if (illegal.isNotEmpty) {
+        throw AgentTemplateValidationException(
+            '输入模态',
+            '输入模态只能是 '
+                '${AgentTypeConfig.kAllowedInputModalities.join(" / ")}：'
+                '不接受 ${illegal.join("、")}');
+      }
+      final unique = <String>[];
+      for (final m in draft.inputModalities!) {
+        if (!unique.contains(m)) unique.add(m);
+      }
+      modalities = unique.isEmpty
+          ? List<String>.from(AgentTypeConfig.kDefaultInputModalities)
+          : unique;
+    }
+
     return AgentTypeConfig(
       name: name,
       provider: provider,
@@ -161,8 +199,7 @@ class AgentTemplateController {
           AgentTypeConfig.kDefaultCompactionThresholdPercent,
       compactionWaitThresholdPercent: base?.compactionWaitThresholdPercent ??
           AgentTypeConfig.kDefaultCompactionWaitThresholdPercent,
-      inputModalities: base?.inputModalities ??
-          AgentTypeConfig.kDefaultInputModalities,
+      inputModalities: List<String>.unmodifiable(modalities),
       commandTimeoutMs:
           base?.commandTimeoutMs ?? AgentTypeConfig.kDefaultCommandTimeoutMs,
       commandMaxTimeoutMs: base?.commandMaxTimeoutMs ??

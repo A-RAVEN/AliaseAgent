@@ -51,7 +51,7 @@ Windows 上还有仓库根的 `run.bat`：一键 `flutter build windows --debug`
 
 ## 配置
 
-首次启动应用会弹出设置对话框，引导输入 Anthropic API key。配置文件保存在 `~/.aliasagent/config.json`。
+首次启动应用会弹出一个两步向导：先填 Provider 的名字、网关地址与 API key，再填上下文窗口。配置文件保存在 `~/.aliasagent/config.json`；之后要增删改 Provider 或探测网关的模型目录，用会话侧栏的 `Providers` 入口。
 
 ## 功能文档索引
 
@@ -61,6 +61,7 @@ Windows 上还有仓库根的 `run.bat`：一键 `flutter build windows --debug`
 |------|-----------|
 | [配置](Docs/user-guide/configuration.md) | 配置文件在哪、每个键什么意思、缺 key 或写错 JSON 会看到什么；`input_modalities` 决定模型能不能收图 |
 | [Agent 模板](Docs/user-guide/agent-templates.md) | 侧栏 `Agents` 菜单：列出、添加、修改模板；模板名创建后不可改，修改只对之后创建或恢复的实例生效 |
+| [Provider 与模型目录](Docs/user-guide/provider-models.md) | 侧栏 `Providers`：增删改 Provider、点"探测"拉取网关模型目录（窗口/模态/档位回填模板）、四类计数与失败原因、已知限制 |
 | [子 Agent](Docs/user-guide/agent-subagents.md) | `spawn_subagent`：一次性子 Agent 怎么用、同步等待、独立历史、工作区继承、只回传结论、取消与限制 |
 | [对话](Docs/user-guide/chat.md) | 新建/删除会话、发消息、**贴图片给模型看**、工具卡片与思考卡片、会话标题 |
 | [真实上下文视图](Docs/user-guide/real-context-view.md) | 看模型这一步**实际**收到了什么（系统提示词、工具、每条消息） |

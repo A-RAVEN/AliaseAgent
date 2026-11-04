@@ -39,6 +39,7 @@ import 'ui/chat_area.dart';
 import 'ui/context_ring.dart';
 import 'ui/input_bar.dart';
 import 'ui/context_view.dart';
+import 'ui/providers_page.dart';
 import 'ui/session_agent_switcher.dart';
 import 'ui/session_sidebar.dart';
 import 'ui/setup_dialog.dart';
@@ -830,6 +831,29 @@ class ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  /// 打开 Provider 管理页（change `add-provider-model-discovery` 任务 4.1）。
+  Future<void> _showProviders() async {
+    await showDialog<void>(
+      context: context,
+      builder: (_) => ProvidersPage(
+        config: _templateController.config,
+        configPath: _templateController.configPath,
+        onConfigChanged: _applyProviderConfig,
+      ),
+    );
+  }
+
+  /// Provider 增删改 / 改名之后的进程内同步：解析器、模板控制器与模板注册表都换成
+  /// 新配置 —— 否则模板编辑器的 provider 下拉还是旧快照，改名后的引用也会悬空。
+  void _applyProviderConfig(AppConfig next) {
+    resolver = ProviderResolver(next);
+    _templateController.replaceConfig(next);
+    for (final template in next.agentTypes.values) {
+      registry.register(template);
+    }
+    if (mounted) setState(() {});
+  }
+
   /// 打开添加 / 修改编辑器；保存通过 [AgentTemplateController] 写回完整配置并更新
   /// 模板注册表。保存成功后提示**生效时机**：只有之后创建或恢复的实例才用新配置。
   Future<void> _openTemplateEditor(AgentTypeConfig? original) async {
@@ -839,6 +863,10 @@ class ChatScreenState extends State<ChatScreen> {
       builder: (dialogContext) => AgentTemplateEditor(
         original: original,
         providers: _templateController.config.providers.keys.toList(),
+        catalogs: {
+          for (final entry in _templateController.config.providers.entries)
+            entry.key: entry.value.models,
+        },
         availableTools: ToolCatalog.instance.names,
         onCancel: () => Navigator.of(dialogContext).pop(),
         onSave: (draft) async {
@@ -1593,6 +1621,7 @@ class ChatScreenState extends State<ChatScreen> {
           onSelect: _selectSession,
           onDelete: _deleteSession,
           onAgents: _showAgentTemplates,
+          onProviders: _showProviders,
         ),
         const VerticalDivider(width: 1),
         Expanded(
