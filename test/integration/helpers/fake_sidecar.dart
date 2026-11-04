@@ -1,6 +1,47 @@
 import 'dart:async';
+import 'dart:io' show sleep;
 
 import 'package:alias_agent/services/sidecar_bridge.dart';
+
+/// 一次工具入口调用的记录（change `parallelize-readonly-tool-calls` 任务 4.2）。
+///
+/// 记录**每一次**工具入口的真实开始 / 结束时刻与所经入口，用例据此断言并发时间窗、
+/// 交付顺序与"取消时零调用"。这是增量字段：既有用例读桩结果的方式不受影响。
+class FakeToolCall {
+  FakeToolCall({
+    required this.toolName,
+    required this.entry,
+    required this.requestJson,
+    required this.startedAt,
+  });
+
+  /// 工具名（`read_file` / `grep_file` / `web_fetch` …）。
+  final String toolName;
+
+  /// 调用经过的入口：
+  ///   - `sync`：六个同步只读方法或写类同步方法（主 isolate 直接调用）；
+  ///   - `worker`：`callToolOnWorker`（并发段的 worker isolate 入口）；
+  ///   - `async`：`webSearch` / `webFetch` / `runCommand` / 浏览器等本来就异步的方法。
+  final String entry;
+
+  /// 这次调用收到的请求原文（`list_dir` 是裸路径，其余是 JSON 字符串）。
+  final String requestJson;
+
+  final DateTime startedAt;
+  DateTime? endedAt;
+
+  bool get finished => endedAt != null;
+
+  /// 执行时间窗（毫秒）。未结束时为 null。
+  double? get durationMs => endedAt == null
+      ? null
+      : endedAt!.difference(startedAt).inMicroseconds / 1000.0;
+
+  @override
+  String toString() => 'FakeToolCall($toolName/$entry, '
+      'start=${startedAt.microsecondsSinceEpoch}, '
+      'end=${endedAt?.microsecondsSinceEpoch})';
+}
 
 /// A programmable fake sidecar for integration testing.
 ///
@@ -10,6 +51,112 @@ class FakeSidecar implements ISidecar {
   final List<_FakeEvent> _events = [];
   String? _readFileResult;
   String? _listDirResult;
+
+  // ---------------------------------------------------------------------------
+  // 工具调用记录与可编程延迟 / 抛错（change parallelize-readonly-tool-calls 4.2）
+  // ---------------------------------------------------------------------------
+
+  /// 每一次工具入口调用（按发生顺序）。用例用它做时间窗、入口与顺序断言。
+  final List<FakeToolCall> toolCalls = [];
+
+  /// 按工具名注册的延迟。**这些毫秒数是测试构造值，不是产品里的任何限制** ——
+  /// 只用来把"并发 vs 串行"的差别放大到可观测。
+  final Map<String, Duration> _toolDelays = {};
+
+  /// 按工具名注册的抛错（模拟工具执行失败）。值就是抛出去的错误。
+  final Map<String, Object> _toolThrows = {};
+
+  /// 给某个工具名登记一次执行延迟（测试构造值）。
+  void stubToolDelay(String toolName, Duration delay) {
+    _toolDelays[toolName] = delay;
+  }
+
+  /// 给某个工具名登记"一调就抛这个错"（字符串会被包成 [Exception]，好让错误文本
+  /// 带上用例给的原因串）。
+  void stubToolThrow(String toolName, Object error) {
+    _toolThrows[toolName] = error;
+  }
+
+  /// 某个工具名被调用过几次。
+  int countOf(String toolName) =>
+      toolCalls.where((c) => c.toolName == toolName).length;
+
+  /// 某个工具名的全部调用记录。
+  List<FakeToolCall> callsOf(String toolName) =>
+      toolCalls.where((c) => c.toolName == toolName).toList();
+
+  /// 所有调用经过的入口（去重前）。
+  List<String> get entriesUsed => [for (final c in toolCalls) c.entry];
+
+  FakeToolCall _beginCall(String toolName, String entry, String requestJson) {
+    final call = FakeToolCall(
+      toolName: toolName,
+      entry: entry,
+      requestJson: requestJson,
+      startedAt: DateTime.now(),
+    );
+    toolCalls.add(call);
+    return call;
+  }
+
+  void _applySyncDelayAndThrow(String toolName) {
+    final delay = _toolDelays[toolName];
+    if (delay != null && delay > Duration.zero) {
+      // 同步入口只能阻塞当前 isolate —— 它本来就只出现在"逐个段"里，段内没有
+      // 并发可被这段等待挡住。
+      sleep(delay);
+    }
+    final error = _toolThrows[toolName];
+    if (error != null) throw _asError(error);
+  }
+
+  Future<void> _applyAsyncDelayAndThrow(String toolName) async {
+    final delay = _toolDelays[toolName];
+    if (delay != null && delay > Duration.zero) {
+      await Future<void>.delayed(delay);
+    }
+    final error = _toolThrows[toolName];
+    if (error != null) throw _asError(error);
+  }
+
+  static Object _asError(Object error) =>
+      error is String ? Exception(error) : error;
+
+  /// 包住同步工具入口：记录开始 / 结束，再执行桩逻辑。
+  String _syncEntry(
+      String toolName, String requestJson, String Function() body) {
+    final call = _beginCall(toolName, 'sync', requestJson);
+    try {
+      _applySyncDelayAndThrow(toolName);
+      return body();
+    } finally {
+      call.endedAt = DateTime.now();
+    }
+  }
+
+  /// 包住本来异步的工具入口：记录开始 / 结束，再执行桩逻辑。
+  Future<String> _asyncEntry(
+      String toolName, String requestJson, Future<String> Function() body) async {
+    final call = _beginCall(toolName, 'async', requestJson);
+    try {
+      await _applyAsyncDelayAndThrow(toolName);
+      return await body();
+    } finally {
+      call.endedAt = DateTime.now();
+    }
+  }
+
+  /// 并发段的 worker 入口：记录开始 / 结束，再按工具名返回对应的桩结果。
+  Future<String> _workerEntry(
+      String toolName, String requestJson, String Function() body) async {
+    final call = _beginCall(toolName, 'worker', requestJson);
+    try {
+      await _applyAsyncDelayAndThrow(toolName);
+      return body();
+    } finally {
+      call.endedAt = DateTime.now();
+    }
+  }
 
   // Search stubs (task 10.2)
   String _searchProvidersResult = '[]';
@@ -300,14 +447,18 @@ class FakeSidecar implements ISidecar {
   @override
   String readFile(String handle, String requestJson) {
     toolHandles.add(handle);
-    return _readFileResult ??
-        '{"ok":true,"content":"fake content","total_lines":1,"start_line":1,"end_line":1}';
+    return _syncEntry('read_file', requestJson, () {
+      return _readFileResult ??
+          '{"ok":true,"content":"fake content","total_lines":1,"start_line":1,"end_line":1}';
+    });
   }
 
   @override
   String listDir(String handle, String path) {
     toolHandles.add(handle);
-    return _listDirResult ?? '{"ok":true,"content":"[]"}';
+    return _syncEntry('list_dir', path, () {
+      return _listDirResult ?? '{"ok":true,"content":"[]"}';
+    });
   }
 
   @override
@@ -320,15 +471,15 @@ class FakeSidecar implements ISidecar {
   String getSearchProviders() => _searchProvidersResult;
 
   @override
-  Future<String> webSearch(String handle, String requestJson) async {
+  Future<String> webSearch(String handle, String requestJson) {
     toolHandles.add(handle);
-    return _webSearchResult;
+    return _asyncEntry('web_search', requestJson, () async => _webSearchResult);
   }
 
   @override
-  Future<String> webFetch(String handle, String requestJson) async {
+  Future<String> webFetch(String handle, String requestJson) {
     toolHandles.add(handle);
-    return _webFetchResult;
+    return _asyncEntry('web_fetch', requestJson, () async => _webFetchResult);
   }
 
   @override
@@ -340,37 +491,41 @@ class FakeSidecar implements ISidecar {
   }
 
   @override
-  Future<String> browserNavigate(String handle, String requestJson) async {
+  Future<String> browserNavigate(String handle, String requestJson) {
     toolHandles.add(handle);
-    return _browserNavigateResult;
+    return _asyncEntry(
+        'browser_navigate', requestJson, () async => _browserNavigateResult);
   }
 
   @override
-  Future<String> browserClick(String handle, String requestJson) async {
+  Future<String> browserClick(String handle, String requestJson) {
     toolHandles.add(handle);
-    return _browserClickResult;
+    return _asyncEntry(
+        'browser_click', requestJson, () async => _browserClickResult);
   }
 
   @override
-  Future<String> browserType(String handle, String requestJson) async {
+  Future<String> browserType(String handle, String requestJson) {
     toolHandles.add(handle);
-    return _browserTypeResult;
+    return _asyncEntry(
+        'browser_type', requestJson, () async => _browserTypeResult);
   }
 
   @override
-  Future<String> browserSnapshot(String handle, String requestJson) async {
+  Future<String> browserSnapshot(String handle, String requestJson) {
     toolHandles.add(handle);
-    return _browserSnapshotResult;
+    return _asyncEntry(
+        'browser_snapshot', requestJson, () async => _browserSnapshotResult);
   }
 
   /// 命令工具：返回用例设定的结果，并把最后一次请求记下来（用例可以核对
   /// "组装进请求的四个配置值"到底传了什么）。
   String? lastRunCommandRequest;
   @override
-  Future<String> runCommand(String handle, String requestJson) async {
+  Future<String> runCommand(String handle, String requestJson) {
     toolHandles.add(handle);
     lastRunCommandRequest = requestJson;
-    return _runCommandResult;
+    return _asyncEntry('run_command', requestJson, () async => _runCommandResult);
   }
 
   // Spill 读回桩（spill-large-tool-output）。默认返回空区间，用例按需覆盖。
@@ -382,47 +537,86 @@ class FakeSidecar implements ISidecar {
   String readSpill(String handle, String requestJson) {
     toolHandles.add(handle);
     lastReadSpillRequest = requestJson;
-    return _readSpillResult;
+    return _syncEntry('read_spill', requestJson, () => _readSpillResult);
   }
 
   @override
   String writeFile(String handle, String requestJson) {
     toolHandles.add(handle);
-    return _writeFileResult;
+    return _syncEntry('write_file', requestJson, () => _writeFileResult);
   }
 
   @override
   String editFile(String handle, String requestJson) {
     toolHandles.add(handle);
-    return _editFileResult;
+    return _syncEntry('edit_file', requestJson, () => _editFileResult);
   }
 
   @override
   String globFile(String handle, String requestJson) {
     toolHandles.add(handle);
-    return _globFileResult;
+    return _syncEntry('glob_file', requestJson, () => _globFileResult);
   }
 
   @override
   String grepFile(String handle, String requestJson) {
     toolHandles.add(handle);
-    return _grepFileResult;
+    return _syncEntry('grep_file', requestJson, () => _grepFileResult);
   }
 
   @override
   String readImage(String handle, String requestJson) {
     toolHandles.add(handle);
-    readImageCallCount++;
-    lastReadImageRequest = requestJson;
-    return _readImageResult;
+    return _syncEntry('read_image', requestJson, () {
+      readImageCallCount++;
+      lastReadImageRequest = requestJson;
+      return _readImageResult;
+    });
   }
 
   @override
   String readClipboardImage(String handle, String requestJson) {
     toolHandles.add(handle);
-    readClipboardImageCallCount++;
-    lastReadClipboardImageRequest = requestJson;
-    return _readClipboardImageResult;
+    return _syncEntry('read_clipboard_image', requestJson, () {
+      readClipboardImageCallCount++;
+      lastReadClipboardImageRequest = requestJson;
+      return _readClipboardImageResult;
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // 并发段的 worker 入口（change parallelize-readonly-tool-calls 任务 4.2）
+  // ---------------------------------------------------------------------------
+
+  /// 把六个同步只读工具之一派到"worker"入口执行。记录与同步入口分开（entry =
+  /// `worker`），用例据此断言"段长 ≥2 时才走 worker、段长 1 仍走同步方法"。
+  @override
+  Future<String> callToolOnWorker(
+      String toolName, String handle, String requestJson) {
+    toolHandles.add(handle);
+    return _workerEntry(toolName, requestJson, () {
+      switch (toolName) {
+        case 'read_file':
+          return _readFileResult ??
+              '{"ok":true,"content":"fake content","total_lines":1,"start_line":1,"end_line":1}';
+        case 'list_dir':
+          return _listDirResult ?? '{"ok":true,"content":"[]"}';
+        case 'glob_file':
+          return _globFileResult;
+        case 'grep_file':
+          return _grepFileResult;
+        case 'read_spill':
+          lastReadSpillRequest = requestJson;
+          return _readSpillResult;
+        case 'read_image':
+          readImageCallCount++;
+          lastReadImageRequest = requestJson;
+          return _readImageResult;
+        default:
+          // 没归类到 worker 表里的名字：显式报错并带上名字（不静默当别的工具执行）。
+          return '{"ok":false,"error":"unknown worker tool: $toolName"}';
+      }
+    });
   }
 }
 

@@ -195,3 +195,29 @@ test\integration\browser_worker_test.dart 396:7
 
 把 worker 的等待上限做成可配置项，或在该用例里放宽等待并写明依据；数字来源必须指出现有常量在哪个文件，不许再凭空发明一个毫秒数。
 
+## sidecar: `web_search` 被进程级互斥锁整体串行，同一轮多个搜索没有时间收益
+
+**来源**: `parallelize-readonly-tool-calls`（任务 1.3，本 change 只披露不改锁）
+**发现日期**: 2026-11-04
+**相关文件**: `sidecar/src/search_provider.cpp`（`dispatch_web_search` 里的 `static std::mutex g_dispatch_mutex`）
+
+### 症状
+
+`dispatch_web_search` 一进函数就取进程级互斥锁，函数体全程持锁。因此即便 Agent 把同一轮里的多个 `web_search` 并发启动，它们在 sidecar 内部仍会一个接一个执行：并行化对 `web_search` 不产生时间收益（`web_fetch` 与其余只读工具不受影响，收益照常兑现）。
+
+### 根因
+
+函数里的注释原文（`dispatch_web_search` 开头）：
+
+> 进程级互斥（change add-context-handles 任务 1.7）：provider 实例、凭据、限流计数与探测结果都是应用级共享状态，两个上下文同时搜索会并发改写它们。串行执行，每次的请求与结果各自封装，不会有半个结果混进来。
+
+即：provider 实例、凭据、限流计数与探测结果都挂在进程级静态量上，没有按上下文隔离，只能靠一把全局锁串起来。
+
+### 期望方向
+
+把 provider 实例、凭据与限流状态下沉到上下文（与 `add-context-handles` 对工作区/文件版本表/spill 序号做过的处理同形），之后 `dispatch_web_search` 才能按上下文并发。
+
+### 重新考虑时机
+
+另立 change 时。`sidecar/test/context_ownership_test.cpp` 的既有用例（"两个上下文并发 web_search 时假 provider 一次只看到一个在跑"）把当前串行钉成了受保护行为，改锁必须同时改那条用例并说明依据；本 change 不动它，只在用户文档如实披露。
+

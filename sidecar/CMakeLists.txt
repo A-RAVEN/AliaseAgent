@@ -142,6 +142,7 @@ add_executable(sidecar_tests
   test/context_test.cpp
   test/context_ownership_test.cpp
   test/context_lifecycle_test.cpp
+  test/context_concurrency_test.cpp
 )
 target_include_directories(sidecar_tests PRIVATE include src test "${JSON_INCLUDE_DIR}" "${STB_INCLUDE_DIR}")
 target_compile_definitions(sidecar_tests PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN NOMINMAX

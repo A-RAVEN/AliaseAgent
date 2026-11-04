@@ -1,3 +1,5 @@
+import 'package:flutter/foundation.dart';
+
 import 'agent_type_config.dart';
 import 'provider_config.dart';
 
@@ -16,12 +18,38 @@ class AppConfig {
   static const int kDefaultSpillPreviewChars = 1000;
   static const int kMinSpillPreviewChars = 1;
 
+  /// `tool.parallel_max`：单个只读并发段一次最多同时启动多少个成员。
+  ///
+  /// 0 = **不设上限**（默认，见 design D6：不发明硬编码上限）；正整数 = 该段按这个
+  /// 值顺次切成多个子并发段，交付顺序不变。缺键、非整数、负数一律回落 0 并打印
+  /// 一次提示（与 `compaction_threshold_percent` 的缺省回落形态一致）。
+  final int toolParallelMax;
+
+  /// 缺省 0 = 不设上限（design D6 的配置项默认值）。
+  static const int kDefaultToolParallelMax = 0;
+
+  /// 只在第一次遇到非法的 `tool.parallel_max` 时打印一行，免得每次读配置都喊一次。
+  static bool _illegalToolParallelMaxReported = false;
+
+  /// 解析 `tool.parallel_max`：只有"非负整数"才生效，其它值一律回落 0。
+  static int _parseToolParallelMax(Object? raw) {
+    if (raw is int && raw >= 0) return raw;
+    if (!_illegalToolParallelMaxReported) {
+      _illegalToolParallelMaxReported = true;
+      debugPrint('[AliasAgent] tool.parallel_max=$raw is absent or not a '
+          'non-negative integer — using the default '
+          '$kDefaultToolParallelMax (no limit)');
+    }
+    return kDefaultToolParallelMax;
+  }
+
   const AppConfig({
     required this.version,
     this.providers = const {},
     this.agentTypes = const {},
     this.search,
     this.spillPreviewChars = kDefaultSpillPreviewChars,
+    this.toolParallelMax = kDefaultToolParallelMax,
   });
 
   factory AppConfig.fromJson(Map<String, dynamic> json) {
@@ -51,12 +79,19 @@ class AppConfig {
       if (raw is int && raw >= kMinSpillPreviewChars) previewChars = raw;
     }
 
+    // `tool` 是可选的顶层块；`parallel_max` 缺键 / 非整数 / 负数一律回落 0
+    // （= 不设上限），并打印一次提示。
+    final tool = json['tool'];
+    final toolParallelMax = _parseToolParallelMax(
+        tool is Map<String, dynamic> ? tool['parallel_max'] : null);
+
     return AppConfig(
       version: json['version'] as int? ?? 1,
       providers: providers,
       agentTypes: agentTypes,
       search: json['search'] as Map<String, dynamic>?,
       spillPreviewChars: previewChars,
+      toolParallelMax: toolParallelMax,
     );
   }
 
@@ -66,6 +101,8 @@ class AppConfig {
       'providers': providers.map((k, v) => MapEntry(k, v.toJson())),
       'agent_types': agentTypes.map((k, v) => MapEntry(k, v.toJson())),
       'spill': {'preview_chars': spillPreviewChars},
+      // 总是写回：这个旋钮没有界面，只能靠 config.json 改（同 spill）。
+      'tool': {'parallel_max': toolParallelMax},
     };
     // Conditionally include search when non-null and non-empty
     if (search != null && search!.isNotEmpty) {
@@ -84,6 +121,7 @@ class AppConfig {
     Map<String, AgentTypeConfig>? agentTypes,
     Map<String, dynamic>? search,
     int? spillPreviewChars,
+    int? toolParallelMax,
   }) {
     return AppConfig(
       version: version ?? this.version,
@@ -91,6 +129,7 @@ class AppConfig {
       agentTypes: agentTypes ?? this.agentTypes,
       search: search ?? this.search,
       spillPreviewChars: spillPreviewChars ?? this.spillPreviewChars,
+      toolParallelMax: toolParallelMax ?? this.toolParallelMax,
     );
   }
 }

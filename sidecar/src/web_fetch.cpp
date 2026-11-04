@@ -71,19 +71,21 @@ static const long SUBPROCESS_TIMEOUT_SEC = 30L;
 
 // ============================================================================
 // Python availability detection (cached at startup)
+//
+// 并发首探测（change parallelize-readonly-tool-calls，design D9）：探测体只允许
+// 执行一次，结果用原子量发布。原实现是两个裸 bool 无锁读写 —— 同一轮多路
+// web_fetch 首次并发时，后到的线程可能读到"已置 checked、未置 available"的
+// 中间态，把"Python 可用"误判成"不可用"。
 // ============================================================================
 
-static bool g_python_available = false;
-static bool g_python_checked = false;
 #ifdef _WIN32
 static const char* PYTHON_BINARIES[] = {"python", "python3", nullptr};
 #else
 static const char* PYTHON_BINARIES[] = {"python3", "python", nullptr};
 #endif
 
-static void detect_python() {
-  if (g_python_checked) return;
-  g_python_checked = true;
+/// 实际探测体：只在这里碰 PATH 上的解释器，返回是否找到可用的 Python。
+bool probe_python_binaries() {
   for (int i = 0; PYTHON_BINARIES[i] != nullptr; ++i) {
     std::string cmd = std::string(PYTHON_BINARIES[i]) + " --version";
 #ifdef _WIN32
@@ -101,9 +103,8 @@ static void detect_python() {
         ret = pclose(fp);
 #endif
         if (ret == 0) {
-          g_python_available = true;
           LOG_INFO("Python detected: " + std::string(buf));
-          return;
+          return true;
         }
       } else {
 #ifdef _WIN32
@@ -115,7 +116,19 @@ static void detect_python() {
     }
   }
   LOG_INFO("Python not found on PATH — web_fetch will use curl fallback");
+  return false;
 }
+
+bool web_fetch_run_python_probe(PythonProbeState& state) {
+  std::call_once(state.once, [&state]() {
+    state.available.store(probe_python_binaries(), std::memory_order_release);
+  });
+  return state.available.load(std::memory_order_acquire);
+}
+
+static PythonProbeState g_python_probe;
+
+static void detect_python() { web_fetch_run_python_probe(g_python_probe); }
 
 // ============================================================================
 // Script path resolution
@@ -642,7 +655,7 @@ std::string web_fetch_impl(const std::string& request_json) {
 
     detect_python();  // lazy-init at first web_fetch call
 
-    if (g_python_available) {
+    if (g_python_probe.available.load(std::memory_order_acquire)) {
       // SSRF pre-spawn check: validate resolved IPs before spawning subprocess
       // Extract hostname (already done above for localhost, redo for IP check)
       std::string ssrf_hostname;

@@ -5,6 +5,8 @@ Flutter 桌面 AI 对话应用，通过 dart:ffi 调用 C++ Sidecar 动态库（
 ## 关键规则
 
 - **不许擅自开应用窗口（2026-11-04 用户明令，原话「以后除非我叫你开窗口，你只允许跑test或livetest」）** — 任何时候**禁止**用 `Start-Process alias_agent.exe`、`flutter run` 或别的方式手动启动应用给用户看界面；用户要看窗口会明确说。允许执行的只有测试命令本身（`flutter test`、`flutter analyze`、live 测试等——live 测试流程自带的短暂窗口属测试行为，跑完即走）；验证配置/外部能力一律优先无窗口方式（读产品代码解析路径、按产品请求形态直连探针）。
+  - **判据是"窗口会不会出现在用户屏幕上"，不是"它被包装成了什么命令"（2026-11-04 第三次犯后补——我把 `run.bat` 冒烟当成"测试命令"跑了它的 launch 步骤，窗口又出现了）**：`run.bat` 的 `[5/5] Launching`、`test/smoke/run_all.sh` 的 `04_launch_and_verify` / `05_visual_regression` 这类**专门为展示而拉起 `alias_agent.exe` 的步骤，默认禁止执行**，即使用户先前批准了"整套验证清单"；要跑必须先拿到用户**当场单独许可**。例外只有一种（与正文一致）：**live 测试命令自身**（`flutter test --tags live … -d windows`）自带的临时窗口属于用户批准过的"livetest"范畴，不在本细则禁止之列。**边界澄清（2026-11-04 对抗审查后）**：全局 AGENTS.md §9 说"启动程序、跑整套由主循环自己做"——那是**分工**条款（谁来做），不授予**可执行性**（该不该做）；可执行性一律由本条判。
+  - **不许在任何工件（tasks/spec/design/报告）里预写"某某启动属于测试行为所以允许"之类的豁免句**——豁免只能来自用户当时的原话，不能由我替用户发明。
 
 - **自己看日志** — 排查问题直接读 `%USERPROFILE%\.aliasagent\logs\sidecar.log`（Windows）或 `~/.aliasagent/logs/sidecar.log`，不要叫用户去看。
 
@@ -25,19 +27,19 @@ Flutter 桌面 AI 对话应用，通过 dart:ffi 调用 C++ Sidecar 动态库（
   2. `Docs/user-guide/<功能名>.md`（每个用户功能一份）：在界面哪里、怎么操作、参数怎么填、出错时会看到什么、有哪些已知限制。不写内部实现。面向没读过代码的人，用中文。
   **硬性同步规则**：新增用户功能、或改动现有功能的行为 / 参数 / 界面文案 / 报错，必须在**同一个 change** 里更新对应文档，并在 tasks.md 落一条**能失败**的验收任务（例如：文档里的命令实际能跑通；文档写的界面元素名与代码文案一致且 grep 得到；文档列的配置键在产品代码的解析路径里存在）。文档不更新不算做完。
 
-- **测试规范以 `Docs/TESTING.md` 为权威**（分层决策、怎么写、实现规范、调试读取、可观测性 §3.1、报错处理 §3.2）。新增任何功能（含工具 / 界面 / 错误路径 / 脚本改动）都要配套对应层测试：纯逻辑 → `test/unit`；渲染交互 → `test/widget`；假 sidecar 端到端 → `test/integration`；真实模型端到端 → `integration_test` + `--tags live`；C++ → `sidecar/test`；整套冒烟 → `test/smoke/run_all.sh`。并在 tasks.md 落到可自测的验证任务。
+- **测试分层与跑法以 `Docs/TESTING.md` 为权威**（分层决策、怎么写、实现规范、调试读取）；**"测试输出可观察"与"报错处理"两条判据的正文权威在本文件**下面对应条目（`TESTING.md` §3.1 自己标注"CLAUDE.md，权威"，是同步副本）。新增任何功能（含工具 / 界面 / 错误路径 / 脚本改动）都要配套对应层测试：纯逻辑 → `test/unit`；渲染交互 → `test/widget`；假 sidecar 端到端 → `test/integration`；真实模型端到端 → `integration_test` + `--tags live`；C++ → `sidecar/test`；整套冒烟 → `test/smoke/run_all.sh`（其起窗步骤按首条禁令跳过）。并在 tasks.md 落到可自测的验证任务。
 
 - **不许有"没有测试的新功能"（2026-10-02 用户要求）** — 原文：「以后所有新功能的添加都应该有能反应它的测试用例，可以多个功能共用一个测试，但是不允许没有测试」「添加测试应该是所有 proposal 的硬性要求」。落成三条：
   1. **每个新功能 / 每个行为改动都必须有一个能反映它的测试用例**（该用例在功能坏掉时会红）。分层按上一条选，便宜的那层够用就不要往贵的那层堆。
   2. **允许共用**：多个功能可以共用同一个测试文件、甚至同一条用例（例：`integration_test/compact_quality_live_test.dart` 一次真实压缩同时验"摘要质量"与"压缩中的提示"）。**共用时要在用例里写清它覆盖哪几件事**，否则"它到底测了啥"无法核对 = 等同于没有测试。
-  3. **提案层面就是硬性要求**：tasks.md 里必须有点名到测试层路径（`test/unit` / `test/widget` / `test/integration` / `integration_test` / `sidecar/test` / `test/smoke`）的任务；一条都没有的 proposal 不合格，不许进入 apply。守卫：`test/unit/openspec_proposal_test.dart` —— 每个还没归档的 change，其 tasks.md 必须至少有一条任务点名测试层路径，否则红。
+  3. **提案层面就是硬性要求**：tasks.md 里必须有点名到测试层路径（`test/unit` / `test/widget` / `test/integration` / `integration_test` / `sidecar/test` / `test/smoke`）的任务；一条都没有的 proposal 不合格，不许进入 apply。守卫：`test/unit/openspec_proposal_test.dart` —— 每个还没归档的 change，其 tasks.md 必须至少出现一处测试层路径，否则红。**守卫的真实强度（2026-11-04 对抗审查核实，写在这里防止把它当成比实际更强的检查）**：它按**整行子串**判定，行内出现在哪都算命中（任务行、判据行、叙述行一视同仁），守卫注释自认"有意从宽"——所以它拦得住"一处都没提"，拦不住"只在叙述里提了路径、没有任何真写测试的任务"；后半截由 apply 验收与人审负责，不许引用守卫时说成"校验了任务行"。
 
 - **验证清单（声称"验证通过"之前逐层跑并贴实际输出，缺一层即未验证）**：
   1. `flutter analyze` —— 改动文件不得新增问题。
-  2. **先让 DLL 是最新的，再跑全量 VM 测试。** 正规做法走项目自己的入口 `run.bat`（第 [3/5] 步把新构建的 sidecar.dll 刷到仓库根，第 [4/5] 步跑依赖 DLL 的冒烟测试）。只想跑测试：`powershell -NoProfile -File scripts\sync_sidecar_dll.ps1` 然后 `flutter test`。原因：`flutter test` 用**裸名字** `DynamicLibrary.open('sidecar.dll')` 加载**仓库根**那份；绕过第 3 步会拿到 15 个 `Failed to lookup symbol 'browser_available'`，看着像回归，其实是流程绕行。守卫测试 `test/unit/sidecar_dll_freshness_test.dart` 会直接报出该跑哪条命令。
+  2. **先让 DLL 是最新的，再跑全量 VM 测试。** 等价的两条无窗口路径：`powershell -NoProfile -File scripts\sync_sidecar_dll.ps1` 然后 `flutter test`；或 `run.bat` **只跑到 [4/5]**（[5/5] Launching 起窗，受首条禁令，未经许可不跑）。原因：`flutter test` 用**裸名字** `DynamicLibrary.open('sidecar.dll')` 加载**仓库根**那份；不先刷新会拿到 15 个 `Failed to lookup symbol 'browser_available'`，看着像回归，其实是流程绕行。守卫测试 `test/unit/sidecar_dll_freshness_test.dart` 会直接报出该跑哪条命令。
   3. **live**：`flutter test --tags live --run-skipped integration_test/<用例> -d windows`；跑完**必须** `read_image` 读 `test/live_visual/<name>.png` 做视觉验收，涉及 OS 级窗口（浏览器工具）另补 OS 全屏截图。只看 "All tests passed" 不算过。
   4. **C++**：`cmake --build sidecar/build/windows --config Debug` + `ctest --test-dir sidecar/build/windows -C Debug`（或 `sidecar_tests.exe "[tag]"`）。
-  5. **整套冒烟**：`test/smoke/run_all.sh`（Windows 上 `run.bat`）。它只有 build / analyze / checkpoints / launch_and_verify / visual_regression 五步，**不含 live，不能代替第 3 条**。
+  5. **整套冒烟**：两个入口、两套步骤，别混为一谈——`test/smoke/run_all.sh` 是 01_build / 02_analyze / 03_checkpoints / 04_launch_and_verify / 05_visual_regression 五步；Windows 的 `run.bat` 是 [1/5] Building Flutter app / [2/5] Validating build products / [3/5] Refreshing DLLs / [4/5] Smoke test / [5/5] Launching。**两处的启动类步骤（`04_launch_and_verify`、`05_visual_regression`、`[5/5] Launching`）会拉起应用窗口，受首条禁开窗规则管辖：默认跳过，只有用户当场许可"开窗口"时才跑**；其余无窗口步骤照常跑。**不含 live，不能代替第 3 条。**
   **禁止**：拿"我改的那层过了"推及全部；用冒烟代替 live；live 通过但不做视觉验收；把上一轮的通过数字当成这一轮的（代码一改，之前结果作废）；把失败归为"不是我的代码 / 既有问题 / 环境问题"。
 
 - **外部状态判定必用产品代码，禁止自造速查脚本** — 判断"配置是否完备 / 某 provider 或外部能力是否可用"，必须复用产品代码的解析路径（读 `lib/models/*.dart` 确认 JSON 键映射，或直接调 `ConfigService.load()` / `getSearchProviders()` / `browser_available()`）。禁止手写 python / grep 凭印象写字段名去解析（真实键是 `agent_types` 下划线，曾误写成驼峰 `agentTypes`，反复误报"无 general config"，还误让 live 测试跳过）。三条子规则：负面结论先复核依据；与用户说法冲突时默认用户对；"外部缺失"写进审查或诚实披露之前必须先经产品代码验证。**顺序钉死（2026-10-15 同一根因第二次犯）**：同一个驼峰错误又犯了一次 —— 手写 PowerShell 用 `apiKey` 解析 `~/.aliasagent/config.json`，报出"密钥是空的"，据此宣称"live 跑不起来、你要先填密钥"，实际 `api_key` 长度 35、文件完好，用户因此怀疑我清掉了他的配置。所以：**给配置或外部能力下任何结论之前，先读那个模型的 `fromJson` 拿到真键名，读之前不许开口**；拿 grep 命中断言"某测试写了某文件"之前同样要先读那几行（当次还错疑了 `checkpoint_2_verify.dart`，它写的是 `%TEMP%` 下的副本）。
@@ -57,9 +59,9 @@ Flutter 桌面 AI 对话应用，通过 dart:ffi 调用 C++ Sidecar 动态库（
 - **归档 change 时必须先把 delta spec 同步进 `openspec/specs/`**（2026-10-25 用户明令：记 CLAUDE，spec 归档时必须同步）—— 不许走"不同步直接归档"那条路，也不许边归档边问。做法：对 `openspec/changes/<name>/specs/<能力>/spec.md` 逐份处理 —— 主 spec 已存在的，把 delta 的 `## ADDED Requirements` / `## MODIFIED Requirements` 等块应用进主 spec 的 `## Requirements` 段；主 spec 不存在的，新建 `openspec/specs/<能力>/spec.md`，**必须带 `## Purpose`**（缺它 `openspec validate` 直接判失败）。落地后 `openspec validate --specs` 的总数与归档前对照，把"同步前 / 同步后"两组数字写进归档报告；仍失败的逐条说明是不是既有缺口。
   **两个已踩过的坑**：① 顺序是先同步、再归档 —— 归档后 delta 已经在 `archive/` 下，补起来别扭；② PowerShell 的 `Set-Content -Encoding UTF8` 会写 **UTF-8 BOM**（文件头 `239,187,191`），解析器看到的是 `\uFEFF## Purpose`，会报「缺 Purpose」；新建规范一律按无 BOM 写（`New-Object System.Text.UTF8Encoding($false)`）。
 
-- **开了 Workflow 后不要等** — 启动 Workflow 或任何后台任务后，禁止阻塞等待或空转等待；完成会自动通知，收到通知再处理。等待期间有可推进的工作就继续做，没有就结束本轮回复。
+- **开了 Workflow / 后台任务后不要等** — 判据全文写在全局 `~/.dsh/AGENTS.md` §9（前台超 20 秒切后台、禁止 `wait: true` 阻塞等待、禁 sleep 轮询、跑完自动通知、审查 workflow 一律后台——那份是正文，本条只是项目侧提醒，避免两份正文漂移）。
 
-- **Git 提交需要明确授权** — 用户没说"提交 / commit / 交"就不许执行 commit / amend / reset / rebase。"任务做完了"不是授权。提交内容要干净，不夹带调试文件和未确认的改动。
+- **Git 提交需要明确授权** — 用户没说"提交 / commit / 交"就不许执行 commit / amend / reset / rebase。"任务做完了"不是授权。提交内容要干净，不夹带调试文件和未确认的改动。**唯一例外**：〈代码必须对应 tasks.md 任务〉条规定的违规回退——该条本身就是用户钉死的处置令，按它把已提交批退到违规批次之前属于**执行用户已下达的规则**，不算自造授权；回退只允许这一种触发场景，范围严格限于该批违规提交。
 
 - **审查必须验证外部真实性（完全参考本地文档）** — 审查对象声称依赖的任何 API 格式、参数、字段、行为，必须能由本地文档（`Docs/DeepSeekAPIDoc.md`、`Docs/AnthropicAPIDoc.md` 等）核实。规则：
   1. 审查输入必须包含项目实际使用的 provider / API 上下文（如 DeepSeek 的 Anthropic 兼容端点），禁止用错误的 provider 标准审查。
@@ -71,13 +73,13 @@ Flutter 桌面 AI 对话应用，通过 dart:ffi 调用 C++ Sidecar 动态库（
   7. 主循环不得把 workflow 输出当真理直接执行；外部事实类结论要自己核对本地文档后才采纳。
   8. **本地文档的维护** —— 主循环在用户授权时用 WebSearch / WebFetch 从官方更新 `Docs/*.md`；审查前若缺相关章节先补文档再开审查；与官方不一致时以官方为准并记录；文档头部标注抓取 / 更新时间与来源 URL。
 
-- **出设计时禁止发明上下限魔数；对抗验证必须查"无中生有"**（2026-10-05 用户明令，规则全文在 `~/.dsh/AGENTS.md` 第 9 节，那里的两个实例就是本仓库的 `maxLen` 与 `kToolResultElisionThreshold`）：
+- **出设计时禁止发明上下限魔数；对抗验证必须查"无中生有"**（2026-10-05 用户明令，规则全文在 `~/.dsh/AGENTS.md` 第 9 节）：
   1. 设计 / spec / tasks 里出现的任何**上下限**（字符数、字节数、条数、次数、超时、重试、并发、批量），必须能追溯到四类来源之一：用户明说过的要求、产品里已有的数字（指明常量）、平台或接口硬限（注明文档）、配置项（默认值与范围 + 出现在 `Docs/user-guide/configuration.md` 的配置键表里）。**写不出处就不许写进设计**，先报"我打算取多少、依据是什么"或做成配置项。
   2. **砍内容必须可见、可见之后必须可恢复**：任何截断 / 省略 / 丢弃的分支都要有标记，标记要说清略去了什么、有多少，并给出取回完整内容的办法（路径 / 网址 / 参数）。静默降级算缺陷，不算优化。
-  3. 跑对抗验证 workflow 前先过 `.claude/hooks/ensure-adversarial-verify.sh` 注入的检查点：逐个数字核出处（`git log -S` 追引入提交、grep 常量名）、核对每句"按用户要求 / 已知限制"是否站得住、检查静默降级、检查可配性；结论必须用命令核。本仓库已有的实例：`lib/main.dart` 的 `const maxLen = 2000`（来历不明、三个后端时静默丢掉后两个）与 `kToolResultElisionThreshold = 8000`（砍掉 `web_fetch` 正文中段，而 `web_fetch` 的 `path` 为空 ⇒ 标记里没有再取路径）。
+  3. 跑对抗验证 workflow 前先过 `.claude/hooks/ensure-adversarial-verify.sh` 注入的检查点：逐个数字核出处（`git log -S` 追引入提交、grep 常量名）、核对每句"按用户要求 / 已知限制"是否站得住、检查静默降级、检查可配性；结论必须用命令核。**两个历史实例（2026-10-05 抓到；现状已变，引用时按历史时态）**：① `lib/main.dart` 曾有的 `const maxLen = 2000`（来历不明、三个后端时静默丢掉后两个）——该常量已随 `fix-silent-truncation` 删除，现仓库里 `maxLen` 只剩 `search_text_assembly.dart` 的局部变量；② `kToolResultElisionThreshold = 8000` 曾砍掉 `web_fetch` 正文中段且 `path` 为空时标记里没有再取路径——现值由 `tool_result_text.dart` 的 `searchTextElisionThreshold` 定义，截断标记的取回落点已修（调用点 `refetchArg` 在 `path` 缺失时回退 `url`，标记会写出 refetch；见 `agent.dart` 的历史重放拼装处）。
 
 - **拿代码注释或用例当证据时，必须再追一步：这个状态由谁产生**（2026-10-05 实测踩到）— 本仓库里那些"填空档 / 兜底 / 容错 / 病理情况"分支的注释，写的是"给我这种输入我会怎么办"，**不是**"生产里会出现这种输入"；`test/` 下的夹具更常手工造出产品流程造不出来的状态（假仓库直接写库、绕过产生该状态的那几步）。凡拿注释或用例断言"某事会发生"，必须再找**写这段数据、产生这个状态的那段代码**，确认正常流程走不走得到；走不到就标成"只有手工构造的状态才到得了"。自查一句：*这句注释是在描述"会发生什么"，还是在描述"如果发生了我会怎么办"？谁会让它发生？* 这一条补的是「结论要用命令核」的漏洞 —— 读注释、读用例也算"核"，但核到的是"有人这么写过"，不等于"事情是这样"。
-  **踩过的实例**：给 `add-context-occupancy-ring` 跑对抗验证时，我据 `lib/services/compaction/compaction_plan.dart` 里 `_coveredRegionInOrder` 的注释「摘要段与原文段交错出现」与 `test/integration/compaction_projection_test.dart` 7.1 夹具注释 `[原文 1..40][摘要 41..91][原文 92..130]`，判定"真实投影会出现原文→摘要→原文的交错"，报成「高」缺陷、要求改掉 design 里"顺序天然是二级摘要 → 一级摘要 → 原文"那句。用户当场否定：「不可能出现这种情况」。复查：那个函数是**填空档**用的；空档要出现，库里得有"没有被一级摘要垫底的二级摘要"，而 `lib/services/summary_node_repository.dart` 的删除只按「同层级 + 同区间」删（"a level-2 node never deletes a level-1 node"），二级永远删不掉一级；一级又"不够远也要收"（`lib/main.dart` 的 `if (!farEnough && n.level >= 2) continue;` 旁注"改收它盖住的那几条 1 级"）⇒ 二级被丢弃时一定有一级顶上。**产品流程造不出那个状态**，用例是拿假仓库写进去的健壮性夹具（它测的是"工具轮不会被拆"）。结论：design 那句是对的，缺陷撤回。
+  **踩过的实例**：给 `add-context-occupancy-ring` 跑对抗验证时，我据 `lib/services/compaction/compaction_plan.dart` 里 `_coveredRegionInOrder` 的注释「摘要段与原文段交错出现」与 `test/integration/compaction_projection_test.dart` 7.1 夹具注释 `[原文 1..40][摘要 41..91][原文 92..130]`，判定"真实投影会出现原文→摘要→原文的交错"，报成「高」缺陷、要求改掉 design 里"顺序天然是二级摘要 → 一级摘要 → 原文"那句。用户当场否定：「不可能出现这种情况」。复查：那个函数是**填空档**用的；空档要出现，库里得有"没有被一级摘要垫底的二级摘要"，而 `lib/services/summary_node_repository.dart` 的删除只按「同层级 + 同区间」删（"a level-2 node never deletes a level-1 node"），二级永远删不掉一级；一级又"不够远也要收"（当时写在 `lib/main.dart` 的 `if (!farEnough && n.level >= 2) continue;`，旁注"改收它盖住的那几条 1 级"——**2026-11-04 复核**：Agent 对象化后该语句现居 `lib/services/agent.dart`，旁注已被移除，判据逻辑未变）⇒ 二级被丢弃时一定有一级顶上。**产品流程造不出那个状态**，用例是拿假仓库写进去的健壮性夹具（它测的是"工具轮不会被拆"）。结论：design 那句是对的，缺陷撤回。
   **配套（同一个错的另一半：审查方法本身）**：对抗审查的产出只能当**待核假设**，不许当缺陷清单直接报给用户。三条硬规矩：① 抽断言不许按"优先挑最可能站不住的"取样 —— 那是自己把靶子做成最容易倒的；② 反驳者的判据不许是"不确定就判不成立" —— 那是把不知道换算成指控；③ 报出口之前，每条都要由主循环核过"产生这个状态的代码"。**症状自查**：一次审查把绝大多数断言都判死，那不是严格，是它没有分辨力（2026-10-05 那次 15 条判死 12 条、重跑 15 条判死 14 条，我却把这当成"审查有收获"）。
 
 - **goal 循环（跨多轮长目标的强制节奏）**：
@@ -114,7 +116,7 @@ Flutter 桌面 AI 对话应用，通过 dart:ffi 调用 C++ Sidecar 动态库（
 
 | 文档 | 只装什么 | **不**装什么 |
 |---|---|---|
-| `~/.dsh/AGENTS.md`（全局规则） | 跨项目通用的行为规则 | 本项目的技术细节、本项目的待办 |
+| `~/.dsh/AGENTS.md`（全局规则） | 跨项目通用的行为规则。**已知例外（2026-11-04 对抗审查核实）**：该文件末尾有 CodeGen 接入现状一节（含 `CODEGEN_ANNOTATED` 76 行/74 短名等本项目技术细节）——那是用户亲手放进全局文件的内容，不归本地图管辖，也不许我据此把它当"跨项目通用规则"引用 | 本项目的待办 |
 | `CLAUDE.md`（本节所在的文件） | 本项目的规则与判据（怎么干、怎么算干完） | 待办条目、缺陷清单、方案台账、功能说明 |
 | `README.md` | 这是什么、装什么、怎么编译/运行/配置，**功能文档索引** | 内部实现、待办、缺陷 |
 | `TODO.md` | **唯一**的可勾选待办：尚未开始 / 已立项待做 | 已确认缺陷（→ `known-bugs.md`）、被否方案（→ `rejected-approaches.md`）、顺序理由（→ `RoadMap.md`） |
@@ -156,6 +158,12 @@ Flutter 桌面 AI 对话应用，通过 dart:ffi 调用 C++ Sidecar 动态库（
 ### 四、三条硬约束（防止同一事实出现两份）
 
 1. **可勾选条目只在 `TODO.md`**；其它文档若要引用待办，只能写"见 TODO.md 的某条"，不许复制成第二份清单。
-2. **规则只写在 `AGENTS.md`（全局）与 `CLAUDE.md`（项目）**；change 工件、user-guide、spec 里不许夹带"以后要怎么做"的规则 —— 规则要落就落进这两个文件，落完在工件里引用。
+2. **规则只写在 `AGENTS.md`（全局）与 `CLAUDE.md`（项目）**；change 工件、user-guide、spec 里不许夹带"以后要怎么做"的规则 —— 规则要落就落进这两个文件，落完在工件里引用。**唯一例外（用户明令，2026-09-13）**：上下文压缩阈值的「🔒 钉死的原始要求」全文由用户指定钉在 `TODO.md` 顶部——用户指定的载体优先于本条；该节正文的维护仍以用户原话为准，本文件只写引用与自检触发。
 3. **不许出现只有指针没有正文的规则**：任何一条规则或不变量，若它只在一处写全，那一处必须是 `AGENTS.md` 或 `CLAUDE.md`，不许指向"某份 change 的 design 里写着"。
+
+### 五、本文件禁令的守卫现状（2026-11-04 对抗审查如实登记，防止把"有规则"当成"有防线"）
+
+**有机器守卫、坏了会变红的**：提案缺测试层路径（`test/unit/openspec_proposal_test.dart`，注意其真实强度见〈不许有"没有测试的新功能"〉第 3 条）；DLL 过期（`test/unit/sidecar_dll_freshness_test.dart`）；spec 缺 `## Purpose`（`openspec validate --specs`）。
+
+**没有机器守卫、违反时不会有任何东西变红的**（靠执行纪律、对抗轮与用户目视兜底——引用这些条目时不许暗示它们"被强制"）：禁开窗及其两条细则（`run.bat` / `run_all.sh` 自身仍无条件含起窗步，拦与不拦在执行者一念之间）；禁预写豁免句；禁写死行号；禁先于改动写"已修复"；代码先有任务；禁改验收标准；禁 `⛔ STOP HERE`；Git 授权；TODO 单载体。候选的补守卫项已记入 `TODO.md`。
 

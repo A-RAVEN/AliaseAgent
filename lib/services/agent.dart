@@ -28,6 +28,7 @@ import 'sidecar_bridge.dart';
 import 'subagent_runner.dart';
 import 'summary_node_repository.dart';
 import 'tool_catalog.dart';
+import 'tool_group_planner.dart';
 import 'tool_result_text.dart';
 
 /// 界面订阅 Agent 事件的通道。
@@ -250,6 +251,12 @@ class Agent {
   /// `summary_nodes` 存储是否可用（注入的仓库永远可用；生产仓库要数据库已打开）。
   final bool summaryStoreOpen;
 
+  /// 顶层配置项 `tool.parallel_max`：单个只读并发段一次最多同时启动的成员数。
+  ///
+  /// 0 = 不设上限（design D6）。它不是模板字段，所以单独从 `AppConfig` 传进来，
+  /// 不进 [ResolvedAgentConfig]。
+  final int toolParallelMax;
+
   AgentCallbacks callbacks;
 
   /// provider 密钥与地址**只作为本实例的执行依赖**保存在这个私有字段里；
@@ -305,6 +312,7 @@ class Agent {
     required this.guard,
     required this.backgroundFoldEnabled,
     required this.summaryStoreOpen,
+    this.toolParallelMax = 0,
     this.subagentRunner,
     this.callbacks = const AgentCallbacks(),
   }) : _provider = provider;
@@ -817,61 +825,56 @@ class Agent {
       apiMessages.add({'role': 'assistant', 'content': assistantBlocks});
 
       final toolResults = <Map<String, dynamic>>[];
-      for (final tc in turnToolCalls) {
-        if (!_isActive(epoch)) break;
-        final result = await _executeTool(tc);
-        final resultContent = result['ok'] == true
-            ? (result['content'] as String? ?? '')
-            : (result['error'] as String? ?? 'Tool failed');
-
-        final toolId = (tc['id'] as String?) ?? '';
-        final toolName2 = (tc['name'] as String?) ?? '';
-        final isSearchTool =
-            toolName2 == 'web_search' || toolName2 == 'web_fetch';
-        final activity = ToolCallActivity(
-          id: toolId,
-          toolName: toolName2,
-          input: (tc['input'] as Map<String, dynamic>?) ?? {},
-          status:
-              result['ok'] == true ? ToolCallStatus.done : ToolCallStatus.error,
-          result: resultContent,
-          resultPreview: resultContent.length > 300
-              ? '${resultContent.substring(0, 300)}...'
-              : resultContent,
-          resultSections:
-              isSearchTool ? _buildResultSections(toolName2, result) : null,
-          hunks: parseEditHunks(result['hunks']),
-          hunksOmitted: result['hunks_omitted'] as String?,
-          imagePath: _toolImagePath(result),
-          // 子运行元数据（只有 spawn_subagent 会带；不含密钥，也不进入父模型内容）。
-          childSessionId: result['child_session_id'] as String?,
-          childAgentType: result['agent_type'] as String?,
-          childModel: result['model'] as String?,
-          childMetering: result['metering'] is Map
-              ? Map<String, dynamic>.from(result['metering'] as Map)
-              : null,
-        );
-        if (_isActive(epoch)) callbacks.onToolResult?.call(activity);
-
-        toolResults.add({
-          'type': 'tool_result',
-          'tool_use_id': tc['id'] ?? '',
-          'content': _toolResultContent(
-            text: resultContent,
-            imagePath: _toolImagePath(result),
-          ),
-        });
-
-        // 工具结果只写进这一轮的 toolCallsJson（DB）与下面的请求体。
-        for (var i = 0; i < turnToolCalls.length; i++) {
-          if (turnToolCalls[i]['id'] == toolId) {
-            turnToolCalls[i].addAll(activity.toJson());
+      // 执行分组（design D1/D6）：连续的只读调用合并成一个并发段，写类 / 有状态 /
+      // 未知名字各自单独成段；配置项 `tool.parallel_max` 决定单个并发段一次最多
+      // 同时启动几个成员（0 = 不设上限）。
+      final groups = planToolGroups(
+        [for (final tc in turnToolCalls) (tc['name'] as String?) ?? ''],
+        maxParallel: toolParallelMax,
+      );
+      var toolsCancelled = false;
+      for (final group in groups) {
+        if (!_isActive(epoch)) {
+          toolsCancelled = true;
+          break;
+        }
+        if (!group.concurrent) {
+          // 逐个段（段长恒为 1）：完全走原来的执行路径，时序与并行化之前一致。
+          final tc = turnToolCalls[group.start];
+          final result = await _executeTool(tc);
+          if (!_isActive(epoch)) {
+            toolsCancelled = true;
             break;
           }
+          _deliverToolResult(tc, result, toolResults, turnToolCalls);
+        } else {
+          final members = turnToolCalls.sublist(group.start, group.end);
+          // 并发启动、按段内原始顺序收集：`Future.wait` 的结果顺序就是启动顺序，
+          // 与谁先执行完无关（design D3）。
+          final results = await Future.wait([
+            for (final tc in members) _executeToolConcurrently(tc),
+          ]);
+          if (!_isActive(epoch)) {
+            // 已启动的成员都已自然结束（Future.wait 收齐）：结果全部丢弃。
+            toolsCancelled = true;
+            break;
+          }
+          for (var i = 0; i < members.length; i++) {
+            _deliverToolResult(members[i], results[i], toolResults, turnToolCalls);
+          }
+        }
+      }
+      if (toolsCancelled) {
+        // 取消：本轮不追加 tool_result（不会进入模型请求）。**所有**还没有结果的
+        // 调用（跑完被丢弃的、以及后面还没轮到就取消的）都要在卡片与 toolCallsJson
+        // 里留下同一条取消说明 —— 否则历史重放会把它读成"工具返回了空"（D4）。
+        for (final tc in turnToolCalls) {
+          if (tc['result'] == null) _markToolCancelled(tc);
         }
       }
 
       // 工具轮写库：整轮写库归属本实例，不读界面当前会话 id。
+      // 取消路径同样要写：卡片与 toolCallsJson 的取消说明必须落库（D4）。
       final enrichedJson = jsonEncode(turnToolCalls);
       await messageRepo.updateToolCalls(intermediateMsg.id, enrichedJson);
       _replaceHistoryMessage(intermediateMsg.id, enrichedJson);
@@ -885,6 +888,9 @@ class Agent {
           debugPrint('[AliasAgent] mark dirty watermark failed: $e');
         }
       }
+
+      // 取消的那一轮到此为止：不把 tool_result 交给模型，也不发下一轮请求。
+      if (toolsCancelled) return _cancelledRun();
 
       apiMessages.add({'role': 'user', 'content': toolResults});
 
@@ -1876,8 +1882,108 @@ class Agent {
   // 工具执行
   // ---------------------------------------------------------------------------
 
+  /// 按段内原始顺序交付一条工具结果（design D3）：
+  /// ① 界面回调（按 id 原位更新卡片）；② 请求体 `tool_result`；③ `toolCallsJson` 富化。
+  void _deliverToolResult(
+    Map<String, dynamic> tc,
+    Map<String, dynamic> result,
+    List<Map<String, dynamic>> toolResults,
+    List<Map<String, dynamic>> turnToolCalls,
+  ) {
+    final resultContent = result['ok'] == true
+        ? (result['content'] as String? ?? '')
+        : (result['error'] as String? ?? 'Tool failed');
+
+    final toolId = (tc['id'] as String?) ?? '';
+    final toolName2 = (tc['name'] as String?) ?? '';
+    final isSearchTool = toolName2 == 'web_search' || toolName2 == 'web_fetch';
+    final activity = ToolCallActivity(
+      id: toolId,
+      toolName: toolName2,
+      input: (tc['input'] as Map<String, dynamic>?) ?? {},
+      status: result['ok'] == true ? ToolCallStatus.done : ToolCallStatus.error,
+      result: resultContent,
+      resultPreview: resultContent.length > 300
+          ? '${resultContent.substring(0, 300)}...'
+          : resultContent,
+      resultSections: isSearchTool ? _buildResultSections(toolName2, result) : null,
+      hunks: parseEditHunks(result['hunks']),
+      hunksOmitted: result['hunks_omitted'] as String?,
+      imagePath: _toolImagePath(result),
+      // 子运行元数据（只有 spawn_subagent 会带；不含密钥，也不进入父模型内容）。
+      childSessionId: result['child_session_id'] as String?,
+      childAgentType: result['agent_type'] as String?,
+      childModel: result['model'] as String?,
+      childMetering: result['metering'] is Map
+          ? Map<String, dynamic>.from(result['metering'] as Map)
+          : null,
+    );
+    callbacks.onToolResult?.call(activity);
+
+    toolResults.add({
+      'type': 'tool_result',
+      'tool_use_id': tc['id'] ?? '',
+      'content': _toolResultContent(
+        text: resultContent,
+        imagePath: _toolImagePath(result),
+      ),
+    });
+
+    // 工具结果只写进这一轮的 toolCallsJson（DB）与请求体。
+    for (var i = 0; i < turnToolCalls.length; i++) {
+      if (turnToolCalls[i]['id'] == toolId) {
+        turnToolCalls[i].addAll(activity.toJson());
+        break;
+      }
+    }
+  }
+
+  /// 本轮被取消、结果不取回：把卡片置为终态并写入同一句取消说明（design D4）。
+  ///
+  /// 这里**不**检查 `_isActive`：取消收尾的目的正是把还停在"执行中"的卡片清掉，
+  /// 让界面与历史都看得出"这个工具没有结果、原因是取消"，而不是一片空文本。
+  void _markToolCancelled(Map<String, dynamic> tc) {
+    // 两个说法都来自 delta spec：Requirement 要求写「本轮被取消，该工具结果未取回」，
+    // 场景要求带「因取消未取回结果」的说明 —— 一句话里两段都在。
+    const note = '因取消未取回结果（本轮被取消，该工具结果未取回）。';
+    final activity = ToolCallActivity(
+      id: (tc['id'] as String?) ?? '',
+      toolName: (tc['name'] as String?) ?? '',
+      input: (tc['input'] as Map<String, dynamic>?) ?? {},
+      status: ToolCallStatus.error,
+      result: note,
+      resultPreview: note,
+    );
+    callbacks.onToolResult?.call(activity);
+    tc.addAll(activity.toJson());
+  }
+
+  /// 逐个段 / 段长 1 的执行入口：与并行化之前完全同一条路径。
   Future<Map<String, dynamic>> _executeTool(
       Map<String, dynamic> toolCall) async {
+    final resultJson = await _dispatchToolCall(toolCall, onWorker: false);
+    return _postProcessToolResult(toolCall, resultJson);
+  }
+
+  /// 并发段里单个成员的执行：任何异常都转成带工具名与原因的 ok:false（design D5），
+  /// 不影响同段其它成员。
+  Future<Map<String, dynamic>> _executeToolConcurrently(
+      Map<String, dynamic> toolCall) async {
+    final name = (toolCall['name'] as String?) ?? '';
+    try {
+      final resultJson = await _dispatchToolCall(toolCall, onWorker: true);
+      return _postProcessToolResult(toolCall, resultJson);
+    } catch (e) {
+      // 不许用不含原因的通用文案顶替：工具名 + 异常原文都要在。
+      return <String, dynamic>{'ok': false, 'error': '$name: $e'};
+    }
+  }
+
+  /// 把一次工具调用派给 sidecar。`onWorker` 为真时，六个同步只读工具改走 worker
+  /// isolate（只有并发段会这么调，段长 ≥2 才真正重叠）；其余工具本来就有独立的
+  /// 异步入口，`get_current_time` 是纯 Dart，都在主 isolate 完成。
+  Future<String> _dispatchToolCall(
+      Map<String, dynamic> toolCall, {required bool onWorker}) async {
     final name = toolCall['name'] as String?;
     final input = (toolCall['input'] as Map<String, dynamic>?) ?? {};
     final path = (input['path'] as String?) ?? '';
@@ -1890,7 +1996,10 @@ class Agent {
         final limit = input['limit'];
         if (offset is int) readReq['offset'] = offset;
         if (limit is int) readReq['limit'] = limit;
-        resultJson = sidecar.readFile(sessionId, jsonEncode(readReq));
+        final requestJson = jsonEncode(readReq);
+        resultJson = onWorker
+            ? await sidecar.callToolOnWorker('read_file', sessionId, requestJson)
+            : sidecar.readFile(sessionId, requestJson);
       case 'write_file':
         resultJson = sidecar.writeFile(sessionId, jsonEncode({
           'path': path,
@@ -1906,19 +2015,27 @@ class Agent {
               sessionId, jsonEncode({'path': path, 'edits': edits}));
         }
       case 'list_dir':
-        resultJson = sidecar.listDir(sessionId, path);
+        resultJson = onWorker
+            ? await sidecar.callToolOnWorker('list_dir', sessionId, path)
+            : sidecar.listDir(sessionId, path);
       case 'glob_file':
-        resultJson = sidecar.globFile(sessionId, jsonEncode({
+        final requestJson = jsonEncode({
           'pattern': input['pattern'] ?? '',
           'max_results': input['max_results'] ?? 200,
-        }));
+        });
+        resultJson = onWorker
+            ? await sidecar.callToolOnWorker('glob_file', sessionId, requestJson)
+            : sidecar.globFile(sessionId, requestJson);
       case 'grep_file':
-        resultJson = sidecar.grepFile(sessionId, jsonEncode({
+        final requestJson = jsonEncode({
           'pattern': input['pattern'] ?? '',
           'glob': input['glob'] ?? '',
           'ignore_case': input['ignore_case'] ?? false,
           'max_results': input['max_results'] ?? 100,
-        }));
+        });
+        resultJson = onWorker
+            ? await sidecar.callToolOnWorker('grep_file', sessionId, requestJson)
+            : sidecar.grepFile(sessionId, requestJson);
       case 'web_search':
         final request = jsonEncode({
           'query': input['query'] ?? '',
@@ -1957,12 +2074,15 @@ class Agent {
         request['preview_chars'] = config.spillPreviewChars;
         resultJson = await sidecar.runCommand(sessionId, jsonEncode(request));
       case 'read_spill':
-        resultJson = sidecar.readSpill(sessionId, jsonEncode({
+        final requestJson = jsonEncode({
           'ref': input['ref'] ?? '',
           if (input['offset'] is int) 'offset': input['offset'],
           if (input['limit'] is int) 'limit': input['limit'],
           'preview_chars': config.spillPreviewChars,
-        }));
+        });
+        resultJson = onWorker
+            ? await sidecar.callToolOnWorker('read_spill', sessionId, requestJson)
+            : sidecar.readSpill(sessionId, requestJson);
       case 'get_current_time':
         final now = DateTime.now();
         final dt = now.toIso8601String();
@@ -1989,7 +2109,10 @@ class Agent {
                 'declare image input (input_modalities)',
           });
         } else {
-          resultJson = sidecar.readImage(sessionId, jsonEncode({'path': path}));
+          final requestJson = jsonEncode({'path': path});
+          resultJson = onWorker
+              ? await sidecar.callToolOnWorker('read_image', sessionId, requestJson)
+              : sidecar.readImage(sessionId, requestJson);
         }
       case 'spawn_subagent':
         final runner = subagentRunner;
@@ -2005,7 +2128,18 @@ class Agent {
       default:
         resultJson = '{"ok":false,"error":"Unknown tool: $name"}';
     }
+    return resultJson;
+  }
 
+  /// 结果后处理：解析 sidecar 返回的 JSON，并按工具补上给模型看的展示文本。
+  ///
+  /// 解析失败时错误文本必须带工具名与实际异常（design D5：不得用不含原因的通用
+  /// 文案顶替 —— 并行化之前这里只写一句 'Failed to parse tool result'）。
+  Map<String, dynamic> _postProcessToolResult(
+      Map<String, dynamic> toolCall, String resultJson) {
+    final name = toolCall['name'] as String?;
+    final input = (toolCall['input'] as Map<String, dynamic>?) ?? {};
+    final path = (input['path'] as String?) ?? '';
     try {
       final parsed = jsonDecode(resultJson) as Map<String, dynamic>;
       if (name == 'web_search' || name == 'web_fetch') {
@@ -2086,7 +2220,10 @@ class Agent {
       return parsed;
     } catch (e) {
       debugPrint('[AliasAgent] _executeTool parse error: $e');
-      return {'ok': false, 'error': 'Failed to parse tool result'};
+      return {
+        'ok': false,
+        'error': '${name ?? 'unknown'}: 工具结果解析失败：$e',
+      };
     }
   }
 

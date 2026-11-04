@@ -243,6 +243,7 @@ class AgentFactory {
       guard: guardForAgent,
       backgroundFoldEnabled: backgroundFoldEnabled,
       summaryStoreOpen: summaryStoreOpen(),
+      toolParallelMax: config.toolParallelMax,
       callbacks: callbacks,
       subagentRunner: subagentRunner,
     );

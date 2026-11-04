@@ -1,9 +1,11 @@
 #ifndef WEB_FETCH_H
 #define WEB_FETCH_H
 
-#include <string>
-#include <cstdint>
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
+#include <mutex>
+#include <string>
 
 // ============================================================================
 // web_fetch — fetch a URL and return extracted text
@@ -64,6 +66,26 @@ size_t fetch_write_callback(char* ptr, size_t size, size_t nmemb, void* userdata
 
 /// 响应体上限（与 `CURLOPT_MAXFILESIZE` 用同一个数）。这是**内存保护**，不是内容预算。
 long long web_fetch_max_response_bytes();
+
+// ============================================================================
+// Python 探测的并发前提（change parallelize-readonly-tool-calls，design D9）
+// ============================================================================
+
+/// Python 探测的缓存状态：一份状态只探测一次。
+///
+/// 生产路径用一份进程级静态状态（`web_fetch.cpp` 里的 `detect_python()`）；测试
+/// 可以自建一份，复现"多线程同时首次探测"这个调用形态。
+struct PythonProbeState {
+    std::once_flag once;
+    std::atomic<bool> available{false};
+};
+
+/// 对 `state` 执行一次（且仅一次）Python 探测，返回探测结果。
+///
+/// 探测体只在 `std::call_once` 里跑一次，结果写进 `state.available` 后再对其它
+/// 线程可见 —— 原实现用两个裸 bool 无锁读写，后到的线程可能读到"已置 checked、
+/// 未置 available"的中间态，把"Python 可用"误判成"不可用"。
+bool web_fetch_run_python_probe(PythonProbeState& state);
 
 /// 当 libcurl 因为体积上限（或跳转次数）中止时，拼一条给用户与模型看的说明。
 /// 说明里必须含：上限多少、服务端声明多大（读不到就写"未知大小"）、正文没被读取、

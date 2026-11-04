@@ -14,7 +14,7 @@ import 'package:alias_agent/services/spill_paths.dart';
 ///      —— 这个数是用户 2026-10-25 的决定，不是随手取的；
 ///   3. 用户文档的配置键表里确实写了这个键（否则用户改不到它）。
 void main() {
-  Map<String, dynamic> baseJson({Object? spill}) {
+  Map<String, dynamic> baseJson({Object? spill, Object? tool}) {
     final m = <String, dynamic>{
       'version': 1,
       'providers': {
@@ -25,6 +25,7 @@ void main() {
       },
     };
     if (spill != null) m['spill'] = spill;
+    if (tool != null) m['tool'] = tool;
     return m;
   }
 
@@ -95,6 +96,42 @@ void main() {
         '${doc.contains('spill.preview_chars')}');
     expect(doc, contains('spill.preview_chars'));
     expect(doc, contains('preview_chars'));
+  });
+
+  // change parallelize-readonly-tool-calls 任务 3.4：`tool.parallel_max`
+  // 0 = 不设上限（缺省）；正整数生效；坏值一律回落 0 并打印一次提示。
+
+  test('读到配置里的 tool.parallel_max（正整数生效）', () {
+    final cfg = AppConfig.fromJson(baseJson(tool: {'parallel_max': 3}));
+    // ignore: avoid_print
+    print('[工具并行配置] parallel_max=3 ⇒ 读到的值 = ${cfg.toolParallelMax}');
+    expect(cfg.toolParallelMax, 3);
+  });
+
+  test('tool.parallel_max 的缺省与坏值：缺键 / 0 / 负数 / 字符串', () {
+    final cases = <String, Object?>{
+      '缺键': null,
+      '等于 0': {'parallel_max': 0},
+      '负数': {'parallel_max': -2},
+      '字符串': {'parallel_max': '两个'},
+      '小数': {'parallel_max': 2.5},
+    };
+    for (final entry in cases.entries) {
+      final cfg = AppConfig.fromJson(baseJson(tool: entry.value));
+      // ignore: avoid_print
+      print('[工具并行配置] ${entry.key} ⇒ ${cfg.toolParallelMax}');
+      expect(cfg.toolParallelMax, 0,
+          reason: '${entry.key} 必须回落到缺省的 0（不设上限）');
+    }
+  });
+
+  test('保存配置时把 tool.parallel_max 写回去（用户能找到它）', () {
+    final cfg = AppConfig.fromJson(baseJson(tool: {'parallel_max': 4}));
+    final back = cfg.toJson();
+    // ignore: avoid_print
+    print('[工具并行配置] 写回的 tool 块 = ${back['tool']}');
+    expect(back['tool'], {'parallel_max': 4});
+    expect(AppConfig.fromJson(back).toolParallelMax, 4);
   });
 
   test('用户文档写明了预览的两处字节改动与无主目录清理（tasks 11.4）', () {

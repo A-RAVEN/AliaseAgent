@@ -235,6 +235,19 @@ abstract class ISidecar {
 
   // Spill 读回（spill-large-tool-output）：只读该上下文自己的 spill 目录。
   String readSpill(String handle, String requestJson);
+
+  /// 把一个只读工具调用派到 worker isolate 执行（change
+  /// `parallelize-readonly-tool-calls` 任务 4.1）。
+  ///
+  /// 只接受六个同步只读工具名：`read_file`、`list_dir`、`glob_file`、
+  /// `grep_file`、`read_spill`、`read_image`。`requestJson` 的形态与同名同步方法
+  /// 一致（`list_dir` 是裸路径，其余是请求 JSON）。
+  ///
+  /// 用途：并发段的每个成员各起一个 isolate，同步 FFI 调用才会真正重叠。段长为 1
+  /// 时调用方仍走原来的同步方法，单工具时序不变。名字不在支持集里时返回带名字的
+  /// 显式错误 JSON，不静默当别的工具执行。
+  Future<String> callToolOnWorker(
+      String toolName, String handle, String requestJson);
 }
 
 // ---------------------------------------------------------------------------
@@ -920,6 +933,31 @@ class SidecarBridge implements ISidecar {
           onTimeout:
               '{"ok":false,"error":"命令等待超时：这一层没能等到命令结束（sidecar 侧的超时应当先到）。"}');
 
+  // -- 并发段的 worker 入口（change parallelize-readonly-tool-calls） --
+
+  @override
+  Future<String> callToolOnWorker(
+      String toolName, String handle, String requestJson) async {
+    // 入参形态与同名同步方法一致：`read_file` 像 `readFile` 那样接受裸路径，
+    // `list_dir` 本来就是裸路径，其余是请求 JSON。
+    var payload = requestJson;
+    if (toolName == 'read_file' && !payload.trimLeft().startsWith('{')) {
+      payload = '{"path":"${_jsonEscape(payload)}"}';
+    }
+    final receivePort = ReceivePort();
+    await Isolate.spawn(_webWorkerMain, {
+      'sendPort': receivePort.sendPort,
+      'handle': handle,
+      'requestJson': payload,
+      'workerType': toolName,
+    });
+    // 这里刻意不加超时：这六个工具原来的同步路径也没有超时，套一层 isolate 不改变
+    // "多久算超时"这件事（不发明新数值）。worker 内的任何异常都会回一条错误 JSON。
+    final result = await receivePort.first as String;
+    receivePort.close();
+    return result;
+  }
+
   Future<String> _workerTool(
       String handle, String requestJson, String workerType, Duration timeout,
       {required String onTimeout}) async {
@@ -989,6 +1027,33 @@ class SidecarBridge implements ISidecar {
               break;
             case 'run_command':
               final fn = lib.lookupFunction<SetWorkspaceNative, RunCommandDart>('run_command');
+              resultPtr = fn(handlePtr, ptr!);
+              break;
+            // 并发段的同步只读工具（change parallelize-readonly-tool-calls 任务 4.1）：
+            // 每个 isolate 打开的是同一份 sidecar.dll，C++ 侧各自一条线程、返回各走
+            // thread_local 槽。
+            case 'read_file':
+              final fn = lib.lookupFunction<SetWorkspaceNative, ReadFileDart>('read_file');
+              resultPtr = fn(handlePtr, ptr!);
+              break;
+            case 'list_dir':
+              final fn = lib.lookupFunction<SetWorkspaceNative, ListDirDart>('list_dir');
+              resultPtr = fn(handlePtr, ptr!);
+              break;
+            case 'glob_file':
+              final fn = lib.lookupFunction<SetWorkspaceNative, GlobFileDart>('glob_file');
+              resultPtr = fn(handlePtr, ptr!);
+              break;
+            case 'grep_file':
+              final fn = lib.lookupFunction<SetWorkspaceNative, GrepFileDart>('grep_file');
+              resultPtr = fn(handlePtr, ptr!);
+              break;
+            case 'read_spill':
+              final fn = lib.lookupFunction<SetWorkspaceNative, RunCommandDart>('read_spill');
+              resultPtr = fn(handlePtr, ptr!);
+              break;
+            case 'read_image':
+              final fn = lib.lookupFunction<SetWorkspaceNative, ReadImageDart>('read_image');
               resultPtr = fn(handlePtr, ptr!);
               break;
             default:
