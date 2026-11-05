@@ -161,6 +161,19 @@ void main() {
         // 工作区 = 仓库根（initState 会先把它重置成主目录，所以必须在 pump 之后重设）。
         final repoRoot = Directory.current.path;
         final chatState = tester.state<ChatScreenState>(find.byType(ChatScreen));
+        // 空库启动时没有当前会话（`setCurrentWorkspace` 自 778b933 起要求先有会话，
+        // 真实产品靠发消息时懒建兜底）：先走界面上真实的「New Chat」按钮建会话。
+        // _newChat 要 await 建会话 + ensureContext（真 FFI），一帧 pump 不一定跑完，
+        // 按秒轮询（与 _waitForTurnComplete 同一既有模式，15s 上限是测试等待构造值）。
+        await tester.tap(find.widgetWithText(FilledButton, 'New Chat'));
+        final chatReadyDeadline =
+            DateTime.now().add(const Duration(seconds: 15));
+        while (chatState.currentSessionId == null &&
+            DateTime.now().isBefore(chatReadyDeadline)) {
+          await tester.pump(const Duration(milliseconds: 200));
+        }
+        expect(chatState.currentSessionId, isNotNull,
+            reason: 'New Chat 按钮必须先建出当前会话，否则后面的 setWorkspace 必然报 no current session');
         expect(await chatState.setCurrentWorkspace(repoRoot), isNull,
             reason: 'setWorkspace(仓库根) 必须成功 —— 否则扫描的不是 lib/ 与 sidecar/');
 
@@ -238,14 +251,18 @@ void main() {
           }
         }
 
-        // ① 恰好一个 assistant 轮里含两个 grep_file（= 同一轮里连续发出）。
+        // ① 至少一个 assistant 轮里含两个 grep_file（= 同一轮里连续发出）。
+        // 轮数允许 >1：最终回复消息也会带整轮 allTurnToolCalls（落库设计如此，
+        // 供刷新后重现工具卡），同一对调用因此出现在两条消息里——spec 的判据是
+        // "存在一个 assistant 轮含 ≥2 个只读 tool_use"（存在量词），不是"恰好一条"。
+        // 真·同一轮的证明在组内：两个调用 id 互不相同且与界面观测到的同一对一致。
         final multi = toolRounds.where((r) => r.length >= 2).toList();
-        expect(multi.length, 1,
+        expect(multi.isNotEmpty, isTrue,
             reason: '必须有一个 assistant 轮里含 ≥2 个只读 tool_use；'
                 '实际各轮 grep 数=${toolRounds.map((r) => r.length).toList()}');
-
-        // ② 按发出顺序交付，且各自 input 指向要求的目录。
-        final round = multi.single;
+        final round = multi.first;
+        expect(round.map((t) => t['id']).toSet().length, 2,
+            reason: '该轮内的两个 grep_file 必须是两个不同 id 的调用（同一 assistant 块），不是把两条各 1 个的轮并进来的假象');
         final firstInput = (round[0]['input'] as Map).cast<String, dynamic>();
         final secondInput = (round[1]['input'] as Map).cast<String, dynamic>();
         final firstGlob = (firstInput['glob'] ?? '').toString();

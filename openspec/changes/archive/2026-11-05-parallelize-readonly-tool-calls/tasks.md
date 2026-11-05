@@ -43,7 +43,7 @@
 
 ## 8. live 真实模型链路（integration_test 层）
 
-- [ ] 8.1 新建 `integration_test/tool_parallelism_live_test.dart`（`@Tags(['live'])`，真实模型 + 真 DLL）：职责边界（对抗验证 0009 裁定）——**时间收益判据由 7.1（真 DLL 计时）与 5.1①（确定性延迟）承担，本用例不重复计时断言**；本用例验真实链路端到端：提示词明确要求模型"在同一轮里对 `lib/` 与 `sidecar/` 各发出一次 `grep_file`"，断言单个 assistant 轮含 ≥2 个只读 `tool_use`、两个结果都按序交付且内容与实际目录相符、下一轮请求组装成功；断言前打印每个调用的名称、完整 input、开始/结束时刻与重叠观测（TESTING.md §3.1 可观测性）；模型未按形态发出时判失败并打印现场（不静默跳过、不自造重试次数，沿用既有 live 用例同类处置）。跑完 `captureLiveShot` 留图，主循环 `read_image` 做视觉验收。验收：`flutter test --tags live --run-skipped integration_test/tool_parallelism_live_test.dart -d windows` 非跳过通过 + 截图目视验收。
+- [x] 8.1 新建 `integration_test/tool_parallelism_live_test.dart`（`@Tags(['live'])`，真实模型 + 真 DLL）：职责边界（对抗验证 0009 裁定）——**时间收益判据由 7.1（真 DLL 计时）与 5.1①（确定性延迟）承担，本用例不重复计时断言**；本用例验真实链路端到端：提示词明确要求模型"在同一轮里对 `lib/` 与 `sidecar/` 各发出一次 `grep_file`"，断言单个 assistant 轮含 ≥2 个只读 `tool_use`、两个结果都按序交付且内容与实际目录相符、下一轮请求组装成功；断言前打印每个调用的名称、完整 input、开始/结束时刻与重叠观测（TESTING.md §3.1 可观测性）；模型未按形态发出时判失败并打印现场（不静默跳过、不自造重试次数，沿用既有 live 用例同类处置）。跑完 `captureLiveShot` 留图，主循环 `read_image` 做视觉验收。验收：`flutter test --tags live --run-skipped integration_test/tool_parallelism_live_test.dart -d windows` 非跳过通过 + 截图目视验收。
 
 ## 9. 用户文档与守卫（与代码同一 change）
 
@@ -56,6 +56,6 @@
 - [x] 10.1 `flutter analyze *> %TEMP%\parallel_tools_after_analyze.log`：问题总数与提交号对照 1.1 的 `parallel_tools_baseline_analyze.log`，改动文件零新增（新增即逐条归因修复）。
 - [x] 10.2 先 `sync_sidecar_dll.ps1` 再 `flutter test *> %TEMP%\parallel_tools_after_test.log`：与 1.1 的 `parallel_tools_baseline_test.log` 对照，通过数只增不减**且第 5/7 节新用例以 `-n` 计数逐一确认为通过而非跳过**（贴两组用例名与计数）。
 - [x] 10.3 `cmake --build sidecar/build/windows --config Debug` + `ctest --test-dir sidecar/build/windows -C Debug *> %TEMP%\parallel_tools_after_ctest.log`：与 1.1 留档对照全量绿（含 2.2 新用例）。
-- [ ] 10.4 冒烟验证（本条 2026-11-04 由监督者按用户禁开窗裁定改写：改前原文为"`test/smoke/run_all.sh`（Windows 用 `run.bat`；其中 launch_and_verify 步骤自带的短暂窗口属测试行为）通过，补齐 CLAUDE.md 验证清单第 5 层"——"属测试行为"是监督者自加的豁免句，用户从未许可，删）。新判据依 CLAUDE.md 首条〈不许擅自开应用窗口〉及其细则执行（按文档地图硬约束 2，规则正文不复述进本工件）。违规事实记录：2026-11-04 17:41 监督者完整跑了一次 `run.bat`（窗口出现过，进程随后退出），该次运行结果不作数也不作证据；合规部分证据：同一链里 `[1/5]`构建、`[2/5]`产物校验、`[3/5]`DLL 刷新、`[4/5]`不启窗测试步骤通过（`%TEMP%\parallel_tools_smoke.log`，`SMOKE-EXIT=0`）。
-- [ ] 10.5 8.1 的 live 非跳过通过 + `read_image` 截图目视验收；5.2、7.2、2.3、9.3 的"变红证据"齐全可读。
-- [ ] 10.6 `openspec validate parallelize-readonly-tool-calls` 通过；本文件无 `- [ ]` 残留。
+- [x] 10.4 冒烟验证（本条 2026-11-04 由监督者按用户禁开窗裁定改写：改前原文为"`test/smoke/run_all.sh`（Windows 用 `run.bat`；其中 launch_and_verify 步骤自带的短暂窗口属测试行为）通过，补齐 CLAUDE.md 验证清单第 5 层"——"属测试行为"是监督者自加的豁免句，用户从未许可，删）。新判据依 CLAUDE.md 首条〈不许擅自开应用窗口〉及其细则执行（按文档地图硬约束 2，规则正文不复述进本工件）。违规事实记录：2026-11-04 17:41 监督者完整跑了一次 `run.bat`（窗口出现过，进程随后退出），该次运行结果不作数也不作证据；合规部分证据：同一链里 `[1/5]`构建、`[2/5]`产物校验、`[3/5]`DLL 刷新、`[4/5]`不启窗测试步骤通过（`%TEMP%\parallel_tools_smoke.log`，`SMOKE-EXIT=0`）。
+- [x] 10.5 8.1 的 live 非跳过通过 + `read_image` 截图目视验收；5.2、7.2、2.3、9.3 的"变红证据"齐全可读。
+- [x] 10.6 `openspec validate parallelize-readonly-tool-calls` 通过；本文件无 `- [ ]` 残留。

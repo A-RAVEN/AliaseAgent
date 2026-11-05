@@ -221,3 +221,23 @@ test\integration\browser_worker_test.dart 396:7
 
 另立 change 时。`sidecar/test/context_ownership_test.cpp` 的既有用例（"两个上下文并发 web_search 时假 provider 一次只看到一个在跑"）把当前串行钉成了受保护行为，改锁必须同时改那条用例并说明依据；本 change 不动它，只在用户文档如实披露。
 
+---
+
+## 窗口版 live 用例在发消息前调 `setCurrentWorkspace`，自上下文句柄化起必报 `no current session`
+
+### 症状
+
+2026-11-04 `parallelize-readonly-tool-calls` 的 live 用例（`integration_test/tool_parallelism_live_test.dart`）首跑 3 秒即失败：`Expected: null / Actual: 'no current session'`（断言消息"setWorkspace(仓库根) 必须成功"）。既有窗口版 live 用例（`browser_live_test.dart`、`live_file_tools_test.dart` 四处、`live_image_read_tool_test.dart`、`live_image_capability_gate_test.dart`）用的是同一调用形态（`pumpWidget` 后立刻 `chatState.setCurrentWorkspace(...)`），自句柄化后无一实际跑过，预计同样会挂。
+
+### 根因
+
+`setCurrentWorkspace` 自提交 `778b933`（2026-11-01，feat: 为工具与模型请求引入独立上下文句柄）起带守卫：`_currentId == null` 时直接返回 `'no current session'`（工作区归上下文所有，必须先有会话句柄）。而启动路径 `_loadSessions` 只在"库里已有会话"时才设 `_currentId`；live 用例的 `setUp` 用 `DatabaseService.openAt(tempDir)` 开**空库**，空库下真正的建会话兜底挂在发消息路径（`_sendMessage` 开头 `_currentId == null → _newChat()`）——所以真实产品首次发消息不受影响，纯用例时序踩坑：它们都必须在**发消息之前**设工作区。
+
+### 期望方向
+
+已受影响用例统一补一步"点界面上真实的 New Chat 按钮建会话再 setWorkspace"（`tool_parallelism_live_test.dart` 已按此修复并实测）；更彻底的做法是给 `integration_test` 加共享的启动助手（确保当前会话），由后续 change 统一处理各用例的重复样板。
+
+### 重新考虑时机
+
+下一个动 `integration_test` 窗口版用例的 change 顺手收敛；或任一上述用例下次真跑到 `no current session` 时即为本条复现。
+
