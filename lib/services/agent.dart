@@ -2045,7 +2045,13 @@ class Agent {
         });
         resultJson = await sidecar.webSearch(sessionId, request);
       case 'web_fetch':
-        final request = jsonEncode({'url': input['url'] ?? ''});
+        // `preview_chars` 与 `run_command` 同形态随请求传下去（C++ 侧按它决定
+        // 头尾各留多少字符；缺省回落是 `spill::kDefaultPreviewChars`）。值来自顶层
+        // 配置 `spill.preview_chars`，执行侧不读配置文件。
+        final request = jsonEncode({
+          'url': input['url'] ?? '',
+          'preview_chars': config.spillPreviewChars,
+        });
         resultJson = await sidecar.webFetch(sessionId, request);
       case 'browser_navigate':
         resultJson = await sidecar.browserNavigate(
@@ -2142,8 +2148,11 @@ class Agent {
     final path = (input['path'] as String?) ?? '';
     try {
       final parsed = jsonDecode(resultJson) as Map<String, dynamic>;
-      if (name == 'web_search' || name == 'web_fetch') {
+      if (name == 'web_search') {
         parsed['content'] = _formatSearchResultForDisplay(name!, parsed);
+      } else if (name == 'web_fetch') {
+        // 正文由 C++ 侧 spill 形状决定，这里只负责外壳拼装（标题 / 网址 / 引用行）。
+        parsed['content'] = _composeWebFetchResultText(parsed);
       } else if (name == 'browser_navigate' ||
           name == 'browser_click' ||
           name == 'browser_type' ||
@@ -2233,18 +2242,54 @@ class Agent {
       final error = (result['error'] as String?) ?? 'Unknown error';
       return error.length > 200 ? '${error.substring(0, 200)}...' : error;
     }
-    final buf = StringBuffer();
     if (toolName == 'web_search') {
       return assembleSearchText(result, budget: kToolResultElisionThreshold);
-    } else if (toolName == 'web_fetch') {
-      final content = (result['content'] as String?) ?? '';
-      if (content.isEmpty) {
-        return '(fetched empty page)';
-      }
-      buf.write(
-          content.length > 2000 ? '${content.substring(0, 2000)}...' : content);
     }
-    return buf.toString().trimRight();
+    // `web_fetch` 不再走这里：正文是 C++ 侧 spill 形状后的文本，外壳（标题 / 网址 /
+    // 引用行）由 `_composeWebFetchResultText` 拼，旧的 2000 字符硬切随之删除。
+    return '';
+  }
+
+  /// `web_fetch` 的**模型可见正文**（delta spec「web_fetch 结果交付给模型的形态」）：
+  /// 第一行标题（`title` 为空时用网址）、第二行网址、正文（C++ 侧 spill 形状后的
+  /// 内联文本），落了盘时**最后一行**是 spill 引用行。
+  ///
+  /// 引用行必须放最后：重放阶段通用省略只保头尾，放中间等于被自己掐掉；它同时是
+  /// [bodyHasSpillRefs] 判断"中段还能不能按 read_spill 读回"的依据。
+  ///
+  /// 旧行为"正文超过 2000 字符就切成前 2000 个加三个点"已删除 —— 那个数字没有出处，
+  /// 且切完既不说略去多少、也不给取回办法（违反"砍内容必须可见、可见之后必须可
+  /// 恢复"）。空正文的 `(fetched empty page)` 提示保留，且此时不产生 spill 引用。
+  String _composeWebFetchResultText(Map<String, dynamic> result) {
+    final body = (result['content'] as String?) ?? '';
+    final title = (result['title'] as String?) ?? '';
+    final url = (result['url'] as String?) ?? '';
+
+    final sb = StringBuffer();
+    final firstLine = title.isNotEmpty ? title : url;
+    if (firstLine.isNotEmpty) sb.writeln(firstLine);
+    if (url.isNotEmpty) sb.writeln(url);
+    if (body.isEmpty) {
+      sb.write('(fetched empty page)');
+      return sb.toString().trimRight();
+    }
+    sb.write(body);
+
+    final spill = result['spill'];
+    if (spill is Map) {
+      final env = spill['content'];
+      if (env is Map) {
+        final ref = (env['ref'] as String?) ?? '';
+        if (ref.isNotEmpty) {
+          final total = env['total_bytes'] ?? 0;
+          final omitted = env['omitted_bytes'] ?? 0;
+          sb.writeln();
+          sb.write('$kSpillRefsMarker content=$ref ($total bytes, $omitted omitted) — '
+              'read any byte range back with read_spill(ref, offset, limit)]');
+        }
+      }
+    }
+    return sb.toString().trimRight();
   }
 
   List<ResultSection> _buildResultSections(
@@ -2282,6 +2327,10 @@ class Agent {
       }
       return sections;
     } else if (toolName == 'web_fetch') {
+      // 卡片拿到的就是发给模型的那一份字符串（`_postProcessToolResult` 已拼好：
+      // 标题 / 网址 / C++ 形状后的正文 / 引用行），不另取未形状化的全文、也不另切。
+      // 结果行的 200 字符折叠摘要是 `tool_call_card.dart` 的 `_buildItem` 按这份
+      // 字符串的开头做的，不构成第二份正文。
       final content = (result['content'] as String?) ?? '';
       if (content.isEmpty) return [];
       final pageTitle = (result['title'] as String?) ?? '';

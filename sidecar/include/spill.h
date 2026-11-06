@@ -14,6 +14,8 @@
 #include <cstddef>
 #include <string>
 
+#include <nlohmann/json.hpp>
+
 namespace context {
 class Context;
 }
@@ -73,6 +75,40 @@ Written write(const std::string& session, const std::string& tag, const std::str
 /// 不同（change add-context-handles 任务 1.5 的验收入口）。
 Written write_for_context(context::Context& ctx, const std::string& session,
                           const std::string& tag, const std::string& content);
+
+// ---------------------------------------------------------------------------
+// 交付形状（change `migrate-web-fetch-to-spill`：从 `command_tool.cpp` 的提升）
+// ---------------------------------------------------------------------------
+
+/// 头尾各留多少字符（`preview_chars` 的缺省值）。用户 2026-10-25 的决定：原话
+/// 「4000字听起来也好多，改成1000字吧」。可配，配置键 `spill.preview_chars`。
+/// 判断"要不要省略"的阈值是它的 2 倍（头 + 尾），算术推论，不是第二个魔数。
+///
+/// 原先住在 `command_tool.cpp` 的匿名命名空间里（跨文件取不到），随形状实现一起
+/// 提升到这里：`run_command` 与 `web_fetch` 的两个工具共读这一份，不再各写一个 1000。
+inline constexpr long long kDefaultPreviewChars = 1000;
+
+/// 一条流的交付形状（`run_command` 的 stdout/stderr 与 `web_fetch` 的 content 共用）。
+///
+/// 三条不变量（`spill-large-tool-output` 的判据就钉在这三条上）：
+///   ① `head` / `tail` 是 spill 文件里的**原始字节切片**（只在码点边界落刀），
+///      所以 `|head| + |tail| + omitted_bytes == total_bytes` 恒成立；
+///   ② 给模型看的 `inline_text` 由 `sanitize_utf8(head/tail)` 拼出来 —— 换行归一
+///      与坏字节替换**只发生在这一步**，不落到文件上；
+///   ③ `ref` 就是那个文件的绝对路径，`read_spill` 能按字节读回中间段。
+struct StreamShape {
+  std::string inline_text;  // 交给模型的那份
+  bool truncated = false;
+  nlohmann::json envelope =
+      nlohmann::json::object();  // {ref,total_bytes,omitted_bytes,head,tail}
+};
+
+/// 把一条流先落盘，再按 `preview_chars × 2` 决定内联全文还是头尾 + 引用。
+///
+/// 落盘失败时不返回 `ok:false` —— 由调用方按"输出是否超过预览阈值"决定兜底方式
+/// （小的直接内联，大的必须报错，见规范"写盘失败必须可见"）。
+StreamShape shape_stream(context::Context& ctx, const std::string& raw, size_t preview_chars,
+                         const std::string& session, const char* tag, Written* written_out);
 
 /// 严格 UTF-8 校验：拒绝过长编码、代理区、超出 U+10FFFF、以及被截断的尾巴。
 bool is_valid_utf8(const std::string& s);

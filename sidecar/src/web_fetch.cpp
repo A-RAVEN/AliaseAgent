@@ -1,7 +1,9 @@
 #include "web_fetch.h"
-#include "tools.h"
+#include "context.h"
 #include "logger.h"
+#include "spill.h"
 #include "subprocess.h"
+#include "tools.h"
 #include <nlohmann/json.hpp>
 #include <curl/curl.h>
 #include <string>
@@ -30,6 +32,21 @@
 #endif
 
 using json = nlohmann::json;
+
+namespace {
+
+/// 从请求 JSON 里取整数字段：缺键 / 非数字 / 小于下限一律回落缺省值。
+/// 与 `command_tool.cpp` 的同名手法一致（`preview_chars` 的读取用它）。
+long long int_field(const json& req, const char* key, long long fallback,
+                    long long minimum = 1) {
+  if (!req.contains(key)) return fallback;
+  const json& v = req[key];
+  if (!v.is_number_integer() && !v.is_number_float()) return fallback;
+  const long long n = v.get<long long>();
+  return n < minimum ? fallback : n;
+}
+
+}  // namespace
 
 // ============================================================================
 // Constants
@@ -605,6 +622,41 @@ std::string strip_html_tags(const std::string& html) {
 }
 
 // ============================================================================
+// 成功结果的 spill 形状（change `migrate-web-fetch-to-spill` 任务 2.1）
+// ============================================================================
+
+bool web_fetch_shape_success_result(context::Context& ctx, json& result,
+                                    long long preview_chars) {
+  if (!result.contains("content") || !result["content"].is_string()) return false;
+  const std::string body = result["content"].get<std::string>();
+  // 归属键就是上下文句柄的名字（与 `run_command` 同法）；流名固定为 `content`。
+  spill::Written written;
+  const spill::StreamShape shape =
+      spill::shape_stream(ctx, body, static_cast<size_t>(preview_chars), ctx.name(),
+                          "content", &written);
+  // 内联文本只对头尾做消毒（换行归一、坏字节替换），文件里仍是原始字节。
+  result["content"] = shape.inline_text;
+  result["truncated"] = shape.truncated;
+  if (!written.ok) {
+    const size_t limit = static_cast<size_t>(preview_chars) * 2;
+    if (spill::char_count(body) <= limit) {
+      // 正文本身不超过预览阈值：全文已经内联，写盘失败不丢内容（规范"写盘失败必须
+      // 可见"的第一种处置），保持成功结果。
+      return false;
+    }
+    // 超过阈值且没能落盘：不许只给一部分冒充完整正文。
+    result = json{{"ok", false},
+                  {"error", "web_fetch 正文没能写进 spill 文件，且正文超过了预览阈值"
+                            "（无法只给一部分冒充完整正文）：" +
+                                written.error}};
+    LOG_WARN("web_fetch: spill write failed for oversized content — returning error");
+    return true;
+  }
+  result["spill"] = json{{"content", shape.envelope}};
+  return false;
+}
+
+// ============================================================================
 // Main web_fetch implementation (tasks 3.4, 3.5, 3.6)
 // ============================================================================
 
@@ -621,6 +673,12 @@ std::string web_fetch_impl(const std::string& request_json) {
     if (url.empty()) {
       return "{\"ok\":false,\"error\":\"URL is empty\"}";
     }
+
+    // 头尾各留多少字符：`spill.preview_chars`（Dart 读好随请求传进来，执行侧不读
+    // 配置文件 —— 与 `run_command` 同形态）。缺省用 `spill.h` 里那一份 1000，两个工具
+    // 共读同一个常量。
+    const long long preview_chars =
+        int_field(req, "preview_chars", spill::kDefaultPreviewChars);
 
     // extract_mode is deprecated — crawl4ai always produces markdown, curl produces tag-stripped text
     // Keep parameter parsing for backward compat but ignore the value
@@ -692,7 +750,13 @@ std::string web_fetch_impl(const std::string& request_json) {
             if (!parsed.contains("title")) parsed["title"] = "";
             LOG_INFO("web_fetch: crawl4ai success — " +
                      std::to_string(parsed.value("content", "").size()) + " chars");
-            return parsed.dump();
+            // 成功出口之一（crawl4ai）：形状必须在 return 前接上。另一个出口是下面
+            // curl 兜底的成功 return —— 两条路径没有天然汇合点，漏一个即那条路径不落盘。
+            web_fetch_shape_success_result(context::Context::current(), parsed,
+                                           preview_chars);
+            // `error_handler_t::replace`：信封里存的是原始字节切片（可能不是合法
+            // UTF-8），这份 JSON 只做呈现，替换掉而不是抛异常；文件里仍是原始字节。
+            return parsed.dump(-1, ' ', false, json::error_handler_t::replace);
           }
           // Subprocess returned ok:false — fall through to curl
           LOG_WARN("web_fetch: crawl4ai returned error: " +
@@ -810,7 +874,9 @@ std::string web_fetch_impl(const std::string& request_json) {
     result["url"] = url;
     result["title"] = "";
     result["content"] = body;
-    return result.dump();
+    // 成功出口之二（curl 兜底）：与 crawl4ai 出口接同一个形状函数，不能漏。
+    web_fetch_shape_success_result(context::Context::current(), result, preview_chars);
+    return result.dump(-1, ' ', false, json::error_handler_t::replace);
 
   } catch (const json::parse_error& e) {
     return "{\"ok\":false,\"error\":\"Fetch failed: invalid request JSON — " +

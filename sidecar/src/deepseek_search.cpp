@@ -42,7 +42,7 @@ static_assert(DEEPSEEK_REQUEST_TIMEOUT_SEC > 0, "请求必须设超时，到点�
 // ============================================================================
 
 /// 把不合法的 UTF-8 字节换成替换字符（U+FFFD）。与
-/// `sidecar/src/command_tool.cpp` 里 `sanitize_utf8` 同一套判定规则，只是不做
+/// `sidecar/src/spill.cpp` 里 `sanitize_utf8` 同一套判定规则，只是不做
 /// 换行归一 —— 这里处理的是标题，原样保留其换行意图。
 /// 实测标题会带坏字节（cctv 那条中文标题被打错），所以这不是理论问题。
 static std::string sanitize_utf8_keep_newlines(const std::string& in) {

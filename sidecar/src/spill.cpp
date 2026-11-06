@@ -550,4 +550,105 @@ std::string read_request(const context::Context& ctx, const std::string& request
         .dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
+namespace {
+
+/// 把不合法的 UTF-8 字节换成替换字符；顺便把 CRLF 归一成 LF（发给模型的文本用
+/// LF 更省 token，也免得同一段内容出现两种换行）。**不丢内容、不崩**。
+///
+/// 只在"拼内联预览"这一步用；spill 文件里写的是原始字节（见 `shape_stream` 的
+/// 不变量 ②）。
+std::string sanitize_utf8(const std::string& in) {
+  std::string out;
+  out.reserve(in.size());
+  size_t i = 0;
+  auto is_cont = [](unsigned char b) { return (b & 0xC0) == 0x80; };
+  while (i < in.size()) {
+    const unsigned char b = static_cast<unsigned char>(in[i]);
+    size_t len = 0;
+    if (b < 0x80) {
+      len = 1;
+    } else if ((b & 0xE0) == 0xC0) {
+      len = 2;
+    } else if ((b & 0xF0) == 0xE0) {
+      len = 3;
+    } else if ((b & 0xF8) == 0xF0) {
+      len = 4;
+    }
+    bool ok = len > 0 && i + len <= in.size();
+    if (ok) {
+      for (size_t k = 1; k < len; ++k) {
+        if (!is_cont(static_cast<unsigned char>(in[i + k]))) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok && len == 2 && b < 0xC2) ok = false;  // 过长编码不接受
+      if (ok && len == 3 && b == 0xE0 && static_cast<unsigned char>(in[i + 1]) < 0xA0) ok = false;
+      if (ok && len == 4 && b == 0xF0 && static_cast<unsigned char>(in[i + 1]) < 0x90) ok = false;
+    }
+    if (ok) {
+      out.append(in, i, len);
+      i += len;
+    } else {
+      out += "\xEF\xBF\xBD";  // U+FFFD
+      i += 1;
+    }
+  }
+  std::string normalized;
+  normalized.reserve(out.size());
+  for (size_t k = 0; k < out.size(); ++k) {
+    if (out[k] == '\r' && k + 1 < out.size() && out[k + 1] == '\n') continue;
+    normalized += out[k];
+  }
+  return normalized;
+}
+
+}  // namespace
+
+StreamShape shape_stream(context::Context& ctx, const std::string& raw, size_t preview_chars,
+                         const std::string& session, const char* tag,
+                         Written* written_out) {
+  StreamShape r;
+  const Written w = write_for_context(ctx, session, tag, raw);
+  if (written_out) *written_out = w;
+  if (!w.ok) {
+    // 写盘失败：先把能给的给出去，形态交给调用方判断。
+    r.inline_text = sanitize_utf8(raw);
+    return r;
+  }
+  const size_t total = w.bytes;
+  const size_t chars = char_count(raw);
+  if (chars <= preview_chars * 2) {
+    // 内联全文：不出现任何"省略"字样（否则省略量会是 0 或负数）
+    r.inline_text = sanitize_utf8(raw);
+    r.truncated = false;
+    r.envelope = {{"ref", w.path},
+                  {"total_bytes", total},
+                  {"omitted_bytes", 0},
+                  {"head", raw},
+                  {"tail", ""}};
+    return r;
+  }
+
+  const std::string head = head_chars(raw, preview_chars);
+  const std::string tail = tail_chars(raw, preview_chars);
+  const size_t covered = head.size() + tail.size();
+  const size_t omitted = total > covered ? total - covered : 0;
+  r.truncated = true;
+  r.envelope = {{"ref", w.path},
+                {"total_bytes", total},
+                {"omitted_bytes", omitted},
+                {"head", head},
+                {"tail", tail}};
+
+  // 省略说明写在**头尾之间**：说清略去了多少、全文在哪、怎么读回。
+  char how[256];
+  std::snprintf(how, sizeof(how),
+                "[... %zu bytes omitted of %zu; full output: %s — read it back with "
+                "read_spill (ref, offset=%zu, limit=%zu)]",
+                omitted, total, w.path.c_str(), head.size(), omitted);
+  r.inline_text = sanitize_utf8(head) + "\n" + how + "\n" + sanitize_utf8(tail);
+  return r;
+}
+
 }  // namespace spill

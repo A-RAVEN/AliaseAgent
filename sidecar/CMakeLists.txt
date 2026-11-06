@@ -136,6 +136,7 @@ add_executable(sidecar_tests
   test/browser_test.cpp
   test/command_tool_test.cpp
   test/spill_write_test.cpp
+  test/web_fetch_spill_test.cpp
   test/deepseek_search_test.cpp
   test/image_probe_test.cpp
   test/clipboard_image_test.cpp

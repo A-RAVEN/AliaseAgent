@@ -7,6 +7,12 @@
 #include <mutex>
 #include <string>
 
+#include <nlohmann/json.hpp>
+
+namespace context {
+class Context;
+}
+
 // ============================================================================
 // web_fetch — fetch a URL and return extracted text
 // ============================================================================
@@ -96,5 +102,35 @@ bool web_fetch_run_python_probe(PythonProbeState& state);
 /// @return 说明字符串；不是这两种错误时返回空串（由调用方走原来的通用分支）
 std::string describe_fetch_size_rejection(int curl_result, long long declared_bytes,
                                           const std::string& url);
+
+// ============================================================================
+// 成功结果的 spill 交付形状（change `migrate-web-fetch-to-spill` 任务 2.1）
+// ============================================================================
+
+/// 把一次**成功**抓取的结果正文接进 spill 交付通道（`tool-output-spill` 能力）：
+/// 完整正文先落盘到本上下文的 spill 目录（流名 `content`），再按 `preview_chars × 2`
+/// 决定交付形态 —— 不超过阈值 ⇒ 内联全文；超过 ⇒ 头尾各 `preview_chars` 个字符 +
+/// 省略说明，并把引用写进结果。
+///
+/// 写回 `result` 的字段：
+///   - `content`：形状后的内联文本（就是交给模型与卡片的那份）；
+///   - `truncated`：是否发生了头尾省略；
+///   - `spill.content`：落盘成功时的信封（`ref` / `total_bytes` / `omitted_bytes` /
+///     `head` / `tail`），落盘失败时没有这个键。
+///
+/// 写盘失败（规范"写盘失败必须可见"，对 `web_fetch` 同样适用）：
+///   - 正文不超过 `preview_chars × 2` ⇒ 保持成功、原样内联全文（此时不丢内容）；
+///   - 正文超过 `preview_chars × 2` ⇒ 整条结果改为 `{"ok":false,...}`，错误里带目录
+///     与系统原因，SHALL NOT 只给头尾预览冒充完整正文。
+///
+/// `web_fetch_impl` 有**两个独立的成功 return**（crawl4ai 与 curl 兜底），不存在天然
+/// 汇合点 —— 两个出口都必须各调它一次（漏一个即那条路径仍不落盘）。
+///
+/// @param ctx            要写入哪个上下文的 spill 目录（归属键就是它的名字）
+/// @param result         成功结果 JSON，原地改写
+/// @param preview_chars  头尾各留多少字符（来自请求字段，缺省 `spill::kDefaultPreviewChars`）
+/// @return 是否因为写盘失败而把结果改成了 `ok:false`
+bool web_fetch_shape_success_result(context::Context& ctx, nlohmann::json& result,
+                                    long long preview_chars);
 
 #endif // WEB_FETCH_H

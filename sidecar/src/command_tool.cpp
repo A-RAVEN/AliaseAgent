@@ -28,17 +28,13 @@ namespace command_tool {
 namespace {
 
 // ---------------------------------------------------------------------------
-// 缺省值（规范：`spill.preview_chars` 与两个超时）
+// 缺省值（规范：两个超时；`spill.preview_chars` 的缺省已随形状实现提升到 `spill.h`）
 // ---------------------------------------------------------------------------
 
 /// 命令缺省超时毫秒数。
 constexpr long long kDefaultTimeoutMs = 120000;
 /// 超时上限：调用方给得比它大就按它执行。
 constexpr long long kDefaultMaxTimeoutMs = 600000;
-/// 头尾各留多少字符（`preview_chars` 的缺省值）。用户 2026-10-25 的决定：原话
-/// 「4000字听起来也好多，改成1000字吧」。可配，配置键 `spill.preview_chars`。
-/// 判断"要不要省略"的阈值是它的 2 倍（头 + 尾），算术推论，不是第二个魔数。
-constexpr long long kDefaultPreviewChars = 1000;
 
 /// UTF-8 输出钉成不带 BOM 的 UTF-8；用 `; ` 与命令接在同一行，好让 PowerShell
 /// 报错时的行号仍对应调用方命令的行号（前缀与命令之间**不许插换行**）。
@@ -146,7 +142,7 @@ std::string resolve_powershell() {
 }
 
 // ---------------------------------------------------------------------------
-// 小工具：取配置值、清洗 UTF-8、按字符切头尾、把一条流落盘并算出交付形状
+// 小工具：取配置值
 // ---------------------------------------------------------------------------
 
 long long int_field(const json& req, const char* key, long long fallback,
@@ -156,118 +152,6 @@ long long int_field(const json& req, const char* key, long long fallback,
   if (!v.is_number_integer() && !v.is_number_float()) return fallback;
   const long long n = v.get<long long>();
   return n < minimum ? fallback : n;
-}
-
-/// 把不合法的 UTF-8 字节换成替换字符；顺便把 CRLF 归一成 LF（发给模型的文本用
-/// LF 更省 token，也免得同一段内容出现两种换行）。**不丢内容、不崩**。
-std::string sanitize_utf8(const std::string& in) {
-  std::string out;
-  out.reserve(in.size());
-  size_t i = 0;
-  auto is_cont = [](unsigned char b) { return (b & 0xC0) == 0x80; };
-  while (i < in.size()) {
-    const unsigned char b = static_cast<unsigned char>(in[i]);
-    size_t len = 0;
-    if (b < 0x80) {
-      len = 1;
-    } else if ((b & 0xE0) == 0xC0) {
-      len = 2;
-    } else if ((b & 0xF0) == 0xE0) {
-      len = 3;
-    } else if ((b & 0xF8) == 0xF0) {
-      len = 4;
-    }
-    bool ok = len > 0 && i + len <= in.size();
-    if (ok) {
-      for (size_t k = 1; k < len; ++k) {
-        if (!is_cont(static_cast<unsigned char>(in[i + k]))) {
-          ok = false;
-          break;
-        }
-      }
-      if (ok && len == 2 && b < 0xC2) ok = false;  // 过长编码不接受
-      if (ok && len == 3 && b == 0xE0 && static_cast<unsigned char>(in[i + 1]) < 0xA0) ok = false;
-      if (ok && len == 4 && b == 0xF0 && static_cast<unsigned char>(in[i + 1]) < 0x90) ok = false;
-    }
-    if (ok) {
-      out.append(in, i, len);
-      i += len;
-    } else {
-      out += "\xEF\xBF\xBD";  // U+FFFD
-      i += 1;
-    }
-  }
-  std::string normalized;
-  normalized.reserve(out.size());
-  for (size_t k = 0; k < out.size(); ++k) {
-    if (out[k] == '\r' && k + 1 < out.size() && out[k + 1] == '\n') continue;
-    normalized += out[k];
-  }
-  return normalized;
-}
-
-/// 一条流的交付形状。
-///
-/// 三条不变量（`spill-large-tool-output` 的判据就钉在这三条上）：
-///   ① `head` / `tail` 是 spill 文件里的**原始字节切片**（只在码点边界落刀），
-///      所以 `|head| + |tail| + omitted_bytes == total_bytes` 恒成立；
-///   ② 给模型看的 `inline_text` 由 `sanitize_utf8(head/tail)` 拼出来 —— 换行归一
-///      与坏字节替换**只发生在这一步**，不落到文件上；
-///   ③ `ref` 就是那个文件的绝对路径，`read_spill` 能按字节读回中间段。
-struct StreamShape {
-  std::string inline_text;  // 交给模型的那份
-  bool truncated = false;
-  json envelope = json::object();  // {ref,total_bytes,omitted_bytes,head,tail}
-};
-
-/// 把一条流先落盘，再按 `preview_chars × 2` 决定内联全文还是头尾 + 引用。
-///
-/// 落盘失败时不返回 `ok:false` —— 由调用方按"输出是否超过预览阈值"决定兜底方式
-/// （小的直接内联，大的必须报错，见规范"写盘失败必须可见"）。
-StreamShape shape_stream(context::Context& ctx, const std::string& raw, size_t preview_chars,
-                         const std::string& session, const char* tag,
-                         spill::Written* written_out) {
-  StreamShape r;
-  const spill::Written w = spill::write_for_context(ctx, session, tag, raw);
-  if (written_out) *written_out = w;
-  if (!w.ok) {
-    // 写盘失败：先把能给的给出去，形态交给调用方判断。
-    r.inline_text = sanitize_utf8(raw);
-    return r;
-  }
-  const size_t total = w.bytes;
-  const size_t chars = spill::char_count(raw);
-  if (chars <= preview_chars * 2) {
-    // 内联全文：不出现任何"省略"字样（否则省略量会是 0 或负数）
-    r.inline_text = sanitize_utf8(raw);
-    r.truncated = false;
-    r.envelope = {{"ref", w.path},
-                  {"total_bytes", total},
-                  {"omitted_bytes", 0},
-                  {"head", raw},
-                  {"tail", ""}};
-    return r;
-  }
-
-  const std::string head = spill::head_chars(raw, preview_chars);
-  const std::string tail = spill::tail_chars(raw, preview_chars);
-  const size_t covered = head.size() + tail.size();
-  const size_t omitted = total > covered ? total - covered : 0;
-  r.truncated = true;
-  r.envelope = {{"ref", w.path},
-                {"total_bytes", total},
-                {"omitted_bytes", omitted},
-                {"head", head},
-                {"tail", tail}};
-
-  // 省略说明写在**头尾之间**：说清略去了多少、全文在哪、怎么读回。
-  char how[256];
-  std::snprintf(how, sizeof(how),
-                "[... %zu bytes omitted of %zu; full output: %s — read it back with "
-                "read_spill (ref, offset=%zu, limit=%zu)]",
-                omitted, total, w.path.c_str(), head.size(), omitted);
-  r.inline_text = sanitize_utf8(head) + "\n" + how + "\n" + sanitize_utf8(tail);
-  return r;
 }
 
 }  // namespace
@@ -347,7 +231,8 @@ std::string run_command(const std::string& request_json) {
 
   // 头尾各留多少字符：单一配置项 `spill.preview_chars`（配置由 Dart 侧读好随请求
   // 传进来，执行侧不读配置文件 —— 与超时那几个值的做法一致）。
-  const long long preview_chars = int_field(req, "preview_chars", kDefaultPreviewChars);
+  const long long preview_chars =
+      int_field(req, "preview_chars", spill::kDefaultPreviewChars);
   // spill 的归属键**就是首参上下文句柄**（change add-context-handles）：不再从请求
   // 里的会话字段取，否则删除上下文时按句柄找不到按会话建的目录。
   context::Context& ctx = context::Context::current();
@@ -375,10 +260,13 @@ std::string run_command(const std::string& request_json) {
 
   spill::Written out_written;
   spill::Written err_written;
-  const StreamShape out = shape_stream(ctx, res.stdout_data, static_cast<size_t>(preview_chars),
-                                       spill_key, "stdout", &out_written);
-  const StreamShape err = shape_stream(ctx, res.stderr_data, static_cast<size_t>(preview_chars),
-                                       spill_key, "stderr", &err_written);
+  // 形状实现只有一份（`spill.cpp`），`web_fetch` 的正文走同一个函数。
+  const spill::StreamShape out =
+      spill::shape_stream(ctx, res.stdout_data, static_cast<size_t>(preview_chars),
+                          spill_key, "stdout", &out_written);
+  const spill::StreamShape err =
+      spill::shape_stream(ctx, res.stderr_data, static_cast<size_t>(preview_chars),
+                          spill_key, "stderr", &err_written);
 
   // 写盘失败要看得见（规范"写盘失败必须可见"）：小输出已经内联全文，不算失败；
   // 大输出则**不能**只给一部分冒充完整结果 —— 直接报错，说清目录与原因。
