@@ -124,19 +124,25 @@
 - 目标：与 `run_command` 同一套契约（先落盘 → 头尾预览 → 引用 → `read_spill` 读回），并把 `Docs/user-guide/` 里对应说明改掉。
 - 为什么现在不做也行：它不会因为拖延变坏；但它现在是"日志里最长的那条已知静默截断"，排在上面的上下文句柄化之后。
 
-### [ ] 把 sidecar 的进程级全局改成「每 agent 一份上下文」 —— 未立项
+### [~] 把 sidecar 的进程级全局改成「每 agent 一份上下文」 —— 进行中：`add-context-handles`
 
 - 依据（可核）：`sidecar/src/tools.cpp` 的 `static std::string g_workspace`；`sidecar/src/sidecar_api.cpp` 里十几个 `static std::string g_*_result`（含 `g_read_spill_result`，注释自认 `thread-unsafe but single-threaded usage`）；`browser.cpp` 的唯一浏览器 worker；`sidecar/src/spill.cpp` 的 `static unsigned g_call_seq`（非原子自增，同一会话内并发会撞序号）。
 - 目标：导出改成 `create_context` 拿句柄，工具都带句柄；**Dart 侧按会话/agent 建销句柄**，`sendMessage` 的串行化也按上下文分；浏览器 worker 变成"每上下文一个"（或每上下文一个浏览器会话）。**这是工具并发的前置条件**。
 - 注意：这条**不是**给"开两个 session"做内容隔离（消息已按 `session_id` 隔离），是为了并发时工具结果、工作区、spill 序号不被互相覆盖。
 
-### [ ] 只读工具并行 —— 未立项，依赖上一条
+### [ ] 子 agent 当工具（`spawn_subagent`）—— 未立项，依赖上下文句柄化
+
+- 在同一个 Flutter 进程内开一个新上下文干窄活，保持独立消息历史，复用现有模型—工具循环，只回传结论；不需要 CLI、新 exe 或跨进程协议。这是治「上下文装不下」最直接的办法，比检索排序更有效。
+- 只读工具并行不是这条的前置。
+
+### [ ] 只读工具并行 —— 未立项，效率优化，依赖上下文句柄化
 
 - 只让 read/grep/glob/web 并行；写类工具保持串行。今天工具循环是 `for (…) { await _executeTool(tc); }`，完全串行。
+- 需要缩短工具等待时可以在子 agent 之前提前单独立项，但它不是子 agent 的正确性前置。
 
-### [ ] 子 agent 当工具（`spawn_subagent`）—— 未立项
+### [ ] 多 agent 异步消息 —— 候选，看需要
 
-- 开一个新上下文干窄活，只回传结论。这是治「上下文装不下」最直接的办法，比检索排序更有效。
+- 等出现多个长期运行 agent 的真实协作场景再做；一次性子 agent 只需要"任务 → 结论"的回传，不需要这套消息机制。群聊目前不单独列待办。
 
 ### [ ] 进程即 agent（每 agent 一个 exe）—— 未立项，长期
 
@@ -144,6 +150,20 @@
 - 前提：上面那步「上下文句柄化」的 API 必须先做，否则等于重写。
 
 ### [ ] 符号索引（定义/调用/所在文件）—— 未立项，大仓库痛时再做
+
+### [ ] 系统提示词分层加载 —— 候选，独立
+
+- 现有 agent 类型已经能配置系统提示词；这条候选要明确全局、项目与 agent 各自规则的来源和优先级，不是子 agent 的前置。
+
+### [ ] 技能与斜杠命令支持 —— 候选，独立
+
+- 技能负责按需加载说明与资源，斜杠命令负责让用户显式触发一段预定义操作；两者与 `run_command` 执行本机命令无关。
+- **已定方向（2026-11-06 用户拍板）**：加载技能全文用一个专门工具（形态见 `Docs/RoadMap.md` 三节同条）；首版只做全局安装的技能目录（`~/.aliasagent/skills/` 下，与 config/spill 同根），不做工作区一级的技能，也不给 `read_file` 开工作区边界例外。技能目录以动态段拼进系统提示词（先例：`lib/services/compaction/guard_anchors.dart` 的每轮注入）。
+- **已定（2026-11-06 用户两轮拍板）**：技能与斜杠命令拆两个 change、技能先行；`load_skill` 带文件参数，允许读同一技能目录内的附属文件（只允许解析后仍在技能目录内的相对路径）；「安装」= 目录约定（文件放进 `~/.aliasagent/skills/` 即生效），**不新增任何交互界面**；技能对所有 Agent 模板全量生效、无逐模板开关（子 agent 共用装配路径自动继承）；斜杠命令后置单独立项，届时只做提示展开型（含 `/技能名` 显式触发），本地动作型与输入补全弹菜单不在首版。技能格式按开放规范 Agent Skills（agentskills.io）实现，事实源已抓进 `Docs/AgentSkillsDoc.md`（含字段硬限 64/1024/500 与 Claude Code 扩展字段的划界）。
+
+### [ ] MCP 客户端接入 —— 候选，独立
+
+- 由 AliasAgent 作为客户端发现外部工具并转成现有工具定义；不要求模型服务支持服务端工具，也不是子 agent 的前置。
 
 ### 明确不做（见 `Docs/rejected-approaches.md` 第 24、25 条）
 
@@ -279,6 +299,15 @@
 **验收（能失败的判据）**：新增用例断言 `ASSISTANT: 用户目标…` → `用户目标…`、`ASSISTANT本次…` → `本次…`、以及正常开头（无标签）原样返回；把 `stripLeadingRoleLabel` 改成恒返回原文后该条必须红。
 
 **来源**：`lib/services/compaction/model_summary_provider.dart`、原条目「上下文压缩：L1 摘要泄漏 ASSISTANT 角色标签」。
+
+---
+
+### [ ] 本文件禁令的机器守卫候选（2026-11-04 对 CLAUDE.md 的对抗审查登记）
+
+- **背景（可核）**：CLAUDE.md〈文档地图·五、本文件禁令的守卫现状》列出了"没有机器守卫、违反时不会有任何东西变红"的禁令清单（禁开窗及细则、禁预写豁免句、禁写死行号、禁先于改动写"已修复"、代码先有任务、禁改验收标准、禁 STOP 门禁、Git 授权、TODO 单载体）。
+- **候选守卫（按成本从低到高）**：① 起窗拦截 hook——`.claude/settings.json` 的命令前置检查，命中 `Start-Process alias_agent`、`flutter run`、`run.bat`、`run_all.sh` 时要求确认（2026-11-04 用户已三次为开窗动怒，这条最值）；② tasks.md 扫描——禁 `⛔ STOP HERE` 标记与"已修复先于改动"句式（正则可查，落在 `test/unit/openspec_proposal_test.dart` 旁边新用例）；③ 记录文件扫描——`Docs/`、`openspec/` 下出现 `文件:数字` 形态的行号引用即红（CLAUDE 工作记录规范第 1 条的机器化）；④ 第二待办载体扫描——仓库根出现新的 `*TODO*.md` 即红。
+- **验收（能失败的判据）**：每条守卫落成可跑测试或 hook，并各做一次"违规样例必红、合规样例绿"的实测（照 CLAUDE 工作记录规范第 3 条附失败输出）。
+- **性质**：立项待做；动手时走 `/opsx:propose` 单独立项或并入下一个合适 change。
 
 ---
 
