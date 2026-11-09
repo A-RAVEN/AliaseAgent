@@ -70,6 +70,7 @@ Windows 上还有仓库根的 `run.bat`：一键 `flutter build windows --debug`
 | [联网工具](Docs/user-guide/tools-web.md) | 搜索、抓网页、当前时间；搜索可以走 DeepSeek 自己的（不用另买 key），也可以配付费服务 |
 | [浏览器工具](Docs/user-guide/tools-browser.md) | 开真实浏览器窗口操作网页；下载与权限请求会被拦 |
 | [命令行工具](Docs/user-guide/tools-command.md) | 在你自己的电脑上真的执行 PowerShell 命令；没有沙箱、不能事后撤销 |
+| [技能](Docs/user-guide/skills.md) | 把反复要用的做法写成 `SKILL.md` 放进 `~/.aliasagent/skills/`，助手按需自动加载；格式兼容开放规范 Agent Skills，装法=放文件（下一条消息就生效，无需重启），无开关 |
 | [常见现象与排查](Docs/user-guide/troubleshooting.md) | 看到某个报错是什么意思、下一步做什么、日志在哪 |
 
 **两条最容易踩的前提：**

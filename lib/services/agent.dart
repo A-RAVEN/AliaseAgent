@@ -25,6 +25,7 @@ import 'message_repository.dart';
 import 'search_text_assembly.dart';
 import 'session_repository.dart';
 import 'sidecar_bridge.dart';
+import 'skills/skill_catalog_service.dart';
 import 'subagent_runner.dart';
 import 'summary_node_repository.dart';
 import 'tool_catalog.dart';
@@ -339,8 +340,20 @@ class Agent {
   bool get workspaceInitialized => _workspaceInitialized;
 
   /// 当前工具目录里本实例真正会发送的工具定义。
-  List<Map<String, dynamic>> get toolDefinitions => ToolCatalog.instance
-      .resolve(config.tools, context: '模板 "$agentTypeName"');
+  ///
+  /// `load_skill` 在这里**无条件追加**（change `add-skill-mechanism` design D4/D9）：
+  /// 它不进 `ToolCatalog.kBaseToolNames`、不进模板勾选清单、不改任何用户配置，
+  /// 但每轮装配都随请求交付 —— 「技能对所有 Agent 模板全量生效、无逐模板开关」
+  /// （`TODO.md:162`）就是靠这一处实现。模板清单里手写了 `load_skill` 时
+  /// `resolve` 已经返回它，此时不再追加（保证数组里恰出现一次）。
+  List<Map<String, dynamic>> get toolDefinitions {
+    final resolved = ToolCatalog.instance
+        .resolve(config.tools, context: '模板 "$agentTypeName"');
+    final alreadyListed =
+        resolved.any((definition) => definition['name'] == kLoadSkillToolName);
+    if (alreadyListed) return resolved;
+    return <Map<String, dynamic>>[...resolved, kLoadSkillToolDefinition];
+  }
 
   /// 这个实例能不能接收图片输入（来自它自己的生效配置，不读注册表）。
   bool get acceptsImages => config.acceptsImages;
@@ -548,6 +561,15 @@ class Agent {
         ? _provider.baseUrl
         : 'https://api.anthropic.com';
 
+    // 每轮请求装配的开头先增量刷新一次技能目录（change
+    // `refresh-skill-catalog-each-turn` design D2）：本方法里的 `toolDefinitions`
+    // 组装与下面循环里的 `promptSection` 读取都在这一处之后，所以"一轮装配刷新一次"
+    // 就落在这里 —— 同一轮的多次模型请求（工具轮）共用这一份快照（一轮内视图一致），
+    // 磁盘上的技能改动到**下一轮装配**才反映。
+    // **不许**放进工具派发（`_dispatchToolCall`）：那会让同一轮里前后两次请求看到
+    // 不同的目录，破坏"一轮内一致"。
+    await SkillCatalogService.instance.scan();
+
     // 实际发送的工具定义 = 本实例生效配置 ∩ 工具目录；未知名字在这里显式失败（
     // 创建路径已经校验过一次，这里保持同一判据，避免绕过目录）。
     final toolsJson = jsonEncode(toolDefinitions);
@@ -633,8 +655,29 @@ class Agent {
 
       final thinkingMode = config.thinkingMode;
       final thinkingEffort = config.thinkingEffort;
-      final systemPrompt =
-          '${config.systemPrompt}\n${guard.inject()}\nCurrent date: ${DateTime.now().toIso8601String().substring(0, 10)}. For precise time-sensitive queries, use the get_current_time tool.';
+      // 系统提示词：模板提示 + 每轮动态段（`guard.inject()`）+ 技能段 + 日期。
+      // 技能段紧随 `guard.inject()` 之后（change `add-skill-mechanism` design D4），
+      // **不受模板工具清单影响**：每个模板都收到它。段内分两种形态（返工 5.1，
+      // design D6）：有生效技能 = "Available skills" 标题 + 清单 + 创建简则；没有生效
+      // 技能 = **只有创建简则**（不再整段消失，也不留空悬的标题/清单行）。技能段的
+      // token 由下面这整段估算覆盖，因此自动计入 `fixedOverheadTokens`。
+      final skillSection = SkillCatalogService.instance.promptSection;
+      final systemPromptBuffer = StringBuffer()
+        ..write(config.systemPrompt)
+        ..write('\n')
+        ..write(guard.inject());
+      if (skillSection.isNotEmpty) {
+        // 现在的 `promptSection` 恒非空（空集合也返回简则），这里保留判断是防御性写法：
+        // 段真为空时仍不留空行。
+        systemPromptBuffer
+          ..write('\n')
+          ..write(skillSection);
+      }
+      systemPromptBuffer
+        ..write('\nCurrent date: ')
+        ..write(DateTime.now().toIso8601String().substring(0, 10))
+        ..write('. For precise time-sensitive queries, use the get_current_time tool.');
+      final systemPrompt = systemPromptBuffer.toString();
 
       // 快照与拆分在同一次赋值里落定：两者描述同一份请求。
       final fixedOverheadTokens =
@@ -2089,6 +2132,31 @@ class Agent {
         resultJson = onWorker
             ? await sidecar.callToolOnWorker('read_spill', sessionId, requestJson)
             : sidecar.readSpill(sessionId, requestJson);
+      case 'load_skill':
+        // 第一道闸（change `add-skill-mechanism` design D6）：技能名必须在本进程的
+        // **生效技能集合**里。目录存在但校验失败的技能也在这里被挡下 —— 它的正文
+        // 不许交给模型。不在集合时不触 FFI，直接给带原因的 `ok:false`。
+        final skillName = (input['skill'] as String?) ?? '';
+        final skillService = SkillCatalogService.instance;
+        if (!skillService.isActive(skillName)) {
+          final failureReason = skillService.failureReasonFor(skillName);
+          final reason = failureReason != null
+              ? '校验失败：$failureReason'
+              : '不在技能目录的生效集合里（当前生效技能：'
+                  '${skillService.activeSkillNames.isEmpty ? '无' : skillService.activeSkillNames.join('、')}）';
+          resultJson = jsonEncode(<String, dynamic>{
+            'ok': false,
+            'error': '技能 "$skillName" 未生效：$reason',
+          });
+        } else {
+          final request = <String, dynamic>{'skill': skillName};
+          final file = input['file'];
+          if (file is String && file.isNotEmpty) request['file'] = file;
+          // `preview_chars` 与 `web_fetch` 同形透传（C++ 侧缺省回落
+          // `spill::kDefaultPreviewChars`；执行侧不读配置文件）。
+          request['preview_chars'] = config.spillPreviewChars;
+          resultJson = await sidecar.loadSkill(sessionId, jsonEncode(request));
+        }
       case 'get_current_time':
         final now = DateTime.now();
         final dt = now.toIso8601String();
@@ -2225,6 +2293,11 @@ class Agent {
             : sb.toString().trim();
       } else if (name == 'read_spill') {
         parsed['content'] = (parsed['text'] as String?) ?? '';
+      } else if (name == 'load_skill' && parsed['ok'] == true) {
+        // 成功结果的模型可见正文：首行说明加载了哪个技能（或哪个附属文件），正文是
+        // C++ 侧 spill 形状后的文本，落了盘时**最后一行**是 spill 引用（截断可见、
+        // `read_spill` 可恢复）。失败结果不带正文，交给 `error` 字段。
+        parsed['content'] = _composeSkillResultText(parsed, input);
       }
       return parsed;
     } catch (e) {
@@ -2292,9 +2365,45 @@ class Agent {
     return sb.toString().trimRight();
   }
 
+  /// `load_skill` 的**模型可见正文**（change `add-skill-mechanism` 任务 5.2）：
+  /// 首行 `skill "<name>"`（带 `file` 时是 `skill "<name>" (file: <相对路径>)`），
+  /// 正文是 C++ 侧 spill 形状后的文本，落了盘时**最后一行**是 spill 引用说明。
+  ///
+  /// 引用行放最后的理由与 `web_fetch` 相同：重放阶段的通用省略只保头尾，放中间会被
+  /// 自己掐掉；它也是 [bodyHasSpillRefs] 判断"中段还能不能按 read_spill 读回"的依据。
+  String _composeSkillResultText(
+      Map<String, dynamic> result, Map<String, dynamic> input) {
+    final skill = (input['skill'] as String?) ?? '';
+    final file = (input['file'] as String?) ?? '';
+    final sb = StringBuffer();
+    sb.write(file.isEmpty
+        ? 'skill "$skill"'
+        : 'skill "$skill" (file: $file)');
+    final body = (result['content'] as String?) ?? '';
+    if (body.isNotEmpty) {
+      sb.write('\n');
+      sb.write(body);
+    }
+
+    final spill = result['spill'];
+    if (spill is Map) {
+      final env = spill['skill'];
+      if (env is Map) {
+        final ref = (env['ref'] as String?) ?? '';
+        if (ref.isNotEmpty) {
+          final total = env['total_bytes'] ?? 0;
+          final omitted = env['omitted_bytes'] ?? 0;
+          sb.write('\n');
+          sb.write('$kSpillRefsMarker skill=$ref ($total bytes, $omitted omitted) — '
+              'read any byte range back with read_spill(ref, offset, limit)]');
+        }
+      }
+    }
+    return sb.toString().trimRight();
+  }
+
   List<ResultSection> _buildResultSections(
-      String toolName, Map<String, dynamic> result) {
-    if (result['ok'] != true) return [];
+      String toolName, Map<String, dynamic> result) {    if (result['ok'] != true) return [];
     if (toolName == 'web_search') {
       final results = result['results'] as Map<String, dynamic>?;
       if (results == null || results.isEmpty) return [];

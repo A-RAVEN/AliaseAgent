@@ -241,3 +241,47 @@ test\integration\browser_worker_test.dart 396:7
 
 下一个动 `integration_test` 窗口版用例的 change 顺手收敛；或任一上述用例下次真跑到 `no current session` 时即为本条复现。
 
+## load_skill / read_file：附属文件的非 ASCII 文件名在 C++ 窄字符路径 API 下可能取不到
+
+**来源**: `add-skill-mechanism`（任务 10.1 登记；design Risks 项如实落账）
+**发现日期**: 2026-11-07
+**相关文件**: `sidecar/src/skill_tool.cpp`、`sidecar/src/tools.cpp`（既有同源面）
+
+### 症状
+
+技能附属文件（`load_skill(file=…)`）的名字若含非 ASCII 字符（如中文），C++ 侧可能报"文件不存在"类可见错误而取不到内容；不是静默返回空，模型与用户能看到原因。
+
+### 根因方向
+
+与本仓库 `read_file` 的现状同源、非本 change 新增缺陷：C++ 文件路径走窄字符 API（`GetFullPathNameA`/A 系函数），非 ASCII 路径的解析依赖 ANSI 码页，UTF-8 字节在部分系统码页下解析不到真实文件。技能目录名本身受规范约束（`name` 仅小写字母/数字/连字符）不受影响，受影响的只有附属文件与正文文件名。
+
+### 证据
+
+`sidecar/test/skill_tool_test.cpp`（tag `[skills]`，2026-11-07 实测 97 assertions/15 cases 全绿）的夹具文件名全部 ASCII；没有任何用例证明中文附属文件名能取回。
+
+### 重新考虑时机
+
+出现统一把 sidecar 文件 API 改宽字符（`GetFullPathNameW`/`_wfopen`）的 change 时一并修复并补非 ASCII 用例；在那之前 `Docs/user-guide/skills.md` 的已知限制节已如实写明"附属文件的名字目前建议只用 ASCII"。
+
+## sidecar_worker 集成测试：并发 grep_file 与串行结果"逐字节一致"断言是顺序竞态
+
+**来源**: `refresh-skill-catalog-each-turn` apply 阶段全量测试暴露（2026-11-08，两次全量 + 多次单跑复现）
+**发现日期**: 2026-11-08
+**相关文件**: `test/integration/sidecar_worker_test.dart`（「同一上下文并发 3 个 grep_file」用例的断言②）、`sidecar/src/tools.cpp`（`grep_file` 的 rg argv 无 `--sort`）
+
+### 症状
+
+`flutter test` 全量偶发 −1：并发版与串行版 `grep_file` 的 JSON 结果"逐字节一致"断言失败，但两者的命中集完全相同，只差**文件块的先后顺序**——且每次失败时交换的位置都不一样（有时 `tool_catalog`/`tool_group_planner` 互换，有时 `agent.dart`/`setup_dialog` 互换）。单跑同一用例有时绿有时红（2026-11-08 实测：1 次绿、其后 9 次全红）。
+
+### 根因
+
+`grep_file` 透传 ripgrep 的多线程 walker 输出顺序，argv 里没有 `--sort`。直接对 `lib/` 连跑 5 次 `tools\rg.exe --json -n --no-require-git -e kBaseToolNames lib`，5 次文件顺序全不同（实测留档）。用例把两次**相互独立**的 rg 调用结果做逐字节相等比较，等于在赌两个随机顺序恰好一致——是测试自身的过强断言，不是产品行为错误（命中内容、计数都正确），也与触发它的 change 无关（本 change 的 diff 不含任何 C++/grep/worker 代码；错序位置逐次不同亦证明非确定性而非回归）。此前多个 change 全量绿只是竞态未发作。
+
+### 期望方向
+
+二选一，需独立 change（本 change tasks 无此任务，按"代码必须对应 tasks.md"未顺手改）：① 产品侧给 `grep_file` 的 rg argv 加 `--sort path`，输出顺序确定后并发/串行自然逐字节一致（用户可见的 grep 结果顺序从"随机"变"按路径排序"，属行为变化，需 spec 同步）；② 测试侧改为无序比较（同一路径+行号集合相等即可），"结果不串"的本意（三次并发请求的结果互不混淆）不受影响。
+
+### 重新考虑时机
+
+下一个动 sidecar 工具或该测试文件的 change 顺手收敛；或全量测试再因此条 −1 时即为本条复现。
+

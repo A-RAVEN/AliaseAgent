@@ -64,6 +64,7 @@ set(SOURCES
   src/browser.cpp
   src/command_tool.cpp
   src/spill.cpp
+  src/skill_tool.cpp
   src/deepseek_search.cpp
   src/image_probe.cpp
   src/clipboard_image.cpp
@@ -123,6 +124,7 @@ add_executable(sidecar_tests
   src/browser.cpp
   src/command_tool.cpp
   src/spill.cpp
+  src/skill_tool.cpp
   src/deepseek_search.cpp
   src/image_probe.cpp
   src/clipboard_image.cpp
@@ -135,6 +137,7 @@ add_executable(sidecar_tests
   test/search_provider_test.cpp
   test/browser_test.cpp
   test/command_tool_test.cpp
+  test/skill_tool_test.cpp
   test/spill_write_test.cpp
   test/web_fetch_spill_test.cpp
   test/deepseek_search_test.cpp
@@ -149,6 +152,7 @@ target_include_directories(sidecar_tests PRIVATE include src test "${JSON_INCLUD
 target_compile_definitions(sidecar_tests PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN NOMINMAX
     FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/sse"
     IMAGE_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/images"
+    SKILL_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/skills"
     SIDECAR_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src"
     SPILL_NAMES_TSV="${CMAKE_CURRENT_SOURCE_DIR}/test/spill_session_names.tsv")
 target_link_libraries(sidecar_tests PRIVATE Catch2::Catch2 CURL::libcurl ${PLATFORM_LIB})

@@ -76,6 +76,10 @@ const char* read_clipboard_image(context::Context& ctx, const char* request_json
 const char* run_command(context::Context& ctx, const char* request_json);
 const char* read_spill(context::Context& ctx, const char* request_json);
 
+/// 技能加载（change `add-skill-mechanism`）：读技能正文或技能目录内的附属文件，
+/// 交付形状复用 `spill::shape_stream`（流名 `skill`）。实现见 `skill_tool.cpp`。
+const char* load_skill(context::Context& ctx, const char* request_json);
+
 const char* browser_navigate(context::Context& ctx, const char* request_json);
 const char* browser_click(context::Context& ctx, const char* request_json);
 const char* browser_type(context::Context& ctx, const char* request_json);
@@ -107,6 +111,7 @@ const char* read_image(const char* handle, const char* request_json);
 const char* read_clipboard_image(const char* handle, const char* request_json);
 const char* run_command(const char* handle, const char* request_json);
 const char* read_spill(const char* handle, const char* request_json);
+const char* load_skill(const char* handle, const char* request_json);
 const char* browser_navigate(const char* handle, const char* request_json);
 const char* browser_click(const char* handle, const char* request_json);
 const char* browser_type(const char* handle, const char* request_json);

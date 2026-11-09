@@ -13,6 +13,7 @@
 #include "model_gateway.h"
 #include "result_buffer.h"
 #include "search_provider.h"
+#include "skill_tool.h"
 #include "spill.h"
 #include "tools.h"
 #include "web_fetch.h"
@@ -36,6 +37,7 @@ enum SlotId {
   kSlotReadClipboardImage,
   kSlotRunCommand,
   kSlotReadSpill,
+  kSlotLoadSkill,
   kSlotBrowserNavigate,
   kSlotBrowserClick,
   kSlotBrowserType,
@@ -317,6 +319,15 @@ const char* read_spill(context::Context& ctx, const char* request_json) {
   });
 }
 
+const char* load_skill(context::Context& ctx, const char* request_json) {
+  result_buffer::Slot& slot = op_slot(kSlotLoadSkill);
+  Lease lease(ctx);
+  LOG_TRACE("load_skill called");
+  return guarded(slot, "load_skill", [&]() {
+    return slot.set(skill_tool::load_skill(ctx, require_request(request_json)));
+  });
+}
+
 const char* browser_navigate(context::Context& ctx, const char* request_json) {
   result_buffer::Slot& slot = op_slot(kSlotBrowserNavigate);
   Lease lease(ctx);
@@ -567,6 +578,12 @@ const char* read_spill(const char* handle, const char* request_json) {
   auto ctx = resolve_handle(handle);
   if (!ctx) return op_slot(kSlotReadSpill).set(unknown_context_json(handle));
   return read_spill(*ctx, request_json);
+}
+
+const char* load_skill(const char* handle, const char* request_json) {
+  auto ctx = resolve_handle(handle);
+  if (!ctx) return op_slot(kSlotLoadSkill).set(unknown_context_json(handle));
+  return load_skill(*ctx, request_json);
 }
 
 const char* browser_navigate(const char* handle, const char* request_json) {

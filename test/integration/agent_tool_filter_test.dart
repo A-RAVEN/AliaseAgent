@@ -124,7 +124,9 @@ void main() {
         'model=${sidecar.lastModel} mode=${sidecar.lastThinkingMode} '
         'effort=${sidecar.lastThinkingEffort} '
         'systemPrompt 含模板提示=${sidecar.lastSystemPrompt?.contains("GENERAL-PROMPT")}');
-    expect(generalTools, ['read_file', 'write_file']);
+    expect(generalTools, ['read_file', 'write_file', 'load_skill'],
+        reason: 'change `add-skill-mechanism`：模板允许的两项之外，装配层无条件追加'
+            ' `load_skill`（它不进模板清单、也不在任何用户配置里），追加在尾部');
     expect(generalTools, isNot(contains('run_command')));
     expect(sidecar.lastModel, 'general-model');
     expect(sidecar.lastThinkingMode, 'adaptive');
@@ -140,8 +142,9 @@ void main() {
     // ignore: avoid_print
     print('  [OBS] ops 请求工具=$opsTools model=${sidecar.lastModel} '
         'mode=${sidecar.lastThinkingMode} effort=${sidecar.lastThinkingEffort}');
-    expect(opsTools, ['run_command', 'list_dir'],
-        reason: '命令工具不依赖搜索或浏览器，模板允许就发送');
+    expect(opsTools, ['run_command', 'list_dir', 'load_skill'],
+        reason: '命令工具不依赖搜索或浏览器，模板允许就发送；`load_skill` 同样由'
+            '装配层追加（与模板内容无关）');
     expect(sidecar.lastModel, 'ops-model');
     expect(sidecar.lastThinkingEffort, 'xhigh');
     expect(sidecar.lastSystemPrompt, contains('OPS-PROMPT'));
@@ -229,7 +232,9 @@ void main() {
     final tools = sentToolNames(sidecar.lastToolsJson!);
     // ignore: avoid_print
     print('  [OBS] 迁移后请求工具=${tools.length} 项：$tools');
-    expect(tools.length, ToolCatalog.kBaseToolNames.length);
+    expect(tools.length, ToolCatalog.kBaseToolNames.length + 1,
+        reason: '迁移后的清单 = 当前 11 项基础工具，外加装配层无条件追加的 '
+            '`load_skill`（它不在 kBaseToolNames 里，也不进模板清单）');
     expect(tools, containsAll(['read_file', 'list_dir', 'run_command']));
     expect(tools, contains('spawn_subagent'),
         reason: '旧两项迁移到当前基础清单后，请求必须含新增的 spawn_subagent');

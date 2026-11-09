@@ -53,6 +53,11 @@ const _toolRegionStart = 'final base = <String, Map<String, dynamic>>{';
 /// 任务 1.3 之后，终点从私有 `_toolDefs` 改成 `ToolCatalog`）。
 const _toolRegionEnd = 'ToolCatalog.instance.seed(base);';
 
+/// 第二个工具定义来源：`load_skill` 的定义常量（change `add-skill-mechanism`）。
+const _skillToolDefinitionPath = 'lib/services/skills/skill_catalog_service.dart';
+const _skillToolDefinitionStart =
+    'const Map<String, dynamic> kLoadSkillToolDefinition = {';
+
 /// 文档里允许出现的、既不是配置键也不是工具/参数名，但确实是代码里存在的名字。
 /// 每条都要写清"它在哪个文件里出现"，测试会逐条去该文件里核对 —— 核对不上的条目
 /// 会让测试变红，所以这份清单自己也会腐烂不了。
@@ -84,6 +89,12 @@ const _otherCodeNames = <String, String>{
   'context_window': 'lib/models/model_catalog_entry.dart',
   'native_endpoints': 'lib/models/model_catalog_entry.dart',
   'pricing': 'lib/models/model_catalog_entry.dart',
+  // 技能 frontmatter 的规范字段名（add-skill-mechanism）：用户文档讲"SKILL.md 怎么写"
+  // 时会用反引号写出这些可选字段名。它们不是配置键、也不是工具参数，但确实在解析
+  // 这些字段的那个文件里逐一存在。
+  'license': 'lib/services/skills/skill_frontmatter.dart',
+  'metadata': 'lib/services/skills/skill_frontmatter.dart',
+  'compatibility': 'lib/services/skills/skill_frontmatter.dart',
 };
 
 /// 文档里"允许出现的、既不是配置键也不是工具名、但确实是代码里存在的名字"清单。
@@ -388,6 +399,11 @@ String _readSource(String path) {
 }
 
 /// 工具定义那一段的源码（用标记切出来，不用行号）。
+///
+/// change `add-skill-mechanism` 之后，工具定义不再只有 `lib/main.dart` 一处：
+/// `load_skill` 的定义常量住在 `skill_catalog_service.dart`（design D9：不进
+/// `kBaseToolNames`，由装配层无条件追加）。两段一起返回，否则文档里写出的
+/// `load_skill` / `skill` / `file` 会被判成"代码里找不到"，而它们其实真实存在。
 String _toolDefinitionRegion() {
   final src = File(_mainDartPath).readAsStringSync();
   final start = src.indexOf(_toolRegionStart);
@@ -397,9 +413,21 @@ String _toolDefinitionRegion() {
   expect(end > start, isTrue,
       reason: '$_mainDartPath 里找不到工具定义的终点标记 "$_toolRegionEnd"');
   final region = src.substring(start, end);
+
+  final skillSrc = File(_skillToolDefinitionPath).readAsStringSync();
+  final skillStart = skillSrc.indexOf(_skillToolDefinitionStart);
+  expect(skillStart >= 0, isTrue,
+      reason: '$_skillToolDefinitionPath 里找不到工具定义起点标记 '
+          '"$_skillToolDefinitionStart"');
+  final skillEnd = skillSrc.indexOf('\n};', skillStart);
+  expect(skillEnd > skillStart, isTrue,
+      reason: '$_skillToolDefinitionPath 里的工具定义常量没有闭合');
+  final skillRegion = skillSrc.substring(skillStart, skillEnd);
+
   // ignore: avoid_print
-  print('[代码] 工具定义那一段共 ${region.split('\n').length} 行');
-  return region;
+  print('[代码] 工具定义那一段共 ${region.split('\n').length} 行'
+      '（另有技能工具定义 ${skillRegion.split('\n').length} 行）');
+  return '$region\n$skillRegion';
 }
 
 /// 真正注册给模型的工具名（工具定义里的 `'name': 'x'`）。

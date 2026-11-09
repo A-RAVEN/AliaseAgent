@@ -169,4 +169,8 @@ SIDECAR_API const char* read_spill(const char* handle, const char* request_json)
   return context_api::read_spill(handle, request_json);
 }
 
+SIDECAR_API const char* load_skill(const char* handle, const char* request_json) {
+  return context_api::load_skill(handle, request_json);
+}
+
 } // extern "C"

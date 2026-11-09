@@ -10,7 +10,7 @@
 // （`const char* handle`）。句柄是不透明的、区分大小写的原始字符串，由
 // `create_context` 返回；**不假设它等于会话 id**。
 //
-// 20 个带句柄的导出（相对上一版全部改了签名）：
+// 21 个带句柄的导出（相对上一版全部改了签名）：
 //   cancel_request(handle, request_id)        send_message(handle, …)
 //   get_workspace(handle)                     set_workspace(handle, path)
 //   read_file(handle, path)
@@ -21,6 +21,7 @@
 //   browser_navigate/click/type/snapshot(handle, request_json)
 //   run_command(handle, request_json)         read_spill(handle, request_json)
 //   web_search(handle, request_json)          web_fetch(handle, request_json)
+//   load_skill(handle, request_json)
 //
 // 4 个保持原样（机器/应用级，不要求上下文，启动时尚无上下文也能调用）：
 //   ping(void)                                browser_available(void)
@@ -255,6 +256,27 @@ SIDECAR_API const char* run_command(const char* handle, const char* request_json
 /// Returns JSON: {"ok":true,"text":"...","bytes_read":N,"total_bytes":M}
 ///           or {"ok":false,"error":"..."}（错误文本按原因各不相同）
 SIDECAR_API const char* read_spill(const char* handle, const char* request_json);
+
+/// Load a skill's instructions, or one file inside the skill's directory
+/// (change `add-skill-mechanism`).
+///
+/// 不带 `file` 返回该技能 `SKILL.md` 中 **frontmatter 之后**的正文（按 design D2
+/// 行切：首行恰 `---`、切到下一个独立成行的 `---`，不解析 YAML 语义）；带 `file`
+/// 返回该附属文件的全文（不切除任何段落）。`file` 是**相对技能目录**的路径，拼接后
+/// 按平台规范化，结果必须仍在该技能目录之内；越界、绝对路径、非法技能名一律
+/// `ok:false` 并带原因。
+///
+/// 交付形状复用共享实现 `spill::shape_stream`：完整内容先落盘到
+/// `~/.aliasagent/spill/<上下文句柄的无损编码>/<序号>-skill.txt`，超过
+/// `preview_chars × 2` 时只内联头尾各 `preview_chars` 个字符并给出可取回的引用；
+/// 写盘失败且内容超阈值 ⇒ `ok:false`（不许只给一部分冒充完整内容）。
+///
+/// @param request_json  {"skill":"<技能名>","file":"<可选,相对路径>","preview_chars":N}
+/// Returns JSON: {"ok":true,"content":"...","truncated":bool,
+///                "spill":{"skill":{"ref":"...","total_bytes":N,
+///                                  "omitted_bytes":N,"head":"...","tail":"..."}}}
+///           or {"ok":false,"error":"..."}（错误文本含技能名与路径）
+SIDECAR_API const char* load_skill(const char* handle, const char* request_json);
 
 #ifdef __cplusplus
 }

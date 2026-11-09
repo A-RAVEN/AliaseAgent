@@ -29,6 +29,7 @@ import 'services/message_repository.dart';
 import 'services/provider_resolver.dart';
 import 'services/session_repository.dart';
 import 'services/sidecar_bridge.dart';
+import 'services/skills/skill_catalog_service.dart';
 import 'services/subagent_runner.dart';
 import 'services/summary_node_repository.dart';
 import 'services/tool_catalog.dart';
@@ -373,6 +374,12 @@ class ChatScreenState extends State<ChatScreen> {
   /// 误判成未知工具。
   final Completer<void> _toolsReadyCompleter = Completer<void>();
 
+  /// 技能目录的失败提示（change `add-skill-mechanism` 任务 6.2）：启动扫描后，未生效
+  /// 技能与"技能目录不可读"汇总成一句句字符串提示，走既有提示通道上屏（与
+  /// `toolMigrationNotice` 同形），同时逐条写日志。null = 没有任何失败（包括没有技能
+  /// 目录这种正常状态），界面不出任何技能提示。
+  String? _skillFailureNotice;
+
   /// 输入框的文本控制器。**2026-10-18 从 `ChatArea` 搬到这里** —— 输入行现在由这个
   /// 文件构造、两屏共用（见 `lib/ui/input_bar.dart` 的 `InputBar`）。
   final _inputCtrl = TextEditingController();
@@ -686,7 +693,23 @@ class ChatScreenState extends State<ChatScreen> {
       },
       onSnapshot: (snapshot) {
         if (!mounted) return;
-        setState(() => _contextSnapshot = snapshot);
+        // 技能目录的失败提示跟着每轮装配刷新（change `refresh-skill-catalog-each-turn`
+        // design D3）：`Agent._callModel` 在本轮装配开头已经增量重扫过技能目录
+        // （design D2），而 `onSnapshot` 是**既有的**每轮回调，就在它里面重读
+        // `failureNotice`、与已上屏的值不同才换。不新建监听机制、不新增界面。
+        // 这个回调本来就要 setState（写快照），所以只在值变时改提示状态，不额外
+        // 制造重建。
+        final skillNotice = SkillCatalogService.instance.failureNotice;
+        if (skillNotice != _skillFailureNotice) {
+          debugPrint('[AliasAgent] 技能目录提示已更新：'
+              '${skillNotice ?? "（已没有未生效技能）"}');
+        }
+        setState(() {
+          _contextSnapshot = snapshot;
+          if (skillNotice != _skillFailureNotice) {
+            _skillFailureNotice = skillNotice;
+          }
+        });
       },
       onCompactionStatusChanged: () {
         if (!isCurrent()) return;
@@ -1192,6 +1215,13 @@ class ChatScreenState extends State<ChatScreen> {
           'required': ['task'],
         },
       },
+      // 技能加载工具（change `add-skill-mechanism` 任务 3.2）：定义常量住在技能
+      // 服务侧（`skill_catalog_service.dart`），这里在**同步段**与 `spawn_subagent`
+      // 同处注册进目录 —— 这样模板显式列 `load_skill` 时 `resolve` 找得到，不会抛
+      // `UnknownToolsException`。它**不**进 `ToolCatalog.kBaseToolNames`（保持 11 项）、
+      // 不写进任何模板的工具清单、不改动任何用户配置；每轮装配由
+      // `Agent.toolDefinitions` 无条件追加（design D4/D9）。
+      kLoadSkillToolName: kLoadSkillToolDefinition,
     };
 
     // Assign the base tool set SYNCHRONOUSLY before the browser-availability await
@@ -1378,6 +1408,29 @@ class ChatScreenState extends State<ChatScreen> {
     }
 
     ToolCatalog.instance.seed(base);
+
+    // 技能目录扫描（change `add-skill-mechanism` 任务 6.2）：在 `_toolsReady` 置位前
+    // 完成一次（纯本地小目录读，延后可忽略）。约定：
+    //   - 没有技能目录 = 首次用户的默认状态 ⇒ 静默（零提示、零日志噪音）；
+    //   - 有技能但校验失败 / 技能目录整体不可读 ⇒ 逐条写日志 **并** 汇总成一句上屏
+    //     提示（复用 `toolMigrationNotice` 同形的字符串提示通道，不新建任何界面）；
+    //   - 扫描自身抛异常也不许挡住启动：给一条可见提示后继续初始化工具。
+    try {
+      await SkillCatalogService.instance.scan();
+      final notices = SkillCatalogService.instance.noticeLines;
+      for (final line in notices) {
+        debugPrint('[AliasAgent] $line');
+      }
+      final notice = SkillCatalogService.instance.failureNotice;
+      if (notice != null && mounted) {
+        setState(() => _skillFailureNotice = notice);
+      }
+    } catch (e) {
+      final line = '技能目录扫描失败：$e';
+      debugPrint('[AliasAgent] $line');
+      if (mounted) setState(() => _skillFailureNotice = line);
+    }
+
     // 到这里动态那批（web_search / web_fetch / 浏览器四件套）也定了 —— 发送入口可以放行。
     // 在此之前 `_toolDefs` 只有本地那 8 个（`base` 在 await 之前就装好了），那一轮请求
     // 会缺搜索工具，所以 `ChatArea` 用 `toolsReady` 挡住发送（fix-silent-truncation 6.1）。
@@ -1643,6 +1696,24 @@ class ChatScreenState extends State<ChatScreen> {
                     style: TextStyle(
                       fontSize: 12,
                       color: Theme.of(context).colorScheme.onTertiaryContainer,
+                    ),
+                  ),
+                ),
+              // 技能目录的失败提示（change `add-skill-mechanism` 任务 6.2）：未生效
+              // 技能逐条一行（技能名 + 原因），技能目录整体不可读时另有一条汇总。
+              // 与旧工具清单迁移提示同形，不新建任何界面。
+              if (_skillFailureNotice != null)
+                Container(
+                  key: const ValueKey('skill-failure-notice'),
+                  width: double.infinity,
+                  color: Theme.of(context).colorScheme.errorContainer,
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  child: Text(
+                    _skillFailureNotice!,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Theme.of(context).colorScheme.onErrorContainer,
                     ),
                   ),
                 ),

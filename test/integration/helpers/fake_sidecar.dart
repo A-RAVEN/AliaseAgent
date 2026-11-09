@@ -540,6 +540,21 @@ class FakeSidecar implements ISidecar {
     return _syncEntry('read_spill', requestJson, () => _readSpillResult);
   }
 
+  // 技能加载桩（change `add-skill-mechanism`）：记录请求原文与调用次数，用例据此
+  // 断言"生效技能走到 FFI、校验失败的技能在 Dart 侧就被挡下（这里根本不该被调用）"。
+  String _loadSkillResult = '{"ok":false,"error":"fake: load_skill not stubbed"}';
+  String? lastLoadSkillRequest;
+  int loadSkillCallCount = 0;
+  void stubLoadSkill(String json) { _loadSkillResult = json; }
+
+  @override
+  Future<String> loadSkill(String handle, String requestJson) {
+    toolHandles.add(handle);
+    lastLoadSkillRequest = requestJson;
+    loadSkillCallCount++;
+    return _asyncEntry('load_skill', requestJson, () async => _loadSkillResult);
+  }
+
   @override
   String writeFile(String handle, String requestJson) {
     toolHandles.add(handle);

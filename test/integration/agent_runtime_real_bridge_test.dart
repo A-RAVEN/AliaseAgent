@@ -153,8 +153,10 @@ void main() {
     expect(firstJson['model'], 'alpha-model');
     expect((firstJson['system'] as String), contains('ALPHA-SYSTEM-PROMPT'));
     expect((firstJson['thinking'] as Map)['type'], 'adaptive');
+    // change `add-skill-mechanism` 6.1：模板允许的那一项之后，装配层无条件追加
+    // `load_skill`（不进模板清单、不进任何用户配置），所以真实请求里多它一项。
     expect((firstJson['tools'] as List).map((t) => t['name']).toList(),
-        ['read_file']);
+        ['read_file', 'load_skill']);
     expect(first.headers['x-api-key'], canary,
         reason: '真实发送路径必须用配置里的密钥（否则这条密钥夹具没意义）');
 
@@ -162,7 +164,7 @@ void main() {
     expect((secondJson['system'] as String), contains('BETA-SYSTEM-PROMPT'));
     expect((secondJson['thinking'] as Map)['type'], 'disabled');
     expect((secondJson['tools'] as List).map((t) => t['name']).toList(),
-        ['list_dir']);
+        ['list_dir', 'load_skill']);
 
     // 回调与写库归属各自会话。
     expect(a.messageHistory.any((m) => m.content == 'real-bridge-reply'), isTrue);

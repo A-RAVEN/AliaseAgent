@@ -236,6 +236,14 @@ abstract class ISidecar {
   // Spill 读回（spill-large-tool-output）：只读该上下文自己的 spill 目录。
   String readSpill(String handle, String requestJson);
 
+  /// 技能加载（change `add-skill-mechanism`）：读技能正文或技能目录内的附属文件，
+  /// 交付形状由 C++ 侧 `spill::shape_stream` 决定（流名 `skill`）。
+  ///
+  /// `requestJson` 形态：`{"skill":"<名字>","file":"<可选相对路径>","preview_chars":N}`。
+  /// 走 worker isolate 执行（本地磁盘读 + 落盘，不阻塞界面 isolate）；**不设超时**
+  /// —— 它不发网络请求，六个只读 worker 工具也没有超时（不发明新数值）。
+  Future<String> loadSkill(String handle, String requestJson);
+
   /// 把一个只读工具调用派到 worker isolate 执行（change
   /// `parallelize-readonly-tool-calls` 任务 4.1）。
   ///
@@ -808,6 +816,22 @@ class SidecarBridge implements ISidecar {
   }
 
   @override
+  Future<String> loadSkill(String handle, String requestJson) async {
+    final receivePort = ReceivePort();
+    await Isolate.spawn(_webWorkerMain, {
+      'sendPort': receivePort.sendPort,
+      'handle': handle,
+      'requestJson': requestJson,
+      'workerType': 'load_skill',
+    });
+    // 这里刻意不加超时：`load_skill` 只读本地磁盘并写 spill 文件，不发网络请求；
+    // 六个只读 worker 工具同样没有超时，不给它编一个新的数字。
+    final result = await receivePort.first as String;
+    receivePort.close();
+    return result;
+  }
+
+  @override
   String readImage(String handle, String requestJson) {
     return _callJsonTool(_readImageFn, handle, requestJson);
   }
@@ -1050,6 +1074,10 @@ class SidecarBridge implements ISidecar {
               break;
             case 'read_spill':
               final fn = lib.lookupFunction<SetWorkspaceNative, RunCommandDart>('read_spill');
+              resultPtr = fn(handlePtr, ptr!);
+              break;
+            case 'load_skill':
+              final fn = lib.lookupFunction<SetWorkspaceNative, RunCommandDart>('load_skill');
               resultPtr = fn(handlePtr, ptr!);
               break;
             case 'read_image':
