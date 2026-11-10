@@ -125,16 +125,11 @@ class _AppShellState extends State<AppShell> {
               migration.notices.isEmpty ? null : migration.notices.join('\n');
           _populateRegistry(migration.config);
         });
-        // R1-7: maxContextTokens is a REQUIRED per-agent config (like apiKey).
-        // If the loaded config's active agent lacks a valid maxContextTokens,
-        // surface the setup prompt again rather than silently disabling compaction
-        // (which the user would otherwise not know about). One-time config.
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          final mct = registry.lookup('general')?.maxContextTokens;
-          if (mct == null || mct <= 0) {
-            _showSetup();
-          }
-        });
+        // change `model-truth-from-gateway` D3：**不再**用"缺 max_context_tokens"触发
+        // 欢迎对话框。缺席从此是合法状态（生效窗口取网关目录值；目录也没有时在创建
+        // Agent 那一刻显式失败并点名模板），原来那条判据会让合法配置反复弹窗。
+        // 删除后产品里只剩"配置文件不存在"这一个自动入口（补问路径另外还用于合并
+        // 既有配置）—— 逐个出口核过，没有别的活触发。
       case ConfigStatus.notFound:
         WidgetsBinding.instance.addPostFrameCallback((_) => _showSetup());
       case ConfigStatus.malformed:
@@ -890,6 +885,13 @@ class ChatScreenState extends State<ChatScreen> {
           for (final entry in _templateController.config.providers.entries)
             entry.key: entry.value.models,
         },
+        // D4 的最小入参：脏值提示的"已探测"判据只能是 discovered_at（不许拿
+        // "目录为空"代替）。这份 map 是**打开编辑器那一刻**的快照，没有实时通道：
+        // 关闭 → Providers 页刷新 → 重开才重算。
+        discoveredAtByProvider: {
+          for (final entry in _templateController.config.providers.entries)
+            entry.key: entry.value.discoveredAt,
+        },
         availableTools: ToolCatalog.instance.names,
         onCancel: () => Navigator.of(dialogContext).pop(),
         onSave: (draft) async {
@@ -898,12 +900,12 @@ class ChatScreenState extends State<ChatScreen> {
           Navigator.of(dialogContext).pop();
           // 注册表已经由 controller 更新；这里只重画并说明生效时机。
           setState(() {});
+          // 文案与菜单底部那句**同一口径**（change `model-truth-from-gateway` 3.3）：
+          // 推理强度从下一条消息起生效，其余字段对新会话生效。
           ScaffoldMessenger.of(context).showSnackBar(SnackBar(
             content: Text(result.created
-                ? '已添加模板 "${result.template.name}"：'
-                    '之后创建或恢复的实例才使用它；运行中的实例继续使用创建时的配置。'
-                : '已保存模板 "${result.template.name}"：'
-                    '之后创建或恢复的实例使用新配置；运行中的实例保持不变。'),
+                ? '已添加模板 "${result.template.name}"：$kAgentTemplateEffectiveNote'
+                : '已保存模板 "${result.template.name}"：$kAgentTemplateEffectiveNote'),
           ));
         },
       ),

@@ -87,6 +87,54 @@ void main() {
     }
   });
 
+  // change `model-truth-from-gateway` 4.1：文档守卫同步（能失败的判据）。
+  //
+  // 这些断言在"代码改了文案/语义而文档没跟"时**真的会红**：
+  // ① 脏值提示的两种文案必须同时存在于代码与文档；② 首启向导已无窗口输入，
+  // 配置文档里不许再出现它的控件名与旧报错；③ 窗口三档语义（目录为准/覆盖/拒绝
+  // 创建）必须在配置文档里写出来；④ 首启需网关可达这一新前提必须写明。
+  test('窗口语义、首启探测门与脏值提示的文档判据（4.1）', () {
+    final agentText = docs.readAsStringSync();
+    final configText = configDoc.readAsStringSync();
+    final joined = _allLibSources().join('\n');
+
+    for (final copy in const [
+      '当前目录没有这个模型',
+      '目录未探测：直接手填模型名（这不代表模型不存在）',
+    ]) {
+      // ignore: avoid_print
+      print('  [OBS] 文案「$copy」：代码=${joined.contains(copy)} '
+          '模板文档=${agentText.contains(copy)}');
+      expect(joined, contains(copy), reason: '产品代码里没有这条文案：$copy');
+      expect(agentText, contains(copy), reason: '模板文档没有写出这条文案：$copy');
+    }
+
+    // 首启向导不再问窗口：旧控件名与旧报错都不许再出现。
+    for (final stale in const [
+      'Max Context Tokens',
+      'Please enter a valid max context token count',
+      'Compaction threshold (one-time setting)',
+    ]) {
+      // ignore: avoid_print
+      print('  [OBS] 过时窗口控件文案「$stale」出现在配置文档=${configText.contains(stale)}');
+      expect(configText.contains(stale), isFalse,
+          reason: '首启的窗口输入步已删除（D2/D3），配置文档不许再写「$stale」');
+    }
+
+    // 窗口三档语义 + 首启前提，缺一条就红。
+    for (final phrase in const [
+      '以目录为准',
+      '覆盖',
+      '拒绝创建',
+      '首启要求网关可达',
+    ]) {
+      // ignore: avoid_print
+      print('  [OBS] 配置文档含「$phrase」=${configText.contains(phrase)}');
+      expect(configText, contains(phrase),
+          reason: '配置文档没有写清窗口语义/首启前提里的「$phrase」');
+    }
+  });
+
   test('文档不再声称"没有图形化设置界面""只认 general""首启只有两项工具"', () {
     final configText = configDoc.readAsStringSync();
     final agentText = docs.readAsStringSync();
@@ -107,11 +155,17 @@ void main() {
     }
   });
 
-  test('文档说明了修改只影响之后创建或恢复的实例，且不包含删除/改名入口', () {
+  test('文档说明了生效时机的两类语义，且不包含删除/改名入口', () {
     final text = docs.readAsStringSync();
     expect(text, contains('不支持删除模板'));
     expect(text, contains('不支持修改模板名'));
-    expect(text, contains('已经运行的会话不会热更新'));
+    // change `model-truth-from-gateway` 4.1：旧的笼统说法「已经运行的会话不会热更新」
+    // 已被 D7 收窄（推理强度是例外），这里改钉**新口径**——文档若退回笼统说法
+    // （或漏掉"推理强度会跟着变"），这条红。
+    expect(text, contains('只有推理强度会跟着变'),
+        reason: '文档必须写明推理强度是唯一热更新的字段（D7）');
+    expect(text, contains(kAgentTemplateEffectiveNote),
+        reason: '文档必须用与菜单同一句的生效时机说明');
   });
 
   test('Session 切换说明与界面一致，且不再声称"重开即用新配置"', () {

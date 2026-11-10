@@ -22,6 +22,14 @@ class AgentTemplateEditor extends StatefulWidget {
   /// 没有目录的 provider 不在 map 里，模型字段照旧手填。
   final Map<String, List<ModelCatalogEntry>> catalogs;
 
+  /// 每个 provider 的 `discovered_at`（null / 不在 map 里 = 从未探测）。
+  ///
+  /// 脏值提示的**唯一**已探测判据（change `model-truth-from-gateway` D4）：
+  /// 不许用"目录是否为空"代替它 —— 空目录可以是探测成功但无模型，也可以是从未探测，
+  /// 两者对用户的含义相反。这份值是**编辑器打开那一刻的快照**，产品没有实时通道：
+  /// 关闭编辑器 → 在 Providers 页刷新 → 重开编辑器才重算。
+  final Map<String, String?> discoveredAtByProvider;
+
   /// 可选工具名（来自 `ToolCatalog`）。
   final List<String> availableTools;
 
@@ -36,6 +44,7 @@ class AgentTemplateEditor extends StatefulWidget {
     this.original,
     required this.providers,
     this.catalogs = const {},
+    this.discoveredAtByProvider = const {},
     required this.availableTools,
     required this.onSave,
     this.onCancel,
@@ -218,10 +227,11 @@ class AgentTemplateEditorState extends State<AgentTemplateEditor> {
       _errorField = null;
     });
     // 先在本地把"模型改了但没确认窗口"这条拦住：这是编辑器独有的要求。
-    // 只有**修改既有模板**时才有"上一个模型的窗口"这个问题；添加时窗口必须
-    // 由用户自己填（controller 会校验它是不是正整数）。
+    // 只有**修改既有模板**、且窗口覆盖值非空时才有"确认这个值"的问题；留空表示
+    // "用网关目录的窗口"（change `model-truth-from-gateway` D1），没有值要确认。
     if (!_windowConfirmedForModel &&
         widget.original != null &&
+        _windowCtrl.text.trim().isNotEmpty &&
         AgentConfigResolver.windowConfirmationRequired(
           previousModel: widget.original?.model ?? '',
           nextModel: _modelCtrl.text,
@@ -283,9 +293,13 @@ class AgentTemplateEditorState extends State<AgentTemplateEditor> {
     final theme = Theme.of(context);
     final entry = _selectedEntry;
     final catalogEmpty = _catalog.isEmpty;
-    final modelNotInCatalog = !catalogEmpty &&
-        _modelCtrl.text.trim().isNotEmpty &&
-        entry == null;
+    // D4：已探测一律以 `discovered_at` 判定（**不许**用"目录为空"代替）。
+    final probed = widget.discoveredAtByProvider[_provider] != null;
+    final modelText = _modelCtrl.text.trim();
+    final modelNotInCatalog = probed && modelText.isNotEmpty && entry == null;
+    final catalogHelp = probed
+        ? (modelNotInCatalog ? '当前目录没有这个模型' : '可从右侧目录选择，也可手填')
+        : '目录未探测：直接手填模型名（这不代表模型不存在）';
     final canSave = widget.providers.isNotEmpty && !_saving;
     return AlertDialog(
       title: Text(isNew ? '添加 Agent 模板' : '修改 Agent 模板'),
@@ -373,9 +387,7 @@ class AgentTemplateEditorState extends State<AgentTemplateEditor> {
                       enabled: !_saving,
                       decoration: InputDecoration(
                         labelText: '模型',
-                        helperText: catalogEmpty
-                            ? '该 Provider 没有目录，直接手填模型名'
-                            : (modelNotInCatalog ? '不在最近一次目录中' : '可从右侧目录选择，也可手填'),
+                        helperText: catalogHelp,
                         border: const OutlineInputBorder(),
                       ),
                     ),
@@ -410,6 +422,23 @@ class AgentTemplateEditorState extends State<AgentTemplateEditor> {
                   ),
                 ],
               ),
+              if (modelNotInCatalog) ...[
+                const SizedBox(height: 4),
+                Text(
+                  '当前目录没有「$modelText」：发送会失败（配置不会被自动改写）',
+                  key: const ValueKey('template-model-catalog-warning'),
+                  style:
+                      TextStyle(fontSize: 12, color: theme.colorScheme.error),
+                ),
+              ] else if (!probed) ...[
+                const SizedBox(height: 4),
+                Text(
+                  '该 Provider 的目录还没有探测过：这不代表模型不存在',
+                  key: const ValueKey('template-model-catalog-unprobed'),
+                  style: TextStyle(
+                      fontSize: 12, color: theme.colorScheme.onSurfaceVariant),
+                ),
+              ],
               if (entry != null && entry.contextWindow == null) ...[
                 const SizedBox(height: 4),
                 Text(
@@ -487,7 +516,8 @@ class AgentTemplateEditorState extends State<AgentTemplateEditor> {
                     const TextInputType.numberWithOptions(decimal: false),
                 decoration: InputDecoration(
                   labelText: '上下文窗口',
-                  helperText: _windowHint ?? '正整数（token 数）',
+                  helperText: _windowHint ??
+                      '留空 = 用网关目录的窗口；填了 = 目录缺失时的覆盖值',
                   border: const OutlineInputBorder(),
                 ),
               ),

@@ -173,7 +173,12 @@ void main() {
     await running.send('改之后');
     expect(sidecar.lastModel, 'old-model',
         reason: '运行中的实例继续用创建时的模型，保存不是热更新');
-    expect(sidecar.lastThinkingEffort, 'high');
+    // change `model-truth-from-gateway` D7：**推理强度是唯一例外** —— 它每轮装配
+    // 重解析，所以"改之后"这条消息（新的一轮）发的是模板里刚保存的 low。
+    // 冻结快照 `running.config.thinkingEffort` 仍是 high（上面已断言），两者不同
+    // 正是 D7 的语义：快照不被改写，只有发送参数按最新模板重解析。
+    expect(sidecar.lastThinkingEffort, 'low',
+        reason: 'D7：推理强度从下一条消息起对运行中对话生效');
 
     // 2）之后创建的实例用新配置，未编辑字段仍保留原值。
     final later = await f.create(session('s2'));
@@ -289,15 +294,16 @@ void main() {
     // 注册表与配置文件都更新了。
     // ignore: avoid_print
     print('  [OBS] 保存后注册表=${registry.listNames()}；'
-        'SnackBar=${find.textContaining('之后创建或恢复的实例').evaluate().length} 处；'
+        'SnackBar 含新口径=${find.textContaining(kAgentTemplateEffectiveNote).evaluate().length} 处；'
         '配置文件含 writer=${File(configPath).readAsStringSync().contains('"writer"')}');
     expect(registry.listNames().toSet(), {'general', 'reviewer', 'writer'});
     final fileText = File(configPath).readAsStringSync();
     expect(fileText, contains('"writer"'));
     expect(fileText, contains('sk-ant-keep'), reason: '其它 provider 配置不许丢');
     expect(fileText, contains('"preview_chars": 1234'));
-    expect(find.textContaining('之后创建或恢复的实例'), findsOneWidget,
-        reason: '保存成功后要明确告诉用户：运行中的实例不会被热更新');
+    expect(find.textContaining(kAgentTemplateEffectiveNote), findsOneWidget,
+        reason: '保存成功后要明确说明生效时机（与菜单同一句，change '
+            'model-truth-from-gateway 3.3）');
 
     // 重新打开菜单：新模板出现在列表里。
     await tester.tap(find.byKey(const ValueKey('agents-entry')));

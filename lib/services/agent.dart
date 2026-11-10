@@ -7,9 +7,11 @@ import '../models/agent_type_config.dart';
 import '../models/compaction_status.dart';
 import '../models/context_breakdown.dart';
 import '../models/message.dart';
+import '../models/model_catalog_entry.dart';
 import '../models/provider_config.dart' as provider_model;
 import '../models/resolved_agent_config.dart';
 import '../models/tool_call_activity.dart';
+import 'agent_config_resolver.dart';
 import 'compaction/compaction_plan.dart';
 import 'compaction/guard_anchors.dart';
 import 'compaction/seam_selector.dart';
@@ -26,6 +28,7 @@ import 'search_text_assembly.dart';
 import 'session_repository.dart';
 import 'sidecar_bridge.dart';
 import 'skills/skill_catalog_service.dart';
+import 'slash_commands.dart';
 import 'subagent_runner.dart';
 import 'summary_node_repository.dart';
 import 'tool_catalog.dart';
@@ -240,6 +243,18 @@ class Agent {
   /// 创建时冻结的模板副本（摘要提供者接口仍按模板取模型等字段）。
   final AgentTypeConfig template;
 
+  /// 每轮装配重解析思考档用的**模板查找器**（change `model-truth-from-gateway` D7）。
+  ///
+  /// 按 [agentTypeName] 读注册表的**当前**引用，所以模板保存后下一轮装配就吃到新值；
+  /// 由 `AgentFactory.create` 注入。null = 退回创建时的冻结快照（直接构造 [Agent] 的
+  /// 既有测试路径，不改变它们的语义）。
+  final AgentTypeConfig? Function(String templateName)? templateLookup;
+
+  /// 每轮装配重解析思考档用的**目录查找器**（按 provider 名读当前 Provider 配置，
+  /// 其中带 `models`/`discovered_at`）。null = 没有目录可查（⇒ 只按显式档解析）。
+  final provider_model.ProviderConfig? Function(String providerName)?
+      providerLookup;
+
   final SessionRepository sessionRepo;
   final MessageRepository messageRepo;
   final SummaryNodeRepository summaryNodeRepo;
@@ -303,6 +318,8 @@ class Agent {
     required this.agentTypeName,
     required this.config,
     required this.template,
+    this.templateLookup,
+    this.providerLookup,
     required provider_model.ProviderConfig provider,
     required this.sessionRepo,
     required this.messageRepo,
@@ -549,6 +566,35 @@ class Agent {
     callbacks.onStreamingChanged?.call(value);
   }
 
+  /// 本轮装配的思考模式与强度（D7 的解析点；推导规则与创建时同一处：D6）。
+  ///
+  /// 显式档取**当前模板**的 `thinking_effort`（用户刚保存的那个值），目录取**当前**
+  /// Provider 配置里该模型条目的 `reasoningEfforts`。模型本身仍用创建时冻结的
+  /// [ResolvedAgentConfig.model]（D7 明确模型不热更新）—— 拿"未来模型"的档位去驱动
+  /// "当前模型"的请求会造成第二个口径。
+  ({String mode, String effort}) _resolveRoundThinking() {
+    final lookupTemplate = templateLookup;
+    final lookupProvider = providerLookup;
+    if (lookupTemplate == null && lookupProvider == null) {
+      // 没有注入查找器（直接构造 Agent 的测试路径）：用创建时解析出的冻结快照。
+      return (mode: config.thinkingMode, effort: config.thinkingEffort);
+    }
+    final current = lookupTemplate?.call(agentTypeName) ?? template;
+    ModelCatalogEntry? entry;
+    for (final candidate
+        in lookupProvider?.call(config.providerName)?.models ??
+            const <ModelCatalogEntry>[]) {
+      if (candidate.id == config.model) {
+        entry = candidate;
+        break;
+      }
+    }
+    return AgentConfigResolver.resolveThinking(
+      explicitEffort: current.thinkingEffort,
+      entry: entry,
+    );
+  }
+
   // ---------------------------------------------------------------------------
   // 模型调用与工具循环（原 `lib/main.dart` 的 `_callModel`）
   // ---------------------------------------------------------------------------
@@ -569,6 +615,12 @@ class Agent {
     // **不许**放进工具派发（`_dispatchToolCall`）：那会让同一轮里前后两次请求看到
     // 不同的目录，破坏"一轮内一致"。
     await SkillCatalogService.instance.scan();
+
+    // D7：思考模式与强度在**每轮装配**这里按最新模板 + 最新目录重解析一次，并写进
+    // 本轮局部变量。本轮内所有模型请求（含工具轮）共用这一份 —— 所以保存发生在
+    // 某轮工具循环进行中时，该轮已发出的请求与后续请求都还是旧档，改动从**下一轮
+    // 装配**（下一条消息）起生效。窗口/工具/模型/系统提示词仍读冻结的 [config]。
+    final roundThinking = _resolveRoundThinking();
 
     // 实际发送的工具定义 = 本实例生效配置 ∩ 工具目录；未知名字在这里显式失败（
     // 创建路径已经校验过一次，这里保持同一判据，避免绕过目录）。
@@ -653,8 +705,8 @@ class Agent {
       var lastInputTokens = 0;
       var lastOutputTokens = 0;
 
-      final thinkingMode = config.thinkingMode;
-      final thinkingEffort = config.thinkingEffort;
+      final thinkingMode = roundThinking.mode;
+      final thinkingEffort = roundThinking.effort;
       // 系统提示词：模板提示 + 每轮动态段（`guard.inject()`）+ 技能段 + 日期。
       // 技能段紧随 `guard.inject()` 之后（change `add-skill-mechanism` design D4），
       // **不受模板工具清单影响**：每个模板都收到它。段内分两种形态（返工 5.1，
@@ -1782,6 +1834,14 @@ class Agent {
     final emittedToolUseIds = <String>{};
     final imagesAllowed = allowImages ?? config.acceptsImages;
     final modelName = config.model;
+    // 当轮生效技能名：在逐条循环**外**取一次、循环内复用（design D2；禁止缓存到
+    // Agent 字段或构造期快照 —— 当轮语义由每轮开头的 `scan()` + getter 保证）。
+    //
+    // `_callModel` 与压缩投影 `_buildCompactionProjection` 共用本入口（投影对每个
+    // 原文段各调一次），所以投影里的历史 user 消息一并按当轮集合展开；这正是 spec
+    // 「进入本次请求的每一条 user 消息」的实现点。压缩折叠进摘要的消息到不了这里，
+    // 属压缩能力的既定损失（design D2 范围限定）。
+    final activeNames = SkillCatalogService.instance.activeSkillNames;
 
     final preparedByMsg = <int, List<ImageRequestParts>>{};
     final planned = <PlannedImage>[];
@@ -1811,7 +1871,18 @@ class Agent {
       final msg = messages[mi];
       final content = <Map<String, dynamic>>[];
       if (msg.content.isNotEmpty) {
-        content.add({'type': 'text', 'text': msg.content});
+        // 斜杠技能展开的唯一接线点（design D1/D2）：只对 `Message` 行
+        // `role == 'user'` 的正文生效，assistant 消息原样。
+        //
+        // 落库 / 会话标题 / 对话视图气泡都发生在装配**之前**（`_sendMessageRound`
+        // 里的 `messageRepo.insert` / `updateTitleIfDefault` 用的就是手打原文），
+        // 天然不受影响。**禁止**在 `_callModel` 的工具轮或装配后的 apiMessages 层
+        // 做替换：那里 role=='user' 的条目可能是 tool_result 块列表（content 是
+        // List 而不是 String），会被误改写。
+        final text = msg.role == 'user'
+            ? expandSlashCommand(msg.content, activeNames)
+            : msg.content;
+        content.add({'type': 'text', 'text': text});
       }
 
       if (msg.role == 'user' && msg.attachments.isNotEmpty) {

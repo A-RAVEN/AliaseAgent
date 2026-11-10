@@ -22,8 +22,8 @@ Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单�
 
 ## 在哪用
 
-- **第一次启动**：应用发现没有配置文件，会弹出一个两步向导：第一步问 Provider 名字、网关地址与密钥，第二步问上下文窗口。
-- **改 Agent 模板**：用侧栏的 `Agents` 菜单（不用重启；保存后**之后创建或恢复**的实例才用新配置）。
+- **第一次启动**：应用发现没有配置文件，会弹出一个两步向导：第一步问 Provider 名字、网关地址与密钥，第二步**当场探测网关的模型目录**并从目录里选模型（没有窗口输入这一步——上下文窗口也取自目录）。
+- **改 Agent 模板**：用侧栏的 `Agents` 菜单（不用重启；保存后**推理强度**从下一条消息起对运行中的对话生效，其余字段对之后创建或恢复的实例生效）。
 - **改 Provider（增删改、探测模型目录）**：用侧栏的 `Providers` 入口（保存后立即写回文件；之后创建或恢复的实例使用新 Provider 配置）。
 - **改搜索、spill 或没有界面入口的模板字段**：直接用文本编辑器改上面那个文件，然后**重启应用**（这些段只在启动时读一次）。
 
@@ -36,13 +36,13 @@ Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单�
 | 第 1 步：`Provider 名称`（默认 `magpie`，可改） | 这份配置里这个供应商的名字；模板用这个名字引用它 |
 | 第 1 步：`网关地址`（默认 `http://127.0.0.1:3425`，可改） | 模型服务的地址；填 `http://127.0.0.1:3425/v1` 这类带尾部 `/v1` 的地址也能存（会自动归一化） |
 | 第 1 步：`API Key`（遮蔽输入，默认预填 `magpie`，可改） | 你的模型服务 key；magpie 网关的密钥约定就叫 magpie |
-| 第 1 步的 `下一步` | 检查名字/地址/密钥后进入第 2 步；校验失败停在第一步并保留输入 |
-| 第 2 步：`Max Context Tokens`（提示 `e.g. 200000`，下面一行小字 `Compaction threshold (one-time setting)`） | 模型能装下多少 token；它决定"什么时候开始压缩"（见 [上下文压缩](context-compaction.md)） |
-| 第 2 步的 `Start` 按钮 | 两步都合法后保存并进入界面 |
+| 第 1 步的 `下一步` | 检查名字/地址/密钥后进入第 2 步并**当场探测**网关目录；校验失败停在第一步并保留输入 |
+| 第 2 步：`模型` 下拉 | 探测成功后才出现，缺省是目录**第一项**（网关给什么顺序就是什么顺序，本产品不排序）；显示网关给的 `display_name`，存的是模型 id，可以改选。模型名与上下文窗口都从这次探测的目录来 |
+| 第 2 步的 `Start` | 探测成功且目录非空后才保存并进入界面；探测失败或目录为空时 `Start` 不会完成向导，红字写明原因（例如 `探测失败：连接失败：Connection refused`） |
 
-整条向导在两步都成功之前不能关闭（点对话框外面也不会关）。补问（已有配置但 `general` 缺窗口）会跳过第 1 步的默认值猜测，把名字与地址预填成 `general` 实际在用的 Provider；密钥不回显，需要重新输入。
+整条向导在两步都成功之前不能关闭（点对话框外面也不会关）。**首启要求网关可达**：探测不通就完不成首启——这是"模型名与窗口都从目录读"的必然代价。先起网关（或到 `Providers` 页探测成功）再来走向导。补问（已有配置、只是缺密钥等）会跳过第 1 步的默认值猜测，把名字与地址预填成 `general` 实际在用的 Provider；密钥不回显，需要重新输入；补问**不碰**已有模板的模型与窗口字段。
 
-按 `Start` 之后，应用会写出这样一份配置（供应商名默认是 `magpie`，可以改；默认地址是 `http://127.0.0.1:3425`、默认密钥预填 `magpie`；模型写死为 `claude-sonnet-4-6`，工具给当前**十一项基础工具**；没探测过目录，所以没有 `models` / `discovered_at` 两个键）：
+按 `Start` 之后，应用会写出这样一份配置（供应商名默认是 `magpie`，可以改；默认地址是 `http://127.0.0.1:3425`、默认密钥预填 `magpie`；模型 = 探测到的目录第一项；工具给当前**十一项基础工具**；目录与 `discovered_at` 在同一次保存里写回；**没有** `max_context_tokens` 键——缺席表示"窗口从目录读"）：
 
 ```json
 {
@@ -50,20 +50,25 @@ Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单�
   "providers": {
     "magpie": {
       "api_key": "magpie",
-      "base_url": "http://127.0.0.1:3425"
+      "base_url": "http://127.0.0.1:3425",
+      "models": [
+        {"id": "deepseek/deepseek-flash", "display_name": "DeepSeek-V4.1-Flash", "context_window": 1048576, "modalities": {"input": ["text"], "output": ["text"]}}
+      ],
+      "discovered_at": "2026-11-10T05:55:07.397859Z"
     }
   },
   "agent_types": {
     "general": {
       "provider": "magpie",
-      "model": "claude-sonnet-4-6",
+      "model": "deepseek/deepseek-flash",
       "system_prompt": "You are a helpful assistant.",
-      "tools": ["read_file", "write_file", "edit_file", "list_dir", "get_current_time", "glob_file", "grep_file", "read_image", "run_command", "read_spill", "spawn_subagent"],
-      "max_context_tokens": 200000
+      "tools": ["read_file", "write_file", "edit_file", "list_dir", "get_current_time", "glob_file", "grep_file", "read_image", "run_command", "read_spill", "spawn_subagent"]
     }
   }
 }
 ```
+
+> 上例里的模型 id 只是**示例**（它来自你那天的网关目录）。产品里没有任何硬编码模型串或写死的窗口长度：模型是探测结果的第一个条目，窗口是目录条目里的 `context_window`。
 
 > 如果你以前用旧版首启生成过 `["read_file", "list_dir"]` 这两项默认清单，启动时会看到一行**迁移提示**：它会被升级成上面这十一项基础工具。你自己收窄或扩展过的清单不会被改动。
 >
@@ -87,7 +92,7 @@ Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单�
   "agent_types": {
     "general": {
       "provider": "magpie",
-      "model": "claude-sonnet-4-6",
+      "model": "deepseek/deepseek-flash",
       "system_prompt": "You are a helpful assistant.",
       "tools": ["read_file", "write_file", "edit_file", "list_dir", "glob_file", "grep_file", "get_current_time"],
       "thinking_effort": "medium",
@@ -122,6 +127,8 @@ Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单�
 }
 ```
 
+> 上面的 `max_context_tokens` 是**可选的覆盖值**：不写就以网关目录的 `context_window` 为准；写小了也不会生效（目录优先，只会多一行"覆盖值被忽略"的日志）。真正需要它的场合只有一个：这个 Provider 没探测过、或目录里没有这个模型。
+
 | 键 | 在哪一层 | 含义 | 不写会怎样 |
 |---|---|---|---|
 | `version` | 顶层 | 配置格式版本，目前是 `1` | 按 `1` 处理 |
@@ -136,7 +143,7 @@ Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单�
 | `system_prompt` | 每个 agent | 系统提示词 | 空字符串 |
 | `tools` | 每个 agent | 允许模型调用的工具名清单；只能写工具目录里存在的名字 | 空清单（模型没有工具可用）；写了不存在的工具会拒绝创建实例并列出名字 |
 | `thinking_effort` | 每个 agent | 思考强度：low、medium、high、xhigh、max 之一；其它值按"关闭"处理 | 关闭（不传） |
-| `max_context_tokens` | 每个 agent | 模型能吃下多少 token；**必须是正整数** | 缺失、为零或负数时拒绝创建 Agent 并显示模板名（不会再按 0 继续发送全文）；`general` 缺这个值时会弹一次欢迎对话框问你要 |
+| `max_context_tokens` | 每个 agent | **窗口的覆盖值**（可选，正整数）。生效窗口的规矩：所属 Provider 的目录里该模型有正数 `context_window` ⇒ **一律以目录为准**（这个覆盖值会被忽略并打一行日志点名）；目录缺失（没探测 / 目录没这个模型 / 值非正）⇒ 用这里的正整数；两者都没有 ⇒ **拒绝创建 Agent** 并显示模板名 | 缺席是**合法**状态（= 窗口从目录读）。只有"目录也拿不到、又没写覆盖"时才会拒绝创建；不再因为缺这个键弹任何对话框 |
 | `compaction_threshold_percent` | 每个 agent | 压缩阈值百分比，1 到 100 的整数 | 用 25 |
 | `compaction_wait_threshold_percent` | 每个 agent | **等待**阈值百分比，1 到 100 的整数：这一轮要发出去的内容占模型总上下文超过这个比例时，才等压缩做完再发（见 [上下文压缩](context-compaction.md)） | 用 75 |
 | `standing_requirements` | 每个 agent | 你写死的目标，压缩时不许丢掉 | 空清单 |
@@ -165,11 +172,12 @@ Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单�
 | 对话框里红字 `Please enter an API key` | 两步向导的第 1 步里 `API Key` 空着就点 `下一步` | 填 key |
 | 对话框里红字 `请填写 Provider 名称` / `Provider "<名字>" 已存在` | 第 1 步的名字空着，或与配置里已有的 Provider 重名 | 换一个没被占用的名字 |
 | 对话框里红字 `网关地址必须是以 http:// 或 https:// 开头的绝对地址` | 第 1 步的网关地址不是绝对 http(s) 地址（例如漏了 `https://`，或写了 `ftp://`） | 补成完整地址，例如 `http://127.0.0.1:3425` |
-| 对话框里红字 `Please enter a valid max context token count (a positive integer)` | `Max Context Tokens` 空着、不是整数、或不是正数 | 填一个正整数，例如 `200000` |
+| 对话框里红字 `探测失败：<原因>。首启要求网关可达并返回模型目录：先起网关，或到 Providers 页探测后重开向导` | 第 2 步的探测没通（网关没起、地址/密钥不对、HTTP 非 200） | 先起网关并确认地址与密钥；修好后点 `上一步` 再 `下一步` 重试 |
+| 对话框里红字 `探测成功但目录为空：这个网关没有返回任何模型，无法确定模型名与上下文窗口` | 探测通了但 `GET /v1/models` 返回空目录 | 去网关侧确认模型已注册；目录为空时无法确定模型名与窗口，向导不会写出配置 |
 | 整屏 `Configuration Error`，下面一行 `Invalid JSON in <路径>: ...` | 配置文件不是合法 JSON（少逗号、多逗号、引号没配对） | 按提示的路径打开文件修好，重启应用 |
 | 整屏 `Configuration Error`，下面一行 `Unexpected data structure in <路径>: ...` | JSON 合法但结构不对（例如某个供应商少了 `api_key`，或 `agent_types` 里少了 `general`） | 按上面的完整示例补全 |
-| 又弹一次欢迎对话框 | 配置文件不存在，或者 `general` 里没有可用的 `max_context_tokens` | 按对话框填；也可以直接改文件补上这个键 |
-| 界面顶部红条 `Agent 模板 "<名字>" 的 max_context_tokens 无效（...）：必须是正整数。拒绝创建实例...` | 某个模板的窗口缺失、为零或负数 | 用 `Agents` 菜单改这个模板的上下文窗口，或直接改文件；修好前这个模板不能创建实例 |
+| 又弹一次欢迎对话框 | 配置文件不存在（这是**唯一**的自动入口）。缺 `max_context_tokens` **不会**再弹它——那是合法状态 | 按对话框填；已有配置只是缺窗口的话，去 `Agents` 菜单写覆盖值或先在 `Providers` 页探测目录 |
+| 界面顶部红条 `Agent 模板 "<名字>" 的上下文窗口无法确定：...两条出路：① 去 Providers 页探测 provider "<名字>" 的目录；② 在 agent_types.<名字>.max_context_tokens 写一个正整数覆盖。` | 该模板的模型在 Provider 目录里没有正数 `context_window`，配置里也没有正整数覆盖值 | 二选一：到 `Providers` 页探测这个 Provider（推荐，此后窗口跟随目录）；或在 `config.json` 的该模板下写一个正整数 `max_context_tokens`。修好前这个模板不能创建实例，也不会按 0 继续发送全文 |
 | 界面顶部红条 `Agent 模板 "<名字>" 不存在：拒绝创建实例，也不会退回 general` | 会话保存的模板名在 `agent_types` 里找不到 | 用 `Agents` 菜单添加一个同名模板，或用当前会话工具栏的模板下拉把它换到一个已存在的模板（切换后数据库 `sessions.agent_type` 会更新；本版没有改名入口） |
 | 界面顶部红条 `未知工具：<名字>（模板 "<名字>"）：不在 ToolCatalog 中。不会静默丢弃...` | 模板的 `tools` 里写了工具目录中不存在的名字 | 用 `Agents` 菜单改工具集合；不会静默删掉这个名字继续跑 |
 | 日志里多一行 `compaction_threshold_percent=... is absent or not an integer in 1..100 — using the default 25% ...` | 这个键写了小数、`0`、负数、大于 `100`、或者写成了字符串 | 改成 1 到 100 的整数；不改也能用（按 25% 走） |

@@ -65,9 +65,14 @@ void main() {
       expect(find.text('API Key'), findsOneWidget);
     });
 
-    // ── 5.4 (R1-7) Config loaded but agent lacks maxContextTokens → SetupDialog ──
+    // ── (D3) Config loaded but agent lacks maxContextTokens → NO SetupDialog ──
+    //
+    // change `model-truth-from-gateway` 2.3：这条判据被**反转**了。缺席
+    // `max_context_tokens` 从此是合法状态（生效窗口取网关目录值；目录也没有时在
+    // 创建 Agent 那一刻显式失败并点名模板），所以"缺窗口 ⇒ 弹欢迎对话框"的自动
+    // 补问入口已删除。旧断言（必须弹 SetupDialog）在这里必然红，故按新语义改写。
 
-    testWidgets('ok config whose agent lacks maxContextTokens surfaces SetupDialog (R1-7)',
+    testWidgets('ok config whose agent lacks maxContextTokens does NOT surface SetupDialog (D3)',
         (tester) async {
       await tester.pumpWidget(MaterialApp(
         home: AppShell(
@@ -82,7 +87,7 @@ void main() {
                 provider: 'test',
                 model: 'm',
                 systemPrompt: '',
-                // maxContextTokens deliberately left null → required config missing
+                // maxContextTokens deliberately left null → legal state since D3.
               ),
             },
           )),
@@ -91,11 +96,18 @@ void main() {
 
       // First frame: loading spinner.
       expect(find.byType(CircularProgressIndicator), findsOneWidget);
-      // Second frame: postFrameCallback → setup dialog because maxContextTokens missing.
+      // Second frame: no setup dialog — the config is legal as-is.
       await tester.pump();
       await tester.pump();
-      expect(find.byType(SetupDialog), findsOneWidget,
-          reason: 'a missing required maxContextTokens must surface setup like a missing apiKey');
+      // ignore: avoid_print
+      print('  [OBS] 缺窗口的合法配置：SetupDialog 数='
+          '${find.byType(SetupDialog).evaluate().length}；'
+          '主界面存在=${find.byType(ChatScreen).evaluate().length}');
+      expect(find.byType(SetupDialog), findsNothing,
+          reason: '缺 max_context_tokens 不再是补问触发条件（D3）：'
+              '合法配置不许再被欢迎对话框挡住');
+      expect(find.byType(ChatScreen), findsOneWidget,
+          reason: '直接进入主界面，说明没有弹对话框接管');
     });
   });
 }

@@ -213,10 +213,27 @@ void main() {
       expectRejected(draft(provider: 'nope'), 'provider', '未定义');
     });
 
-    test('非法上下文窗口（零、负数、非整数）', () {
-      for (final window in ['0', '-1', 'abc', '']) {
+    test('非法上下文窗口（零、负数、非整数）仍被拒绝', () {
+      for (final window in ['0', '-1', 'abc']) {
         expectRejected(draft(window: window), '上下文窗口', '正整数');
       }
+    });
+
+    // change `model-truth-from-gateway` 1.3（D1/D3）：窗口覆盖**不再是必填**。
+    // 缺席 = 合法状态（生效窗口取网关目录值；目录也缺时创建阶段显式失败），
+    // 所以保存必须成功，且写回的配置里**不出现**这个键。
+    test('窗口留空：保存成功，且写回的配置不带 max_context_tokens 键', () {
+      final result = controller.save(draft(window: ''));
+      final raw = reread();
+      final writer = (raw['agent_types'] as Map)['writer'] as Map;
+      // ignore: avoid_print
+      print('  [OBS] 留空窗口保存后：配置里含键=${writer.containsKey('max_context_tokens')} '
+          'registered=${result.template.name} '
+          'model.maxContextTokens=${result.template.maxContextTokens}');
+      expect(writer.containsKey('max_context_tokens'), isFalse,
+          reason: '缺席是合法状态：不许写回一个 0 或任何缺省窗口数字');
+      expect(result.template.maxContextTokens, isNull);
+      expect(registry.lookup('writer')?.maxContextTokens, isNull);
     });
 
     test('未知工具名必须列出来，不许静默删除', () {

@@ -1,8 +1,11 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:alias_agent/models/agent_type_config.dart';
 import 'package:alias_agent/models/app_config.dart';
+import 'package:alias_agent/models/model_catalog_entry.dart';
 import 'package:alias_agent/models/provider_config.dart';
+import 'package:alias_agent/models/resolved_agent_config.dart';
 import 'package:alias_agent/services/agent_config_resolver.dart';
 import 'package:alias_agent/services/provider_resolver.dart';
 
@@ -19,6 +22,23 @@ void main() {
         },
       ));
 
+  /// 带目录的 provider 引用表（change `model-truth-from-gateway` 1.2）。
+  ///
+  /// `models` 是持久化目录的形状（`ModelCatalogEntry`，窗口键 `context_window`）；
+  /// `null` = 从未探测（配置里没有 models 键）。
+  ProviderResolver providersWithCatalog(List<ModelCatalogEntry>? models) =>
+      ProviderResolver(AppConfig(
+        version: 1,
+        providers: {
+          'magpie': ProviderConfig(
+            apiKey: 'k',
+            baseUrl: 'https://x',
+            models: models ?? const [],
+            discoveredAt: models == null ? null : '2026-11-09T00:00:00.000Z',
+          ),
+        },
+      ));
+
   AgentTypeConfig template({
     String name = 'general',
     String? thinkingEffort,
@@ -31,11 +51,12 @@ void main() {
     int threshold = 25,
     int wait = 75,
     String provider = 'test',
+    String model = 'model-a',
   }) =>
       AgentTypeConfig(
         name: name,
         provider: provider,
-        model: 'model-a',
+        model: model,
         systemPrompt: '你是助手',
         tools: tools,
         thinkingEffort: thinkingEffort,
@@ -126,6 +147,196 @@ void main() {
               previousModel: 'a', nextModel: '  '),
           isFalse,
           reason: '空模型由"模型非空"那条校验拦，不属于窗口确认');
+    });
+  });
+
+  // change `model-truth-from-gateway` 1.2：D1 窗口链 + D6 思考链的 unit 断言。
+  group('目录链（model-truth-from-gateway）', () {
+    const flashEntry = ModelCatalogEntry(
+      id: 'deepseek/deepseek-flash',
+      displayName: 'DeepSeek-V4.1-Flash',
+      contextWindow: 1048576,
+      reasoningEfforts: ['none', 'low', 'high', 'max'],
+    );
+    const qwenEntry = ModelCatalogEntry(
+      id: 'qwen/qwen-max',
+      displayName: 'Qwen Max',
+      contextWindow: 131072,
+      reasoningEfforts: ['none', 'low', 'medium', 'xhigh'],
+    );
+    const noReasoningEntry = ModelCatalogEntry(
+      id: 'plain/model',
+      displayName: '无推理',
+      contextWindow: 32000,
+      reasoningEfforts: [],
+    );
+
+    /// 捕获 debugPrint 的全部输出（与 `agent_type_config_command_test.dart` 同一手法）。
+    ({T value, List<String> logs}) capture<T>(T Function() body) {
+      final captured = <String>[];
+      final original = debugPrint;
+      debugPrint = (String? message, {int? wrapWidth}) {
+        if (message != null) captured.add(message);
+      };
+      try {
+        return (value: body(), logs: captured);
+      } finally {
+        debugPrint = original;
+      }
+    }
+
+    test('窗口：目录有正数窗口 ⇒ 一律以目录为准，覆盖值被忽略并打日志点名', () {
+      ({ResolvedAgentConfig value, List<String> logs}) resolveWith(int override) =>
+          capture(() => AgentConfigResolver(providersWithCatalog(const [flashEntry]))
+              .resolve(
+            template: template(
+              provider: 'magpie',
+              model: 'deepseek/deepseek-flash',
+              maxContextTokens: override,
+            ),
+            spillPreviewChars: 1000,
+          ));
+
+      final smaller = resolveWith(200000);
+      final bigger = resolveWith(4000000);
+      // ignore: avoid_print
+      print('  [OBS] 目录 ${flashEntry.contextWindow}：覆盖 200000 ⇒ 生效='
+          '${smaller.value.maxContextTokens}，日志=${smaller.logs.where((l) => l.contains("被忽略")).toList()}');
+      // ignore: avoid_print
+      print('  [OBS] 覆盖 4000000 ⇒ 生效=${bigger.value.maxContextTokens}，日志='
+          '${bigger.logs.where((l) => l.contains("被忽略")).toList()}');
+
+      expect(smaller.value.maxContextTokens, 1048576,
+          reason: '目录值存在且为正 ⇒ 覆盖值必须被忽略');
+      expect(smaller.logs.any((l) => l.contains('被忽略') && l.contains('200000')),
+          isTrue, reason: '覆盖值被忽略时必须有一行日志点名它（静默忽略等于骗人）');
+      expect(bigger.value.maxContextTokens, 1048576);
+      expect(bigger.logs.any((l) => l.contains('被忽略') && l.contains('4000000')),
+          isTrue, reason: '大于目录方向的覆盖值也要点名');
+    });
+
+    test('窗口：目录缺失（未探测 / 无此模型 / 值非正）⇒ 用配置正整数覆盖', () {
+      final cases = <String, ({ProviderResolver providers, AgentTypeConfig tpl})>{
+        '未探测': (providers: providersWithCatalog(null), tpl: template(provider: 'magpie', maxContextTokens: 777000)),
+        '目录无此模型': (providers: providersWithCatalog(const [flashEntry]), tpl: template(provider: 'magpie', model: 'gone/model', maxContextTokens: 666000)),
+        '目录窗口非正': (
+          providers: providersWithCatalog(const [
+            ModelCatalogEntry(id: 'zero/window', contextWindow: 0),
+          ]),
+          tpl: template(provider: 'magpie', model: 'zero/window', maxContextTokens: 555000),
+        ),
+      };
+      for (final entry in cases.entries) {
+        final resolved = AgentConfigResolver(entry.value.providers).resolve(
+          template: entry.value.tpl,
+          spillPreviewChars: 1000,
+        );
+        // ignore: avoid_print
+        print('  [OBS] ${entry.key} ⇒ 生效窗口=${resolved.maxContextTokens}');
+        expect(resolved.maxContextTokens, entry.value.tpl.maxContextTokens,
+            reason: '${entry.key} 时必须用覆盖值');
+      }
+    });
+
+    test('窗口：双缺 ⇒ 抛错，消息带模板名与两条出路，不回落任何数字', () {
+      var message = '';
+      try {
+        AgentConfigResolver(providersWithCatalog(null)).resolve(
+          template: template(
+            name: '裸配置模板',
+            provider: 'magpie',
+            model: 'deepseek/deepseek-flash',
+            maxContextTokens: null,
+          ),
+          spillPreviewChars: 1000,
+        );
+        fail('目录与覆盖都缺时必须拒绝创建');
+      } on InvalidAgentContextWindowException catch (e) {
+        message = e.toString();
+      }
+      // ignore: avoid_print
+      print('  [OBS] 双缺报错：$message');
+      expect(message, contains('裸配置模板'));
+      expect(message, contains('Providers 页探测'));
+      expect(message, contains('max_context_tokens'));
+      expect(message, contains('正整数'));
+      expect(message, contains('拒绝创建'));
+    });
+
+    test('思考：缺键时按目录取中间档（flash → high，qwen → medium）', () {
+      final flash = AgentConfigResolver(providersWithCatalog(const [flashEntry]))
+          .resolve(
+              template: template(
+                  provider: 'magpie', model: 'deepseek/deepseek-flash'),
+              spillPreviewChars: 1000);
+      final qwen = AgentConfigResolver(providersWithCatalog(const [qwenEntry]))
+          .resolve(
+              template: template(provider: 'magpie', model: 'qwen/qwen-max'),
+              spillPreviewChars: 1000);
+      // ignore: avoid_print
+      print('  [OBS] 缺键 ⇒ flash=${flash.thinkingMode}/${flash.thinkingEffort}；'
+          'qwen=${qwen.thinkingMode}/${qwen.thinkingEffort}');
+      expect(flash.thinkingMode, 'adaptive');
+      expect(flash.thinkingEffort, 'high',
+          reason: 'flash 目录档位 low/high/max ⇒ 按 kThinkingEfforts 顺序取中间档 high');
+      expect(qwen.thinkingMode, 'adaptive');
+      expect(qwen.thinkingEffort, 'medium',
+          reason: 'qwen 目录档位 low/medium/xhigh ⇒ 中间档是 medium（不是字面写死）');
+    });
+
+    test('思考：空 / 全 none / 未探测 ⇒ disabled', () {
+      final cases = <String, ({ProviderResolver providers, String model})>{
+        '空档位': (providers: providersWithCatalog(const [noReasoningEntry]), model: 'plain/model'),
+        '全 none': (
+          providers: providersWithCatalog(const [
+            ModelCatalogEntry(id: 'none/model', contextWindow: 1000, reasoningEfforts: ['none']),
+          ]),
+          model: 'none/model',
+        ),
+        '未探测': (providers: providersWithCatalog(null), model: 'deepseek/deepseek-flash'),
+      };
+      for (final entry in cases.entries) {
+        final resolved = AgentConfigResolver(entry.value.providers).resolve(
+          template: template(provider: 'magpie', model: entry.value.model),
+          spillPreviewChars: 1000,
+        );
+        // ignore: avoid_print
+        print('  [OBS] ${entry.key} ⇒ ${resolved.thinkingMode} '
+            '"${resolved.thinkingEffort}"');
+        expect(resolved.thinkingMode, 'disabled', reason: '${entry.key} 必须解析为 disabled');
+        expect(resolved.thinkingEffort, '');
+      }
+    });
+
+    test('思考：显式档位永远优先于目录中间档（xhigh）', () {
+      final resolved = AgentConfigResolver(providersWithCatalog(const [flashEntry]))
+          .resolve(
+              template: template(
+                provider: 'magpie',
+                model: 'deepseek/deepseek-flash',
+                thinkingEffort: 'xhigh',
+              ),
+              spillPreviewChars: 1000);
+      // ignore: avoid_print
+      print('  [OBS] 显式 xhigh + 目录 low/high/max ⇒ '
+          '${resolved.thinkingMode}/${resolved.thinkingEffort}');
+      expect(resolved.thinkingMode, 'adaptive');
+      expect(resolved.thinkingEffort, 'xhigh');
+    });
+
+    test('思考：显式但非法（非白名单）仍解析为 disabled，不被目录推导静默修好', () {
+      final resolved = AgentConfigResolver(providersWithCatalog(const [flashEntry]))
+          .resolve(
+              template: template(
+                provider: 'magpie',
+                model: 'deepseek/deepseek-flash',
+                thinkingEffort: 'turbo',
+              ),
+              spillPreviewChars: 1000);
+      // ignore: avoid_print
+      print('  [OBS] 显式 turbo ⇒ ${resolved.thinkingMode} "${resolved.thinkingEffort}"');
+      expect(resolved.thinkingMode, 'disabled');
+      expect(resolved.thinkingEffort, '');
     });
   });
 

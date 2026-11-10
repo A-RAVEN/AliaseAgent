@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:alias_agent/models/agent_type_config.dart';
 import 'package:alias_agent/models/model_catalog_entry.dart';
 import 'package:alias_agent/services/agent_template_controller.dart';
 import 'package:alias_agent/ui/agent_template_editor.dart';
@@ -187,14 +188,22 @@ void main() {
     expect(find.text('DeepSeek-V4.1-Flash'), findsNothing);
   });
 
-  testWidgets('手输目录外模型可保存，并显示中性提示"不在最近一次目录中"', (tester) async {
+  // change `model-truth-from-gateway` 3.2（D4）：脏模型名可见提示。
+  //
+  // 判据钉死为 `discovered_at`（**不是**"目录是否为空"）：
+  // - 已探测且目录不含该模型 ⇒ 警示（error 色）；
+  // - 从未探测 ⇒ 中性文案（onSurfaceVariant 色），不声称模型不存在；
+  // - 提示按"编辑器打开那一刻"的快照算，刷新后重开编辑器重算（无实时通道）。
+  testWidgets('已探测且目录不含该模型：警示文案点名模型名，且不阻断保存、不改写配置', (tester) async {
     tester.view.physicalSize = const Size(1400, 1800);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
+
     AgentTemplateDraft? saved;
     await tester.pumpWidget(wrap(AgentTemplateEditor(
       providers: const ['magpie'],
       catalogs: catalogs,
+      discoveredAtByProvider: const {'magpie': '2026-11-09T00:00:00.000Z'},
       availableTools: const ['read_file'],
       onSave: (draft) async => saved = draft,
     )));
@@ -206,20 +215,127 @@ void main() {
     await tester.enterText(
         find.byKey(const ValueKey('template-window')), '1234');
     await tester.pump();
+
     final hint = tester
         .widget<TextField>(find.byKey(const ValueKey('template-model')))
         .decoration
         ?.helperText;
+    final warning = _textOf(
+        tester, const ValueKey('template-model-catalog-warning'));
     // ignore: avoid_print
-    print('  [OBS] 手输目录外模型提示=$hint');
-    expect(hint, contains('不在最近一次目录中'));
+    print('  [OBS] 已探测缺失模型：helperText=$hint；警示=$warning；'
+        '中性文案=${find.byKey(const ValueKey('template-model-catalog-unprobed')).evaluate().length}');
+    expect(hint, contains('当前目录没有这个模型'));
+    expect(warning, contains('manual/custom-model'),
+        reason: '警示必须点名该模型名');
+    expect(
+        tester
+            .widget<Text>(
+                find.byKey(const ValueKey('template-model-catalog-warning')))
+            .style
+            ?.color,
+        isNotNull,
+        reason: '警示要有独立视觉权重（error 色），不能和中性说明同色');
+    expect(find.byKey(const ValueKey('template-model-catalog-unprobed')),
+        findsNothing);
 
+    // 只提示不改写：目录外的名字照样能保存，存的就是用户写的那个。
     await tester.tap(find.byKey(const ValueKey('save-template')));
     await tester.pumpAndSettle();
     // ignore: avoid_print
     print('  [OBS] 保存草稿 model=${saved?.model} window=${saved?.maxContextTokensText}');
-    expect(saved, isNotNull, reason: '目录外模型不得被拒绝');
+    expect(saved, isNotNull, reason: '提示不是拦截：目录外模型仍可保存');
     expect(saved!.model, 'manual/custom-model');
+  });
+
+  testWidgets('从未探测：中性文案"目录未探测"，不声称模型不存在', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1800);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    await tester.pumpWidget(wrap(AgentTemplateEditor(
+      providers: const ['magpie'],
+      // 目录里**有**条目（证明判据不是"目录为空"），但这个 Provider 从未探测。
+      catalogs: catalogs,
+      discoveredAtByProvider: const {'magpie': null},
+      availableTools: const ['read_file'],
+      onSave: (draft) async {},
+    )));
+    await tester.pump();
+    await tester.enterText(
+        find.byKey(const ValueKey('template-model')), 'manual/custom-model');
+    await tester.pump();
+
+    final hint = tester
+        .widget<TextField>(find.byKey(const ValueKey('template-model')))
+        .decoration
+        ?.helperText;
+    final neutral = _textOf(
+        tester, const ValueKey('template-model-catalog-unprobed'));
+    // ignore: avoid_print
+    print('  [OBS] 未探测：helperText=$hint；中性=$neutral；'
+        '警示=${find.byKey(const ValueKey('template-model-catalog-warning')).evaluate().length}');
+    expect(hint, contains('目录未探测'));
+    expect(neutral, contains('这不代表模型不存在'));
+    expect(find.byKey(const ValueKey('template-model-catalog-warning')),
+        findsNothing, reason: '未探测时不许出现"不存在"级别的警示');
+  });
+
+  testWidgets('刷新后重开编辑器：新目录包含该模型 ⇒ 警示消失、不留残留', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1800);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    Widget editor(String key) => wrap(AgentTemplateEditor(
+          key: ValueKey(key),
+          providers: const ['magpie'],
+          catalogs: catalogs,
+          discoveredAtByProvider: const {'magpie': '2026-11-09T00:00:00.000Z'},
+          availableTools: const ['read_file'],
+          onSave: (draft) async {},
+        ));
+
+    await tester.pumpWidget(editor('before-refresh'));
+    await tester.pump();
+    await tester.enterText(
+        find.byKey(const ValueKey('template-model')), 'deepseek/other');
+    await tester.pump();
+    expect(find.byKey(const ValueKey('template-model-catalog-warning')),
+        findsOneWidget, reason: '刷新前：目录里没有 deepseek/other');
+    // ignore: avoid_print
+    print('  [OBS] 刷新前警示='
+        '${_textOf(tester, const ValueKey('template-model-catalog-warning'))}');
+
+    // 用户在 Providers 页刷新了目录（新目录包含该模型），然后重开编辑器。
+    final refreshed = <String, List<ModelCatalogEntry>>{
+      'magpie': [...catalogs['magpie']!, deepseekOther],
+    };
+    await tester.pumpWidget(wrap(AgentTemplateEditor(
+      key: const ValueKey('after-refresh'),
+      original: AgentTypeConfig(
+        name: 'general',
+        provider: 'magpie',
+        model: 'deepseek/other',
+        systemPrompt: '',
+        tools: const ['read_file'],
+      ),
+      providers: const ['magpie'],
+      catalogs: refreshed,
+      discoveredAtByProvider: const {'magpie': '2026-11-10T00:00:00.000Z'},
+      availableTools: const ['read_file'],
+      onSave: (draft) async {},
+    )));
+    await tester.pump();
+
+    // ignore: avoid_print
+    print('  [OBS] 刷新后：警示='
+        '${find.byKey(const ValueKey('template-model-catalog-warning')).evaluate().length} '
+        '中性=${find.byKey(const ValueKey('template-model-catalog-unprobed')).evaluate().length} '
+        'helperText=${tester.widget<TextField>(find.byKey(const ValueKey('template-model'))).decoration?.helperText}');
+    expect(find.byKey(const ValueKey('template-model-catalog-warning')),
+        findsNothing, reason: '新目录包含该模型 ⇒ 警示必须消失');
+    expect(find.byKey(const ValueKey('template-model-catalog-unprobed')),
+        findsNothing, reason: '已探测的 Provider 不该退回中性文案');
   });
 
   testWidgets('providers 为空：显示"请先在 Providers 页添加供应商"并禁用保存', (tester) async {

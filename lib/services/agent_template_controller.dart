@@ -21,6 +21,9 @@ class AgentTemplateDraft {
 
   final String systemPrompt;
   final List<String> tools;
+
+  /// 窗口**覆盖值**的输入文本。空串 = 不写 `max_context_tokens`（缺席合法：生效窗口
+  /// 取网关目录值；目录也没有时创建会显式失败）。非空则必须是正整数。
   final String maxContextTokensText;
 
   /// 编辑器里勾选的输入模态。null = 旧调用方（未经过编辑器），沿用模板既有值。
@@ -139,10 +142,21 @@ class AgentTemplateController {
     }
 
     final windowText = draft.maxContextTokensText.trim();
-    final window = int.tryParse(windowText);
-    if (window == null || window <= 0) {
-      throw const AgentTemplateValidationException(
-          '上下文窗口', '上下文窗口必须是正整数（当前输入不合法）');
+    // 缺席从此是合法状态（change `model-truth-from-gateway` D1/D3）：窗口覆盖是可选的，
+    // 不写就用网关目录值。只有"写了但写错"才拒绝 —— 静默吞掉非法输入等于把用户
+    // 亲手写的覆盖值丢掉，那比报错更糟。
+    final int? window;
+    if (windowText.isEmpty) {
+      window = null;
+    } else {
+      final parsed = int.tryParse(windowText);
+      if (parsed == null || parsed <= 0) {
+        throw const AgentTemplateValidationException(
+            '上下文窗口',
+            '上下文窗口必须是正整数（当前输入不合法）：留空表示用网关目录的窗口，'
+            '填了就是目录缺失时的覆盖值');
+      }
+      window = parsed;
     }
 
     final unknownTools = <String>[

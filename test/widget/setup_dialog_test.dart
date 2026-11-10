@@ -2,8 +2,53 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:alias_agent/models/app_config.dart';
+import 'package:alias_agent/models/model_catalog_entry.dart';
+import 'package:alias_agent/services/model_discovery_service.dart';
 import 'package:alias_agent/services/tool_catalog.dart';
 import 'package:alias_agent/ui/setup_dialog.dart';
+
+/// 首启 / 补问两步向导（change `model-truth-from-gateway` 2.3 改写）。
+///
+/// 第 2 步从"手填上下文窗口"改成**探测门**：探测成功且目录非空才能 Start，
+/// 模型来自目录（缺省第一项），目录与 `discovered_at` 在同一次保存里写回，
+/// 写出的配置**没有** `max_context_tokens` 键。
+class _FakeProbe implements ModelCatalogProbe {
+  _FakeProbe(this.result);
+
+  ModelCatalogProbeResult result;
+  final List<({String baseUrl, String apiKey})> calls = [];
+
+  @override
+  Future<ModelCatalogProbeResult> fetch({
+    required String baseUrl,
+    required String apiKey,
+    required int previewChars,
+  }) async {
+    calls.add((baseUrl: baseUrl, apiKey: apiKey));
+    return result;
+  }
+}
+
+const _flash = ModelCatalogEntry(
+  id: 'deepseek/deepseek-flash',
+  displayName: 'DeepSeek-V4.1-Flash',
+  contextWindow: 1048576,
+  reasoningEfforts: ['none', 'low', 'high', 'max'],
+);
+const _kimi = ModelCatalogEntry(
+  id: 'kimi/kimi-for-coding',
+  displayName: 'K2.8 Preview',
+  contextWindow: 262144,
+);
+
+ModelCatalogProbeResult _okCatalog() =>
+    ModelCatalogProbeResult.success(const [_flash, _kimi], 0);
+
+ModelCatalogProbeResult _emptyCatalog() =>
+    ModelCatalogProbeResult.success(const [], 0);
+
+ModelCatalogProbeResult _failedProbe() =>
+    ModelCatalogProbeResult.failure('连接失败：Connection refused');
 
 Widget _wrapDialog(SetupDialog dialog) {
   return MaterialApp(home: Scaffold(body: dialog));
@@ -29,20 +74,24 @@ Future<void> _fillStepOne(
   await tester.pump();
 }
 
-/// 走完第一步（填 key 后点"下一步"）。
-Future<void> _passStepOne(WidgetTester tester, {String key = 'sk-ant-test-key'}) async {
+/// 走完第一步（填 key 后点"下一步"，等探测返回）。
+Future<void> _passStepOne(WidgetTester tester,
+    {String key = 'sk-ant-test-key'}) async {
   await _fillStepOne(tester, key: key);
   await tester.tap(find.byKey(const ValueKey('setup-next')));
+  await tester.pump();
   await tester.pump();
 }
 
 void main() {
   group('SetupDialog（两步向导）', () {
-    // ── 4.1 Renders provider fields + "Start" button ───────────────
+    // ── 2.3 改写：第 2 步是探测门，没有窗口输入 ─────────────────────
 
-    testWidgets('renders API key + max context tokens fields and Start button', (tester) async {
+    testWidgets('第 1 步是 Provider 三要素；第 2 步是探测后的模型下拉，全流程无窗口输入',
+        (tester) async {
+      final probe = _FakeProbe(_okCatalog());
       await tester.pumpWidget(_wrapDialog(
-        SetupDialog(onComplete: () {}),
+        SetupDialog(onComplete: () {}, probe: probe),
       ));
       await tester.pump();
 
@@ -52,18 +101,31 @@ void main() {
       expect(find.byKey(const ValueKey('setup-api-key')), findsOneWidget);
       expect(find.text('API Key'), findsOneWidget); // labelText
       expect(find.text('下一步'), findsOneWidget);
-      // 第二步的窗口输入框此时还不在界面上。
+      expect(find.byKey(const ValueKey('setup-model')), findsNothing);
       expect(find.text('Max Context Tokens'), findsNothing);
 
       await _passStepOne(tester);
-      expect(find.text('Max Context Tokens'), findsOneWidget); // labelText
+      // ignore: avoid_print
+      print('  [OBS] 探测调用=${probe.calls}；模型下拉='
+          '${find.byKey(const ValueKey('setup-model')).evaluate().length}；'
+          '窗口输入=${find.byKey(const ValueKey('setup-max-context-tokens')).evaluate().length}');
+      expect(find.text('Max Context Tokens'), findsNothing,
+          reason: '窗口输入步已被删除（D2/D3）：窗口取网关目录值');
+      expect(find.byKey(const ValueKey('setup-max-context-tokens')), findsNothing);
+      expect(find.byKey(const ValueKey('setup-model')), findsOneWidget);
+      expect(find.text('DeepSeek-V4.1-Flash'), findsWidgets,
+          reason: '下拉显示 display_name');
       expect(find.text('Start'), findsOneWidget);
       expect(find.text('上一步'), findsOneWidget);
+      expect(probe.calls.single.baseUrl, 'http://127.0.0.1:3425',
+          reason: '探测必须用第 1 步填入的地址');
+      expect(probe.calls.single.apiKey, 'sk-ant-test-key',
+          reason: '探测必须用第 1 步填入的密钥');
     });
 
     testWidgets('首启默认名与地址为 magpie 与 127.0.0.1:3425', (tester) async {
       await tester.pumpWidget(_wrapDialog(
-        SetupDialog(onComplete: () {}),
+        SetupDialog(onComplete: () {}, probe: _FakeProbe(_okCatalog())),
       ));
       await tester.pump();
 
@@ -87,13 +149,14 @@ void main() {
       expect(keyField.obscureText, isTrue, reason: '密钥输入框必须遮蔽');
     });
 
-    // ── 4.2 Empty input → error, dialog stays ──────────────────────
+    // ── 空输入 → 报错、对话框不关闭 ────────────────────────────────
 
     testWidgets('empty API key shows validation error', (tester) async {
       bool completed = false;
+      final probe = _FakeProbe(_okCatalog());
 
       await tester.pumpWidget(_wrapDialog(
-        SetupDialog(onComplete: () => completed = true),
+        SetupDialog(onComplete: () => completed = true, probe: probe),
       ));
       await tester.pump();
 
@@ -108,54 +171,142 @@ void main() {
       expect(find.byType(SetupDialog), findsOneWidget);
       expect(find.byKey(const ValueKey('setup-api-key')), findsOneWidget,
           reason: '校验失败必须停在第一步并保留输入');
+      expect(probe.calls, isEmpty, reason: '第一步没过就不该探测');
     });
 
-    // ── 4.3 Valid key + window → onComplete called ─────────────────
+    // ── 合法输入 + 探测成功 → onComplete，写回目录且无窗口键 ──────────
 
-    testWidgets('valid API key triggers onComplete', (tester) async {
+    testWidgets('valid input + probed catalog triggers onComplete and saves catalog', (tester) async {
       bool completed = false;
       AppConfig? savedConfig;
+      final probe = _FakeProbe(_okCatalog());
 
       await tester.pumpWidget(_wrapDialog(
         SetupDialog(
           onComplete: () => completed = true,
           saveConfig: (config) => savedConfig = config,
+          probe: probe,
         ),
       ));
       await tester.pump();
 
       await _passStepOne(tester);
-      await tester.enterText(
-          find.byKey(const ValueKey('setup-max-context-tokens')), '200000');
-      await tester.pump();
-
-      // 只有两步都过了，"Start"才完成向导。
-      expect(completed, isFalse, reason: '第二步还没点 Start');
+      // 只有探测成功后才有下拉；此时还没保存。
+      expect(completed, isFalse, reason: '还没点 Start');
       await tester.tap(find.text('Start'));
       await tester.pump();
 
+      final general = savedConfig!.agentTypes['general']!;
+      final provider = savedConfig!.providers['magpie']!;
+      final providerJson = provider.toJson();
+      // ignore: avoid_print
+      print('  [OBS] 保存后 general.model=${general.model} '
+          'window=${general.maxContextTokens} '
+          'toJson 含窗口键=${general.toJson().containsKey('max_context_tokens')}；'
+          'provider.models=${provider.models.map((m) => m.id).toList()} '
+          'discovered_at=${provider.discoveredAt} '
+          '目录条目 JSON 键=${(providerJson['models'] as List).first.keys.toList()}');
+
       expect(completed, isTrue);
-      expect(savedConfig, isNotNull);
-      expect(savedConfig!.providers['magpie']!.apiKey, 'sk-ant-test-key');
-      expect(savedConfig!.providers['magpie']!.baseUrl,
-          'http://127.0.0.1:3425');
-      expect(
-        savedConfig!.agentTypes['general']!.maxContextTokens,
-        200000,
-        reason: 'max context tokens must be required and captured on setup',
-      );
+      expect(provider.apiKey, 'sk-ant-test-key');
+      expect(provider.baseUrl, 'http://127.0.0.1:3425');
+      expect(provider.models.map((m) => m.id).toList(),
+          ['deepseek/deepseek-flash', 'kimi/kimi-for-coding'],
+          reason: '探测到的目录必须在同一次保存里写回 providers.<名>.models');
+      expect(provider.discoveredAt, isNotNull,
+          reason: '已探测必须以 discovered_at 为准（脏值判定要用它，不许靠目录为空）');
+      expect((providerJson['models'] as List).first.containsKey('context_window'),
+          isTrue,
+          reason: '持久化目录的窗口键必须是 context_window');
+      expect(general.model, _flash.id,
+          reason: '缺省模型 = 探测目录第一项（网关顺序），产品里没有硬编码模型串');
+      expect(general.toJson().containsKey('max_context_tokens'), isFalse,
+          reason: '首启写出的配置不含窗口键：缺席 = 从目录推导');
+      expect(general.maxContextTokens, isNull);
       expect(
         savedConfig!.agentTypes['general']!.toJson()['input_modalities'],
         ['text'],
-        reason: 'setup 写出的配置必须带 input_modalities：默认只有 text，'
-            '模型能不能收图由用户改这一项，且图片不会被静默发出去',
+        reason: 'setup 写出的配置必须带 input_modalities：默认只有 text',
       );
-      // ignore: avoid_print
-      print('  [OBS] 首启默认工具清单=${savedConfig!.agentTypes['general']!.tools}');
-      expect(savedConfig!.agentTypes['general']!.tools,
-          ToolCatalog.kBaseToolNames,
-          reason: '首启默认清单必须覆盖当前十项基础工具，不能还是旧版那两项');
+      expect(general.tools, ToolCatalog.kBaseToolNames,
+          reason: '首启默认清单必须覆盖当前基础工具');
     });
+
+    testWidgets('模型下拉可改：存的是目录条目的 id，不是 display_name', (tester) async {
+      AppConfig? savedConfig;
+      await tester.pumpWidget(_wrapDialog(SetupDialog(
+        onComplete: () {},
+        saveConfig: (config) => savedConfig = config,
+        probe: _FakeProbe(_okCatalog()),
+      )));
+      await tester.pump();
+
+      await _passStepOne(tester);
+      await tester.tap(find.byKey(const ValueKey('setup-model')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('K2.8 Preview').last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Start'));
+      await tester.pump();
+
+      // ignore: avoid_print
+      print('  [OBS] 改选第二个模型后 general.model=${savedConfig?.agentTypes['general']?.model}');
+      expect(savedConfig!.agentTypes['general']!.model, _kimi.id,
+          reason: '下拉显示 display_name，但存进配置的必须是目录条目的 id');
+    });
+
+    // ── 探测门：失败 / 空目录都不放行、不写配置 ─────────────────────
+
+    testWidgets('probe failure blocks Start and names the failure', (tester) async {
+      bool completed = false;
+      AppConfig? saved;
+      await tester.pumpWidget(_wrapDialog(SetupDialog(
+        onComplete: () => completed = true,
+        saveConfig: (config) => saved = config,
+        probe: _FakeProbe(_failedProbe()),
+      )));
+      await tester.pump();
+
+      await _passStepOne(tester);
+      final error = tester
+          .widget<Text>(find.byKey(const ValueKey('setup-error')))
+          .data;
+      // ignore: avoid_print
+      print('  [OBS] 探测失败后错误="$error"；Start 存在=${find.text('Start').evaluate().length}');
+      expect(error, contains('探测失败'));
+      expect(error, contains('Connection refused'));
+
+      await tester.tap(find.text('Start'));
+      await tester.pump();
+      expect(completed, isFalse, reason: '探测失败时 Start 不许完成向导');
+      expect(saved, isNull, reason: '探测失败不许写出任何配置');
+    });
+
+    testWidgets('empty catalog blocks Start', (tester) async {
+      bool completed = false;
+      AppConfig? saved;
+      await tester.pumpWidget(_wrapDialog(SetupDialog(
+        onComplete: () => completed = true,
+        saveConfig: (config) => saved = config,
+        probe: _FakeProbe(_emptyCatalog()),
+      )));
+      await tester.pump();
+
+      await _passStepOne(tester);
+      final error = tester
+          .widget<Text>(find.byKey(const ValueKey('setup-error')))
+          .data;
+      // ignore: avoid_print
+      print('  [OBS] 空目录错误="$error"');
+      expect(error, contains('目录为空'));
+
+      await tester.tap(find.text('Start'));
+      await tester.pump();
+      expect(completed, isFalse);
+      expect(saved, isNull);
+    });
+
+    // ── 补问：合并既有配置，不碰模型/窗口 ──────────────────────────
 
     testWidgets('补问合并现有配置：provider/search/spill/自定义模板与未编辑字段都保留', (tester) async {
       final existing = AppConfig.fromJson({
@@ -169,7 +320,7 @@ void main() {
         },
         'spill': {'preview_chars': 2500},
         'agent_types': {
-          // general 故意缺 max_context_tokens —— 这正是补问的触发条件。
+          // general 故意缺 max_context_tokens —— 这从此是**合法状态**（D3）。
           'general': {
             'provider': 'anthropic',
             'model': 'claude-custom',
@@ -198,6 +349,7 @@ void main() {
         existingConfig: existing,
         onComplete: () => completed = true,
         saveConfig: (config) => saved = config,
+        probe: _FakeProbe(_okCatalog()),
       )));
       await tester.pump();
 
@@ -218,8 +370,6 @@ void main() {
       expect(keyField.obscureText, isTrue);
 
       await _passStepOne(tester, key: 'sk-new-key');
-      await tester.enterText(
-          find.byKey(const ValueKey('setup-max-context-tokens')), '300000');
       await tester.tap(find.text('Start'));
       await tester.pump();
 
@@ -239,14 +389,18 @@ void main() {
       expect(saved!.providers.keys.toSet(), {'anthropic', 'deepseek'});
       expect(saved!.providers['anthropic']!.apiKey, 'sk-new-key');
       expect(saved!.providers['deepseek']!.apiKey, 'ds-key');
+      expect(saved!.providers['anthropic']!.models, (_okCatalog()).entries,
+          reason: '补问也要把探测到的目录写回该 Provider');
+      expect(saved!.providers['anthropic']!.discoveredAt, isNotNull);
       expect(saved!.search, {
         'deepseek': {'enabled': true, 'k': 4},
       });
       expect(saved!.spillPreviewChars, 2500);
       expect(saved!.agentTypes.keys.toSet(), {'general', 'reviewer'});
       expect(saved!.agentTypes['reviewer']!.model, 'deepseek-v4');
-      expect(general.maxContextTokens, 300000);
-      expect(general.model, 'claude-custom');
+      expect(general.model, 'claude-custom', reason: '补问不碰模型字段');
+      expect(general.toJson().containsKey('max_context_tokens'), isFalse,
+          reason: '补问不许顺手塞一个窗口键进去');
       expect(general.systemPrompt, '老的系统提示词');
       expect(general.tools, ['read_file', 'run_command']);
       expect(general.thinkingEffort, 'high');
@@ -285,14 +439,14 @@ void main() {
         existingConfig: existing,
         onComplete: () {},
         saveConfig: (config) => saved = config,
+        probe: _FakeProbe(_okCatalog()),
       )));
       await tester.pump();
 
       await _fillStepOne(tester, name: 'gateway', key: 'sk-new');
       await tester.tap(find.byKey(const ValueKey('setup-next')));
       await tester.pump();
-      await tester.enterText(
-          find.byKey(const ValueKey('setup-max-context-tokens')), '5000');
+      await tester.pump();
       await tester.tap(find.text('Start'));
       await tester.pump();
 
@@ -307,31 +461,11 @@ void main() {
       expect(saved!.agentTypes['general']!.provider, 'gateway');
       expect(saved!.agentTypes['reviewer']!.provider, 'gateway',
           reason: '引用旧名的其它模板不能悬空');
+      expect(saved!.agentTypes['reviewer']!.maxContextTokens, 1000,
+          reason: '既有覆盖值原样保留（它是合法的目录缺失兜底）');
     });
 
-    // ── 4.3b Max context tokens is required → validation error ─────
-
-    testWidgets('missing max context tokens shows validation error', (tester) async {
-      bool completed = false;
-
-      await tester.pumpWidget(_wrapDialog(
-        SetupDialog(onComplete: () => completed = true),
-      ));
-      await tester.pump();
-
-      await _passStepOne(tester);
-      // 第二步的窗口留空。
-      await tester.tap(find.text('Start'));
-      await tester.pump();
-
-      expect(completed, isFalse);
-      expect(
-        find.text('Please enter a valid max context token count (a positive integer)'),
-        findsOneWidget,
-      );
-    });
-
-    // ── 4.4 barrierDismissible=false ───────────────────────────────
+    // ── barrierDismissible=false ───────────────────────────────────
 
     testWidgets('tapping outside dialog does not close it', (tester) async {
       // SetupDialog must be shown via showDialog to have a barrier
@@ -343,7 +477,8 @@ void main() {
                 showDialog(
                   context: context,
                   barrierDismissible: false,
-                  builder: (_) => SetupDialog(onComplete: () {}),
+                  builder: (_) => SetupDialog(
+                      onComplete: () {}, probe: _FakeProbe(_okCatalog())),
                 );
               },
               child: const Text('Open'),
@@ -367,14 +502,16 @@ void main() {
       expect(find.byType(SetupDialog), findsOneWidget);
     });
 
-    // ── 新增：非法网关地址、两步都过才完成、名字为空 / 重名 ───────────
+    // ── 非法网关地址、两步都过才完成、名字为空 / 重名 ───────────────
 
     testWidgets('invalid base URL blocked', (tester) async {
       var completed = false;
       AppConfig? saved;
+      final probe = _FakeProbe(_okCatalog());
       await tester.pumpWidget(_wrapDialog(SetupDialog(
         onComplete: () => completed = true,
         saveConfig: (config) => saved = config,
+        probe: probe,
       )));
       await tester.pump();
 
@@ -393,33 +530,36 @@ void main() {
       }
       expect(completed, isFalse);
       expect(saved, isNull, reason: '非法地址不得落盘');
+      expect(probe.calls, isEmpty, reason: '地址非法时不该发探测请求');
     });
 
     testWidgets('两步都过才 onComplete', (tester) async {
       var completed = false;
+      AppConfig? saved;
       await tester.pumpWidget(_wrapDialog(
-        SetupDialog(onComplete: () => completed = true),
+        SetupDialog(
+          onComplete: () => completed = true,
+          // 必须注入 saveConfig：否则会走 ConfigService.save 写真实的
+          // ~/.aliasagent/config.json（测试不许碰用户配置）。
+          saveConfig: (config) => saved = config,
+          probe: _FakeProbe(_okCatalog()),
+        ),
       ));
       await tester.pump();
 
-      // 第一步通过：还没有完成。
+      // 第一步通过 + 探测成功：还没有完成（还没点 Start）。
       await _passStepOne(tester);
       expect(completed, isFalse);
-      expect(find.byKey(const ValueKey('setup-max-context-tokens')), findsOneWidget);
+      expect(saved, isNull);
+      expect(find.byKey(const ValueKey('setup-model')), findsOneWidget);
 
-      // 第二步空窗口被拒：仍没完成。
-      await tester.tap(find.text('Start'));
-      await tester.pump();
-      expect(completed, isFalse);
-
-      // 两步都合法才完成。
-      await tester.enterText(
-          find.byKey(const ValueKey('setup-max-context-tokens')), '1000');
+      // 点 Start 才完成。
       await tester.tap(find.text('Start'));
       await tester.pump();
       // ignore: avoid_print
-      print('  [OBS] 两步都过后 completed=$completed');
+      print('  [OBS] 两步都过后 completed=$completed saved=${saved != null}');
       expect(completed, isTrue);
+      expect(saved, isNotNull);
     });
 
     testWidgets('empty or duplicate provider name blocked', (tester) async {
@@ -444,6 +584,7 @@ void main() {
         existingConfig: existing,
         onComplete: () => completed = true,
         saveConfig: (_) {},
+        probe: _FakeProbe(_okCatalog()),
       )));
       await tester.pump();
 

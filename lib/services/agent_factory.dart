@@ -233,6 +233,11 @@ class AgentFactory {
       agentTypeName: template.name,
       config: resolved,
       template: template,
+      // D7：注入两个**当前引用**查找器 —— 模板按名字读注册表、目录按 provider 名读
+      // ProviderResolver。Agent 每轮装配各查一次，因此模板保存后下一轮生效；
+      // 窗口/工具/模型/系统提示词仍只用 [resolved] 里冻结的那份。
+      templateLookup: templates.lookup,
+      providerLookup: (name) => providerResolver()?.resolve(name),
       provider: candidate.provider,
       sessionRepo: sessionRepo,
       messageRepo: messageRepo,
