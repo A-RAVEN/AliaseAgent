@@ -3,6 +3,9 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../services/skills/skill_catalog_service.dart';
+import 'slash_completion.dart';
+
 /// `Ctrl+V` 在输入行里的意图：先试贴图，没贴到再退回文本粘贴。
 ///
 /// 单独定义一个 Intent 才能用 `Actions` 覆盖默认的 `PasteTextIntent`
@@ -75,13 +78,226 @@ class InputBar extends StatefulWidget {
 class _InputBarState extends State<InputBar> {
   final _focusNode = FocusNode();
 
+  // ---------------------------------------------------------------------------
+  // 技能名补全（change `slash-command-completion`，design D1～D6）
+  //
+  // 接线点就在这里：Flutter 的按键分发从 primary focus（TextField 的内部节点）沿
+  // 祖先上溯，本类这个 `Focus(onKeyEvent: _onKey)` 比 WidgetsApp 默认的 Shortcuts
+  // 更近，所以 Tab（默认是 NextFocusIntent 焦点遍历）能在这里先被截住。
+  // ---------------------------------------------------------------------------
+
+  /// 面板的锚：`CompositedTransformTarget` 挂在输入框上（`build` 里），
+  /// `CompositedTransformFollower` 在 Overlay 里贴住它。
+  final _link = LayerLink();
+
+  /// 量输入框宽度用的 key（面板宽度对齐输入框）。挂在 Target 上，量的就是输入框。
+  final _fieldKey = GlobalKey();
+
+  /// 面板的浮层条目；null = 当前没有面板（也是按键分支问的"面板可见吗"）。
+  OverlayEntry? _panelEntry;
+
+  /// 浮层从哪儿来（`didChangeDependencies` 里取一次；没有 Overlay 就没有浮层可放）。
+  OverlayState? _overlay;
+
+  /// 当前候选：每次重筛**现读** `activeSkillNames`（design D6：不缓存、不监听、
+  /// 不触发扫描 —— 读到的就是最近一次 scan 的快照）。
+  List<String> _candidates = const <String>[];
+
+  /// 生效技能集合是否为空 —— 只决定提示行用哪一句文案（空目录 / 无匹配）。
+  bool _catalogEmpty = true;
+
+  /// 高亮行下标（[_candidates] 为空时无意义）。
+  int _highlight = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_onEditingChanged);
+    _focusNode.addListener(_onFocusChanged);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _overlay = Overlay.maybeOf(context);
+  }
+
   @override
   void dispose() {
+    widget.controller.removeListener(_onEditingChanged);
+    _focusNode.removeListener(_onFocusChanged);
+    _hidePanel();
     _focusNode.dispose();
     super.dispose();
   }
 
+  /// 文本或光标变了：重算面板（打出空白 / 删掉 `/` / 光标离开首段都走这里）。
+  void _onEditingChanged() {
+    _refreshPanel();
+  }
+
+  /// 失焦即关（design D1 的硬规则）：面板是纯建议层，从不抢焦点。
+  void _onFocusChanged() {
+    if (!_focusNode.hasFocus) {
+      _hidePanel();
+      return;
+    }
+    _refreshPanel();
+  }
+
+  /// 重算"该不该有面板、有哪几条、哪条高亮"，据此插入 / 刷新 / 拆掉浮层。
+  ///
+  /// 显示条件 = design D1 四条同时成立：
+  ///   ① 文本以 `/` 开头；
+  ///   ② 有焦点；
+  ///   ③ 光标在首段之内且是塌缩选区（`1 <= baseOffset <= 首段末`，非法/越界 ⇒ 不显示）；
+  ///   ④ 首段之后没有任何文本。
+  ///
+  /// 任何一条不再成立就关闭 —— 这也是"接受补全不会吃掉正文"的双保险（D4）。
+  void _refreshPanel() {
+    if (!mounted) return;
+    final text = widget.controller.text;
+    final selection = widget.controller.selection;
+    final firstSegmentEnd = slashFirstSegmentEnd(text);
+    final shouldShow = _focusNode.hasFocus &&
+        text.isNotEmpty &&
+        text.startsWith('/') &&
+        selection.isValid &&
+        selection.isCollapsed &&
+        selection.baseOffset >= 1 &&
+        selection.baseOffset <= firstSegmentEnd &&
+        firstSegmentEnd == text.length;
+    if (!shouldShow) {
+      _hidePanel();
+      return;
+    }
+
+    final names = SkillCatalogService.instance.activeSkillNames;
+    final candidates = filterSkillNames(text.substring(1), names);
+    final highlight =
+        candidates.isEmpty ? 0 : _highlight.clamp(0, candidates.length - 1);
+    final changed = !_sameNames(candidates, _candidates) ||
+        _catalogEmpty != names.isEmpty ||
+        highlight != _highlight;
+    _candidates = candidates;
+    _catalogEmpty = names.isEmpty;
+    _highlight = highlight;
+    final entry = _panelEntry;
+    if (entry == null) {
+      _insertPanel();
+    } else if (changed) {
+      entry.markNeedsBuild();
+    }
+  }
+
+  /// 把面板插进浮层。高度上限用**实测**的输入框上方空间（不是发明的常数），
+  /// 宽度对齐输入框，位置由 `buildSlashCompletionOverlay` 里那条 LayerLink 决定。
+  void _insertPanel() {
+    final overlay = _overlay;
+    if (overlay == null) return; // 没有 Overlay 就不显示，也不拦键（行为不变）
+    final entry = OverlayEntry(builder: _buildPanel);
+    _panelEntry = entry;
+    overlay.insert(entry);
+  }
+
+  Widget _buildPanel(BuildContext context) {
+    final box = _fieldKey.currentContext?.findRenderObject() as RenderBox?;
+    final width = box?.size.width ?? 0;
+    // 面板浮在输入框**上方** ⇒ 可用高度 = 输入框顶边到窗口顶边的距离（实测）。
+    final top = box == null ? 0.0 : box.localToGlobal(Offset.zero).dy;
+    return buildSlashCompletionOverlay(
+      link: _link,
+      width: width,
+      maxHeight: top - kSlashCompletionGap,
+      candidates: _candidates,
+      highlightIndex: _highlight,
+      emptyCatalog: _catalogEmpty,
+      onAccept: _acceptCandidate,
+    );
+  }
+
+  /// 拆掉面板。连候选项与高亮一起清空 —— 关闭之后这些值没有任何意义。
+  void _hidePanel() {
+    _candidates = const <String>[];
+    _highlight = 0;
+    final entry = _panelEntry;
+    _panelEntry = null;
+    if (entry == null) return;
+    entry.remove();
+    entry.dispose();
+  }
+
+  /// 接受第 [index] 条候选（键盘 Tab/回车与鼠标点击共用这一条路，design D4）。
+  ///
+  /// 只做两件事：把首段替换成 `/完整技能名␣`、把光标放到插入文本之后。
+  /// **不发送**（发送仍由用户显式进行）、不碰任何其它状态；其后文本原样保留
+  /// （design D1④ 已经让"首段后有文本"进不来，所以今天恒为空串）。
+  void _acceptCandidate(int index) {
+    if (index < 0 || index >= _candidates.length) return;
+    final insertion = '/${_candidates[index]} ';
+    final text = widget.controller.text;
+    final tail = text.substring(slashFirstSegmentEnd(text));
+    widget.controller.value = TextEditingValue(
+      text: '$insertion$tail',
+      selection: TextSelection.collapsed(offset: insertion.length),
+    );
+    _hidePanel();
+  }
+
+  /// ↑/↓ 移动高亮（到头回绕，手柄式菜单的常见行为）。
+  void _moveHighlight(int delta) {
+    if (_candidates.isEmpty) return;
+    _highlight = (_highlight + delta) % _candidates.length;
+    _panelEntry?.markNeedsBuild();
+  }
+
+  /// 两个候选表是否逐项相同（只在"内容真变了"时才让浮层重建）。
+  static bool _sameNames(List<String> a, List<String> b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
+    // 补全面板**先**截键（design D2）：这条分支必须在下面既有的 Enter→发送之前。
+    // 前置条件是"面板可见且存在高亮行"：零候选（无匹配 / 空目录）一律不拦 ——
+    // Enter 仍发送、Tab 仍走默认焦点遍历，面板只是提示层，不吞键。
+    if (event is KeyDownEvent && _panelEntry != null && _candidates.isNotEmpty) {
+      final key = event.logicalKey;
+      if (key == LogicalKeyboardKey.tab) {
+        if (HardwareKeyboard.instance.isShiftPressed) {
+          _hidePanel(); // Shift+Tab = Esc：关闭，不改写
+        } else {
+          _acceptCandidate(_highlight); // Tab = 接受高亮行
+        }
+        return KeyEventResult.handled;
+      }
+      if (key == LogicalKeyboardKey.enter) {
+        if (HardwareKeyboard.instance.isShiftPressed) {
+          return KeyEventResult.ignored; // Shift+Enter 仍是换行（既有行为）
+        }
+        // 回车改道语义（design D4）：面板可见且有高亮行时，回车是"接受补全"，
+        // 不是发送。想直接发送：接受后（或 Esc 关闭后）再按一次回车。
+        _acceptCandidate(_highlight);
+        return KeyEventResult.handled;
+      }
+      if (key == LogicalKeyboardKey.arrowDown) {
+        _moveHighlight(1);
+        return KeyEventResult.handled;
+      }
+      if (key == LogicalKeyboardKey.arrowUp) {
+        _moveHighlight(-1);
+        return KeyEventResult.handled;
+      }
+      if (key == LogicalKeyboardKey.escape) {
+        _hidePanel();
+        return KeyEventResult.handled;
+      }
+    }
+
     if (event is KeyDownEvent &&
         event.logicalKey == LogicalKeyboardKey.enter) {
       if (HardwareKeyboard.instance.isShiftPressed) {
@@ -124,21 +340,27 @@ class _InputBarState extends State<InputBar> {
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
               Expanded(
-                child: _shortcutLayer(
-                  Focus(
-                    onKeyEvent: _onKey,
-                    child: TextField(
-                      controller: widget.controller,
-                      focusNode: _focusNode,
-                      maxLines: 5,
-                      minLines: 1,
-                      textInputAction: TextInputAction.newline,
-                      decoration: const InputDecoration(
-                        hintText: 'Type a message...',
-                        border: OutlineInputBorder(),
-                        contentPadding:
-                            EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                        isDense: true,
+                // 补全面板的锚：`CompositedTransformTarget` 只包输入框（不包整个
+                // 输入行）—— 面板宽度对齐的就是输入框，design D5。
+                child: CompositedTransformTarget(
+                  key: _fieldKey,
+                  link: _link,
+                  child: _shortcutLayer(
+                    Focus(
+                      onKeyEvent: _onKey,
+                      child: TextField(
+                        controller: widget.controller,
+                        focusNode: _focusNode,
+                        maxLines: 5,
+                        minLines: 1,
+                        textInputAction: TextInputAction.newline,
+                        decoration: const InputDecoration(
+                          hintText: 'Type a message...',
+                          border: OutlineInputBorder(),
+                          contentPadding: EdgeInsets.symmetric(
+                              horizontal: 12, vertical: 10),
+                          isDense: true,
+                        ),
                       ),
                     ),
                   ),
