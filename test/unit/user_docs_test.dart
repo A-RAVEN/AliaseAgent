@@ -44,7 +44,12 @@ const _cppConfigRegionStart = 'ensure_search_infra_impl';
 const _cppConfigRegionEnd = 'get_search_providers_json';
 
 /// 工具定义所在文件。
-const _mainDartPath = 'lib/main.dart';
+///
+/// change `web-ui-core-shim` 任务 2.1：工具目录播种（基础工具 + load_skill schema、
+/// 浏览器/搜索条件注册）从 `lib/main.dart` 抽取为共享函数供 Flutter 与无头核心两侧
+/// 调用，定义表随之搬到 `lib/services/tool_bootstrap.dart`。这里只改**源码位置**，
+/// 断言（文档里的名字必须都能在工具定义里找到）不变。
+const _mainDartPath = 'lib/services/tool_bootstrap.dart';
 
 /// 工具定义那一段的起止标记（用标记而不是行号，行号会被后续编辑顶偏）。
 const _toolRegionStart = 'final base = <String, Map<String, dynamic>>{';
@@ -67,8 +72,9 @@ const _otherCodeNames = <String, String>{
   'browser_available': 'lib/services/sidecar_bridge.dart',
   // PowerShell 的换目录命令名。命令工具的说明文字里写着"pass workdir instead of
   // using cd"（告诉模型别用 cd），用户文档讲"要不要 cd"时也会把这两个字母括起来，
-  // 所以文档一致性检查会在产品代码里逐一核到这个记号。
-  'cd': 'lib/main.dart',
+  // 所以文档一致性检查会在产品代码里逐一核到这个记号。工具说明随
+  // `web-ui-core-shim` 2.1 搬到了共享播种文件。
+  'cd': 'lib/services/tool_bootstrap.dart',
   // 子运行的可区分失败码（add-spawn-subagent-tool）：它们不是工具名也不是配置键，
   // 但会在用户文档与工具结果里原样出现；每个都必须在运行器里真实存在。
   'invalid_task': 'lib/services/subagent_runner.dart',

@@ -1,4 +1,4 @@
-import 'package:flutter/foundation.dart';
+import '../services/logging.dart';
 
 /// 网关模型目录里的一个条目（change `add-provider-model-discovery` 任务 2.1）。
 ///

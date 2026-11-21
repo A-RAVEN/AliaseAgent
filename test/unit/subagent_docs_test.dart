@@ -58,17 +58,20 @@ void main() {
       final doc = read(docPath);
       final sidebar = read('lib/ui/session_sidebar.dart');
       final templateMenu = read('lib/ui/agent_template_menu.dart');
-      final mainDart = read('lib/main.dart');
+      // 工具定义（真实注册名）。change `web-ui-core-shim` 2.1 起，工具目录播种与
+      // 定义表住在共享文件 `lib/services/tool_bootstrap.dart`（Flutter 与无头核心
+      // 共用同一份），不再是 `lib/main.dart`。只改读取位置，断言不变。
+      final mainDart = read('lib/services/tool_bootstrap.dart');
 
       // 工具定义（真实注册名）。
       final definitionAt = mainDart.indexOf("'spawn_subagent': const {");
       // ignore: avoid_print
-      print('  [OBS] main.dart 里的工具定义位置=$definitionAt '
+      print('  [OBS] tool_bootstrap.dart 里的工具定义位置=$definitionAt '
           '侧栏 Agents=${sidebar.contains("Text('Agents')")} '
           '模板菜单 Agents=${templateMenu.contains("Text('Agents')")} '
           '修改模板=${templateMenu.contains("tooltip: '修改模板'")}');
       expect(definitionAt >= 0, isTrue,
-          reason: 'main.dart 里必须有 spawn_subagent 的工具定义');
+          reason: 'tool_bootstrap.dart 里必须有 spawn_subagent 的工具定义');
       expect(sidebar, contains("Text('Agents')"),
           reason: '文档说的 Agents 入口必须真的在侧栏里');
       expect(templateMenu, contains("Text('Agents')"));

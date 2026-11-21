@@ -27,9 +27,10 @@ library;
 
 import 'dart:io';
 
-import 'package:flutter/foundation.dart';
+import 'package:meta/meta.dart';
 
 import '../config_service.dart';
+import '../logging.dart';
 import 'skill_frontmatter.dart';
 
 /// `load_skill` 的工具名（不进 `ToolCatalog.kBaseToolNames`，见 design D9）。

@@ -81,3 +81,7 @@ Docs/architecture.visual-check.*
 # Ad-hoc analysis dumps at the repo root
 context_view_review.txt
 live_real_context_output.txt
+
+# web 客户端（React/Vite）：依赖与构建产物不入库，lockfile 入
+web/node_modules/
+web/dist/

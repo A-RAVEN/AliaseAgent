@@ -5,7 +5,10 @@
 //   ① 同一上下文、同一句柄，三个 worker isolate 同时调 `grep_file`（pattern 各不
 //      相同）—— C++ 的 thread_local 返回槽不串，三份结果两两不同，且每份只含自己
 //      pattern 的命中；
-//   ② 再串行跑同样三个调用，每一项与并发版**逐字节一致**（并发没有改变结果内容）；
+//   ② 再串行跑同样三个调用，每一项与并发版**命中集合一致**（并发没有改变结果内容）；
+//      比较前按 path+line 排序——rg 默认并行、跨文件输出顺序非确定（ripgrepDoc
+//      「并行性能断言—未验证」），逐字节相等对并行搜索是不成立的契约。2026-11-18
+//      用户授权把"逐字节一致"改为"排序后集合相等"（web-ui-core-shim §6 期间暴露）。
 //   ③ 计时：并发总耗时 < 串行总耗时。判据先按 tasks 7.1 的 60% 比值；若某次实测抖动
 //      超过 60%，按任务允许的回落形态退到"严格小于"，并把两组读数打印出来（绝不
 //      放宽成恒真）。
@@ -42,6 +45,23 @@ void main() {
   String request(String pattern) =>
       jsonEncode({'pattern': pattern, 'max_results': 50});
 
+  /// 把一份 grep 结果规范化成"按 path+line 排序的命中集合"再比较。
+  /// rg 默认并行、跨文件输出顺序非确定，故不能逐字节比；但命中的内容/数量必须
+  /// 完全一致（并发不许改变结果内容）。ok/truncated 等元字段也一并纳入比较。
+  String canonicalMatches(String rawJson) {
+    final parsed = jsonDecode(rawJson) as Map<String, dynamic>;
+    final matches = (parsed['matches'] as List<dynamic>? ?? const [])
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .toList();
+    matches.sort((a, b) {
+      final p = (a['path'] ?? '').toString().compareTo((b['path'] ?? '').toString());
+      if (p != 0) return p;
+      return ((a['line'] ?? 0) as num).compareTo((b['line'] ?? 0) as num);
+    });
+    final meta = Map<String, dynamic>.from(parsed)..remove('matches');
+    return jsonEncode({'meta': meta, 'matches': matches});
+  }
+
   Future<List<String>> runConcurrent() {
     return Future.wait([
       for (final p in patterns)
@@ -57,7 +77,7 @@ void main() {
     return out;
   }
 
-  test('同一上下文并发 3 个 grep_file：结果不串、与串行逐字节一致、并发更快', () async {
+  test('同一上下文并发 3 个 grep_file：结果不串、与串行命中集合一致、并发更快', () async {
     // 预热：第一次 grep 要起 ripgrep 子进程并预热文件系统缓存，先跑一次，
     // 免得把冷启动只算进某一侧。
     final warm = await bridge.callToolOnWorker(
@@ -106,10 +126,10 @@ void main() {
       }
     }
 
-    // ② 串行版与并发版逐字节一致。
+    // ② 串行版与并发版命中集合一致（按 path+line 排序后比较；rg 跨文件序非确定）。
     for (var i = 0; i < patterns.length; i++) {
-      expect(serial[i], equals(concurrent[i]),
-          reason: '第 $i 项：并发版与串行版的结果必须逐字节一致');
+      expect(canonicalMatches(serial[i]), equals(canonicalMatches(concurrent[i])),
+          reason: '第 $i 项：并发版与串行版的命中集合必须一致（排序后）');
     }
 
     // ③ 计时判据。

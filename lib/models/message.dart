@@ -1,6 +1,6 @@
 import 'dart:convert';
 
-import 'package:flutter/foundation.dart' show debugPrint;
+import '../services/logging.dart';
 
 class Message {
   final String id;

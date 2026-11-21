@@ -1,9 +1,8 @@
-import 'package:flutter/foundation.dart';
-
 import '../models/agent_type_config.dart';
 import '../models/model_catalog_entry.dart';
 import '../models/provider_config.dart';
 import '../models/resolved_agent_config.dart';
+import 'logging.dart';
 import 'provider_resolver.dart';
 
 /// 解析实例生效配置时发现的**可区分**错误。

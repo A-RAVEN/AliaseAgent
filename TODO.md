@@ -118,24 +118,24 @@
 - 规范：主规范 53 → 54 份，`openspec validate --specs` 全绿；其中 `command-tool` / `command-tool-tests` 是两条 MODIFIED 改写。
 - 提交：`fbc4cef`。
 
-### [ ] 把 `web_fetch` 的 2000 字硬切迁到 spill 交付 —— 未立项
+### [x] 把 `web_fetch` 的 2000 字硬切迁到 spill 交付 —— **已完成**：提交 `91e7512`（web_fetch 正文迁入 spill 交付通道，废除无出处的 2000 字符硬切），主 spec `tool-output-spill` 已同步。原条目保留作历史。
 
 - 现状（仍是缺陷）：`lib/main.dart` 的 `web_fetch` 分支把正文 `substring(0, 2000)` 硬切、只留 `...`，**没有任何取回指针** —— 切掉就真取不回。上一件事只修了 `run_command`，`web_fetch` 当时被明确划到本期范围之外（见归档 change 的 design D7）。
 - 目标：与 `run_command` 同一套契约（先落盘 → 头尾预览 → 引用 → `read_spill` 读回），并把 `Docs/user-guide/` 里对应说明改掉。
 - 为什么现在不做也行：它不会因为拖延变坏；但它现在是"日志里最长的那条已知静默截断"，排在上面的上下文句柄化之后。
 
-### [~] 把 sidecar 的进程级全局改成「每 agent 一份上下文」 —— 进行中：`add-context-handles`
+### [x] 把 sidecar 的进程级全局改成「每 agent 一份上下文」 —— **已完成并归档**：`openspec/changes/archive/2026-11-01-add-context-handles`（上下文句柄化，提交 `92f7569` 起）。原条目保留作历史。
 
 - 依据（可核）：`sidecar/src/tools.cpp` 的 `static std::string g_workspace`；`sidecar/src/sidecar_api.cpp` 里十几个 `static std::string g_*_result`（含 `g_read_spill_result`，注释自认 `thread-unsafe but single-threaded usage`）；`browser.cpp` 的唯一浏览器 worker；`sidecar/src/spill.cpp` 的 `static unsigned g_call_seq`（非原子自增，同一会话内并发会撞序号）。
 - 目标：导出改成 `create_context` 拿句柄，工具都带句柄；**Dart 侧按会话/agent 建销句柄**，`sendMessage` 的串行化也按上下文分；浏览器 worker 变成"每上下文一个"（或每上下文一个浏览器会话）。**这是工具并发的前置条件**。
 - 注意：这条**不是**给"开两个 session"做内容隔离（消息已按 `session_id` 隔离），是为了并发时工具结果、工作区、spill 序号不被互相覆盖。
 
-### [ ] 子 agent 当工具（`spawn_subagent`）—— 未立项，依赖上下文句柄化
+### [x] 子 agent 当工具（`spawn_subagent`）—— **已完成并归档**：`openspec/changes/archive/2026-11-01-add-spawn-subagent-tool`。原条目保留作历史。
 
 - 在同一个 Flutter 进程内开一个新上下文干窄活，保持独立消息历史，复用现有模型—工具循环，只回传结论；不需要 CLI、新 exe 或跨进程协议。这是治「上下文装不下」最直接的办法，比检索排序更有效。
 - 只读工具并行不是这条的前置。
 
-### [ ] 只读工具并行 —— 未立项，效率优化，依赖上下文句柄化
+### [x] 只读工具并行 —— **已完成并归档**：`openspec/changes/archive/`（parallelize-readonly-tool-calls，提交 `d2b2abf`）。原条目保留作历史。
 
 - 只让 read/grep/glob/web 并行；写类工具保持串行。今天工具循环是 `for (…) { await _executeTool(tc); }`，完全串行。
 - 需要缩短工具等待时可以在子 agent 之前提前单独立项，但它不是子 agent 的正确性前置。
@@ -155,15 +155,29 @@
 
 - 现有 agent 类型已经能配置系统提示词；这条候选要明确全局、项目与 agent 各自规则的来源和优先级，不是子 agent 的前置。
 
-### [ ] 技能与斜杠命令支持 —— 候选，独立
+### [x] 技能与斜杠命令支持 —— **全部完成并归档**（含 Tab 补全）
 
 - 技能负责按需加载说明与资源，斜杠命令负责让用户显式触发一段预定义操作；两者与 `run_command` 执行本机命令无关。
 - **已定方向（2026-11-06 用户拍板）**：加载技能全文用一个专门工具（形态见 `Docs/RoadMap.md` 三节同条）；首版只做全局安装的技能目录（`~/.aliasagent/skills/` 下，与 config/spill 同根），不做工作区一级的技能，也不给 `read_file` 开工作区边界例外。技能目录以动态段拼进系统提示词（先例：`lib/services/compaction/guard_anchors.dart` 的每轮注入）。
 - **已定（2026-11-06 用户两轮拍板）**：技能与斜杠命令拆两个 change、技能先行；`load_skill` 带文件参数，允许读同一技能目录内的附属文件（只允许解析后仍在技能目录内的相对路径）；「安装」= 目录约定（文件放进 `~/.aliasagent/skills/` 即生效），**不新增任何交互界面**；技能对所有 Agent 模板全量生效、无逐模板开关（子 agent 共用装配路径自动继承）；斜杠命令后置单独立项，届时只做提示展开型（含 `/技能名` 显式触发），本地动作型与输入补全弹菜单不在首版。技能格式按开放规范 Agent Skills（agentskills.io）实现，事实源已抓进 `Docs/AgentSkillsDoc.md`（含字段硬限 64/1024/500 与 Claude Code 扩展字段的划界）。
+- **落地（2026-11-08 ~ 11-10）**：`add-skill-mechanism`（已归档）→ `refresh-skill-catalog-each-turn`（热刷新，已归档）→ `add-slash-commands`（提示展开型 + `/技能名`，已归档）。用户文档 `Docs/user-guide/skills.md` / `slash-commands.md`。
+- **追加立项（2026-11-11 用户拍板，反转 2026-11-06「输入补全弹菜单不在首版」）**：斜杠技能名 Tab 补全，change `slash-command-completion` —— **已实现并归档（2026-11-12，提交 `3e5ec1c`）**。
+- **同批已机制化（2026-11-10，change `model-truth-from-gateway` 已归档）**：模型上下文窗口与缺省思考强度以 magpie 网关目录为事实源；首启向导探测门；脏模型名可见；推理强度每轮重解析（改完下一条消息生效）。
 
 ### [ ] MCP 客户端接入 —— 候选，独立
 
 - 由 AliasAgent 作为客户端发现外部工具并转成现有工具定义；不要求模型服务支持服务端工具，也不是子 agent 的前置。
+
+### [ ] GUI web 化（路线 C）—— 已定方向，待立项
+
+- **2026-11-16 用户拍板**：直接 web 化，原「路线 A（Flutter 内立设计系统）先做」取消（原话「既然web化是目标，就没有A的必要吧」）。方向与理由见 `Docs/RoadMap.md` 三节 GUI 改造条。
+- 形态：Dart 业务层抽成无头进程 + WebSocket/JSON-RPC shim，C++ sidecar 仍由该进程 FFI 加载；界面用 web 技术栈重写（Tauri 壳或内嵌浏览器窗口，立项时定）。周级、多 change、逐屏灰度迁移。
+- F-002（工具/思考卡片默认折叠单行）、F-003（贴底自动跟随）、F-004（跳到底部按钮）并入新界面需求，不在旧 Flutter 界面修（2026-11-16 用户选定；台账 `Docs/feedback.md`）。
+- **第一块基石已实施**：change `web-ui-core-shim`（无头 Dart 核心 + WebSocket/JSON-RPC + 本地静态服务 + 最小 web 验证页）已按 tasks §1~§5 落地，待主循环 §6 验证与归档。
+- **后继条目（change `web-ui-core-shim` 任务 5.3 登记，2026-11-18）**：
+  - [ ] 完整聊天屏 change：把最小验证页扩成完整聊天屏，含 F-002（卡片折叠）、F-003（自动贴底）、F-004（跳底按钮）、会话列表虚拟滚动、消息分页落地（RPC 读路径的 `message.query` 游标分页已存在，屏上要真正用起来）。**另须修两个已确认缺陷（2026-11-21 用户拍板并入本 change）**：① 工具轮空正文助手消息渲染成空气泡、真回复被淹没（`web/src/App.tsx`，见 `Docs/known-bugs.md`「web 验证页」条）——空正文工具轮不渲染独立空气泡、toolCalls/thinking 折叠成卡、live 与 history 一致；② WS 断开无自动重连（`web/src/protocol.ts` onclose 只置状态）——加自动重连+心跳保活。
+  - [ ] 规模优化 change：`Agent.restore` / `_history` 的内存边界（发送/创建路径仍全量载入历史并常驻属现状；本 change 只落了 `message.query` 读路径分页）。
+  - [ ] 核心 Dart→TS 迁移 change（终态 C++ + TS）：Dart 核心是过渡层，架构验证通过后迁移；C++ sidecar 恒留。
 
 ### 明确不做（见 `Docs/rejected-approaches.md` 第 24、25 条）
 

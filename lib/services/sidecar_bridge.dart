@@ -5,7 +5,7 @@ import 'dart:io';
 import 'dart:isolate';
 
 import 'package:ffi/ffi.dart';
-import 'package:flutter/foundation.dart' show visibleForTesting;
+import 'package:meta/meta.dart';
 
 // ---------------------------------------------------------------------------
 // Native C function signatures (must match sidecar_api.h exactly)

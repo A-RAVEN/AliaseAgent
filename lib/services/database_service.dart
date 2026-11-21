@@ -1,6 +1,9 @@
 import 'dart:io';
 
-import 'package:sqflite/sqflite.dart';
+// 用 sqflite_common（纯 Dart）而不是 sqflite Flutter 插件：无头核心在纯 Dart VM
+// 下也要能打开同一个数据库。`databaseFactory` 由组合根/测试在启动时用
+// `sqfliteFfiInit()` + `databaseFactoryFfi` 注入（change `web-ui-core-shim`）。
+import 'package:sqflite_common/sqflite.dart';
 import 'package:path/path.dart' as p;
 
 import 'config_service.dart';

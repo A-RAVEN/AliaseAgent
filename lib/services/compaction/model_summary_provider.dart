@@ -1,8 +1,7 @@
 import 'dart:convert';
 
-import 'package:flutter/foundation.dart';
-
 import '../context_estimator.dart';
+import '../logging.dart';
 import '../provider_resolver.dart';
 import '../sidecar_bridge.dart';
 import '../../models/agent_type_config.dart';

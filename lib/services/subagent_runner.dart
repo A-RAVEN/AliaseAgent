@@ -9,12 +9,11 @@
 //
 // 第一版不做下一层子 Agent、不做并行调度、不做异步消息；这些由“工具清单排除”和
 // “同步等待”直接保证，而不是运行到递归调用时才静默失败。
-import 'package:flutter/foundation.dart';
-
 import '../models/session.dart';
 import 'agent.dart';
 import 'agent_config_resolver.dart';
 import 'agent_factory.dart';
+import 'logging.dart';
 import 'sidecar_bridge.dart';
 import 'tool_catalog.dart';
 

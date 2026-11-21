@@ -1,4 +1,6 @@
-import 'package:flutter/foundation.dart';
+import 'package:meta/meta.dart';
+
+import '../services/logging.dart';
 
 class AgentTypeConfig {
   final String name;

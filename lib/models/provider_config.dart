@@ -1,5 +1,4 @@
-import 'package:flutter/foundation.dart';
-
+import '../services/logging.dart';
 import 'model_catalog_entry.dart';
 
 /// 一个供应商的配置（change `add-provider-model-discovery` 任务 2.2）。

@@ -20,6 +20,8 @@ dependencies:
   sqflite_common_ffi: ^2.4.0+3
   url_launcher: ^6.3.2
   yaml: ^3.1.4
+  meta: ^1.17.0
+  sqflite_common: ^2.5.8
 
 dev_dependencies:
   flutter_test:
@@ -27,6 +29,19 @@ dev_dependencies:
   integration_test:
     sdk: flutter
   flutter_lints: ^6.0.0
+  test: ^1.30.0
 
 flutter:
   uses-material-design: true
+
+# 本机环境修复（非产品行为改动）：package:sqlite3 3.3.1 的 build hook 默认从
+# GitHub Releases 下载预编译 sqlite3.dll。本机 GitHub 目前不可达（FastGitHub 未运行），
+# hook 每次失效都会下载失败，导致 flutter test / dart test 无法启动。
+# 改用 Windows 自带的 winsqlite3.dll（系统库，无网络、无仓库内二进制）。
+# 网络恢复后如要回到默认打包版 sqlite，删掉本段即可（hook 会重新下载并缓存）。
+hooks:
+  user_defines:
+    sqlite3:
+      source: system
+      name_windows: winsqlite3
+      name: sqlite3

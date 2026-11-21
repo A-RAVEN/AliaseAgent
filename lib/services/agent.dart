@@ -1,8 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:flutter/foundation.dart';
-
 import '../models/agent_type_config.dart';
 import '../models/compaction_status.dart';
 import '../models/context_breakdown.dart';
@@ -23,6 +21,7 @@ import 'context_snapshot.dart';
 import 'database_service.dart';
 import 'image_budget.dart';
 import 'image_request.dart';
+import 'logging.dart';
 import 'message_repository.dart';
 import 'search_text_assembly.dart';
 import 'session_repository.dart';

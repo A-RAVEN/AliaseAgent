@@ -285,3 +285,27 @@ test\integration\browser_worker_test.dart 396:7
 
 下一个动 sidecar 工具或该测试文件的 change 顺手收敛；或全量测试再因此条 −1 时即为本条复现。
 
+> **2026-11-18 更新**：web-ui-core-shim §6 期间此条稳定复现（单跑 3/3 红），用户拍板取方向②——测试②改为 `canonicalMatches`（按 path+line 排序后比集合），保留"结果不串"本意，未动产品代码。改后 3/3 绿。方向①（产品加 --sort path）仍未做。
+
+## web 验证页：工具轮助手消息渲染成空气泡，真回复被淹没
+
+**来源**: 用户实测反馈（2026-11-21，web-ui-core-shim 最小验证页）
+**发现日期**: 2026-11-21
+**相关文件**: `web/src/App.tsx`（`assistant.message` 事件处理 + `messages.map` 渲染）、`lib/core/event_serialization.dart`（`serializeMessage`）
+
+### 症状
+
+web 验证页里"很多 agent 回复直接不显示"，并出现大量空的 ASSISTANT 气泡。
+
+### 根因
+
+实测（WS 探针查运行中核心）：会话「你是谁」62 条助手消息中 56 条正文为空（只带 tool_calls 的工具轮）、仅 6 条有正文；回复文本核心都发了、库里也存着（如有 contentLen=2847 的新闻简报）。最小页把**每条持久化助手消息都渲染成气泡**（`messages.map` 不区分空正文），56 个工具轮空气泡把 6 条真回复淹没。两个具体缺陷：① 空正文工具轮消息渲染成独立空气泡；② 助手消息上的 `toolCalls`/`thinking` 未被渲染（只渲染 `content`），工具活动仅靠独立 `tool.call` 卡片。且 live 与 history 不一致：live 的 `assistant.message` 处理有 `content.length>0` 守卫会丢弃空正文消息，history 加载却全渲染成空气泡。
+
+### 期望方向
+
+属 F-002（工具/思考卡片默认折叠单行）那一层，完整聊天屏 change 解决：空正文工具轮消息不渲染成独立空气泡，其 toolCalls/thinking 折叠成工具卡；助手消息的 toolCalls 内联渲染；live 与 history 处理一致。
+
+### 重新考虑时机
+
+完整聊天屏 change（TODO.md 已登记）；或用户要求先给最小页打补丁时。
+

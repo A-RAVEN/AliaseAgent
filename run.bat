@@ -68,6 +68,15 @@ echo [4/5] Smoke test...
 call flutter test test\unit\sidecar_bridge_test.dart
 if errorlevel 1 goto smoke_failed
 
+:: Web client build (no window). change web-ui-core-shim: the headless core serves
+:: web/dist, so the smoke path must prove the web bundle builds. node_modules/dist
+:: are gitignored; ci restores from the committed lockfile.
+echo [4/5] Building web client (no window)...
+call npm --prefix web ci
+if errorlevel 1 goto web_build_failed
+call npm --prefix web run build
+if errorlevel 1 goto web_build_failed
+
 :: ---- Step 5: Launch ----
 echo [5/5] Launching...
 if not exist "%APP_EXE%" goto no_exe
@@ -107,6 +116,11 @@ exit /b 1
 
 :smoke_failed
 echo [ERROR] Smoke test failed. Check the sidecar API against the current build.
+pause
+exit /b 1
+
+:web_build_failed
+echo [ERROR] Web client build failed. Check web/ dependencies and Vite config.
 pause
 exit /b 1
 
