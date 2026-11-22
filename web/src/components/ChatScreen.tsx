@@ -27,6 +27,8 @@ export interface ChatScreenProps {
   onSelectSession: (sessionId: string) => void;
   /** 会话管理（change `web-management-ui` 1.3）：不传 = 隐藏对应入口（详见 SessionList）。 */
   onCreateSession?: () => void;
+  /** 新建组（change gent-group-chat）：组视图的入口。 */
+  onCreateGroup?: () => void;
   onRenameSession?: (sessionId: string, title: string) => void;
   onDeleteSession?: (sessionId: string) => void;
   templates?: string[];
@@ -58,6 +60,7 @@ export function ChatScreen({
   currentSessionId,
   onSelectSession,
   onCreateSession,
+  onCreateGroup,
   onRenameSession,
   onDeleteSession,
   templates = [],
@@ -141,6 +144,7 @@ export function ChatScreen({
             currentSessionId={currentSessionId}
             onSelect={onSelectSession}
             onCreate={onCreateSession ?? (() => {})}
+            onCreateGroup={onCreateGroup}
             onRename={onRenameSession ?? (() => {})}
             onDelete={onDeleteSession ?? (() => {})}
             templates={templates}

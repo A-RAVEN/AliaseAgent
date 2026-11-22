@@ -36,6 +36,10 @@ Map<String, dynamic> serializeMessage(Message message) {
     'outputTokenCount': message.outputTokenCount,
     'createdAt': message.createdAt,
     'attachments': List<String>.unmodifiable(message.attachments),
+    // 群聊（agent-group-chat 7.2）：可空字段如实写出 —— author 为 NULL 表示用户写的，
+    // visibility 缺省 public；MUST NOT 静默丢弃。
+    'author': message.author,
+    'visibility': message.visibility,
   };
 }
 

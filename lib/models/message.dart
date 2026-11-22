@@ -3,6 +3,17 @@ import 'dart:convert';
 import '../services/logging.dart';
 
 class Message {
+  /// 可见性：所有人都能看到（用户消息、成员公开回复、旧数据）。
+  static const String visibilityPublic = 'public';
+
+  /// 只对作者本人可见（成员的 thinking / 工具轮等私有活动）。
+  static const String visibilityPrivateToAuthor = 'private-to-author';
+
+  static const Set<String> kVisibilityValues = {
+    visibilityPublic,
+    visibilityPrivateToAuthor,
+  };
+
   final String id;
   final int? seq; // stable per-session ordering key (monotonic; set at insert)
   final String sessionId;
@@ -13,6 +24,17 @@ class Message {
   final int? tokenCount;
   final int? outputTokenCount;
   final int createdAt;
+
+  /// 作者：**稳定成员 id**（组成员写的行），用户消息为 `null`。
+  ///
+  /// 显示名不写这里 —— 改名不得改变历史归属（`agent-group-chat` D17）。
+  final String? author;
+
+  /// 可见性：`public` / `private-to-author`（缺省 `public`，即变更前的行为）。
+  ///
+  /// 用 assert 而不是运行时分支拒绝：取值只来自内部代码，写错是程序 bug；
+  /// 读取路径对缺省 / 非法值回落 `public`（旧数据必须是"公开"）。
+  final String visibility;
 
   /// 这条消息带的图片附件，**只装绝对路径**（add-image-input）。
   ///
@@ -33,9 +55,25 @@ class Message {
     this.outputTokenCount,
     required this.createdAt,
     this.attachments = const [],
-  });
+    this.author,
+    this.visibility = visibilityPublic,
+  }) : assert(
+          visibility == visibilityPublic ||
+              visibility == visibilityPrivateToAuthor,
+          'visibility 只能是 public 或 private-to-author：收到 "$visibility"',
+        );
+
+  /// 作者是不是用户（用户消息没有成员作者）。
+  bool get isUserAuthored => author == null;
+
+  /// 是不是只对作者可见的私有行。
+  bool get isPrivate => visibility == visibilityPrivateToAuthor;
 
   factory Message.fromRow(Map<String, dynamic> row) {
+    final rawVisibility = row['visibility'] as String?;
+    final visibility = kVisibilityValues.contains(rawVisibility)
+        ? rawVisibility!
+        : visibilityPublic;
     return Message(
       id: row['id'] as String,
       seq: row['seq'] as int?,
@@ -48,6 +86,8 @@ class Message {
       outputTokenCount: row['output_token_count'] as int?,
       createdAt: row['created_at'] as int,
       attachments: _parseAttachments(row['attachments'], messageId: row['id'] as String?),
+      author: row['author'] as String?,
+      visibility: visibility,
     );
   }
 
@@ -100,9 +140,39 @@ class Message {
         'token_count': tokenCount,
         if (outputTokenCount != null) 'output_token_count': outputTokenCount,
         'created_at': createdAt,
+        // 两列总是写出（作者可为 NULL）：读取路径据此区分"用户写的"与"成员写的"。
+        'author': author,
+        'visibility': visibility,
         // 只写路径：`[{"path":"…"}]`。没有附件时写 NULL。
         'attachments': attachments.isEmpty
             ? null
             : jsonEncode(attachments.map((path) => {'path': path}).toList()),
       };
+
+  /// 派生副本：只换可见性/作者（投影与写入路径用；其余字段原样带过来）。
+  Message copyWith({
+    String? content,
+    String? toolCallsJson,
+    String? thinkingJson,
+    Object? author = _unset,
+    String? visibility,
+    List<String>? attachments,
+  }) =>
+      Message(
+        id: id,
+        seq: seq,
+        sessionId: sessionId,
+        role: role,
+        content: content ?? this.content,
+        toolCallsJson: toolCallsJson ?? this.toolCallsJson,
+        thinkingJson: thinkingJson ?? this.thinkingJson,
+        tokenCount: tokenCount,
+        outputTokenCount: outputTokenCount,
+        createdAt: createdAt,
+        attachments: attachments ?? this.attachments,
+        author: identical(author, _unset) ? this.author : author as String?,
+        visibility: visibility ?? this.visibility,
+      );
+
+  static const Object _unset = Object();
 }

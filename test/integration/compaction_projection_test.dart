@@ -211,6 +211,7 @@ class _SizedFakeSummaryProvider implements SummaryProvider {
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
     String? sessionId,
+    String? systemPromptSuffix,
   }) async {
     summarizeCalls++;
     return SummaryResult(
@@ -268,6 +269,7 @@ class _EchoSummaryProvider implements SummaryProvider {
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
     String? sessionId,
+    String? systemPromptSuffix,
   }) async {
     summarizeCalls++;
     referencesPerCall.add(List.of(reference));
@@ -300,6 +302,7 @@ class _RecordingSummaryProvider implements SummaryProvider {
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
     String? sessionId,
+    String? systemPromptSuffix,
   }) async {
     foldedCalls.add(List.of(folded));
     return SummaryResult(
@@ -340,6 +343,7 @@ class _FakeSummaryNodeRepository implements SummaryNodeRepository {
   @override
   Future<SummaryNode> materialize({
     required String sessionId,
+    String? memberId,
     required int level,
     required int startSeq,
     required int endSeq,
@@ -352,15 +356,18 @@ class _FakeSummaryNodeRepository implements SummaryNodeRepository {
     required int coveredMinSeq,
     required int coveredMaxSeq,
   }) async {
-    // Mirrors the repository's upsert: one row per covered span per level.
+    // Mirrors the repository's upsert: one row per covered span per level
+    // **in the same member scope**（成员作用域是 agent-group-chat 加的键）。
     nodes.removeWhere((n) =>
         n.sessionId == sessionId &&
+        n.memberId == memberId &&
         n.level == level &&
         n.coveredMinSeq == coveredMinSeq &&
         n.coveredMaxSeq == coveredMaxSeq);
     final stored = SummaryNode(
       id: _nextId++,
       sessionId: sessionId,
+      memberId: memberId,
       level: level,
       startSeq: startSeq,
       endSeq: endSeq,
@@ -379,15 +386,21 @@ class _FakeSummaryNodeRepository implements SummaryNodeRepository {
   }
 
   @override
-  Future<List<SummaryNode>> queryBySession(String sessionId) async =>
+  Future<List<SummaryNode>> queryAllBySession(String sessionId) async =>
       nodes.where((n) => n.sessionId == sessionId).toList();
 
   @override
+  Future<List<SummaryNode>> queryBySession(String sessionId, {String? memberId}) async =>
+      nodes.where((n) => n.sessionId == sessionId && n.memberId == memberId).toList();
+
+  @override
   Future<SummaryNode?> findCovering(
-      String sessionId, int startSeq, int endSeq, {int? level}) async {
+      String sessionId, int startSeq, int endSeq,
+      {int? level, String? memberId}) async {
     final hits = nodes
         .where((n) =>
             n.sessionId == sessionId &&
+            n.memberId == memberId &&
             n.coveredMinSeq == startSeq &&
             n.coveredMaxSeq == endSeq &&
             (level == null || n.level == level))
@@ -2801,6 +2814,7 @@ class _GatedSummaryProvider implements SummaryProvider {
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
     String? sessionId,
+    String? systemPromptSuffix,
   }) {
     summarizeCalls++;
     final g = gate;
@@ -2883,6 +2897,7 @@ class _ThrowingSummaryProvider implements SummaryProvider {
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
     String? sessionId,
+    String? systemPromptSuffix,
   }) async {
     throw StateError('summarization failed (simulated done!=0/empty)');
   }

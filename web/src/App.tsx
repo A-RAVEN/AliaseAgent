@@ -17,6 +17,8 @@ import {
 } from './chat/paging';
 import { emptyChatView, type ChatView } from './chat/render';
 import { ChatScreen } from './components/ChatScreen';
+import { GroupView } from './group/GroupView';
+import { splitGroupMessages } from './group/model';
 import { ProvidersPage } from './components/ProvidersPage';
 import { TemplatesPage } from './components/TemplatesPage';
 import { Wizard } from './components/Wizard';
@@ -26,6 +28,10 @@ import {
   type AgentEvent,
   type ConnectionStatus,
   type Session,
+  type GroupListResult,
+  type GroupSummary,
+  type GroupViewResult,
+  type Message,
   type SessionResult,
   type SessionSwitchResult,
   type SnapshotEventData,
@@ -64,6 +70,16 @@ export default function App() {
   const [imagesSupported, setImagesSupported] = useState<boolean | null>(null);
   const [panel, setPanel] = useState<'providers' | 'templates' | null>(null);
   const [configMissing, setConfigMissing] = useState(false);
+  // 群视图状态（change `agent-group-chat`）：组成员、**原始消息列表**（分页的单一来源）、
+  // 成员快照。时间线与私有分栏由 `splitGroupMessages` 从同一份列表派生 —— 上翻补页时
+  // 两栏同步补、按 author/visibility 归位、不丢不重。
+  const [groupSummary, setGroupSummary] = useState<GroupSummary | null>(null);
+  const [groupMessages, setGroupMessages] = useState<Message[]>([]);
+  const [groupEarlierCursor, setGroupEarlierCursor] = useState<number | null>(null);
+  const [groupLoadingEarlier, setGroupLoadingEarlier] = useState(false);
+  const [groupSnapshots, setGroupSnapshots] = useState<Record<string, SnapshotEventData | null>>({});
+  const [groupToolNames, setGroupToolNames] = useState<string[]>([]);
+  const [groupEfforts, setGroupEfforts] = useState<string[]>([]);
   const currentSessionIdRef = useRef<string | null>(null);
   const requestedAttachments = useRef<Set<string>>(new Set());
 
@@ -183,11 +199,121 @@ export default function App() {
     setNotice(null);
     const first = result.sessions[0];
     setCurrentSessionId(first.id);
-    await loadLatestPage(first.id);
+    if (first.kind === 'group') {
+      await loadGroup(first.id);
+    } else {
+      await loadLatestPage(first.id);
+    }
   }, [client, loadLatestPage]);
 
+  const groupSplit = useMemo(
+    () => splitGroupMessages(groupMessages, groupSummary?.members ?? []),
+    [groupMessages, groupSummary],
+  );
+
+  /** 拉一个组的全部视图数据（成员 / 尾锚一页原始消息 / 每成员快照）。 */
+  const loadGroup = useCallback(
+    async (sessionId: string) => {
+      try {
+        const list = await client.request<GroupListResult>('group.list');
+        const summary = list.groups.find((entry) => entry.id === sessionId) ?? null;
+        setGroupSummary(summary);
+        const page = await loadInitialPage(
+          (method, params) => client.request(method, params),
+          sessionId,
+          HISTORY_PAGE_SIZE,
+        );
+        // 分页 helper 的 RawMessage 是聊天屏的窄类型；组视图需要 author/visibility，
+        // 线上的核心响应本来就带这些字段（message.query 的序列化契约）。
+        setGroupMessages(page.messages as Message[]);
+        setGroupEarlierCursor(page.earlierCursor);
+        const snapshots: Record<string, SnapshotEventData | null> = {};
+        for (const member of summary?.members ?? []) {
+          try {
+            const view = await client.request<GroupViewResult>('group.view', {
+              groupId: sessionId,
+              memberId: member.id,
+            });
+            snapshots[member.id] = view.snapshot;
+          } catch {
+            snapshots[member.id] = null;
+          }
+        }
+        setGroupSnapshots(snapshots);
+      } catch (groupError: unknown) {
+        setError(`加载组视图失败：${errorText(groupError)}`);
+      }
+    },
+    [client],
+  );
+
+  /** 组视图上翻：复用聊天屏同一套 `before`/`prevCursor` 分页，补更早一页。 */
+  const loadGroupEarlier = useCallback(async () => {
+    const sessionId = currentSessionIdRef.current;
+    if (!sessionId || groupEarlierCursor === null || groupLoadingEarlier) return;
+    setGroupLoadingEarlier(true);
+    try {
+      const page = await loadEarlierPage(
+        (method, params) => client.request(method, params),
+        sessionId,
+        HISTORY_PAGE_SIZE,
+        groupEarlierCursor,
+      );
+      setGroupMessages(
+        (previous) => prependOlder(previous, page.messages) as Message[],
+      );
+      setGroupEarlierCursor(page.earlierCursor);
+    } catch (loadError: unknown) {
+      setError(`加载更早消息失败：${errorText(loadError)}`);
+    } finally {
+      setGroupLoadingEarlier(false);
+    }
+  }, [client, groupEarlierCursor, groupLoadingEarlier]);
+
+  /** 模板 / 工具目录 / 思考档位（覆盖层编辑器用）。 */
+  const loadGroupOptions = useCallback(async () => {
+    try {
+      const result = await client.request<{
+        tools: string[];
+        thinkingEfforts: string[];
+      }>('template.list');
+      setGroupToolNames(result.tools ?? []);
+      setGroupEfforts(result.thinkingEfforts ?? []);
+    } catch {
+      setGroupToolNames([]);
+      setGroupEfforts([]);
+    }
+  }, [client]);
+
+  /** 新建组（会话列表的「＋ 组」入口）。 */
+  const createGroup = async () => {
+    setError(null);
+    try {
+      const created = await client.request<{ group: Session }>('group.create', {});
+      const result = await client.request<{ sessions: Session[] }>('session.list');
+      setSessions(result.sessions);
+      setCurrentSessionId(created.group.id);
+      setGroupMessages([]);
+      setGroupEarlierCursor(null);
+      await loadGroup(created.group.id);
+    } catch (createError: unknown) {
+      setError(`新建组失败：${errorText(createError)}`);
+    }
+  };
   const onEvent = useCallback((event: AgentEvent) => {
     if (event.sessionId !== currentSessionIdRef.current) return;
+    // 组事件按 payload（groupId/memberId）归位：消息类事件到达时重拉组数据，
+    // 不依赖 DOM 选中的分栏（design D11 的 payload 判据）。
+    if (event.groupId && event.groupId === currentSessionIdRef.current) {
+      if (
+        event.type === 'user.message' ||
+        event.type === 'assistant.message' ||
+        event.type === 'turn.completed'
+      ) {
+        void loadGroup(event.groupId);
+      }
+      return;
+    }
     const data = event.data ?? {};
     switch (event.type) {
       case 'user.message':
@@ -272,6 +398,7 @@ export default function App() {
       .then(async () => {
         await loadSessions();
         await loadTemplates();
+        await loadGroupOptions();
         await checkConfig();
       })
       .catch((connectError: unknown) => setError(errorText(connectError)));
@@ -292,6 +419,11 @@ export default function App() {
     setMetering(null);
     setError(null);
     try {
+      const selected = sessions.find((session) => session.id === sessionId);
+      if (selected?.kind === 'group') {
+        await loadGroup(sessionId);
+        return;
+      }
       await loadLatestPage(sessionId);
     } catch (loadError: unknown) {
       setError(errorText(loadError));
@@ -408,8 +540,9 @@ export default function App() {
     }
   };
 
-  const currentAgentType =
-    sessions.find((session) => session.id === currentSessionId)?.agentType ?? null;
+  const currentSession = sessions.find((session) => session.id === currentSessionId) ?? null;
+  const currentAgentType = currentSession?.agentType ?? null;
+  const currentSessionKind = currentSession?.kind ?? null;
 
   // 图片模态（决定「图片未发送」提示）随当前模板变化重查；附件字节随消息补取。
   useEffect(() => {
@@ -438,6 +571,23 @@ export default function App() {
             })();
           }}
         />
+      ) : currentSessionKind === 'group' && groupSummary ? (
+        <GroupView
+          client={client}
+          group={groupSummary}
+          members={groupSummary.members}
+          timeline={groupSplit.timeline}
+          lanes={groupSplit.lanes}
+          hasEarlier={groupEarlierCursor !== null}
+          loadingEarlier={groupLoadingEarlier}
+          onLoadEarlier={() => void loadGroupEarlier()}
+          snapshots={groupSnapshots}
+          templates={templates}
+          thinkingEfforts={groupEfforts}
+          toolNames={groupToolNames}
+          onReload={() => loadGroup(groupSummary.id)}
+          onError={(message) => setError(message)}
+        />
       ) : (
         <ChatScreen
       status={status}
@@ -445,6 +595,7 @@ export default function App() {
       currentSessionId={currentSessionId}
       onSelectSession={(sessionId) => void selectSession(sessionId)}
       onCreateSession={() => void createSession()}
+      onCreateGroup={() => void createGroup()}
       onRenameSession={(sessionId, title) => void renameSession(sessionId, title)}
       onDeleteSession={(sessionId) => void deleteSession(sessionId)}
       templates={templates}

@@ -105,6 +105,8 @@ class _ExplodingChildWriteRepo extends FakeMessageRepository {
     int? tokenCount,
     int? outputTokenCount,
     List<String> attachments = const [],
+    String? author,
+    String visibility = Message.visibilityPublic,
   }) async {
     if (role == 'assistant' && sessionId != 'parent-1') {
       throw StateError('子会话写库炸了-独特');
@@ -118,6 +120,8 @@ class _ExplodingChildWriteRepo extends FakeMessageRepository {
       tokenCount: tokenCount,
       outputTokenCount: outputTokenCount,
       attachments: attachments,
+      author: author,
+      visibility: visibility,
     );
   }
 }

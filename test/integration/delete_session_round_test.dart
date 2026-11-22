@@ -51,7 +51,7 @@ class _RecordingSessionRepo implements SessionRepository {
   final List<Session> sessions;
 
   @override
-  Future<Session> create({String? title, String? agentType, String? parentSessionId}) async {
+  Future<Session> create({String? title, String? agentType, String? parentSessionId, String kind = Session.kindSingle, String? overridesJson}) async {
     final s = Session(
       id: 'new-${sessions.length}',
       title: title ?? 'New Chat',
@@ -63,6 +63,9 @@ class _RecordingSessionRepo implements SessionRepository {
     sessions.insert(0, s);
     return s;
   }
+
+  @override
+  Future<void> updateOverrides(String id, String? json) async {}
 
   @override
   Future<Session?> get(String id) async {
@@ -130,6 +133,8 @@ class _RecordingMessageRepo implements MessageRepository {
     int? tokenCount,
     int? outputTokenCount,
     List<String> attachments = const [],
+    String? author,
+    String visibility = Message.visibilityPublic,
   }) async {
     final msg = Message(
       id: 'msg-${messages.length}',
@@ -166,6 +171,26 @@ class _RecordingMessageRepo implements MessageRepository {
   @override
   Future<List<Message>> queryBySession(String sessionId) async =>
       messages.where((m) => m.sessionId == sessionId).toList();
+
+  @override
+  Future<List<Map<String, dynamic>>> queryRawAfterSeq(
+      String sessionId, int afterSeq) async =>
+      [
+        for (final message in messages)
+          if (message.sessionId == sessionId && (message.seq ?? 0) > afterSeq)
+            message.toRow(),
+      ]..sort((a, b) => (a['seq'] as int).compareTo(b['seq'] as int));
+
+  @override
+  Future<List<Map<String, dynamic>>> queryRawInRange(
+      String sessionId, int minSeq, int maxSeq) async =>
+      [
+        for (final message in messages)
+          if (message.sessionId == sessionId &&
+              (message.seq ?? 0) >= minSeq &&
+              (message.seq ?? 0) <= maxSeq)
+            message.toRow(),
+      ]..sort((a, b) => (a['seq'] as int).compareTo(b['seq'] as int));
 
   @override
   Future<void> updateToolCalls(String id, String toolCallsJson) async {
@@ -270,6 +295,7 @@ class _RecordingSummaryRepo implements SummaryNodeRepository {
   @override
   Future<SummaryNode> materialize({
     required String sessionId,
+    String? memberId,
     required int level,
     required int startSeq,
     required int endSeq,
@@ -307,15 +333,21 @@ class _RecordingSummaryRepo implements SummaryNodeRepository {
   }
 
   @override
-  Future<List<SummaryNode>> queryBySession(String sessionId) async =>
+  Future<List<SummaryNode>> queryAllBySession(String sessionId) async =>
+      nodes.where((n) => n.sessionId == sessionId).toList();
+
+  @override
+  Future<List<SummaryNode>> queryBySession(String sessionId, {String? memberId}) async =>
       nodes.where((n) => n.sessionId == sessionId).toList();
 
   @override
   Future<SummaryNode?> findCovering(
-      String sessionId, int startSeq, int endSeq, {int? level}) async {
+      String sessionId, int startSeq, int endSeq,
+      {int? level, String? memberId}) async {
     final hits = nodes
         .where((n) =>
             n.sessionId == sessionId &&
+            n.memberId == memberId &&
             n.coveredMinSeq == startSeq &&
             n.coveredMaxSeq == endSeq &&
             (level == null || n.level == level))

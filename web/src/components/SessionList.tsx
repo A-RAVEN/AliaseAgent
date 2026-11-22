@@ -20,6 +20,8 @@ export interface SessionListProps {
   onSelect: (sessionId: string) => void;
   /** 新建会话（核心 `session.create`）。 */
   onCreate: () => void;
+  /** 新建组（核心 `group.create`）；不传 = 不显示入口。 */
+  onCreateGroup?: () => void;
   /** 重命名（核心 `session.rename`）；页面负责继续拼 `session.title`。 */
   onRename: (sessionId: string, title: string) => void;
   /** 删除（核心 `session.delete`）；确认浮层由本组件负责。 */
@@ -41,6 +43,7 @@ export function SessionList({
   currentSessionId,
   onSelect,
   onCreate,
+  onCreateGroup,
   onRename,
   onDelete,
   templates,
@@ -82,6 +85,24 @@ export function SessionList({
     <div className="relative flex min-h-0 flex-1 flex-col">
       <div className="flex items-center justify-between px-3 py-2">
         <h2 className="text-xs font-semibold uppercase tracking-wide text-muted">会话</h2>
+        <div className="flex items-center gap-1">
+          {onCreateGroup && (
+            <button
+              type="button"
+              data-testid="group-create"
+              title="新建组"
+              aria-label="新建组"
+              disabled={disabled}
+              onClick={() => {
+                setPendingDeleteId(null);
+                setEditingId(null);
+                onCreateGroup();
+              }}
+              className="flex h-6 items-center justify-center rounded-card border border-line px-1 text-xs text-muted hover:bg-surface-2 hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              + 组
+            </button>
+          )}
         <button
           type="button"
           data-testid="session-create"
@@ -97,6 +118,7 @@ export function SessionList({
         >
           <Plus size={16} aria-hidden="true" />
         </button>
+        </div>
       </div>
 
       <div ref={scrollRef} data-testid="session-list" className="min-h-0 flex-1 overflow-y-auto px-2 py-1">

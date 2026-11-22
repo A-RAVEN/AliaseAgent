@@ -1,4 +1,4 @@
-import 'package:flutter_test/flutter_test.dart';
+﻿import 'package:flutter_test/flutter_test.dart';
 
 import 'package:alias_agent/main.dart';
 import 'package:alias_agent/models/agent_type_config.dart';
@@ -284,7 +284,7 @@ void main() {
 /// 只用于验证 `SessionRepository.create` 的缺省 agentType（与生产实现同义）。
 class _FakeCreateSessionRepository implements SessionRepository {
   @override
-  Future<Session> create({String? title, String? agentType, String? parentSessionId}) async =>
+  Future<Session> create({String? title, String? agentType, String? parentSessionId, String kind = Session.kindSingle, String? overridesJson}) async =>
       Session(
         id: 'new-default',
         title: title ?? 'New Chat',
@@ -293,6 +293,9 @@ class _FakeCreateSessionRepository implements SessionRepository {
         createdAt: 1,
         updatedAt: 1,
       );
+
+  @override
+  Future<void> updateOverrides(String id, String? json) async {}
 
   @override
   Future<Session?> get(String id) async => null;

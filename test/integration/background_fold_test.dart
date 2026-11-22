@@ -49,6 +49,7 @@ class _GatedSummaryProvider implements SummaryProvider {
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
     String? sessionId,
+    String? systemPromptSuffix,
   }) async {
     summarizeCalls++;
     final g = gate;
@@ -626,6 +627,7 @@ class _PerCallGatedSummaryProvider implements SummaryProvider {
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
     String? sessionId,
+    String? systemPromptSuffix,
   }) {
     calls++;
     if (!_gated()) return Future.value(SummaryResult(text: 'L1', tokens: 1));

@@ -74,6 +74,7 @@ Windows 上还有仓库根的 `run.bat`：一键 `flutter build windows --debug`
 | [斜杠命令](Docs/user-guide/slash-commands.md) | 输入 `/技能名 正文` 显式让这一条按某技能处理：模型收到"先加载技能"的指示，对话气泡、标题与落库仍是原文；未命中静默透传 |
 | [无头核心与 web 客户端（完整聊天屏）](Docs/user-guide/web-core-shim.md) | 无头 Dart 核心 + WebSocket JSON-RPC + 本机静态服务 + 完整聊天屏（卡片折叠/贴底跟随/跳底按钮/虚拟滚动/分页/自动重连与心跳）；单实例守卫、回退方式、开发期 Vite 代理、参数键表与已知限制 |
 | [web 管理屏](Docs/user-guide/web-management.md) | 在浏览器里管会话（新建/改名/删除/切模板）、贴图片、看占用环与真实上下文、管 Provider 与 Agent 模板、空配置首启向导；密钥不回显、模板与 Provider 删除带引用守卫、图片上限取既有常量 |
+| [群聊（组会话与成员）](Docs/user-guide/group-chat.md) | web 组视图：建组/加成员/编辑覆盖层/点名发言；成员共享一份原文、各自只看得到自己的私有过程；共享工作区、逐成员真实上下文与占用环、已知限制 |
 | [常见现象与排查](Docs/user-guide/troubleshooting.md) | 看到某个报错是什么意思、下一步做什么、日志在哪 |
 
 **两条最容易踩的前提：**

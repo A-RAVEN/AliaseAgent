@@ -38,6 +38,8 @@ class _ExplodingAssistantRepo extends FakeMessageRepository {
     int? tokenCount,
     int? outputTokenCount,
     List<String> attachments = const [],
+    String? author,
+    String visibility = Message.visibilityPublic,
   }) async {
     if (role == 'assistant') {
       throw StateError('写库炸了-独特');
@@ -51,6 +53,8 @@ class _ExplodingAssistantRepo extends FakeMessageRepository {
       tokenCount: tokenCount,
       outputTokenCount: outputTokenCount,
       attachments: attachments,
+      author: author,
+      visibility: visibility,
     );
   }
 }

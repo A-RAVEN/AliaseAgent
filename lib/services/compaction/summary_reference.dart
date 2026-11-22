@@ -75,3 +75,19 @@ List<SummaryReference> selectSummaryReferences({
   picked.sort((a, b) => a.coveredMaxSeq.compareTo(b.coveredMaxSeq));
   return picked;
 }
+/// 按**成员作用域**过滤已落盘摘要的候选集（change `agent-group-chat` D19）。
+///
+/// 参考上下文是投影之外的第二条泄漏通道：B 折叠时若把 A 的摘要当参考块，A 的私有
+/// 内容就进了 B 的模型输入。作用域的权威过滤在查询层（`SummaryNodeRepository`
+/// 按 `member_id IS NULL` / `= ?` 取），这里再按同一规则过一遍，作为**纯函数**被
+/// 单测直接证明 —— 数据库作用域写错时这条规则仍拦得住。
+///
+/// [memberId] 为 null = 单会话（只留作用域为空的条目）。
+List<SummaryReference> memberScopedReferences(
+  Iterable<({String? memberId, SummaryReference reference})> persisted, {
+  required String? memberId,
+}) =>
+    [
+      for (final entry in persisted)
+        if (entry.memberId == memberId) entry.reference,
+    ];

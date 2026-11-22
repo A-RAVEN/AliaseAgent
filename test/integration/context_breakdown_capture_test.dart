@@ -89,6 +89,7 @@ class _EchoSummaryProvider implements SummaryProvider {
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
     String? sessionId,
+    String? systemPromptSuffix,
   }) async {
     final lo = folded.isEmpty ? 0 : (folded.first.seq ?? 0);
     final hi = folded.isEmpty ? 0 : (folded.last.seq ?? 0);

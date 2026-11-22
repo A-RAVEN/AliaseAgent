@@ -177,7 +177,8 @@
 - **后继条目（change `web-ui-core-shim` 任务 5.3 登记，2026-11-18）**：
   - [x] 完整聊天屏 change：把最小验证页扩成完整聊天屏，含 F-002（卡片折叠）、F-003（自动贴底）、F-004（跳底按钮）、会话列表虚拟滚动、消息分页落地（RPC 读路径的 `message.query` 游标分页已存在，屏上要真正用起来）。**另须修两个已确认缺陷（2026-11-21 用户拍板并入本 change）**：① 工具轮空正文助手消息渲染成空气泡、真回复被淹没（`web/src/App.tsx`，见 `Docs/known-bugs.md`「web 验证页」条）——空正文工具轮不渲染独立空气泡、toolCalls/thinking 折叠成卡、live 与 history 一致；② WS 断开无自动重连（`web/src/protocol.ts` onclose 只置状态）——加自动重连+心跳保活。**已完成**：change `web-chat-screen` 2026-11-22 归档（提交 `2f57b43`），两缺陷均修，主 spec `web-chat-screen` 已同步。
   - [x] 管理界面 change（2026-11-22 用户拍板三阶段合一）：① 会话管理（新建/删除/重命名/切换模板）③ 图片输入+上下文占用环 ② provider/模板管理+首启向导；含核心接线（配置进程内同步/空配置启动门/AgentSessionController）。**已完成**：change `web-management-ui` 2026-11-22 归档，22/22 任务、双变异红证据、11 屏视觉验收、live 探测写回核验；主 spec `web-management-ui` 新建 + `agent-template-management`（删除开放）/`web-core-shim`（空配置启动）MODIFIED 同步。
-  - [ ] 规模优化 change：`Agent.restore` / `_history` 的内存边界（发送/创建路径仍全量载入历史并常驻属现状；本 change 只落了 `message.query` 读路径分页）。
+  - [x] 群聊 change `agent-group-chat`（2026-11-22 用户拍板立项）：组内 agent 共享对话记录作公开上下文，各成员工具调用/思考仅自己与用户可见。口径（explore 敲定）：单一原文 + author/visibility 两列；视图 = 可见性过滤 + 主客体映射（自己→assistant 第一人称，他人→user 轮「X 说」，Anthropic 兼容端点无 name 字段已核文档）；**逐成员视图为压缩对象**（主客体一致 + 阈值逐成员窗口天然满足钉死规则 + 摘要泄漏通道结构消失）；调度 v1 用户点名；公开回复自包含纪律；成员 = 模板 + 会话级覆盖层（新能力 agent-instance-overrides：工具子集/提示词追加/effort）；web 组视图（公开时间线 + 成员私有分栏 + 逐成员真实上下文/占用环）。规模优化并入本 change 前置。**已完成**：2026-11-22 归档，66/66 任务 + 主循环 §11 复核（全量 +1039 ~1、四变异独立红证据、真核心组视图视觉验收 design_audit 0/86、live 真模型隐私隔离）；主 spec `agent-group-chat` + `agent-instance-overrides` 新建，`context-compaction`/`session-persistence`/`web-core-shim` MODIFIED/ADDED 同步。自动编排（@mention 解析/主持人/并行发言）留待后续 change。
+  - [ ] 规模优化（`agent-group-chat` 前置已落地一部分：成员视图按需装配 + 解析缓存随驻留视图淘汰）：单会话 `Agent.restore` / `_history` 发送/创建路径仍全量载入历史并常驻属现状，待后续定边界。
   - [ ] 核心 Dart→TS 迁移 change（终态 C++ + TS）：Dart 核心是过渡层，架构验证通过后迁移；C++ sidecar 恒留。
 
 ### 明确不做（见 `Docs/rejected-approaches.md` 第 24、25 条）

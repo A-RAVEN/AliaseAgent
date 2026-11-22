@@ -9,7 +9,9 @@ class AgentRegistry {
 
   /// 登记一个刚创建好的实例（同一句柄重复登记会覆盖，调用方应先 [lookup]）。
   void register(Agent agent) {
-    _agents[agent.sessionId] = agent;
+    // 按**实例句柄**登记（agent-group-chat D3）：单会话 handle == sessionId（行为不变），
+    // 成员实例则是 `<groupId>::<memberId>`，同一组 N 个成员互不覆盖。
+    _agents[agent.handle] = agent;
   }
 
   Agent? lookup(String handle) => _agents[handle];

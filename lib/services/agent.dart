@@ -4,12 +4,14 @@ import 'dart:convert';
 import '../models/agent_type_config.dart';
 import '../models/compaction_status.dart';
 import '../models/context_breakdown.dart';
+import '../models/instance_overrides.dart';
 import '../models/message.dart';
 import '../models/model_catalog_entry.dart';
 import '../models/provider_config.dart' as provider_model;
 import '../models/resolved_agent_config.dart';
 import '../models/tool_call_activity.dart';
 import 'agent_config_resolver.dart';
+import 'api_message_builder.dart';
 import 'compaction/compaction_plan.dart';
 import 'compaction/guard_anchors.dart';
 import 'compaction/seam_selector.dart';
@@ -19,15 +21,15 @@ import 'config_service.dart';
 import 'context_estimator.dart';
 import 'context_snapshot.dart';
 import 'database_service.dart';
-import 'image_budget.dart';
-import 'image_request.dart';
+import 'group_member_context.dart';
+import 'group_prompts.dart';
+import 'group_view_loader.dart';
 import 'logging.dart';
 import 'message_repository.dart';
 import 'search_text_assembly.dart';
 import 'session_repository.dart';
 import 'sidecar_bridge.dart';
 import 'skills/skill_catalog_service.dart';
-import 'slash_commands.dart';
 import 'subagent_runner.dart';
 import 'summary_node_repository.dart';
 import 'tool_catalog.dart';
@@ -231,7 +233,30 @@ class AgentRetiredException implements Exception {
 /// **并发约定**：同一实例同一时刻只允许一轮（与原来"正在发送时忽略新发送"一致）。
 /// 不同实例之间没有共享的可变列表或请求队列：消息历史各一份，句柄各自一个。
 class Agent {
+  /// **DB 作用域**：消息、摘要、会话行都按它归属。组会话里它是组 id。
   final String sessionId;
+
+  /// **实例句柄**：sidecar 上下文键 + `AgentRegistry` 键 + 取消目标（design D3）。
+  ///
+  /// 单会话实例 `handle == sessionId`（行为与变更前一致）；成员实例是成员专属句柄
+  /// `<groupId>::<memberId>`。两者不能兼任：拿组 id 当句柄会让 N 个成员共用一个
+  /// sidecar 上下文、互相 cancel / 互相 disposeContext。
+  final String handle;
+
+  /// 成员上下文（单会话为 null）。压缩作用域、组角色纪律、事件身份都由它派生。
+  final GroupMemberContext? member;
+
+  /// 成员视图的增量装配器（单会话为 null ⇒ 走原来的全量 `restore()`）。
+  final GroupViewLoader? viewLoader;
+
+  /// 实例级覆盖层（单会话来自 `sessions.overrides_json`，成员来自成员行）。
+  ///
+  /// 工具子集与提示词追加已在创建时叠进 [config]（创建/恢复时生效）；[overrides]
+  /// 保留在这里是为了**思考强度的逐轮热更新**（下一消息生效）。
+  final AgentInstanceOverrides? overrides;
+
+  /// 每轮重读覆盖层的解析器（思考强度热更新：改档位不必重建实例）。
+  final Future<AgentInstanceOverrides?> Function()? overridesLookup;
 
   /// 会话引用的模板名（`Session.agentType`），错误消息要带它。
   final String agentTypeName;
@@ -314,6 +339,11 @@ class Agent {
 
   Agent({
     required this.sessionId,
+    String? handle,
+    this.member,
+    this.viewLoader,
+    this.overrides,
+    this.overridesLookup,
     required this.agentTypeName,
     required this.config,
     required this.template,
@@ -332,7 +362,8 @@ class Agent {
     this.toolParallelMax = 0,
     this.subagentRunner,
     this.callbacks = const AgentCallbacks(),
-  }) : _provider = provider;
+  })  : handle = handle ?? sessionId,
+        _provider = provider;
 
   // ---------------------------------------------------------------------------
   // 只读状态出口
@@ -385,21 +416,106 @@ class Agent {
   Future<bool> ensureContext({String? defaultWorkspace}) async {
     if (_disposed) throw AgentDisposedException(sessionId);
     if (_retiring) throw AgentRetiredException(sessionId, agentTypeName);
-    final created = await sidecar.ensureContext(sessionId,
+    final created = await sidecar.ensureContext(handle,
         defaultWorkspace: defaultWorkspace ?? ConfigService.homeDir);
     if (created) _workspaceInitialized = true;
     return created;
   }
 
-  /// 从数据库恢复消息历史（新建实例与恢复既有会话都走这里）。
+  /// 恢复/装配该实例的视图序列。
+  ///
+  /// - 单会话：保持变更前的行为（全量 `queryBySession` 载入常驻）。
+  /// - 组成员：**增量装配**（只读高水位之后的行），绝不走全量查询（design D9 /
+  ///   任务 4.2 的"全量查询即抛错"红靶就是守这一条）。
   Future<void> restore() async {
     if (_disposed) throw AgentDisposedException(sessionId);
     if (_retiring) throw AgentRetiredException(sessionId, agentTypeName);
+    final groupMember = member;
+    if (groupMember != null) {
+      await assembleMemberView();
+      _restored = true;
+      return;
+    }
     final messages = await messageRepo.queryBySession(sessionId);
     _history
       ..clear()
       ..addAll(messages);
     _restored = true;
+  }
+
+  /// 摘要/压缩的成员作用域：单会话为 null（按 `IS NULL` 匹配），成员为成员 id。
+  String? get _memberScope => member?.memberId;
+
+  /// 成员显示名的解析器（含已移除成员；每次装配现解析 ⇒ 改名不改归属）。
+  ///
+  /// 由 `AgentFactory` / 组服务注入（它们能读 `group_members`）；直接构造 Agent 的
+  /// 测试不注入时至少知道自己的显示名。
+  Future<Map<String, String>> Function()? displayNamesResolver;
+
+  /// 成员视图的摘要覆盖情况（作用域内摘要覆盖到的最大 seq + 覆盖区间）。
+  Future<({int through, List<({int min, int max})> spans})>
+      _memberCoveredSpans() async {
+    final groupMember = member;
+    if (groupMember == null || !summaryStoreOpen) {
+      return (through: 0, spans: const <({int min, int max})>[]);
+    }
+    try {
+      final nodes = await summaryNodeRepo.queryBySession(sessionId,
+          memberId: groupMember.memberId);
+      if (nodes.isEmpty) {
+        return (through: 0, spans: const <({int min, int max})>[]);
+      }
+      var through = 0;
+      final spans = <({int min, int max})>[];
+      for (final node in nodes) {
+        if (node.coveredMaxSeq > through) through = node.coveredMaxSeq;
+        spans.add((min: node.coveredMinSeq, max: node.coveredMaxSeq));
+      }
+      return (through: through, spans: spans);
+    } catch (e) {
+      debugPrint('[AliasAgent] 成员摘要覆盖范围读取失败：$e');
+      return (through: 0, spans: const <({int min, int max})>[]);
+    }
+  }
+
+  /// 增量装配成员视图（只读高水位之后的行；被摘要覆盖的区间非常驻）。
+  Future<void> assembleMemberView() async {
+    final groupMember = member;
+    final loader = viewLoader;
+    if (groupMember == null || loader == null) return;
+    final names = await (displayNamesResolver?.call() ??
+        Future<Map<String, String>>.value(
+            <String, String>{groupMember.memberId: groupMember.displayName}));
+    final covered = await _memberCoveredSpans();
+    await loader.assemble(
+      memberId: groupMember.memberId,
+      displayNames: names,
+      coveredThrough: covered.through,
+    );
+    _history
+      ..clear()
+      ..addAll(loader.residentView(groupMember.memberId));
+  }
+
+  /// 这次请求用的完整视图（公开入口：组服务的两个前置门要读它）。
+  Future<List<Message>> memberViewForRound() => _memberViewForRound();
+
+  /// 这次请求用的完整视图 = 驻留视图 + 按需读回的、被该成员摘要覆盖的区间。
+  Future<List<Message>> _memberViewForRound() async {
+    final groupMember = member;
+    final loader = viewLoader;
+    if (groupMember == null || loader == null) {
+      return List<Message>.from(_history);
+    }
+    final names = await (displayNamesResolver?.call() ??
+        Future<Map<String, String>>.value(
+            <String, String>{groupMember.memberId: groupMember.displayName}));
+    final covered = await _memberCoveredSpans();
+    return loader.fullViewForCompaction(
+      memberId: groupMember.memberId,
+      displayNames: names,
+      coveredSpans: covered.spans,
+    );
   }
 
   void _registerRound(Future<void> round) {
@@ -428,7 +544,7 @@ class Agent {
     _foldGen++;
     _foldIdleTimer?.cancel();
     _foldIdleTimer = null;
-    sidecar.cancelRequest(sessionId);
+    sidecar.cancelRequest(handle);
     if (_streaming) _endStreaming();
   }
 
@@ -444,10 +560,10 @@ class Agent {
     _foldIdleTimer = null;
     _cancelledEpoch = _requestEpoch;
     try {
-      sidecar.cancelRequest(sessionId);
+      sidecar.cancelRequest(handle);
     } catch (_) {}
     await waitForRounds();
-    await sidecar.disposeContext(sessionId);
+    await sidecar.disposeContext(handle);
   }
 
   /// 退役：把实例让位给同一 Session 的新 Agent 对象。
@@ -487,8 +603,11 @@ class Agent {
   ///
   /// 返回不可变 [AgentRunResult]：界面可以忽略它（消息、流式事件与错误展示照旧），
   /// 子 Agent 运行器据此区分成功、失败、取消与实例正忙。
+  /// [writeUserMessage] 为 false 时**不写**用户消息行（群聊里"不带文本的点名"用：
+  /// 那不写空用户行，直接基于现有原文发言）。
   Future<AgentRunResult> send(String text,
-      {List<String> attachments = const []}) async {
+      {List<String> attachments = const [],
+      bool writeUserMessage = true}) async {
     if (_disposed) throw AgentDisposedException(sessionId);
     if (_retiring) throw AgentRetiredException(sessionId, agentTypeName);
     if (_streaming) {
@@ -500,12 +619,15 @@ class Agent {
     // 自己的句柄，排期中的空闲定时器也清掉。
     if (_foldInFlight || _foldIdleTimer != null) {
       _foldGen++;
-      sidecar.cancelRequest(sessionId);
+      sidecar.cancelRequest(handle);
       _foldIdleTimer?.cancel();
       _foldIdleTimer = null;
     }
     if (!_restored) await restore();
-    final round = _sendMessageRound(text: text, attachments: attachments);
+    final round = _sendMessageRound(
+        text: text,
+        attachments: attachments,
+        writeUserMessage: writeUserMessage);
     _registerRound(round);
     return await round;
   }
@@ -513,26 +635,43 @@ class Agent {
   Future<AgentRunResult> _sendMessageRound({
     required String text,
     required List<String> attachments,
+    bool writeUserMessage = true,
   }) async {
     final epoch = ++_requestEpoch;
-    final userMsg = await messageRepo.insert(
-      sessionId: sessionId,
-      role: 'user',
-      content: text,
-      attachments: attachments,
-    );
-    await sessionRepo.touch(sessionId);
-    _history.add(userMsg);
-    callbacks.onUserMessage?.call(userMsg);
+    if (writeUserMessage) {
+      // 用户消息：author 一律为空（用户没有成员作者）、公开可见。组会话里也**只写一次**
+      // —— 由这一轮写入，不重复写（spec「不带用户消息的点名」的另一面）。
+      final userMsg = await messageRepo.insert(
+        sessionId: sessionId,
+        role: 'user',
+        content: text,
+        attachments: attachments,
+        author: null,
+        visibility: Message.visibilityPublic,
+      );
+      await sessionRepo.touch(sessionId);
+      // 成员视图以装配器为唯一来源：用户消息落库后立刻增量装配进来（不手工 add，
+      // 否则 next assembly 会把它读第二遍）。
+      if (member != null) {
+        await assembleMemberView();
+      } else {
+        _history.add(userMsg);
+      }
+      callbacks.onUserMessage?.call(userMsg);
+
+      final titleUpdated = await sessionRepo.updateTitleIfDefault(sessionId, text);
+      if (titleUpdated) {
+        final session = await sessionRepo.get(sessionId);
+        callbacks.onTitleChanged?.call(session?.title ?? 'New Chat');
+      }
+    }
     _setStreaming(true);
 
-    final titleUpdated = await sessionRepo.updateTitleIfDefault(sessionId, text);
-    if (titleUpdated) {
-      final session = await sessionRepo.get(sessionId);
-      callbacks.onTitleChanged?.call(session?.title ?? 'New Chat');
-    }
-
-    final snapshotMessages = List<Message>.from(_history);
+    // 成员请求的输入是**该成员的视图**（驻留视图 + 按需读回的覆盖区间）；
+    // 单会话保持变更前的行为（`_history` 全量常驻）。
+    final snapshotMessages = member == null
+        ? List<Message>.from(_history)
+        : await _memberViewForRound();
     try {
       return await _callModel(messages: snapshotMessages, epoch: epoch);
     } catch (e, st) {
@@ -571,7 +710,21 @@ class Agent {
   /// Provider 配置里该模型条目的 `reasoningEfforts`。模型本身仍用创建时冻结的
   /// [ResolvedAgentConfig.model]（D7 明确模型不热更新）—— 拿"未来模型"的档位去驱动
   /// "当前模型"的请求会造成第二个口径。
-  ({String mode, String effort}) _resolveRoundThinking() {
+  /// 本实例当前生效的覆盖层：每轮现读（思考强度热更新），读不到时退回创建时快照。
+  Future<AgentInstanceOverrides?> _currentOverrides() async {
+    final lookup = overridesLookup;
+    if (lookup != null) {
+      try {
+        final fresh = await lookup();
+        if (fresh != null) return fresh;
+      } catch (e) {
+        debugPrint('[AliasAgent] 覆盖层重读失败，沿用创建时快照：$e');
+      }
+    }
+    return overrides;
+  }
+
+  Future<({String mode, String effort})> _resolveRoundThinking() async {
     final lookupTemplate = templateLookup;
     final lookupProvider = providerLookup;
     if (lookupTemplate == null && lookupProvider == null) {
@@ -588,8 +741,15 @@ class Agent {
         break;
       }
     }
+    // 覆盖层的思考强度覆盖模板：字段出现即由它决定（显式空串 / 非白名单 ⇒ disabled，
+    // 不回落模板推导）；字段缺席才按模板 + 目录推导。逐轮生效 = 既有热更新口径
+    // （下一消息起作用，工具与提示词不动）。
+    final override = await _currentOverrides();
+    final overrideEffort = override?.hasThinkingEffort == true
+        ? (override!.thinkingEffort ?? '')
+        : null;
     return AgentConfigResolver.resolveThinking(
-      explicitEffort: current.thinkingEffort,
+      explicitEffort: overrideEffort ?? current.thinkingEffort,
       entry: entry,
     );
   }
@@ -619,7 +779,7 @@ class Agent {
     // 本轮局部变量。本轮内所有模型请求（含工具轮）共用这一份 —— 所以保存发生在
     // 某轮工具循环进行中时，该轮已发出的请求与后续请求都还是旧档，改动从**下一轮
     // 装配**（下一条消息）起生效。窗口/工具/模型/系统提示词仍读冻结的 [config]。
-    final roundThinking = _resolveRoundThinking();
+    final roundThinking = await _resolveRoundThinking();
 
     // 实际发送的工具定义 = 本实例生效配置 ∩ 工具目录；未知名字在这里显式失败（
     // 创建路径已经校验过一次，这里保持同一判据，避免绕过目录）。
@@ -771,7 +931,7 @@ class Agent {
       callbacks.onMeteringChanged?.call();
 
       await sidecar.sendMessage(
-        handle: sessionId,
+        handle: handle,
         apiKey: _provider.apiKey,
         baseUrl: baseUrl,
         model: config.model,
@@ -864,17 +1024,27 @@ class Agent {
           final toolCallsJson = allTurnToolCalls.isNotEmpty
               ? jsonEncode(allTurnToolCalls)
               : null;
+          // 组成员的**最终公开行只存正文**（design D1）：tool_calls 与 thinking_json
+          // 都是 NULL、无附件 —— 私有证据只落 private 行，隐私不靠"映射时记得过滤"。
+          // 单会话保持变更前的行为（该会话不存在跨成员投影）。
+          final isGroupMember = member != null;
           final assistantMsg = await messageRepo.insert(
             sessionId: sessionId,
             role: 'assistant',
             content: turnText,
-            toolCallsJson: toolCallsJson,
-            thinkingJson: thinkingJsonStr,
+            toolCallsJson: isGroupMember ? null : toolCallsJson,
+            thinkingJson: isGroupMember ? null : thinkingJsonStr,
             tokenCount: lastInputTokens,
             outputTokenCount: lastOutputTokens,
+            author: member?.memberId,
+            visibility: Message.visibilityPublic,
           );
           await sessionRepo.touch(sessionId);
-          _history.add(assistantMsg);
+          if (isGroupMember) {
+            await assembleMemberView();
+          } else {
+            _history.add(assistantMsg);
+          }
           callbacks.onAssistantMessage?.call(assistantMsg, true);
         }
         if (!_isActive(epoch)) return _cancelledRun();
@@ -890,6 +1060,8 @@ class Agent {
       if (!_isActive(epoch)) return _cancelledRun();
       allTurnToolCalls.addAll(turnToolCalls);
       final turnJson = jsonEncode(turnToolCalls);
+      // 工具轮的中间行对组成员是**私有证据**（author = 成员 id、
+      // visibility = private-to-author）：thinking 与工具调用只存在这里。
       final intermediateMsg = await messageRepo.insert(
         sessionId: sessionId,
         role: 'assistant',
@@ -898,9 +1070,17 @@ class Agent {
         thinkingJson: thinkingJsonStr,
         tokenCount: lastInputTokens,
         outputTokenCount: lastOutputTokens,
+        author: member?.memberId,
+        visibility: member == null
+            ? Message.visibilityPublic
+            : Message.visibilityPrivateToAuthor,
       );
       await sessionRepo.touch(sessionId);
-      _history.add(intermediateMsg);
+      if (member != null) {
+        await assembleMemberView();
+      } else {
+        _history.add(intermediateMsg);
+      }
       callbacks.onAssistantMessage?.call(intermediateMsg, false);
 
       final assistantBlocks = <Map<String, dynamic>>[];
@@ -1021,6 +1201,8 @@ class Agent {
       outputTokenCount: old.outputTokenCount,
       createdAt: old.createdAt,
       attachments: old.attachments,
+      author: old.author,
+      visibility: old.visibility,
     );
   }
 
@@ -1079,7 +1261,9 @@ class Agent {
     _foldInFlight = true;
     final myGen = _foldGen;
     try {
-      final messages = await messageRepo.queryBySession(sessionId);
+      final messages = member == null
+          ? await messageRepo.queryBySession(sessionId)
+          : await _memberViewForRound();
       if (messages.isEmpty) return;
       final loaded = await _loadClosedSegments(messages);
       final topClosedMax =
@@ -1125,7 +1309,8 @@ class Agent {
       return (projected: const <ClosedSummary>[], coveredThrough: -1);
     }
     try {
-      final nodes = await summaryNodeRepo.queryBySession(sessionId);
+      final nodes = await summaryNodeRepo.queryBySession(sessionId,
+          memberId: _memberScope);
       final candidates = nodes
           .where((n) =>
               n.level >= 1 && n.summaryJson != null && n.coveredMinSeq > 0)
@@ -1203,7 +1388,7 @@ class Agent {
     try {
       await seamSel.ensure(
           far: seamInputs.far, k: seamInputs.k, config: template,
-          sessionId: sessionId);
+          sessionId: handle);
       return (far, k) => seamSel.memoizedSeams(far: far, k: k) ?? const [];
     } catch (e) {
       debugPrint('[AliasAgent] seam selection failed, using arithmetic skeleton: $e');
@@ -1222,7 +1407,7 @@ class Agent {
     if (dbOpen && minSeq != null && maxSeq != null) {
       try {
         final node = await summaryNodeRepo.findCovering(sessionId, minSeq, maxSeq,
-            level: 1);
+            level: 1, memberId: _memberScope);
         if (node != null &&
             node.summaryJson != null &&
             (dirtySince == 0 || node.coveredMaxSeq < dirtySince)) {
@@ -1238,11 +1423,12 @@ class Agent {
           'background fold aborted during L1 sub-span');
     }
     final s = await summaryProvider.summarize(
-        folded: msgs, config: template, sessionId: sessionId);
+        folded: msgs, config: template, sessionId: handle);
     if (dbOpen && minSeq != null && maxSeq != null) {
       try {
         await summaryNodeRepo.materialize(
           sessionId: sessionId,
+          memberId: _memberScope,
           level: 1,
           startSeq: minSeq,
           endSeq: maxSeq,
@@ -1278,8 +1464,13 @@ class Agent {
     if (msgs.isEmpty) return const [];
     final raw = CompactionEngine.rawTokens(msgs);
     final summary = await summaryProvider.summarize(
-        folded: msgs, config: template,
-        reference: reference, sessionId: sessionId);
+        folded: msgs,
+        config: template,
+        reference: reference,
+        sessionId: handle,
+        // 组成员的摘要必须保留「Y 说」归属（摘要私有，但只要归属纪律，
+        // 不带「自包含 + 文件指针」那条公开回复纪律）。
+        systemPromptSuffix: member == null ? null : kGroupSummaryPromptSuffix);
     if (CompactionEngine.summarySideWins(raw, summary.tokens)) {
       return [
         (seg: CompactionSegment(messages: msgs, summary: true, level: 1),
@@ -1372,7 +1563,7 @@ class Agent {
         }
         final node = await summaryNodeRepo.findCovering(sessionId,
             seg.reuse!.coveredMinSeq, seg.reuse!.coveredMaxSeq,
-            level: seg.reuse!.level);
+            level: seg.reuse!.level, memberId: _memberScope);
         if (node == null || node.summaryJson == null) {
           throw StateError('closed segment ${seg.reuse!.coveredMinSeq}..'
               '${seg.reuse!.coveredMaxSeq} has no persisted summary — cannot re-summarize an immutable segment');
@@ -1390,7 +1581,7 @@ class Agent {
         try {
           final node = await summaryNodeRepo.findCovering(
               sessionId, minSeq, maxSeq,
-              level: seg.level);
+              level: seg.level, memberId: _memberScope);
           if (node != null &&
               node.summaryJson != null &&
               (dirtySince == 0 || node.coveredMaxSeq < dirtySince)) {
@@ -1429,13 +1620,14 @@ class Agent {
         }
         final summary = await summaryProvider.summarizeText(
             text: l1Texts.join('\n\n'), config: template,
-            sessionId: sessionId);
+            sessionId: handle);
         if (dbOpen && minSeq != null && maxSeq != null) {
           debugPrint('[AliasAgent] folding ${seg.messages.length} messages '
               '(seq $minSeq..$maxSeq) into a level-${seg.level} summary');
           try {
             await summaryNodeRepo.materialize(
               sessionId: sessionId,
+              memberId: _memberScope,
               level: seg.level,
               startSeq: minSeq,
               endSeq: maxSeq,
@@ -1482,6 +1674,7 @@ class Agent {
           try {
             await summaryNodeRepo.materialize(
               sessionId: sessionId,
+              memberId: _memberScope,
               level: leaf.seg.level,
               startSeq: lo,
               endSeq: hi,
@@ -1606,7 +1799,7 @@ class Agent {
       final l2 = await summaryProvider.summarizeText(
           text: candGroup.map((e) => e.text).join('\n\n'),
           config: template,
-          sessionId: sessionId);
+          sessionId: handle);
       final l2Wins = CompactionEngine.summarySideWins(groupSum, l2.tokens);
       final l2IsVerbatim = candGroup.any((e) => e.seg.verbatimAtLevel);
       final l2Text = l2Wins ? l2.text : candGroup.map((e) => e.text).join('\n\n');
@@ -1630,6 +1823,7 @@ class Agent {
         try {
           await summaryNodeRepo.materialize(
             sessionId: sessionId,
+            memberId: _memberScope,
             level: 2,
             startSeq: lo,
             endSeq: hi,
@@ -1736,17 +1930,27 @@ class Agent {
   Future<List<SummaryReference>> _loadReferenceCandidates(bool dbOpen) async {
     if (!dbOpen) return const [];
     try {
-      final nodes = await summaryNodeRepo.queryBySession(sessionId);
-      return [
-        for (final n in nodes)
-          if (n.summaryJson != null && n.summaryJson!.isNotEmpty)
-            SummaryReference(
-              level: n.level,
-              coveredMinSeq: n.coveredMinSeq,
-              coveredMaxSeq: n.coveredMaxSeq,
-              text: _summaryTextFromJson(n.summaryJson!),
-            ),
-      ];
+      // 参考上下文是**第二条泄漏通道**（design D19）：候选只取本人作用域的摘要。
+      final nodes = await summaryNodeRepo.queryBySession(sessionId,
+          memberId: _memberScope);
+      // 双层作用域：查询已按成员过滤，这里再用纯函数过一遍（数据库作用域写错时
+      // 仍拦得住 —— 参考块是成员模型的输入，与视图同一隐私边界）。
+      return memberScopedReferences(
+        [
+          for (final n in nodes)
+            if (n.summaryJson != null && n.summaryJson!.isNotEmpty)
+              (
+                memberId: n.memberId,
+                reference: SummaryReference(
+                  level: n.level,
+                  coveredMinSeq: n.coveredMinSeq,
+                  coveredMaxSeq: n.coveredMaxSeq,
+                  text: _summaryTextFromJson(n.summaryJson!),
+                ),
+              ),
+        ],
+        memberId: _memberScope,
+      );
     } catch (e) {
       debugPrint('[AliasAgent] reference candidates unavailable: $e');
       return const [];
@@ -1800,196 +2004,26 @@ class Agent {
     return out;
   }
 
-  static String? _toolImagePath(Map<String, dynamic> source) {
-    final image = source['image'];
-    if (image is! Map) return null;
-    final path = image['path'];
-    return path is String && path.isNotEmpty ? path : null;
-  }
+  // 工具图片路径 / 工具结果内容 / thinking 块清洗 / 请求体装配都搬到了
+  // `api_message_builder.dart`：成员视图与单会话必须共用**同一份** replay 实现
+  // （agent-group-chat design D2/D9）。这里保留同名入口只做委托，行为逐字不变。
+  static String? _toolImagePath(Map<String, dynamic> source) =>
+      toolImagePath(source);
 
-  Object _toolResultContent({required String text, String? imagePath}) {
-    if (imagePath == null) return text;
-    final blocks = <Map<String, dynamic>>[
-      {'type': 'text', 'text': text},
-    ];
-    final parts = buildImageRequestParts(imagePath);
-    if (parts.block == null) {
-      blocks.add({'type': 'text', 'text': parts.note});
-    } else if (!config.acceptsImages) {
-      blocks.add({
-        'type': 'text',
-        'text': '[图片未发送：当前模型 ${config.model} 未声明图片输入'
-            '（input_modalities 不含 image）；图片路径：$imagePath]',
-      });
-    } else {
-      blocks.add(parts.block!);
-    }
-    return blocks;
-  }
+  Object _toolResultContent({required String text, String? imagePath}) =>
+      toolResultContent(
+        text: text,
+        imagePath: imagePath,
+        acceptsImages: config.acceptsImages,
+        model: config.model,
+      );
 
-  List<Map<String, dynamic>> _buildApiMessages(List<Message> messages,
-      {bool? allowImages}) {
-    final apiMessages = <Map<String, dynamic>>[];
-    final emittedToolUseIds = <String>{};
-    final imagesAllowed = allowImages ?? config.acceptsImages;
-    final modelName = config.model;
-    // 当轮生效技能名：在逐条循环**外**取一次、循环内复用（design D2；禁止缓存到
-    // Agent 字段或构造期快照 —— 当轮语义由每轮开头的 `scan()` + getter 保证）。
-    //
-    // `_callModel` 与压缩投影 `_buildCompactionProjection` 共用本入口（投影对每个
-    // 原文段各调一次），所以投影里的历史 user 消息一并按当轮集合展开；这正是 spec
-    // 「进入本次请求的每一条 user 消息」的实现点。压缩折叠进摘要的消息到不了这里，
-    // 属压缩能力的既定损失（design D2 范围限定）。
-    final activeNames = SkillCatalogService.instance.activeSkillNames;
-
-    final preparedByMsg = <int, List<ImageRequestParts>>{};
-    final planned = <PlannedImage>[];
-    for (var mi = 0; mi < messages.length; mi++) {
-      final msg = messages[mi];
-      if (msg.role != 'user' || msg.attachments.isEmpty) continue;
-      final partsList = <ImageRequestParts>[];
-      for (var j = 0; j < msg.attachments.length; j++) {
-        final parts = buildImageRequestParts(msg.attachments[j], index: j + 1);
-        partsList.add(parts);
-        planned.add(PlannedImage(path: msg.attachments[j], parts: parts));
-      }
-      preparedByMsg[mi] = partsList;
-    }
-    final omissions = planImageOmissions(planned);
-    final omittedByMsg = <int, List<String?>>{};
-    var planCursor = 0;
-    for (final entry in preparedByMsg.entries) {
-      final notes = List<String?>.filled(entry.value.length, null);
-      for (var j = 0; j < entry.value.length; j++) {
-        notes[j] = omissions[planCursor++];
-      }
-      omittedByMsg[entry.key] = notes;
-    }
-
-    for (var mi = 0; mi < messages.length; mi++) {
-      final msg = messages[mi];
-      final content = <Map<String, dynamic>>[];
-      if (msg.content.isNotEmpty) {
-        // 斜杠技能展开的唯一接线点（design D1/D2）：只对 `Message` 行
-        // `role == 'user'` 的正文生效，assistant 消息原样。
-        //
-        // 落库 / 会话标题 / 对话视图气泡都发生在装配**之前**（`_sendMessageRound`
-        // 里的 `messageRepo.insert` / `updateTitleIfDefault` 用的就是手打原文），
-        // 天然不受影响。**禁止**在 `_callModel` 的工具轮或装配后的 apiMessages 层
-        // 做替换：那里 role=='user' 的条目可能是 tool_result 块列表（content 是
-        // List 而不是 String），会被误改写。
-        final text = msg.role == 'user'
-            ? expandSlashCommand(msg.content, activeNames)
-            : msg.content;
-        content.add({'type': 'text', 'text': text});
-      }
-
-      if (msg.role == 'user' && msg.attachments.isNotEmpty) {
-        final partsList = preparedByMsg[mi]!;
-        final omitted = omittedByMsg[mi]!;
-        for (var i = 0; i < msg.attachments.length; i++) {
-          final path = msg.attachments[i];
-          final parts = partsList[i];
-          final omission = omitted[i];
-          if (omission != null) {
-            content.add({'type': 'text', 'text': omission});
-          } else if (parts.block == null) {
-            content.add({'type': 'text', 'text': parts.note});
-          } else if (!imagesAllowed) {
-            content.add({
-              'type': 'text',
-              'text': '[图片未发送：当前模型 $modelName 未声明图片输入'
-                  '（input_modalities 不含 image）；图片路径：$path]',
-            });
-          } else {
-            content.add({'type': 'text', 'text': parts.note});
-            content.add(parts.block!);
-          }
-        }
-      }
-
-      if (msg.role == 'assistant' &&
-          msg.thinkingJson != null &&
-          msg.thinkingJson!.isNotEmpty) {
-        try {
-          final thinkingBlocks =
-              jsonDecode(msg.thinkingJson!) as List<dynamic>;
-          content.insertAll(
-              0,
-              thinkingBlocks.map((b) => _thinkingBlockWithoutIndex(
-                  b as Map<String, dynamic>)));
-        } catch (e) {
-          debugPrint('[AliasAgent] Failed to parse thinkingJson: $e');
-        }
-      }
-
-      var ownedToolCalls = const <Map<String, dynamic>>[];
-      if (msg.role == 'assistant' &&
-          msg.toolCallsJson != null &&
-          msg.toolCallsJson!.isNotEmpty) {
-        try {
-          final toolCalls = jsonDecode(msg.toolCallsJson!) as List<dynamic>;
-          ownedToolCalls = <Map<String, dynamic>>[];
-          for (final tc in toolCalls) {
-            final id = ((tc as Map<String, dynamic>)['id'] ?? '').toString();
-            if (id.isEmpty || emittedToolUseIds.add(id)) {
-              ownedToolCalls.add(tc);
-            }
-          }
-        } catch (e) {
-          debugPrint('[AliasAgent] Failed to parse toolCallsJson: $e');
-          ownedToolCalls = const [];
-        }
-      }
-
-      for (final tc in ownedToolCalls) {
-        content.add({
-          'type': 'tool_use',
-          'id': tc['id'] ?? '',
-          'name': tc['toolName'] ?? tc['name'] ?? '',
-          'input': tc['input'] ?? {},
-        });
-      }
-
-      apiMessages.add({'role': msg.role, 'content': content});
-
-      if (ownedToolCalls.isNotEmpty) {
-        try {
-          final toolResults = <Map<String, dynamic>>[];
-          for (final tc in ownedToolCalls) {
-            final rawBody =
-                (tc['result'] ?? tc['resultPreview'] ?? '').toString();
-            final tcInput =
-                (tc['input'] as Map<String, dynamic>?) ?? const {};
-            final toolName = (tc['toolName'] ?? tc['name'] ?? '').toString();
-            final refetchPath = (tcInput['path'] as String?) ?? '';
-            final refetchUrl = (tcInput['url'] as String?) ?? '';
-            final refetchArg = refetchPath.isNotEmpty
-                ? refetchPath
-                : (refetchUrl.isNotEmpty ? refetchUrl : '');
-            // spawn_subagent 的最终结论**完整**重放：不套通用省略规则。
-            // 其它工具继续沿用既有截断与取回规则（见 tool_result_text.dart）。
-            final body = toolName == 'spawn_subagent'
-                ? rawBody
-                : elideOversizedToolResult(
-                    name: toolName, path: refetchArg, body: rawBody);
-            toolResults.add({
-              'type': 'tool_result',
-              'tool_use_id': tc['id'] ?? '',
-              'content': _toolResultContent(
-                text: body,
-                imagePath: _toolImagePath(tc),
-              ),
-            });
-          }
-          apiMessages.add({'role': 'user', 'content': toolResults});
-        } catch (e) {
-          debugPrint('[AliasAgent] Failed to build tool_results: $e');
-        }
-      }
-    }
-    return apiMessages;
-  }
+  List<Map<String, dynamic>> _buildApiMessages(List<Message> messages) =>
+      buildApiMessages(
+        messages,
+        acceptsImages: config.acceptsImages,
+        model: config.model,
+      );
 
   // ---------------------------------------------------------------------------
   // 工具执行
@@ -2111,10 +2145,10 @@ class Agent {
         if (limit is int) readReq['limit'] = limit;
         final requestJson = jsonEncode(readReq);
         resultJson = onWorker
-            ? await sidecar.callToolOnWorker('read_file', sessionId, requestJson)
-            : sidecar.readFile(sessionId, requestJson);
+            ? await sidecar.callToolOnWorker('read_file', handle, requestJson)
+            : sidecar.readFile(handle, requestJson);
       case 'write_file':
-        resultJson = sidecar.writeFile(sessionId, jsonEncode({
+        resultJson = sidecar.writeFile(handle, jsonEncode({
           'path': path,
           'content': input['content'] ?? '',
         }));
@@ -2125,20 +2159,20 @@ class Agent {
               '{"ok":false,"error":"edits must contain at least one replacement"}';
         } else {
           resultJson = sidecar.editFile(
-              sessionId, jsonEncode({'path': path, 'edits': edits}));
+              handle, jsonEncode({'path': path, 'edits': edits}));
         }
       case 'list_dir':
         resultJson = onWorker
-            ? await sidecar.callToolOnWorker('list_dir', sessionId, path)
-            : sidecar.listDir(sessionId, path);
+            ? await sidecar.callToolOnWorker('list_dir', handle, path)
+            : sidecar.listDir(handle, path);
       case 'glob_file':
         final requestJson = jsonEncode({
           'pattern': input['pattern'] ?? '',
           'max_results': input['max_results'] ?? 200,
         });
         resultJson = onWorker
-            ? await sidecar.callToolOnWorker('glob_file', sessionId, requestJson)
-            : sidecar.globFile(sessionId, requestJson);
+            ? await sidecar.callToolOnWorker('glob_file', handle, requestJson)
+            : sidecar.globFile(handle, requestJson);
       case 'grep_file':
         final requestJson = jsonEncode({
           'pattern': input['pattern'] ?? '',
@@ -2147,8 +2181,8 @@ class Agent {
           'max_results': input['max_results'] ?? 100,
         });
         resultJson = onWorker
-            ? await sidecar.callToolOnWorker('grep_file', sessionId, requestJson)
-            : sidecar.grepFile(sessionId, requestJson);
+            ? await sidecar.callToolOnWorker('grep_file', handle, requestJson)
+            : sidecar.grepFile(handle, requestJson);
       case 'web_search':
         final request = jsonEncode({
           'query': input['query'] ?? '',
@@ -2156,7 +2190,7 @@ class Agent {
           'depth': input['depth'] ?? 'basic',
           'max_results': input['max_results'] ?? 5,
         });
-        resultJson = await sidecar.webSearch(sessionId, request);
+        resultJson = await sidecar.webSearch(handle, request);
       case 'web_fetch':
         // `preview_chars` 与 `run_command` 同形态随请求传下去（C++ 侧按它决定
         // 头尾各留多少字符；缺省回落是 `spill::kDefaultPreviewChars`）。值来自顶层
@@ -2165,20 +2199,20 @@ class Agent {
           'url': input['url'] ?? '',
           'preview_chars': config.spillPreviewChars,
         });
-        resultJson = await sidecar.webFetch(sessionId, request);
+        resultJson = await sidecar.webFetch(handle, request);
       case 'browser_navigate':
         resultJson = await sidecar.browserNavigate(
-            sessionId, jsonEncode({'url': input['url'] ?? ''}));
+            handle, jsonEncode({'url': input['url'] ?? ''}));
       case 'browser_click':
         resultJson = await sidecar.browserClick(
-            sessionId, jsonEncode({'selector': input['selector'] ?? ''}));
+            handle, jsonEncode({'selector': input['selector'] ?? ''}));
       case 'browser_type':
-        resultJson = await sidecar.browserType(sessionId, jsonEncode({
+        resultJson = await sidecar.browserType(handle, jsonEncode({
           'selector': input['selector'] ?? '',
           'text': input['text'] ?? '',
         }));
       case 'browser_snapshot':
-        resultJson = await sidecar.browserSnapshot(sessionId, jsonEncode({}));
+        resultJson = await sidecar.browserSnapshot(handle, jsonEncode({}));
       case 'run_command':
         final request = <String, dynamic>{
           'command': input['command'] ?? '',
@@ -2191,7 +2225,7 @@ class Agent {
             (input['timeout_ms'] as int?) ?? config.commandTimeoutMs;
         request['max_timeout_ms'] = config.commandMaxTimeoutMs;
         request['preview_chars'] = config.spillPreviewChars;
-        resultJson = await sidecar.runCommand(sessionId, jsonEncode(request));
+        resultJson = await sidecar.runCommand(handle, jsonEncode(request));
       case 'read_spill':
         final requestJson = jsonEncode({
           'ref': input['ref'] ?? '',
@@ -2200,8 +2234,8 @@ class Agent {
           'preview_chars': config.spillPreviewChars,
         });
         resultJson = onWorker
-            ? await sidecar.callToolOnWorker('read_spill', sessionId, requestJson)
-            : sidecar.readSpill(sessionId, requestJson);
+            ? await sidecar.callToolOnWorker('read_spill', handle, requestJson)
+            : sidecar.readSpill(handle, requestJson);
       case 'load_skill':
         // 第一道闸（change `add-skill-mechanism` design D6）：技能名必须在本进程的
         // **生效技能集合**里。目录存在但校验失败的技能也在这里被挡下 —— 它的正文
@@ -2225,7 +2259,7 @@ class Agent {
           // `preview_chars` 与 `web_fetch` 同形透传（C++ 侧缺省回落
           // `spill::kDefaultPreviewChars`；执行侧不读配置文件）。
           request['preview_chars'] = config.spillPreviewChars;
-          resultJson = await sidecar.loadSkill(sessionId, jsonEncode(request));
+          resultJson = await sidecar.loadSkill(handle, jsonEncode(request));
         }
       case 'get_current_time':
         final now = DateTime.now();
@@ -2255,8 +2289,8 @@ class Agent {
         } else {
           final requestJson = jsonEncode({'path': path});
           resultJson = onWorker
-              ? await sidecar.callToolOnWorker('read_image', sessionId, requestJson)
-              : sidecar.readImage(sessionId, requestJson);
+              ? await sidecar.callToolOnWorker('read_image', handle, requestJson)
+              : sidecar.readImage(handle, requestJson);
         }
       case 'spawn_subagent':
         final runner = subagentRunner;
@@ -2536,7 +2570,7 @@ class Agent {
   /// 清掉流式展示状态并取消在途请求（与原来的 `_endStreaming` 等价）。
   void _endStreaming() {
     if (_disposed) return;
-    sidecar.cancelRequest(sessionId);
+    sidecar.cancelRequest(handle);
     _setStreaming(false);
   }
 
@@ -2545,9 +2579,15 @@ class Agent {
       sessionId: sessionId,
       role: 'assistant',
       content: 'Error: $message',
+      author: member?.memberId,
+      visibility: Message.visibilityPublic,
     );
     await sessionRepo.touch(sessionId);
-    _history.add(errorMsg);
+    if (member != null) {
+      await assembleMemberView();
+    } else {
+      _history.add(errorMsg);
+    }
     callbacks.onAssistantMessage?.call(errorMsg, true);
   }
 }

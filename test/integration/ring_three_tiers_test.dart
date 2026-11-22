@@ -93,6 +93,7 @@ class _FixedSummaryProvider implements SummaryProvider {
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
     String? sessionId,
+    String? systemPromptSuffix,
   }) async {
     l1Inputs.add(folded.length);
     return SummaryResult(text: 'L1(${folded.length})', tokens: tokens);

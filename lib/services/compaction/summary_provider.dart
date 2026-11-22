@@ -45,6 +45,10 @@ abstract class SummaryProvider {
     /// 被压缩会话的上下文句柄（change add-context-handles）：摘要请求必须落在
     /// **这个会话自己的**上下文上，不能读全局的"当前会话"。
     String? sessionId,
+
+    /// 追加到摘要系统文本后面的纪律（change `agent-group-chat` 4.7：组成员的摘要
+    /// 必须保留「Y 说」归属）。null = 不追加（单会话行为不变）。
+    String? systemPromptSuffix,
   });
 
   /// Produce a 2-pass "summary of summaries": summarize the already-produced

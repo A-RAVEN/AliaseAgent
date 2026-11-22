@@ -1,4 +1,4 @@
-import 'dart:io';
+﻿import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -163,9 +163,9 @@ void main() {
         final freshCols = await freshDb.rawQuery('PRAGMA table_info(messages)');
         expect(freshCols.any((c) => c['name'] == 'attachments'), isTrue,
             reason: 'CREATE TABLE 里也要带 attachments（v7 全新建库）');
-        // 当前建库版本已随 add-spawn-subagent-tool 升到 8；这里验的是「全新建库
+        // 当前建库版本已随 agent-group-chat 升到 9；这里验的是「全新建库
         // 也带 attachments」，版本号取当前 schema 版本。
-        expect(await freshDb.getVersion(), 8);
+        expect(await freshDb.getVersion(), 9);
       } finally {
         await DatabaseService.close();
         if (freshDir.existsSync()) {
@@ -264,7 +264,7 @@ void main() {
           '${sessionCols.map((c) => c['name']).join(',')}');
       expect(sessionCols.any((c) => c['name'] == 'parent_session_id'), isTrue,
           reason: 'v7→v8 必须给 sessions 加上 parent_session_id');
-      expect(await db.getVersion(), 8);
+      expect(await db.getVersion(), 9);
 
       final sessions = await db.query('sessions');
       // ignore: avoid_print
@@ -312,7 +312,7 @@ void main() {
         final cols = await db.rawQuery('PRAGMA table_info(sessions)');
         expect(cols.any((c) => c['name'] == 'parent_session_id'), isTrue,
             reason: 'CREATE TABLE 里也要带 parent_session_id（v8 全新建库）');
-        expect(await db.getVersion(), 8);
+        expect(await db.getVersion(), 9);
 
         final repo = SessionRepository();
         final parent = await repo.create(title: '父会话');
@@ -369,6 +369,242 @@ void main() {
         expect(children.map((s) => s.id).toList(), [child.id, olderChild.id],
             reason: '子记录按父 id 查询，按最近更新倒序');
         expect(await repo.listChildren(otherTop.id), isEmpty);
+      } finally {
+        await DatabaseService.close();
+        if (freshDir.existsSync()) {
+          try {
+            freshDir.deleteSync(recursive: true);
+          } catch (_) {}
+        }
+      }
+    });
+  });
+
+  _v9MigrationTests();
+}
+
+// -----------------------------------------------------------------------------
+// v8 → v9（change `agent-group-chat` 任务 1.6 / design D14）
+// -----------------------------------------------------------------------------
+
+/// 按 v8 的建表语句造一个旧库：会话、消息（带附件）、摘要各一条 + 索引。
+Future<void> _createV8Database(Directory dir) async {
+  final dbPath = p.join(dir.path, 'aliasagent.db');
+  final db8 = await openDatabase(dbPath, version: 8, onCreate: (db, v) async {
+    await db.execute('''CREATE TABLE sessions (
+      id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT 'New Chat',
+      agent_type TEXT NOT NULL DEFAULT 'general',
+      parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      tree_version INTEGER NOT NULL DEFAULT 0,
+      dirty_since_seq INTEGER NOT NULL DEFAULT 0)''');
+    await db.execute('''CREATE TABLE messages (
+      id TEXT PRIMARY KEY, seq INTEGER,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+      content TEXT NOT NULL, tool_calls TEXT, thinking_json TEXT,
+      token_count INTEGER, output_token_count INTEGER,
+      attachments TEXT, created_at INTEGER NOT NULL)''');
+    await db.execute('CREATE INDEX idx_messages_session ON messages(session_id)');
+    await db.execute('CREATE INDEX idx_messages_seq ON messages(session_id, seq)');
+    await db.execute('CREATE INDEX idx_sessions_updated ON sessions(updated_at DESC)');
+    await db.execute('''CREATE TABLE summary_nodes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      level INTEGER NOT NULL, start_seq INTEGER NOT NULL, end_seq INTEGER NOT NULL,
+      node_type TEXT NOT NULL, parent_id INTEGER, summary_json TEXT,
+      token_cost INTEGER, summary_prompt_version INTEGER, model TEXT,
+      covered_min_seq INTEGER NOT NULL, covered_max_seq INTEGER NOT NULL)''');
+    await db.execute('CREATE INDEX idx_summary_nodes_session ON summary_nodes(session_id)');
+    await db.execute('CREATE INDEX idx_summary_nodes_span ON summary_nodes(session_id, level, start_seq, end_seq)');
+    await db.execute('CREATE INDEX idx_summary_nodes_leaf_owner ON summary_nodes(session_id, covered_min_seq, covered_max_seq)');
+  });
+  await db8.insert('sessions', {
+    'id': 'old-8',
+    'title': '升级前会话',
+    'agent_type': 'reviewer',
+    'created_at': 11,
+    'updated_at': 22,
+    'tree_version': 3,
+    'dirty_since_seq': 5,
+  });
+  await db8.insert('messages', {
+    'id': 'old-8-msg',
+    'seq': 1,
+    'session_id': 'old-8',
+    'role': 'user',
+    'content': '升级前的消息',
+    'attachments': '[{"path":"old.png"}]',
+    'token_count': 7,
+    'output_token_count': 3,
+    'created_at': 11,
+  });
+  await db8.insert('summary_nodes', {
+    'session_id': 'old-8',
+    'level': 1,
+    'start_seq': 1,
+    'end_seq': 1,
+    'node_type': 'leaf',
+    'summary_json': '{"summary":"旧摘要"}',
+    'token_cost': 9,
+    'covered_min_seq': 1,
+    'covered_max_seq': 1,
+  });
+  await db8.close();
+}
+
+/// 结构指纹：每张表取 `PRAGMA table_info`（列名/类型/非空/默认值/主键）与
+/// `PRAGMA index_list` + `index_info`（索引名、唯一、列序列）。逐项比对，不用
+/// "看起来一样"糊过去（design D14 第 6 条）。
+///
+/// 列**按名字索引**而不是按位置：`ALTER TABLE ADD COLUMN` 只能把新列追加到表尾，
+/// 物理列序与全新建库不可能一致，而 SQLite 的所有访问都按列名进行（列序没有语义）。
+/// 除列序之外的每一项（类型 / 非空 / 默认值 / 主键）与索引的（唯一性 / 列序列）
+/// 都逐项严格比较。
+Future<Map<String, Object?>> _structureFingerprint(Database db) async {
+  const tables = ['sessions', 'messages', 'summary_nodes', 'group_members'];
+  final out = <String, Object?>{};
+  for (final table in tables) {
+    final columns = await db.rawQuery('PRAGMA table_info($table)');
+    final indexList = await db.rawQuery('PRAGMA index_list($table)');
+    final indexes = <String, Object?>{};
+    for (final index in indexList) {
+      final name = index['name'] as String;
+      if (name.startsWith('sqlite_autoindex')) continue;
+      final info = await db.rawQuery('PRAGMA index_info($name)');
+      indexes[name] = {
+        'unique': index['unique'],
+        'columns': [for (final row in info) row['name']],
+      };
+    }
+    out[table] = {
+      'columns': {
+        for (final column in columns)
+          column['name'] as String: {
+            'type': column['type'],
+            'notnull': column['notnull'],
+            'default': column['dflt_value'],
+            'pk': column['pk'],
+          }
+      },
+      'indexes': indexes,
+    };
+  }
+  return out;
+}
+
+void _v9MigrationTests() {
+  group('Database schema migration v8 -> v9 (agent-group-chat)', () {
+    late Directory tempDir;
+
+    setUp(() {
+      tempDir = Directory.systemTemp.createTempSync('mig_v9_test_');
+    });
+
+    tearDown(() async {
+      await DatabaseService.close();
+      if (tempDir.existsSync()) {
+        try {
+          tempDir.deleteSync(recursive: true);
+        } catch (_) {}
+      }
+    });
+
+    test('v8 库无损升级：行数不变、旧行按默认语义读出、新列新表都在', () async {
+      await _createV8Database(tempDir);
+      await DatabaseService.openAt(tempDir.path);
+      final db = await DatabaseService.database;
+
+      final version = await db.getVersion();
+      final sessions = await db.query('sessions');
+      final messages = await db.query('messages');
+      final summaries = await db.query('summary_nodes');
+      // ignore: avoid_print
+      print('  [OBS] v9 version=$version sessions=${sessions.length} '
+          'messages=${messages.length} summaries=${summaries.length}');
+      // ignore: avoid_print
+      print('  [OBS] 旧会话 => kind=${sessions.first['kind']} '
+          'overrides=${sessions.first['overrides_json']} '
+          'agent_type=${sessions.first['agent_type']} '
+          'tree=${sessions.first['tree_version']} dirty=${sessions.first['dirty_since_seq']}');
+      // ignore: avoid_print
+      print('  [OBS] 旧消息 => author=${messages.first['author']} '
+          'visibility=${messages.first['visibility']} '
+          'content=${messages.first['content']}');
+      // ignore: avoid_print
+      print('  [OBS] 旧摘要 => member_id=${summaries.first['member_id']}');
+
+      expect(version, 9);
+      expect(sessions.length, 1, reason: '迁移不删行');
+      expect(messages.length, 1, reason: '迁移不删行');
+      expect(summaries.length, 1, reason: '迁移不删行');
+
+      expect(sessions.first['agent_type'], 'reviewer', reason: '模板选择原样保留');
+      expect(sessions.first['kind'], 'single');
+      expect(sessions.first['overrides_json'], isNull);
+      expect(sessions.first['tree_version'], 3);
+      expect(sessions.first['dirty_since_seq'], 5);
+
+      expect(messages.first['content'], '升级前的消息');
+      expect(messages.first['attachments'], '[{"path":"old.png"}]');
+      expect(messages.first['author'], isNull);
+      expect(messages.first['visibility'], 'public');
+
+      expect(summaries.first['member_id'], isNull,
+          reason: '旧摘要的成员作用域为空 = 单会话路径');
+      expect(summaries.first['summary_json'], '{"summary":"旧摘要"}');
+
+      // group_members 新表（含 overrides_json 与 removed_at）。
+      final memberCols = await db.rawQuery('PRAGMA table_info(group_members)');
+      // ignore: avoid_print
+      print('  [OBS] group_members cols => '
+          '${memberCols.map((c) => c['name']).join(',')}');
+      expect(memberCols.map((c) => c['name']).toSet(), containsAll([
+        'id',
+        'group_session_id',
+        'name',
+        'template_name',
+        'overrides_json',
+        'removed_at',
+        'created_at',
+      ]));
+
+      // 模型读旧行也不炸。
+      final session = Session.fromRow(sessions.first);
+      expect(session.kind, 'single');
+      expect(session.overrides, isNull);
+      expect(Message.fromRow(messages.first).visibility, 'public');
+      expect(Message.fromRow(messages.first).author, isNull);
+    });
+
+    test('升级产物 vs 全新建库：table_info / index_list 逐项一致', () async {
+      await _createV8Database(tempDir);
+      await DatabaseService.openAt(tempDir.path);
+      final upgraded = await _structureFingerprint(
+          await DatabaseService.database);
+      await DatabaseService.close();
+
+      final freshDir = Directory.systemTemp.createTempSync('mig_v9_fresh_');
+      try {
+        await DatabaseService.openAt(freshDir.path);
+        final fresh =
+            await _structureFingerprint(await DatabaseService.database);
+        // ignore: avoid_print
+        print('  [OBS] 升级产物 messages 列 => '
+            '${((upgraded['messages'] as Map)['columns'] as Map).keys.join(",")}');
+        // ignore: avoid_print
+        print('  [OBS] 全新建库 messages 列 => '
+            '${((fresh['messages'] as Map)['columns'] as Map).keys.join(",")}');
+        // ignore: avoid_print
+        print('  [OBS] 升级产物 summary_nodes 索引 => '
+            '${(upgraded['summary_nodes'] as Map)['indexes']}');
+        // ignore: avoid_print
+        print('  [OBS] 全新建库 summary_nodes 索引 => '
+            '${(fresh['summary_nodes'] as Map)['indexes']}');
+        for (final table in upgraded.keys) {
+          expect(upgraded[table], equals(fresh[table]),
+              reason: '表 $table 的列/索引在「升级产物」与「全新建库」之间不一致');
+        }
       } finally {
         await DatabaseService.close();
         if (freshDir.existsSync()) {

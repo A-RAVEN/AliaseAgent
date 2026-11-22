@@ -146,6 +146,8 @@ function makeSessions(count: number): Session[] {
     parentSessionId: null,
     createdAt: index,
     updatedAt: index,
+    kind: 'single' as const,
+    overrides: null,
   }));
 }
 
@@ -347,6 +349,8 @@ function Harness({ scenario }: { scenario: HarnessScenario }) {
       parentSessionId: null,
       createdAt: Date.now(),
       updatedAt: Date.now(),
+      kind: 'single',
+      overrides: null,
     };
     setSessions((previous) => [created, ...previous]);
     setCurrentSessionId(created.id);

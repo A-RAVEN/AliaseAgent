@@ -29,10 +29,16 @@ class SessionRepository {
 
   /// 建一条会话记录。普通顶层会话不传 [parentSessionId]（存 NULL）；一次性子
   /// Agent 的运行记录传入父会话 id。该字段只影响记录归属，不改写父会话。
+  ///
+  /// [kind]：`single`（缺省，变更前的行为）或 `group`（组会话，单 Agent 入口一律
+  /// 拒绝/路由，见 `agent-group-chat` D16）。[overridesJson]：会话级覆盖层文本
+  /// （单会话用；成员覆盖层在成员行里）。
   Future<Session> create({
     String? title,
     String? agentType,
     String? parentSessionId,
+    String kind = Session.kindSingle,
+    String? overridesJson,
   }) async {
     final db = await DatabaseService.database;
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -43,6 +49,8 @@ class SessionRepository {
       parentSessionId: parentSessionId,
       createdAt: now,
       updatedAt: now,
+      kind: kind,
+      overridesJson: overridesJson,
     );
     await db.insert('sessions', session.toRow());
     return session;
@@ -101,6 +109,16 @@ class SessionRepository {
     final db = await DatabaseService.database;
     final now = DateTime.now().millisecondsSinceEpoch;
     await db.update('sessions', {'updated_at': now},
+        where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// 写会话级覆盖层（`overrides_json`）。[json] 为 null = 清空覆盖层（写 NULL）。
+  ///
+  /// **不改模板**：模板注册表与配置文件都不知情（`agent-instance-overrides` 的
+  /// 「覆盖层持久化且单会话可用」要求）。
+  Future<void> updateOverrides(String id, String? json) async {
+    final db = await DatabaseService.database;
+    await db.update('sessions', {'overrides_json': json},
         where: 'id = ?', whereArgs: [id]);
   }
 

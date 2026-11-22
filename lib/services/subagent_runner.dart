@@ -1,4 +1,4 @@
-// 一次性子 Agent 的运行服务（change `add-spawn-subagent-tool`）。
+﻿// 一次性子 Agent 的运行服务（change `add-spawn-subagent-tool`）。
 //
 // 职责边界：
 //   - 校验工具输入与候选模板（与普通创建共用 `AgentFactory.resolveCandidate`）；
@@ -174,7 +174,7 @@ class SubagentRunner {
     // ④ 父工作区按父句柄只读读取：不假定等于应用主目录，也不读界面当前会话。
     final WorkspaceQueryResult workspaceResult;
     try {
-      workspaceResult = _sidecar.getWorkspace(parent.sessionId);
+      workspaceResult = _sidecar.getWorkspace(parent.handle);
     } on StateError catch (e) {
       return SubagentPreparation.rejected(SubagentFailure(
           'workspace_unavailable', '读取父上下文工作区失败：$e'));

@@ -304,6 +304,10 @@ class FakeSidecar implements ISidecar {
     defaultWorkspaceByHandle[sessionId] = defaultWorkspace;
     final created = _createdByEnsure[sessionId] ?? !_ensured.contains(sessionId);
     _ensured.add(sessionId);
+    // 真实 sidecar 在**新建**上下文时把 defaultWorkspace 记进上下文；getWorkspace$nl    // 之后读回的就是它（组服务靠这条路径让成员继承组工作区）。桩这里照做。
+    if (created && defaultWorkspace != null) {
+      workspaceByHandle[sessionId] = defaultWorkspace;
+    }
     return created;
   }
 

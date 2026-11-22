@@ -161,6 +161,7 @@ class _AlwaysBiggerSummaryProvider implements SummaryProvider {
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
     String? sessionId,
+    String? systemPromptSuffix,
   }) async {
     summarizeCalls++;
     final lo = folded.isEmpty ? 0 : (folded.first.seq ?? 0);
@@ -204,6 +205,7 @@ class _FakeSummaryNodeRepository implements SummaryNodeRepository {
   @override
   Future<SummaryNode> materialize({
     required String sessionId,
+    String? memberId,
     required int level,
     required int startSeq,
     required int endSeq,
@@ -218,12 +220,14 @@ class _FakeSummaryNodeRepository implements SummaryNodeRepository {
   }) async {
     nodes.removeWhere((n) =>
         n.sessionId == sessionId &&
+        n.memberId == memberId &&
         n.level == level &&
         n.coveredMinSeq == coveredMinSeq &&
         n.coveredMaxSeq == coveredMaxSeq);
     final stored = SummaryNode(
       id: _nextId++,
       sessionId: sessionId,
+      memberId: memberId,
       level: level,
       startSeq: startSeq,
       endSeq: endSeq,
@@ -242,15 +246,21 @@ class _FakeSummaryNodeRepository implements SummaryNodeRepository {
   }
 
   @override
-  Future<List<SummaryNode>> queryBySession(String sessionId) async =>
+  Future<List<SummaryNode>> queryAllBySession(String sessionId) async =>
       nodes.where((n) => n.sessionId == sessionId).toList();
 
   @override
+  Future<List<SummaryNode>> queryBySession(String sessionId, {String? memberId}) async =>
+      nodes.where((n) => n.sessionId == sessionId && n.memberId == memberId).toList();
+
+  @override
   Future<SummaryNode?> findCovering(
-      String sessionId, int startSeq, int endSeq, {int? level}) async {
+      String sessionId, int startSeq, int endSeq,
+      {int? level, String? memberId}) async {
     final hits = nodes
         .where((n) =>
             n.sessionId == sessionId &&
+            n.memberId == memberId &&
             n.coveredMinSeq == startSeq &&
             n.coveredMaxSeq == endSeq &&
             (level == null || n.level == level))

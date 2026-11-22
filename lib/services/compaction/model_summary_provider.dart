@@ -72,6 +72,7 @@ class ModelSummaryProvider implements SummaryProvider {
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
     String? sessionId,
+    String? systemPromptSuffix,
   }) async {
     final provider = _resolver.resolve(config.provider);
     if (provider == null) {
@@ -132,9 +133,13 @@ class ModelSummaryProvider implements SummaryProvider {
       apiKey: apiKey,
       baseUrl: baseUrl,
       model: config.model,
-      systemPrompt: reference.isEmpty
-          ? kSummarySystemPrompt
-          : kSummarySystemPrompt + kReferenceOnlyProhibition,
+      systemPrompt: [
+        reference.isEmpty
+            ? kSummarySystemPrompt
+            : kSummarySystemPrompt + kReferenceOnlyProhibition,
+        if (systemPromptSuffix != null && systemPromptSuffix.isNotEmpty)
+          systemPromptSuffix,
+      ].join('\n'),
       messagesJson: jsonEncode(summaryMessages),
       toolsJson: '[]',
       thinkingMode: 'summary', // summary profile: thinking disabled, no max_tokens sent
@@ -331,6 +336,9 @@ class FakeSummaryProvider implements SummaryProvider {
   List<SummaryReference> get lastReference =>
       referencesPerCall.isEmpty ? const [] : referencesPerCall.last;
 
+  /// 每次 summarize 收到的系统文本追加段（组摘要的归属纪律）。
+  final List<String?> systemPromptSuffixes = [];
+
   /// Records the joined level-1 texts passed into the 2-pass summarizeText.
   String? lastSummarizeText;
 
@@ -345,9 +353,11 @@ class FakeSummaryProvider implements SummaryProvider {
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
     String? sessionId,
+    String? systemPromptSuffix,
   }) async {
     lastFolded = List.of(folded);
     referencesPerCall.add(List.of(reference));
+    systemPromptSuffixes.add(systemPromptSuffix);
     return SummaryResult(text: text, tokens: ContextEstimator.estimateTokens(text));
   }
 

@@ -8,7 +8,7 @@ class FakeSessionRepository implements SessionRepository {
   FakeSessionRepository(this.sessions);
 
   @override
-  Future<Session> create({String? title, String? agentType, String? parentSessionId}) async {
+  Future<Session> create({String? title, String? agentType, String? parentSessionId, String kind = Session.kindSingle, String? overridesJson}) async {
     final s = Session(
       id: 'new-${sessions.length}',
       title: title ?? 'New Chat',
@@ -16,6 +16,8 @@ class FakeSessionRepository implements SessionRepository {
       parentSessionId: parentSessionId,
       createdAt: DateTime.now().millisecondsSinceEpoch,
       updatedAt: DateTime.now().millisecondsSinceEpoch,
+      kind: kind,
+      overridesJson: overridesJson,
     );
     sessions.insert(0, s);
     return s;
@@ -28,6 +30,23 @@ class FakeSessionRepository implements SessionRepository {
     } catch (_) {
       return null;
     }
+  }
+
+  @override
+  Future<void> updateOverrides(String id, String? json) async {
+    final index = sessions.indexWhere((s) => s.id == id);
+    if (index < 0) return;
+    final old = sessions[index];
+    sessions[index] = Session(
+      id: old.id,
+      title: old.title,
+      agentType: old.agentType,
+      parentSessionId: old.parentSessionId,
+      createdAt: old.createdAt,
+      updatedAt: old.updatedAt,
+      kind: old.kind,
+      overridesJson: json,
+    );
   }
 
   @override
@@ -94,6 +113,8 @@ class FakeMessageRepository implements MessageRepository {
     int? tokenCount,
     int? outputTokenCount,
     List<String> attachments = const [],
+    String? author,
+    String visibility = Message.visibilityPublic,
   }) async {
     final msg = Message(
       id: 'msg-${messages.length}',
@@ -106,6 +127,8 @@ class FakeMessageRepository implements MessageRepository {
       outputTokenCount: outputTokenCount,
       createdAt: DateTime.now().millisecondsSinceEpoch,
       attachments: attachments,
+      author: author,
+      visibility: visibility,
     );
     messages.add(msg);
     return msg;
@@ -114,6 +137,28 @@ class FakeMessageRepository implements MessageRepository {
   @override
   Future<List<Message>> queryBySession(String sessionId) async {
     return messages.where((m) => m.sessionId == sessionId).toList();
+  }
+
+  @override
+  Future<List<Map<String, dynamic>>> queryRawAfterSeq(
+      String sessionId, int afterSeq) async {
+    return [
+      for (final message in messages)
+        if (message.sessionId == sessionId && (message.seq ?? 0) > afterSeq)
+          message.toRow(),
+    ]..sort((a, b) => (a['seq'] as int).compareTo(b['seq'] as int));
+  }
+
+  @override
+  Future<List<Map<String, dynamic>>> queryRawInRange(
+      String sessionId, int minSeq, int maxSeq) async {
+    return [
+      for (final message in messages)
+        if (message.sessionId == sessionId &&
+            (message.seq ?? 0) >= minSeq &&
+            (message.seq ?? 0) <= maxSeq)
+          message.toRow(),
+    ]..sort((a, b) => (a['seq'] as int).compareTo(b['seq'] as int));
   }
 
   @override

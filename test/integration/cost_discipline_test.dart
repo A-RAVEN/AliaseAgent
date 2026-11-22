@@ -151,6 +151,7 @@ class _AccumulatingSummaryProvider implements SummaryProvider {
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
     String? sessionId,
+    String? systemPromptSuffix,
   }) async {
     totalFoldedRaw += ContextEstimator.estimateConversation(folded);
     final tokens = ContextEstimator.estimateTokens(text);

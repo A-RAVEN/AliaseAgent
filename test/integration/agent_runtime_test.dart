@@ -335,6 +335,7 @@ class _RecordingSummaryProvider implements SummaryProvider {
     required AgentTypeConfig config,
     List<SummaryReference> reference = const [],
     String? sessionId,
+    String? systemPromptSuffix,
   }) async {
     calls.add(sessionId ?? '(null)');
     final lo = folded.isEmpty ? 0 : (folded.first.seq ?? 0);

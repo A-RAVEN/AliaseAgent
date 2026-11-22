@@ -91,6 +91,12 @@ const _otherCodeNames = <String, String>{
   // 模型目录条目的 JSON 字段名（add-provider-model-discovery）：不是配置键（它们
   // 只出现在 `providers.<名>.models` 数组的元素里），但用户文档讲解目录字段时
   // 会用反引号写出来，逐个到解析它们的文件里核对存在性。
+  // 群聊的消息作者与可见性（change agent-group-chat）：不是配置键也不是工具名，
+  // 但用户文档讲"谁写的、谁能看"时会用反引号写出来；到真实解析符号所在的
+  // Message.toRow / fromRow 里核对（列名与缺省值都在那个文件）。
+  'author': 'lib/models/message.dart',
+  'visibility': 'lib/models/message.dart',
+  'public': 'lib/models/message.dart',
   'display_name': 'lib/models/model_catalog_entry.dart',
   'context_window': 'lib/models/model_catalog_entry.dart',
   'native_endpoints': 'lib/models/model_catalog_entry.dart',

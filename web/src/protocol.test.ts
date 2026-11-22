@@ -9,7 +9,7 @@ import type { AddressInfo } from 'node:net';
 import { createServer } from 'node:net';
 import { once } from 'node:events';
 
-import { RpcClient, type ConnectionStatus } from './protocol';
+import { GROUP_RPC_METHODS, RpcClient, type ConnectionStatus } from './protocol';
 import { readLayoutConfig } from './tokens';
 
 function obs(label: string, value: unknown): void {
@@ -199,5 +199,62 @@ describe('断线期间的请求', () => {
     const client = makeClient();
     openClients.push(client);
     await expect(client.request('core.ping')).rejects.toThrow(/未连接/);
+  });
+});
+// ---------------------------------------------------------------------------
+// 群聊协议（change `agent-group-chat` 任务 8.1）
+// ---------------------------------------------------------------------------
+
+describe('群聊协议形状', () => {
+  it('八个群聊方法名在客户端清单里齐备（与核心 kCoreRpcMethodNames 同步）', () => {
+    expect([...GROUP_RPC_METHODS]).toEqual([
+      'group.create',
+      'group.list',
+      'group.delete',
+      'group.member.add',
+      'group.member.remove',
+      'group.member.update',
+      'group.send',
+      'group.view',
+    ]);
+  });
+
+  it('group.send 的实际 params 带 speaker（payload 判据，不是 DOM 选中值）', async () => {
+    const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+    const received: Array<Record<string, unknown>> = [];
+    server.on('connection', (socket) => {
+      socket.on('message', (raw) => {
+        const request = JSON.parse(raw.toString()) as {
+          id?: number;
+          method?: string;
+          params?: Record<string, unknown>;
+        };
+        if (request.method === 'group.send' && request.params) {
+          received.push(request.params);
+          socket.send(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: request.id,
+              result: { status: 'completed', memberId: request.params.speaker },
+            }),
+          );
+        }
+      });
+    });
+    await once(server, 'listening');
+    const port = (server.address() as AddressInfo).port;
+    const client = new RpcClient();
+    await client.connect(`ws://127.0.0.1:${port}`);
+    const result = await client.request<{ status: string; memberId: string }>(
+      'group.send',
+      { groupId: 'g-1', speaker: 'member-a', text: '说一句' },
+    );
+    obs('group.send 实际收到的 params', received);
+    expect(received).toEqual([
+      { groupId: 'g-1', speaker: 'member-a', text: '说一句' },
+    ]);
+    expect(result.memberId).toBe('member-a');
+    client.close();
+    server.close();
   });
 });

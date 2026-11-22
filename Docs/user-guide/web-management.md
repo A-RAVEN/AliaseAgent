@@ -123,11 +123,19 @@ web 端不再只能聊天：左侧会话栏能新建 / 改名 / 删除 / 切换�
 | `session.switchTemplate` | `{sessionId, templateName}` | `{sessionId, agentType, templateName}`；失败消息含阶段与候选名 |
 | `message.query` | `{sessionId, pageSize, anchor?, cursor?, before?}` | 分页（详见 web-core-shim 文档） |
 | `agent.send` | `{sessionId, text, attachments?}` | `{sessionId, status, finalText, error, metering}`；`attachments` 是 `attachment.upload` 返回的路径数组 |
-| `agent.cancel` | `{sessionId}` | `{sessionId, cancelled, reason?}` |
+| `agent.cancel` | `{sessionId, memberId?}` | `{sessionId, cancelled, reason?, memberId?}`；组会话按组路由（没有成员在运行时说真话，带 `memberId` 时指名） |
 | `config.get` | 无 | `{missing, configPath, providers, agentTypes, tools}`；**api_key 永不回显**（只给 hasApiKey） |
 | `config.save` | `{providers}` | `{config}`；providers 是**整份表**（没提交的现存 provider = 删除），值可带 `api_key`（留空 = 沿用）、`rename_from`（改名级联）、`models` + `discovered_at`（向导写目录） |
 | `provider.probe` | `{providerName}` | 探测报告（新增/更新/移除/丢弃/`discovered_at`），成功写回目录 |
 | `provider.probeFetch` | `{providerName?, baseUrl, apiKey}` | 探测结果（**只探测不写盘**，向导用） |
+| `group.create` | `{title?, workspace?}` | `{group}`；建组并建立组上下文 |
+| `group.list` | 无 | `{groups:[{...session, members:[...]}]}`；成员带 `removedAt` / 「overrides」 / 「effective」 |
+| `group.delete` | `{groupId}` | `{groupId, deleted:true}`；级联删除成员/消息/摘要 |
+| `group.member.add` | `{groupId, name, templateName, overrides?}` | `{groupId, member}` |
+| `group.member.remove` | `{groupId, memberId}` | 软删成员（行保留） |
+| `group.member.update` | `{groupId, memberId, name?, templateName?, overrides?, clearOverrides?}` | 原地改并重建实例 |
+| `group.send` | `{groupId, speaker, text?}` | `{status, memberId, ...}`；组级单运行门 |
+| `group.view` | `{groupId, memberId}` | `{snapshot\|null}`；本次运行内最近一次真实发出的快照 |
 | `template.list` | 无 | `{templates, tools, providers, defaultTools, thinkingEfforts, allowedModalities, effectiveNote}` |
 | `template.save` | `{originalName?, name, provider, model, thinkingEffort, systemPrompt, tools, maxContextTokens, inputModalities, compactionThresholdPercent?, compactionWaitThresholdPercent?}` | `{template, created}`；校验失败消息含字段名 |
 | `template.delete` | `{templateName}` | `{templateName, deleted:true}`；general 不可删、被会话引用拒删（名单在错误消息里） |

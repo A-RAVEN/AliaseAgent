@@ -22,6 +22,8 @@ import '../models/app_config.dart';
 import '../models/compaction_status.dart';
 import '../models/model_catalog_entry.dart';
 import '../models/provider_config.dart';
+import '../models/group_member.dart';
+import '../models/instance_overrides.dart';
 import '../models/session.dart';
 import '../services/agent.dart';
 import '../services/agent_config_resolver.dart';
@@ -31,6 +33,8 @@ import '../services/agent_session_controller.dart';
 import '../services/agent_template_controller.dart';
 import '../services/agent_type_registry.dart';
 import '../services/config_service.dart';
+import '../services/group_member_repository.dart';
+import '../services/group_service.dart';
 import '../services/database_service.dart';
 import '../services/image_budget.dart';
 import '../services/image_probe.dart';
@@ -85,6 +89,15 @@ const List<String> kCoreRpcMethodNames = <String>[
   'template.delete',
   'attachment.upload',
   'attachment.read',
+  // 群聊（change `agent-group-chat` §7）：八个方法，实现与清单必须一致。
+  'group.create',
+  'group.list',
+  'group.delete',
+  'group.member.add',
+  'group.member.remove',
+  'group.member.update',
+  'group.send',
+  'group.view',
 ];
 
 /// WebSocket 路径（与 web 客户端一致）。
@@ -130,6 +143,7 @@ class HeadlessCore {
     required this.providerResolverRef,
     required this.sessionController,
     required this.templateController,
+    required this.groups,
     required this.configPath,
     required this.attachmentsDir,
     required this.probe,
@@ -152,6 +166,9 @@ class HeadlessCore {
   /// 模板编辑 / 删除的协调者（design D9 / D10）。组合根构造，RPC 层复用同一份规则
   /// （`validate` / `save` / 校验错误字段），不另写一套。
   final AgentTemplateController templateController;
+
+  /// 组服务（change `agent-group-chat` §5）：组/成员生命周期、调度、共享工作区。
+  final GroupService groups;
 
   /// 核心读写的配置文件路径（design D14 注入点）。
   ///
@@ -435,6 +452,14 @@ class HeadlessCore {
       'template.delete': _handleTemplateDelete,
       'attachment.upload': _handleAttachmentUpload,
       'attachment.read': _handleAttachmentRead,
+      'group.create': _handleGroupCreate,
+      'group.list': _handleGroupList,
+      'group.delete': _handleGroupDelete,
+      'group.member.add': _handleGroupMemberAdd,
+      'group.member.remove': _handleGroupMemberRemove,
+      'group.member.update': _handleGroupMemberUpdate,
+      'group.send': _handleGroupSend,
+      'group.view': _handleGroupView,
     };
     for (final name in kCoreRpcMethodNames) {
       final handler = handlers[name];
@@ -569,6 +594,13 @@ class HeadlessCore {
       throw JsonRpcException(JsonRpcErrorCode.invalidParams,
           '会话 "$sessionId" 不存在：切换模板被拒绝');
     }
+    if (session.isGroup) {
+      throw JsonRpcException(
+        JsonRpcErrorCode.invalidParams,
+        '会话 "$sessionId" 是组会话（kind=group）：组会话没有自己的模板，'
+            '切换模板被拒绝（每个成员的模板来自成员行）',
+      );
+    }
     try {
       final agent = await sessionController.switchTemplate(
         session,
@@ -682,6 +714,16 @@ class HeadlessCore {
       throw JsonRpcException(
           JsonRpcErrorCode.invalidParams, '会话 "$sessionId" 不存在');
     }
+    // kind 守卫（agent-group-chat D16）：组会话不建/不复用单 Agent 实例 —— 否则
+    // `restore()` 会把整份原文（含他人 private 行）直接喂给模型，等于在投影之外
+    // 开了第二条出口。
+    if (session.isGroup) {
+      throw JsonRpcException(
+        JsonRpcErrorCode.invalidParams,
+        '会话 "$sessionId" 是组会话（kind=group）：单 Agent 的 agent.send 被拒绝，'
+            '请走群聊 RPC（group.send，带 speaker）',
+      );
+    }
 
     final callbacks = callbacksFor(sessionId);
     final Agent agent =
@@ -714,6 +756,27 @@ class HeadlessCore {
   Future<Map<String, dynamic>> _handleAgentCancel(
       Map<String, dynamic> params) async {
     final sessionId = _requireString(params, 'sessionId');
+    final rawMemberId = params['memberId'];
+    if (rawMemberId != null && rawMemberId is! String) {
+      throw const JsonRpcException(
+          JsonRpcErrorCode.invalidParams, 'Invalid params: memberId 必须是字符串或省略');
+    }
+    final session = await sessionRepo.get(sessionId);
+    // 组会话的 sessionId 不是任何成员实例的键：按组路由，不许返回"查不到实例"这种
+    // 假原因（agent-group-chat D18）。
+    if (session != null && session.isGroup) {
+      try {
+        final outcome =
+            await groups.cancel(sessionId, memberId: rawMemberId as String?);
+        return {
+          'sessionId': sessionId,
+          'groupId': sessionId,
+          ...outcome.toJson(),
+        };
+      } on GroupException catch (e) {
+        throw _groupError(e);
+      }
+    }
     final agent = agents.lookup(sessionId);
     if (agent == null) {
       return {'sessionId': sessionId, 'cancelled': false,
@@ -1228,6 +1291,230 @@ class HeadlessCore {
     };
   }
 
+  // ---------------------------------------------------------------------------
+  // 群聊（change `agent-group-chat` §7 / design D10、D16、D18）
+  // ---------------------------------------------------------------------------
+
+  /// 把组服务抛出的可归因错误转成 JSON-RPC 错误（带 code 与对象 id）。
+  JsonRpcException _groupError(GroupException e) => JsonRpcException(
+        JsonRpcErrorCode.invalidParams,
+        '群聊请求失败（${e.code}）：${e.message}',
+      );
+
+  Future<Map<String, dynamic>> _handleGroupCreate(
+      Map<String, dynamic> params) async {
+    final rawTitle = params['title'];
+    if (rawTitle != null && rawTitle is! String) {
+      throw const JsonRpcException(
+          JsonRpcErrorCode.invalidParams, 'Invalid params: title 必须是字符串或省略');
+    }
+    final rawWorkspace = params['workspace'];
+    if (rawWorkspace != null && rawWorkspace is! String) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: workspace 必须是字符串或省略');
+    }
+    try {
+      final session = await groups.createGroup(
+        title: rawTitle as String?,
+        workspace: rawWorkspace as String?,
+      );
+      return {'group': serializeSession(session)};
+    } on GroupException catch (e) {
+      throw _groupError(e);
+    }
+  }
+
+  Future<Map<String, dynamic>> _handleGroupList(
+      Map<String, dynamic> params) async {
+    final entries = await groups.listGroups();
+    final out = <Map<String, dynamic>>[];
+    for (final entry in entries) {
+      out.add({
+        ...serializeSession(entry.session),
+        'members': await groups.describeMembers(entry.session.id),
+      });
+    }
+    return {'groups': out};
+  }
+
+  Future<Map<String, dynamic>> _handleGroupDelete(
+      Map<String, dynamic> params) async {
+    final groupId = _requireString(params, 'groupId');
+    try {
+      await groups.deleteGroup(groupId);
+      return {'groupId': groupId, 'deleted': true};
+    } on GroupException catch (e) {
+      throw _groupError(e);
+    }
+  }
+
+  /// 解析 `overrides` 参数（对象 / 省略）；显式 `null` 当作"没有覆盖"。
+  AgentInstanceOverrides? _optionalOverrides(
+      Map<String, dynamic> params, String key) {
+    final raw = params[key];
+    if (raw == null) return null;
+    if (raw is! Map) {
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: $key 必须是对象或省略');
+    }
+    try {
+      return AgentInstanceOverrides.fromJson(
+          Map<String, dynamic>.from(raw));
+    } on AgentOverridesException catch (e) {
+      throw JsonRpcException(
+          JsonRpcErrorCode.invalidParams, '覆盖层被拒绝：${e.message}');
+    }
+  }
+
+  Future<Map<String, dynamic>> _describeSingleMember(
+      String groupId, String memberId) async {
+    final members = await groups.describeMembers(groupId);
+    for (final member in members) {
+      if (member['id'] == memberId) return member;
+    }
+    throw JsonRpcException(JsonRpcErrorCode.internalError,
+        '成员 "$memberId" 写入了但读不回来（组 "$groupId"）');
+  }
+
+  Future<Map<String, dynamic>> _handleGroupMemberAdd(
+      Map<String, dynamic> params) async {
+    final groupId = _requireString(params, 'groupId');
+    final name = _requireString(params, 'name');
+    final templateName = _requireString(params, 'templateName');
+    final overrides = _optionalOverrides(params, 'overrides');
+    try {
+      final member = await groups.addMember(
+        groupId: groupId,
+        name: name,
+        templateName: templateName,
+        overrides: overrides,
+      );
+      return {
+        'groupId': groupId,
+        'member': await _describeSingleMember(groupId, member.id),
+      };
+    } on GroupMemberNameConflictException catch (e) {
+      throw JsonRpcException(
+          JsonRpcErrorCode.invalidParams, '加入成员被拒绝：$e');
+    } on GroupException catch (e) {
+      throw _groupError(e);
+    } on AgentConfigException catch (e) {
+      throw JsonRpcException(
+          JsonRpcErrorCode.invalidParams, '成员实例创建失败：$e');
+    } on UnknownToolsException catch (e) {
+      throw JsonRpcException(
+          JsonRpcErrorCode.invalidParams, '成员实例创建失败：$e');
+    }
+  }
+
+  Future<Map<String, dynamic>> _handleGroupMemberRemove(
+      Map<String, dynamic> params) async {
+    final groupId = _requireString(params, 'groupId');
+    final memberId = _requireString(params, 'memberId');
+    try {
+      await groups.removeMember(groupId, memberId);
+      return {'groupId': groupId, 'memberId': memberId, 'removed': true};
+    } on GroupException catch (e) {
+      throw _groupError(e);
+    }
+  }
+
+  Future<Map<String, dynamic>> _handleGroupMemberUpdate(
+      Map<String, dynamic> params) async {
+    final groupId = _requireString(params, 'groupId');
+    final memberId = _requireString(params, 'memberId');
+    final rawName = params['name'];
+    if (rawName != null && rawName is! String) {
+      throw const JsonRpcException(
+          JsonRpcErrorCode.invalidParams, 'Invalid params: name 必须是字符串或省略');
+    }
+    final rawTemplate = params['templateName'];
+    if (rawTemplate != null && rawTemplate is! String) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: templateName 必须是字符串或省略');
+    }
+    final rawClear = params['clearOverrides'];
+    if (rawClear != null && rawClear is! bool) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: clearOverrides 必须是布尔或省略');
+    }
+    final overrides = _optionalOverrides(params, 'overrides');
+    try {
+      final member = await groups.updateMember(
+        groupId: groupId,
+        memberId: memberId,
+        name: rawName as String?,
+        templateName: rawTemplate as String?,
+        overrides: overrides,
+        clearOverrides: rawClear == true,
+      );
+      return {
+        'groupId': groupId,
+        'member': await _describeSingleMember(groupId, member.id),
+      };
+    } on GroupMemberNameConflictException catch (e) {
+      throw JsonRpcException(
+          JsonRpcErrorCode.invalidParams, '修改成员被拒绝：$e');
+    } on GroupException catch (e) {
+      throw _groupError(e);
+    }
+  }
+
+  Future<Map<String, dynamic>> _handleGroupSend(
+      Map<String, dynamic> params) async {
+    await _ready;
+    final groupId = _requireString(params, 'groupId');
+    final rawSpeaker = params['speaker'];
+    if (rawSpeaker is! String || rawSpeaker.isEmpty) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: 群发送必须带 speaker（成员 id）—— 不指定发言者的发送被拒绝');
+    }
+    final rawText = params['text'];
+    if (rawText != null && rawText is! String) {
+      throw const JsonRpcException(
+          JsonRpcErrorCode.invalidParams, 'Invalid params: text 必须是字符串或省略');
+    }
+    try {
+      final outcome = await groups.send(
+        groupId: groupId,
+        memberId: rawSpeaker,
+        text: rawText as String?,
+      );
+      if (outcome.status == 'failed') {
+        _sendEvent(groupId, 'turn.failed',
+            {'error': outcome.error ?? '(整轮失败但没有错误文本)'},
+            groupId: groupId, memberId: outcome.memberId);
+      }
+      return {
+        'groupId': groupId,
+        'sessionId': groupId,
+        ...outcome.toJson(),
+      };
+    } on GroupException catch (e) {
+      throw _groupError(e);
+    }
+  }
+
+  Future<Map<String, dynamic>> _handleGroupView(
+      Map<String, dynamic> params) async {
+    final groupId = _requireString(params, 'groupId');
+    final memberId = _requireString(params, 'memberId');
+    try {
+      await groups.requireGroup(groupId);
+      await groups.requireMember(groupId, memberId);
+      final snapshot = groups.snapshotOf(memberId);
+      return {
+        'groupId': groupId,
+        'memberId': memberId,
+        // 本次运行内没发过言（或已重启）⇒ null：界面显示占位，绝不用历史拼一份
+        // "没发过的上下文"。
+        'snapshot': snapshot == null ? null : serializeContextSnapshot(snapshot),
+      };
+    } on GroupException catch (e) {
+      throw _groupError(e);
+    }
+  }
+
   String _requireString(Map<String, dynamic> params, String key) {    final value = params[key];
     if (value is! String || value.isEmpty) {
       throw JsonRpcException(
@@ -1254,9 +1541,27 @@ class HeadlessCore {
   ///
   /// 公开（而不是私有）：`session.switchTemplate` / `session.delete` 必须把**当前**
   /// 回调交给新实例，组合根之外（测试）也要能核对"事件到底发往谁"。
-  AgentCallbacks callbacksFor(String sessionId) {
-    void event(String type, Map<String, dynamic> data) =>
-        _sendEvent(sessionId, type, data);
+  AgentCallbacks callbacksFor(String sessionId) =>
+      _eventCallbacks(sessionId, sessionId, null, null);
+
+  /// 成员事件回调：事件在既有 `sessionId` 之外带 `groupId` + `memberId`
+  /// （spec「成员事件带身份」；事件类型与语义不新造）。
+  AgentCallbacks callbacksForMember(GroupMember member) => _eventCallbacks(
+        member.groupSessionId,
+        member.handle,
+        member.groupSessionId,
+        member.id,
+      );
+
+  AgentCallbacks _eventCallbacks(
+      String sessionId, String handle, String? groupId, String? memberId) {
+    void event(String type, Map<String, dynamic> data) => _sendEvent(
+          sessionId,
+          type,
+          data,
+          groupId: groupId,
+          memberId: memberId,
+        );
     return AgentCallbacks(
       onUserMessage: (message) =>
           event('user.message', serializeMessage(message)),
@@ -1289,21 +1594,25 @@ class HeadlessCore {
       onCompactionStatusChanged: () {
         // 回调无参：回读当前 agent 的 getter（D9）。
         final status =
-            agents.lookup(sessionId)?.compactionStatus ?? CompactionStatus.idle;
+            agents.lookup(handle)?.compactionStatus ?? CompactionStatus.idle;
         event('compaction.status', serializeCompactionStatus(status));
       },
       onTitleChanged: (title) => event('session.title', {'title': title}),
       onMeteringChanged: () {
-        final metering = agents.lookup(sessionId)?.metering;
+        final metering = agents.lookup(handle)?.metering;
         event('agent.metering', metering?.toJson() ?? const {});
       },
     );
   }
 
   void _sendEvent(
-      String sessionId, String type, Map<String, dynamic> data) {
+      String sessionId, String type, Map<String, dynamic> data,
+      {String? groupId, String? memberId}) {
     _broadcast('agent.event', {
+      // `sessionId` 保留（既有消费者不受影响）；组事件另带 groupId/memberId。
       'sessionId': sessionId,
+      'groupId': ?groupId,
+      'memberId': ?memberId,
       'type': type,
       'data': data,
     });
@@ -1330,6 +1639,10 @@ Map<String, dynamic> serializeSession(Session session) => {
       'parentSessionId': session.parentSessionId,
       'createdAt': session.createdAt,
       'updatedAt': session.updatedAt,
+      // 客户端据此分流：组会话 → 组视图，单会话 → 聊天屏（agent-group-chat D16）。
+      'kind': session.kind,
+      // 会话级覆盖层：可空字段如实写出（没有覆盖时是 null，不是 {}）。
+      'overrides': session.overrides?.toJson(),
     };
 
 // -----------------------------------------------------------------------------
@@ -1420,7 +1733,22 @@ Future<HeadlessCore> buildHeadlessCore({
     configPath: configPath,
   );
 
-  return HeadlessCore(
+  // 组服务（change `agent-group-chat` §5）。回调晚绑定到 core：成员事件的
+  // groupId/memberId 由 core 的 `callbacksForMember` 组装。
+  late final HeadlessCore core;
+  final groups = GroupService(
+    sidecar: sidecar,
+    sessionRepo: sessionRepo,
+    memberRepo: GroupMemberRepository(),
+    messageRepo: messageRepo,
+    summaryNodeRepo: summaryNodeRepo,
+    agents: agents,
+    factory: factory,
+    templates: templates,
+    callbacksForMember: (member) => core.callbacksForMember(member),
+  );
+
+  core = HeadlessCore(
     config: config,
     sidecar: sidecar,
     sessionRepo: sessionRepo,
@@ -1433,11 +1761,13 @@ Future<HeadlessCore> buildHeadlessCore({
     providerResolverRef: providers,
     sessionController: sessionController,
     templateController: templateController,
+    groups: groups,
     configPath: configPath ?? ConfigService.configPath,
     attachmentsDir: attachmentsDir ?? ConfigService.attachmentsDir,
     probe: probe ?? HttpModelCatalogProbe(),
     ready: toolsReady.future,
   );
+  return core;
 }
 
 /// 生产组合根：单实例锁 → 配置 → sqflite ffi 工厂 + 开库 → sidecar →

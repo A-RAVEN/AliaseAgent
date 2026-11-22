@@ -748,7 +748,19 @@ class ChatScreenState extends State<ChatScreen> {
   ///
   /// 模板缺失、provider 未定义、窗口非法、工具未知都会给出**可区分**错误：
   /// 记日志并在界面顶部显示，绝不静默改用 `general` 或隐藏错误。
+  /// 当前选中的会话是不是组会话（`kind = group`）。
+  ///
+  /// 组会话在 Flutter 侧**没有组界面**：列表里可见，打开只显示「请在 web 组视图
+  /// 打开」占位，并且**不**为它建单 Agent 实例、不把整份原文当聊天历史加载
+  /// （`agent-group-chat` D16：堵死投影之外的第二条出口）。
+  bool get _currentIsGroup => _currentSession?.isGroup ?? false;
+
   Future<Agent?> _ensureAgentFor(Session session) async {
+    if (session.isGroup) {
+      debugPrint('[AliasAgent] 会话 "${session.id}" 是组会话（kind=group）：'
+          '跳过单 Agent 实例创建/恢复（组视图在 web 端）');
+      return null;
+    }
     // 条件注册（搜索 / 浏览器工具）完成前不校验工具名：否则一个合法的
     // "模板允许 web_search" 会在启动瞬间被误判成未知工具。
     if (!_toolsReadyCompleter.isCompleted) {
@@ -949,7 +961,8 @@ class ChatScreenState extends State<ChatScreen> {
       _loading = false;
       if (sessions.isNotEmpty && _currentId == null) {
         _currentId = sessions.first.id;
-        _loadMessages();
+        // 组会话不加载整份原文当聊天历史（打开只显示占位）。
+        if (!sessions.first.isGroup) _loadMessages();
       }
     });
     // 启动恢复：每个会话都按它自己的 agentType 建 / 复用 Agent 实例。工厂内部
@@ -1276,7 +1289,11 @@ class ChatScreenState extends State<ChatScreen> {
                 ),
               ),
               Expanded(
-                child: _viewMode == ContextViewMode.conversation
+                // 组会话只显示「请在 web 组视图打开」占位：不渲染组内容、不把整份
+                // 原文当单会话历史（agent-group-chat D16 / 任务 7.6）。
+                child: _currentIsGroup
+                    ? const _GroupSessionPlaceholder()
+                    : _viewMode == ContextViewMode.conversation
                     ? ChatArea(
                         items: _chatItems,
                         isStreaming: _isStreaming,
@@ -1352,6 +1369,46 @@ class ChatScreenState extends State<ChatScreen> {
           ),
         ),
       ],
+    );
+  }
+}
+/// 组会话在 Flutter 侧的占位（change `agent-group-chat` 任务 7.6 / design D16）。
+///
+/// 组视图本期只做 web：这里**只**说明去哪里看，不渲染任何组内容、不加载整份原文
+/// （否则等于在投影之外开了第二条出口）。文案与 `Docs/user-guide/group-chat.md`
+/// 的已知限制同源。
+class _GroupSessionPlaceholder extends StatelessWidget {
+  const _GroupSessionPlaceholder();
+
+  /// 占位文案（文档守卫与用例都读这一句）。
+  static const String message = '请在 web 组视图打开';
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.groups_outlined,
+                size: 48, color: Theme.of(context).colorScheme.primary),
+            const SizedBox(height: 12),
+            Text(
+              message,
+              key: const ValueKey('group-session-placeholder'),
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '这是组会话：成员共享一份原文，按成员投影后各自发言。'
+              'Flutter 端不提供组界面，也不把组原文当单会话历史加载。',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

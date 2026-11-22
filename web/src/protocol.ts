@@ -28,6 +28,10 @@ export interface Session {
   parentSessionId: string | null;
   createdAt: number;
   updatedAt: number;
+  /** single / group（change gent-group-chat）：客户端据此分流。 */
+  kind: 'single' | 'group';
+  /** 会话级覆盖层（没有覆盖时是 null）。 */
+  overrides: InstanceOverrides | null;
 }
 
 /**
@@ -70,6 +74,10 @@ export interface Message {
   outputTokenCount: number | null;
   createdAt: number;
   attachments: string[];
+  /** 稳定成员 id（用户消息为 null）。 */
+  author: string | null;
+  /** public / private-to-author。 */
+  visibility: 'public' | 'private-to-author';
 }
 
 export interface ContextBreakdown {
@@ -111,6 +119,9 @@ export interface SnapshotEventData {
 
 export interface AgentEvent {
   sessionId: string;
+  /** 组事件的身份（单会话事件没有这两个字段）。 */
+  groupId?: string;
+  memberId?: string;
   type: string;
   data: Record<string, unknown>;
 }
@@ -393,3 +404,86 @@ export class RpcClient {
     }
   }
 }
+// ---------------------------------------------------------------------------
+// 群聊（change `agent-group-chat`）
+// ---------------------------------------------------------------------------
+
+/** 覆盖层三字段（与核心 `AgentInstanceOverrides` 同一格式）。 */
+export interface InstanceOverrides {
+  toolsSubset?: string[] | null;
+  systemPromptAppend?: string | null;
+  thinkingEffort?: string | null;
+}
+
+/** 成员的生效配置（`group.list` 的 `effective`）：覆盖层"真的生效"在界面上可核。 */
+export interface EffectiveMemberConfig {
+  tools?: string[];
+  systemPrompt?: string;
+  thinkingMode?: string;
+  thinkingEffort?: string;
+  model?: string;
+  maxContextTokens?: number;
+  error?: string;
+}
+
+export interface GroupMemberSummary {
+  id: string;
+  name: string;
+  template: string;
+  /** 已移除成员的软删标记（毫秒）；null = 仍在组里。 */
+  removedAt: number | null;
+  overrides: InstanceOverrides | null;
+  effective: EffectiveMemberConfig | null;
+}
+
+export interface GroupSummary extends Session {
+  members: GroupMemberSummary[];
+}
+
+/** `group.list` 的结果形状。 */
+export interface GroupListResult {
+  groups: GroupSummary[];
+}
+
+/** `group.create` 的结果形状。 */
+export interface GroupCreateResult {
+  group: Session;
+}
+
+/** `group.send` 的结果形状（带 speaker；busy 是结构化结果，不是异常）。 */
+export interface GroupSendResult {
+  groupId: string;
+  sessionId: string;
+  status: string;
+  memberId: string;
+  finalText?: string | null;
+  error?: string | null;
+}
+
+/** `group.view` 的结果形状：本次运行内没发过言时 `snapshot` 为 null。 */
+export interface GroupViewResult {
+  groupId: string;
+  memberId: string;
+  snapshot: SnapshotEventData | null;
+}
+
+/** `agent.cancel` 在组会话上的结果形状。 */
+export interface GroupCancelResult {
+  sessionId: string;
+  groupId?: string;
+  cancelled: boolean;
+  reason: string;
+  memberId?: string | null;
+}
+
+/** 群聊 RPC 方法名（与核心 `kCoreRpcMethodNames` 的群聊段一一对应）。 */
+export const GROUP_RPC_METHODS = [
+  'group.create',
+  'group.list',
+  'group.delete',
+  'group.member.add',
+  'group.member.remove',
+  'group.member.update',
+  'group.send',
+  'group.view',
+] as const;

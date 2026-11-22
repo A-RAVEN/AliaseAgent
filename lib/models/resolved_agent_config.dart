@@ -73,19 +73,22 @@ class ResolvedAgentConfig {
   /// 这个实例能不能接收图片输入。
   bool get acceptsImages => inputModalities.contains('image');
 
-  /// 只改系统提示词 / 工具清单的派生副本（一次性子 Agent 用）。
+  /// 只改系统提示词 / 工具清单 / 思考档的派生副本（一次性子 Agent 与覆盖层用）。
   ///
   /// 共享的参数值全部原样带过来；调用方拿到的是新对象，父实例与模板都不受影响。
+  /// [thinking] 传 null = 保留原值；传 record = 整体替换模式与强度（空串强度是合法
+  /// 值，不能用"null 表示不变"那种写法）。
   ResolvedAgentConfig copyWith({
     String? systemPrompt,
     List<String>? tools,
+    ({String mode, String effort})? thinking,
   }) =>
       ResolvedAgentConfig(
         templateName: templateName,
         providerName: providerName,
         model: model,
-        thinkingMode: thinkingMode,
-        thinkingEffort: thinkingEffort,
+        thinkingMode: thinking?.mode ?? thinkingMode,
+        thinkingEffort: thinking?.effort ?? thinkingEffort,
         systemPrompt: systemPrompt ?? this.systemPrompt,
         tools: tools ?? this.tools,
         maxContextTokens: maxContextTokens,

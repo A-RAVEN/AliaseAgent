@@ -9,7 +9,7 @@ import 'package:path/path.dart' as p;
 import 'config_service.dart';
 
 class DatabaseService {
-  static const _schemaVersion = 8;
+  static const _schemaVersion = 9;
   static Database? _db;
 
   /// Whether a database is currently open. Compaction-tree persistence
@@ -66,7 +66,9 @@ class DatabaseService {
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         tree_version INTEGER NOT NULL DEFAULT 0,
-        dirty_since_seq INTEGER NOT NULL DEFAULT 0
+        dirty_since_seq INTEGER NOT NULL DEFAULT 0,
+        kind TEXT NOT NULL DEFAULT 'single',
+        overrides_json TEXT
       )
     ''');
     await db.execute('''
@@ -81,7 +83,9 @@ class DatabaseService {
         token_count INTEGER,
         output_token_count INTEGER,
         attachments TEXT,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        author TEXT,
+        visibility TEXT NOT NULL DEFAULT 'public'
       )
     ''');
     await db.execute(
@@ -92,17 +96,46 @@ class DatabaseService {
     await db.execute(
         'CREATE INDEX idx_sessions_updated ON sessions(updated_at DESC)');
     await _createSummaryNodes(db);
+    await _createGroupMembers(db);
+  }
+
+  /// 组成员表（change `agent-group-chat` D14 / D17）。
+  ///
+  /// 成员 id 是**稳定身份**（`messages.author` 存它，改名不改归属）。移除是软删
+  /// （写 `removed_at`、行保留）：唯一性只在**未移除**成员之间成立，靠部分唯一索引
+  /// `WHERE removed_at IS NULL`，删掉之后同名重建是新 id、不撞旧行。
+  static Future<void> _createGroupMembers(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS group_members (
+        id TEXT PRIMARY KEY,
+        group_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        template_name TEXT NOT NULL,
+        overrides_json TEXT,
+        removed_at INTEGER,
+        created_at INTEGER NOT NULL
+      )
+    ''');
+    await db.execute(
+        'CREATE INDEX IF NOT EXISTS idx_group_members_group ON group_members(group_session_id)');
+    await db.execute(
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_group_members_active_name '
+        'ON group_members(group_session_id, name) WHERE removed_at IS NULL');
   }
 
   /// Compaction tree table. Derived index over messages — originals are never
-  /// deleted/overwritten by compaction. Keyed by (session_id, level, start_seq,
-  /// end_seq) with a leaf-owner index and dense non-overlap constraint via
-  /// covered_min/covered_max_seq.
+  /// deleted/overwritten by compaction. Keyed by (session_id, member_id, level,
+  /// start_seq, end_seq) with a leaf-owner index and dense non-overlap constraint
+  /// via covered_min/covered_max_seq.
+  ///
+  /// `member_id` 是**成员作用域**（change `agent-group-chat`）：单 Agent 会话为空
+  /// （NULL），组会话按成员的投影视图各存一条；同一 span 两个成员各一行、互不覆盖。
   static Future<void> _createSummaryNodes(Database db) async {
     await db.execute('''
-      CREATE TABLE summary_nodes (
+      CREATE TABLE IF NOT EXISTS summary_nodes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        member_id TEXT,
         level INTEGER NOT NULL,
         start_seq INTEGER NOT NULL,
         end_seq INTEGER NOT NULL,
@@ -117,11 +150,11 @@ class DatabaseService {
       )
     ''');
     await db.execute(
-        'CREATE INDEX idx_summary_nodes_session ON summary_nodes(session_id)');
+        'CREATE INDEX IF NOT EXISTS idx_summary_nodes_session ON summary_nodes(session_id)');
     await db.execute(
-        'CREATE INDEX idx_summary_nodes_span ON summary_nodes(session_id, level, start_seq, end_seq)');
+        'CREATE INDEX IF NOT EXISTS idx_summary_nodes_span ON summary_nodes(session_id, member_id, level, start_seq, end_seq)');
     await db.execute(
-        'CREATE INDEX idx_summary_nodes_leaf_owner ON summary_nodes(session_id, covered_min_seq, covered_max_seq)');
+        'CREATE INDEX IF NOT EXISTS idx_summary_nodes_leaf_owner ON summary_nodes(session_id, member_id, covered_min_seq, covered_max_seq)');
   }
 
   /// Migrate schema versions 1→current sequentially.
@@ -170,6 +203,42 @@ class DatabaseService {
       // 既有顶层会话保持 NULL；列上的外键让删除父会话时子记录随父删除。
       await db.execute(
           'ALTER TABLE sessions ADD COLUMN parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE');
+    }
+    if (oldV <= 8) {
+      // v8 → v9：群聊（change `agent-group-chat` D14）。只加列 / 加表 / 加索引，
+      // 不删任何行；旧行语义：visibility='public'、author=NULL、kind='single'、
+      // overrides_json=NULL、member_id=NULL（= 单会话路径）。
+      await db.execute('ALTER TABLE messages ADD COLUMN author TEXT');
+      await db.execute(
+          "ALTER TABLE messages ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'");
+      await db.execute(
+          "ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'single'");
+      await db.execute('ALTER TABLE sessions ADD COLUMN overrides_json TEXT');
+      // 从更老的版本（≤3）升上来时 `_createSummaryNodes` 已经带 member_id，这里不能
+      // 再 ADD 一次（SQLite 会报 duplicate column）；按真实列名判断。手工造的残缺
+      // 旧库可能根本没有这张表（真实 v4 起一定有），那就不动它。
+      final summaryTables = (await db.rawQuery(
+              "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'summary_nodes'"))
+          .isNotEmpty;
+      final summaryColumns = summaryTables
+          ? (await db.rawQuery('PRAGMA table_info(summary_nodes)'))
+              .map((row) => row['name'])
+              .toSet()
+          : const <String>{};
+      if (summaryTables && !summaryColumns.contains('member_id')) {
+        await db.execute('ALTER TABLE summary_nodes ADD COLUMN member_id TEXT');
+      }
+      await _createGroupMembers(db);
+      // 含成员作用域的索引：span 查询与 leaf_owner 查询都按 (session, member) 先过滤。
+      // 旧索引（不含 member）在纯新增的升级里可以直接重建：它们只是索引，不承载数据。
+      if (summaryTables) {
+        await db.execute('DROP INDEX IF EXISTS idx_summary_nodes_span');
+        await db.execute('DROP INDEX IF EXISTS idx_summary_nodes_leaf_owner');
+        await db.execute(
+            'CREATE INDEX IF NOT EXISTS idx_summary_nodes_span ON summary_nodes(session_id, member_id, level, start_seq, end_seq)');
+        await db.execute(
+            'CREATE INDEX IF NOT EXISTS idx_summary_nodes_leaf_owner ON summary_nodes(session_id, member_id, covered_min_seq, covered_max_seq)');
+      }
     }
     if (oldV < 1 || oldV > _schemaVersion) {
       await db.execute('DROP TABLE IF EXISTS messages');

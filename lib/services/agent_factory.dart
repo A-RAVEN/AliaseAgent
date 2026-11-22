@@ -2,6 +2,8 @@ import '../models/agent_type_config.dart';
 import '../models/app_config.dart';
 import '../models/provider_config.dart';
 import '../models/resolved_agent_config.dart';
+import '../models/group_member.dart';
+import '../models/instance_overrides.dart';
 import '../models/session.dart';
 import 'agent.dart';
 import 'agent_config_resolver.dart';
@@ -11,6 +13,9 @@ import 'compaction/guard_anchors.dart';
 import 'compaction/model_summary_provider.dart';
 import 'compaction/seam_selector.dart';
 import 'compaction/summary_provider.dart';
+import 'group_member_context.dart';
+import 'group_prompts.dart';
+import 'group_view_loader.dart';
 import 'message_repository.dart';
 import 'provider_resolver.dart';
 import 'session_repository.dart';
@@ -168,7 +173,13 @@ class AgentFactory {
   ///
   /// 任何一项失败都抛出**可区分**错误（带模板名 / provider 名 / 未知工具名），并且
   /// **不产生任何副作用**：不 ensureContext、不写库、不登记实例。
-  AgentCandidate resolveCandidate(String templateName) {
+  /// 解析候选模板：模板存在、provider 已定义、窗口为正整数、工具名都在目录里。
+  ///
+  /// [overrides] 是成员/会话的覆盖层：**创建/恢复时**叠上去（工具子集求交、提示词
+  /// 追加、初始思考档），与模板的非推理字段同一口径（`kAgentTemplateEffectiveNote`）。
+  /// 单会话与群成员走**同一条**解析路径（`agent-instance-overrides` 的硬要求）。
+  AgentCandidate resolveCandidate(String templateName,
+      {AgentInstanceOverrides? overrides}) {
     final template = templates.lookup(templateName);
     if (template == null) {
       throw MissingAgentTemplateException(templateName);
@@ -179,10 +190,14 @@ class AgentFactory {
       throw MissingAgentProviderException(template.name, template.provider);
     }
     final resolver = AgentConfigResolver(providers);
-    final resolved = resolver.resolve(
+    var resolved = resolver.resolve(
       template: template,
       spillPreviewChars: config.spillPreviewChars,
     );
+    if (overrides != null && !overrides.isEmpty) {
+      // 保存路径已校验过；这里再求交一次（模板漂移只收紧 + 留一行说明）。
+      resolved = overrides.applyTo(resolved);
+    }
     final provider = resolver.resolveProvider(resolved);
     // 未知工具名在创建时显式失败并列出名字（不静默少给）。
     ToolCatalog.instance.resolve(resolved.tools,
@@ -209,7 +224,9 @@ class AgentFactory {
   Future<Agent> create(Session session,
       {AgentCallbacks callbacks = const AgentCallbacks(),
       ChildRunOptions? child}) async {
-    final candidate = resolveCandidate(session.agentType);
+    final sessionOverrides = session.overrides;
+    final candidate =
+        resolveCandidate(session.agentType, overrides: sessionOverrides);
     final template = candidate.template;
     var resolved = candidate.resolved;
     if (child != null) {
@@ -234,6 +251,10 @@ class AgentFactory {
 
     final agent = Agent(
       sessionId: session.id,
+      handle: session.id,
+      overrides: sessionOverrides,
+      // 单会话的覆盖层来自会话行：每轮现读（思考强度热更新）。
+      overridesLookup: () async => (await sessionRepo.get(session.id))?.overrides,
       agentTypeName: template.name,
       config: resolved,
       template: template,
@@ -258,6 +279,77 @@ class AgentFactory {
     );
     await agent.ensureContext(defaultWorkspace: child?.workspace);
     await agent.restore();
+    registry.register(agent);
+    return agent;
+  }
+
+  /// 创建一个**组成员实例**（change `agent-group-chat` / design D3、D7）。
+  ///
+  /// 与单会话实例的三处差别：
+  ///   ① `handle` 是成员专属句柄（`<groupId>::<memberId>`），`sessionId` 仍是组会话 id
+  ///      —— 消息写进组会话、摘要按它存，sidecar 上下文按 handle 隔离；
+  ///   ② 上下文工作区 = **组上下文已保存的工作区**（`group.create` 建立，成员继承，
+  ///      不给成员单独的私有工作区）；
+  ///   ③ 历史 = 该成员的**投影视图**（增量装配），不走全量 `restore()`。
+  /// 系统提示词追加组角色说明（`kGroupMemberRolePrompt`，复用 `systemPromptSuffix`
+  /// seam 的同一做法：只改实例配置副本，不改模板）。
+  Future<Agent> createMember({
+    required Session group,
+    required GroupMember member,
+    required String workspace,
+    required GroupViewLoader viewLoader,
+    Future<Map<String, String>> Function()? displayNamesResolver,
+    Future<AgentInstanceOverrides?> Function()? overridesLookup,
+    AgentCallbacks callbacks = const AgentCallbacks(),
+  }) async {
+    final overrides = member.overrides;
+    final candidate =
+        resolveCandidate(member.templateName, overrides: overrides);
+    final template = candidate.template;
+    var resolved = candidate.resolved;
+    resolved = resolved.copyWith(
+      systemPrompt:
+          '${resolved.systemPrompt}\n\n$kGroupMemberRolePrompt'.trim(),
+    );
+
+    final guardForAgent = guard ?? _guardFrom(template);
+    final injectedSummary = summaryProvider != null;
+    final summary = summaryProvider ??
+        ModelSummaryProvider(sidecar: sidecar, resolver: candidate.providers);
+    final seams = seamSelector ??
+        (!injectedSummary
+            ? ModelSeamSelector(sidecar: sidecar, resolver: candidate.providers)
+            : null);
+
+    final context = GroupMemberContext.fromMember(member);
+    final agent = Agent(
+      sessionId: group.id,
+      handle: context.handle,
+      member: context,
+      viewLoader: viewLoader,
+      overrides: overrides,
+      overridesLookup: overridesLookup,
+      agentTypeName: template.name,
+      config: resolved,
+      template: template,
+      templateLookup: templates.lookup,
+      providerLookup: (name) => providerResolver()?.resolve(name),
+      provider: candidate.provider,
+      sessionRepo: sessionRepo,
+      messageRepo: messageRepo,
+      summaryNodeRepo: summaryNodeRepo,
+      sidecar: sidecar,
+      summaryProvider: summary,
+      seamSelector: seams,
+      guard: guardForAgent,
+      backgroundFoldEnabled: backgroundFoldEnabled,
+      summaryStoreOpen: summaryStoreOpen(),
+      toolParallelMax: config.toolParallelMax,
+      callbacks: callbacks,
+      subagentRunner: subagentRunner,
+    )..displayNamesResolver = displayNamesResolver;
+    await agent.ensureContext(defaultWorkspace: workspace);
+    await agent.assembleMemberView();
     registry.register(agent);
     return agent;
   }

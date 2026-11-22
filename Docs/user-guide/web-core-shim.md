@@ -159,14 +159,14 @@ web 客户端本身是独立子项目，回退到最少形态就是恢复 `web/s
 | 方法 | 参数 | 返回 |
 |---|---|---|
 | `core.ping` | 无 | `{ok, service, protocolVersion, pid}` |
-| `session.list` | 无 | `{sessions: [{id,title,agentType,parentSessionId,createdAt,updatedAt}]}`（只含顶层会话，按最近更新倒序） |
+| `session.list` | 无 | `{sessions: [{id,title,agentType,parentSessionId,createdAt,updatedAt,kind,overrides}]}`（只含顶层会话，按最近更新倒序）；「kind」 为 「single」 / 「group」，客户端据此分流到聊天屏或组视图 |
 | `session.create` | `{title?, agentType?}` | `{session}`；`agentType` 必须是已存在的模板 |
 | `session.delete` | `{sessionId}` | `{sessionId, deleted}`；删除进行中的切换被拒（阶段 deleting） |
 | `session.rename` | `{sessionId, title}` | `{session}`；不存在的会话 → 可归因 `-32602` |
 | `session.switchTemplate` | `{sessionId, templateName}` | `{sessionId, agentType, templateName}`；失败消息含阶段与候选名 |
 | `message.query` | `{sessionId, pageSize, anchor?, cursor?, before?}` | `{sessionId,pageSize,messages,nextCursor,prevCursor}`。`pageSize` **请求方必填且为正整数**，缺参/非法返回 `-32602`；核心不提供默认页大小，也不发明上限。`anchor`：`tail`（缺省，取**最新一页**）或 `head`（从最旧开始）；`cursor` = 上一页的 `nextCursor`（前向，seq 升序）；`before` = 上一页的 `prevCursor`（反向，取更早一页）；`cursor` 与 `before` 不能同时出现。`prevCursor` 是本页首条 seq（没有更早页时为 null）。 |
 | `agent.send` | `{sessionId, text, attachments?}` | `{sessionId,status,finalText,error,metering}`；复用 `Agent.send` / `AgentFactory.ensure`。 |
-| `agent.cancel` | `{sessionId}` | `{sessionId,cancelled,reason?}`。 |
+| `agent.cancel` | `{sessionId, memberId?}` | `{sessionId,cancelled,reason?,memberId?,groupId?}`。单会话按实例表；**组会话按组路由**：组内没有成员在运行时说明「该组当前没有成员在运行」（不是"查不到实例"），有成员在运行时取消它并返回 `memberId`；带 `memberId` 时只取消该成员，不在运行则指名（**不静默成功**）。 |
 | `config.get` | 无 | `{missing, configPath, providers, agentTypes, tools}`；**api_key 不回显**（只给 hasApiKey） |
 | `config.save` | `{providers}` | `{config}`；整份 provider 表（没提交的现存 provider = 删除），支持 `rename_from` 改名级联与向导写目录 |
 | `provider.probe` | `{providerName}` | 探测报告（新增/更新/移除/丢弃 + `discovered_at`），成功写回目录 |
@@ -176,6 +176,14 @@ web 客户端本身是独立子项目，回退到最少形态就是恢复 `web/s
 | `template.delete` | `{templateName}` | `{templateName, deleted}`；general 不可删、被会话引用拒删（名单在错误里） |
 | `attachment.upload` | `{filename, base64}` | `{path, bytes, format, mediaType, width, height}`；单张上限与文件头魔数校验见管理屏文档 |
 | `attachment.read` | `{path}` | `{path, bytes, base64, mediaType}`；只读附件目录内文件 |
+| `group.create` | `{title?, workspace?}` | `{group}`；建组并建立组上下文（「workspace」 缺省 = 产品既有缺省工作区） |
+| `group.list` | 无 | `{groups:[{...session, members:[{id,name,template,removedAt,overrides,effective}]}]}`；含已移除成员 |
+| `group.delete` | `{groupId}` | `{groupId, deleted:true}`；先取消并销毁成员实例，成员/消息/摘要随外键级联删除 |
+| `group.member.add` | `{groupId, name, templateName, overrides?}` | `{groupId, member}`；重名/空名/未知模板/非法覆盖层都可归因拒绝 |
+| `group.member.remove` | `{groupId, memberId}` | `{groupId, memberId, removed:true}`；软删（行与历史保留，同名重建是新 id） |
+| `group.member.update` | `{groupId, memberId, name?, templateName?, overrides?, clearOverrides?}` | `{groupId, member}`；原地改（id 不变）并重建实例 |
+| `group.send` | `{groupId, speaker, text?}` | `{groupId, sessionId, status, memberId, finalText, error}`；「speaker」 必须是一个成员 id（缺 = `-32602`）；组级单运行门，busy 是结构化结果；不带 `text` 时有两个前置门（空视图 / 本人 assistant 结尾） |
+| `group.view` | `{groupId, memberId}` | `{groupId, memberId, snapshot\|null}`；只给该成员**本次运行内**最近一次真实发出的快照（重启后为空） |
 
 > 管理类方法的参数 / 返回细节、以及各管理屏怎么操作，见
 > [web 管理屏](web-management.md) 的「管理 RPC 表」。
