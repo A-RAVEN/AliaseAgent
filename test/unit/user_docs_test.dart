@@ -101,6 +101,15 @@ const _otherCodeNames = <String, String>{
   'license': 'lib/services/skills/skill_frontmatter.dart',
   'metadata': 'lib/services/skills/skill_frontmatter.dart',
   'compatibility': 'lib/services/skills/skill_frontmatter.dart',
+  // 无头核心 message.query 的 RPC 参数名与 anchor 取值（web-chat-screen）：用户文档
+  // 讲分页（尾锚/反向游标）时用反引号写出这些名字。它们不是工具参数，但确实在解析
+  // 它们的 headless_core.dart 里逐一存在（params['anchor'/'before'/'cursor']、
+  // anchor 取值 'tail'/'head'）。
+  'anchor': 'lib/core/headless_core.dart',
+  'tail': 'lib/core/headless_core.dart',
+  'head': 'lib/core/headless_core.dart',
+  'cursor': 'lib/core/headless_core.dart',
+  'before': 'lib/core/headless_core.dart',
 };
 
 /// 文档里"允许出现的、既不是配置键也不是工具名、但确实是代码里存在的名字"清单。

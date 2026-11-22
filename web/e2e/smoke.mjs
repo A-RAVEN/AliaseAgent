@@ -89,12 +89,24 @@ try {
   // 给 React 一次渲染时机（最后一条 assistant.message 可能在 streaming 结束前入列）。
   await new Promise((resolve) => setTimeout(resolve, 1200));
 
-  // 最小验证页刻意不做自动贴底；视觉验收前把消息列表滚到底，让最后一条可见。
-  await page.evaluate(() => {
+  // change web-chat-screen（审查 TC-5）：完整聊天屏自带贴底跟随，**不再手动滚底**——
+  // 手动滚底会用人造状态掏空"贴底"断言。这里只**测量**列表是否自然停在底部，
+  // 由 Dart 侧断言 distanceFromBottom ≤ 阈值（证明是产品自动跟随，不是驱动滚的）。
+  report.scroll = await page.evaluate(() => {
     const list = document.querySelector('[data-testid="message-list"]');
-    if (list) list.scrollTop = list.scrollHeight;
+    if (!list) return null;
+    const distanceFromBottom =
+      list.scrollHeight - list.scrollTop - list.clientHeight;
+    return {
+      scrollTop: list.scrollTop,
+      scrollHeight: list.scrollHeight,
+      clientHeight: list.clientHeight,
+      distanceFromBottom,
+    };
   });
-  await new Promise((resolve) => setTimeout(resolve, 200));
+  report.jumpButtonVisible = await page
+    .$eval('[data-testid="jump-to-bottom"]', () => true)
+    .catch(() => false);
 
   report.status = await page.$eval(
     '[data-testid="connection-status"]',

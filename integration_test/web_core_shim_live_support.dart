@@ -185,6 +185,19 @@ void runWebCoreShimLiveSuite() {
             reason: '页面必须渲染工具卡片');
         expect('${report['snapshot']}', contains('上下文窗口'));
 
+        // 自然贴底（change web-chat-screen 审查 TC-5）：完整屏自带贴底跟随，驱动
+        // **不手动滚底**；这里断言列表自然停在底部——距底距离 ≤ bottomThresholdPx
+        // （web/src/tokens.ts layoutConfig.bottomThresholdPx = 24px = 正文行高），
+        // 且贴底时跳底按钮隐藏。证明是产品自动跟随，不是驱动滚出来的人造状态。
+        final scroll = report['scroll'] as Map?;
+        _obs('自然贴底度量', scroll);
+        _obs('跳底按钮可见', report['jumpButtonVisible']);
+        expect(scroll, isNotNull, reason: '页面须报告滚动度量');
+        expect((scroll!['distanceFromBottom'] as num) <= 24, isTrue,
+            reason: '完整屏应自动贴底（距底 ≤ 24px token），而非靠驱动手动滚底');
+        expect(report['jumpButtonVisible'], false,
+            reason: '贴底时跳底按钮应隐藏');
+
         final eventTypes = [for (final event in events) '${event['type']}'];
         expect(eventTypes, contains('assistant.chunk'), reason: '必须有流式文本事件');
         expect(eventTypes, contains('assistant.message'));

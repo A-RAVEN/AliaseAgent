@@ -368,21 +368,60 @@ class HeadlessCore {
           'Invalid params: pageSize 必填且必须是正整数'
               '（核心不提供默认页大小，也不发明上限）');
     }
+    // 游标方向（change `web-chat-screen` 任务 1.2 / design D10 additive 扩展）：
+    //   - 只传 cursor（= afterSeq）：前向分页，语义与扩展前完全一致；
+    //   - 只传 before：反向分页，取 seq < before 的更早一页；
+    //   - 都不传：anchor=tail（缺省）取最新一页；anchor=head 取最旧页（兼容旧调用）；
+    //   - 两者同时出现是歧义请求，显式 -32602，不猜优先级。
     final cursor = params['cursor'];
     if (cursor != null && cursor is! int) {
       throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
           'Invalid params: cursor 必须是整数（上一页的 nextCursor）或省略');
     }
-    final page = await messageRepo.queryPageBySession(
-      sessionId,
-      pageSize: pageSize,
-      afterSeq: cursor as int?,
-    );
+    final before = params['before'];
+    if (before != null && before is! int) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: before 必须是整数（上一页的 prevCursor）或省略');
+    }
+    if (cursor != null && before != null) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: cursor 与 before 不能同时出现（前向/反向游标只能选一个）');
+    }
+    final anchorRaw = params['anchor'] ?? 'tail';
+    if (anchorRaw is! String || !const {'tail', 'head'}.contains(anchorRaw)) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: anchor 只能是 "tail"（最新页，缺省）或 "head"（最旧页）');
+    }
+    final MessagePage page;
+    if (before != null) {
+      page = await messageRepo.queryPageBeforeSeq(
+        sessionId,
+        pageSize: pageSize,
+        beforeSeq: before,
+      );
+    } else if (cursor != null) {
+      page = await messageRepo.queryPageBySession(
+        sessionId,
+        pageSize: pageSize,
+        afterSeq: cursor,
+      );
+    } else if (anchorRaw == 'head') {
+      page = await messageRepo.queryPageBySession(
+        sessionId,
+        pageSize: pageSize,
+      );
+    } else {
+      page = await messageRepo.queryLatestPageBySession(
+        sessionId,
+        pageSize: pageSize,
+      );
+    }
     return {
       'sessionId': sessionId,
       'pageSize': pageSize,
       'messages': [for (final message in page.messages) serializeMessage(message)],
       'nextCursor': page.nextCursor,
+      'prevCursor': page.prevCursor,
     };
   }
 

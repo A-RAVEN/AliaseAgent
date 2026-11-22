@@ -93,11 +93,19 @@ void main() {
 
   test('已知限制段落覆盖本 change 必须披露的边界', () {
     final text = doc.readAsStringSync();
+    // change `web-chat-screen` 任务 7.2（审查 TC-2）：文档已从"验证页"口径改成
+    // **完整聊天屏**口径，旧锚点 '最小验证页' 不再成立（改前红证据见 change 报告）。
+    // 这里只换锚点集、不改断言语义：仍然要求每个边界锚点都在文档里出现，
+    // 并且新增的锚点覆盖完整屏必须披露的边界（折叠/贴底/跳底/重连）。
     for (final anchor in const [
-      '最小验证页',
+      '完整聊天屏',
       '无鉴权',
       '全量载入历史',
       '测试',
+      '折叠',
+      '贴底跟随',
+      '跳底按钮',
+      '重连',
     ]) {
       _obs('边界锚点', anchor);
       expect(text, contains(anchor), reason: '已知限制缺少锚点 "$anchor"');

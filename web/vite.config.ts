@@ -1,4 +1,5 @@
-import { defineConfig, loadEnv } from 'vite';
+import { loadEnv } from 'vite';
+import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 
@@ -21,5 +22,13 @@ export default defineConfig(({ mode }) => {
           },
         }
       : undefined,
+    // 纯逻辑单测走 vitest（node 环境，无 DOM）：renderMessages 归一/去重、
+    // protocol 重连状态机、分页请求形状、tokens 一致性。**布局/滚动断言不在这里**
+    // ——jsdom 没有布局引擎，那些走 `e2e/layout.mjs` 的 puppeteer 真实渲染。
+    test: {
+      environment: 'node',
+      include: ['src/**/*.test.ts'],
+      reporters: ['default'],
+    },
   };
 });

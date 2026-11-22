@@ -686,8 +686,11 @@ void main() {
         expect(all.map((m) => m.content).toList(),
             ['msg-0', 'msg-1', 'msg-2', 'msg-3', 'msg-4']);
 
+        // change `web-chat-screen` 任务 1.2 起，不传游标缺省是**尾锚**（最新页）；
+        // 本用例验证的是"从最旧开始的既有前向分页语义"，故显式 anchor=head。
+        // 断言本身未改（前向 afterSeq/nextCursor 的语义仍是扩展前那一套）。
         final page1 = await harness.ws.request('message.query',
-            {'sessionId': session.id, 'pageSize': 2});
+            {'sessionId': session.id, 'pageSize': 2, 'anchor': 'head'});
         final r1 = page1['result'] as Map;
         _obs('第 1 页', r1);
         expect([for (final m in r1['messages'] as List) (m as Map)['content']],
@@ -742,6 +745,172 @@ void main() {
           _obs('非法参数 $params 的响应', response);
           expect((response['error'] as Map)['code'], -32602,
               reason: 'params=$params');
+        }
+      } finally {
+        await harness.stop();
+      }
+    });
+
+    // change `web-chat-screen` 任务 1.3：message.query 的 additive 扩展（尾锚 +
+    // 反向游标 + prevCursor）。三条用例先红后绿，红证据见 change 报告。
+    test('尾锚：不传游标取最新一页（不是最旧页）+ prevCursor', () async {
+      final harness = await _Harness.start();
+      try {
+        final session = await harness.core.sessionRepo.create();
+        for (var i = 0; i < 5; i++) {
+          await harness.core.messageRepo
+              .insert(sessionId: session.id, role: 'user', content: 'msg-$i');
+        }
+        final tail = await harness.ws.request('message.query',
+            {'sessionId': session.id, 'pageSize': 2});
+        final tailPage = tail['result'] as Map;
+        _obs('尾锚页（不传游标）', tailPage);
+        expect(
+            [
+              for (final m in tailPage['messages'] as List)
+                (m as Map)['content']
+            ],
+            ['msg-3', 'msg-4'],
+            reason: '不传游标必须是"最新一页"（尾锚），不是最旧页');
+        expect(
+            [for (final m in tailPage['messages'] as List) (m as Map)['seq']],
+            [4, 5],
+            reason: '尾锚页内按 seq 升序返回');
+        expect(tailPage['prevCursor'], 4,
+            reason: 'prevCursor = 本页首条 seq，指向更早页');
+        expect(tailPage['nextCursor'], isNull,
+            reason: '尾锚页之后没有更新的页，前向游标为 null');
+
+        final explicit = await harness.ws.request('message.query',
+            {'sessionId': session.id, 'pageSize': 2, 'anchor': 'tail'});
+        _obs('显式 anchor=tail', explicit['result']);
+        expect(
+            [
+              for (final m in (explicit['result'] as Map)['messages'] as List)
+                (m as Map)['content']
+            ],
+            ['msg-3', 'msg-4']);
+      } finally {
+        await harness.stop();
+      }
+    });
+
+    test('反向游标：beforeSeq 加载更早一页，不重叠、走到头 prevCursor 为 null', () async {
+      final harness = await _Harness.start();
+      try {
+        final session = await harness.core.sessionRepo.create();
+        for (var i = 0; i < 5; i++) {
+          await harness.core.messageRepo
+              .insert(sessionId: session.id, role: 'user', content: 'msg-$i');
+        }
+        final newest = await harness.ws.request('message.query',
+            {'sessionId': session.id, 'pageSize': 2});
+        final newestPage = newest['result'] as Map;
+        _obs('最新页', newestPage);
+        final newestSeqs = [
+          for (final m in newestPage['messages'] as List) (m as Map)['seq']
+        ];
+        final newestContents = [
+          for (final m in newestPage['messages'] as List) (m as Map)['content']
+        ];
+
+        final earlier1 = await harness.ws.request('message.query',
+            {'sessionId': session.id, 'pageSize': 2, 'before': newestPage['prevCursor']});
+        final earlier1Page = earlier1['result'] as Map;
+        _obs('上翻第 1 页', earlier1Page);
+        expect(
+            [
+              for (final m in earlier1Page['messages'] as List)
+                (m as Map)['content']
+            ],
+            ['msg-1', 'msg-2'],
+            reason: 'before=最新页首条 seq，返回 seq 更小的更早一页（升序）');
+        expect(
+            [for (final m in earlier1Page['messages'] as List) (m as Map)['seq']],
+            [2, 3]);
+        expect(earlier1Page['prevCursor'], 2);
+        // 不重叠：两页的 seq 集合交集必须为空。
+        _obs('两页 seq', '$newestSeqs / ${earlier1Page['messages']}');
+        final earlierSeqs = {
+          for (final m in earlier1Page['messages'] as List) (m as Map)['seq']
+        };
+        expect(newestSeqs.toSet().intersection(earlierSeqs), isEmpty,
+            reason: '反向页不得与当前页重叠（newest=$newestContents）');
+
+        final earlier2 = await harness.ws.request('message.query',
+            {'sessionId': session.id, 'pageSize': 2, 'before': earlier1Page['prevCursor']});
+        final earlier2Page = earlier2['result'] as Map;
+        _obs('上翻第 2 页', earlier2Page);
+        expect(
+            [
+              for (final m in earlier2Page['messages'] as List)
+                (m as Map)['content']
+            ],
+            ['msg-0']);
+        expect(earlier2Page['prevCursor'], isNull,
+            reason: '没有更早消息时 prevCursor 必须是 null（不是 0/负数）');
+      } finally {
+        await harness.stop();
+      }
+    });
+
+    test('前向兼容：anchor=head + cursor/nextCursor 与扩展前一致', () async {
+      final harness = await _Harness.start();
+      try {
+        final session = await harness.core.sessionRepo.create();
+        for (var i = 0; i < 5; i++) {
+          await harness.core.messageRepo
+              .insert(sessionId: session.id, role: 'user', content: 'msg-$i');
+        }
+        final head = await harness.ws.request('message.query',
+            {'sessionId': session.id, 'pageSize': 2, 'anchor': 'head'});
+        final headPage = head['result'] as Map;
+        _obs('anchor=head 首页', headPage);
+        expect(
+            [
+              for (final m in headPage['messages'] as List) (m as Map)['content']
+            ],
+            ['msg-0', 'msg-1'],
+            reason: 'anchor=head 保留"从最旧开始"的既有语义');
+        expect(headPage['nextCursor'], 2);
+        expect(headPage['prevCursor'], isNull,
+            reason: '最旧页没有更早页，prevCursor 为 null');
+
+        // 只传 cursor（不传 anchor）仍是前向分页：这是既有 web 客户端/Flutter 的
+        // 调用形状，不能被尾锚缺省改成反向。
+        final forward = await harness.ws.request('message.query',
+            {'sessionId': session.id, 'pageSize': 2, 'cursor': 2});
+        final forwardPage = forward['result'] as Map;
+        _obs('cursor=2 前向页', forwardPage);
+        expect(
+            [
+              for (final m in forwardPage['messages'] as List)
+                (m as Map)['content']
+            ],
+            ['msg-2', 'msg-3']);
+        expect(forwardPage['nextCursor'], 4);
+        expect(forwardPage['prevCursor'], 3,
+            reason: 'prevCursor 与页内首条 seq 一致（本页 seq 3..4）');
+      } finally {
+        await harness.stop();
+      }
+    });
+
+    test('非法 anchor / cursor 与 before 同时出现 → -32602', () async {
+      final harness = await _Harness.start();
+      try {
+        final session = await harness.core.sessionRepo.create();
+        await harness.core.messageRepo
+            .insert(sessionId: session.id, role: 'user', content: 'x');
+        for (final params in <Map<String, dynamic>>[
+          {'sessionId': session.id, 'pageSize': 2, 'anchor': 'middle'},
+          {'sessionId': session.id, 'pageSize': 2, 'anchor': 1},
+          {'sessionId': session.id, 'pageSize': 2, 'before': 'bad'},
+          {'sessionId': session.id, 'pageSize': 2, 'cursor': 1, 'before': 2},
+        ]) {
+          final response = await harness.ws.request('message.query', params);
+          _obs('非法分页参数 $params 的响应', response);
+          expect((response['error'] as Map)['code'], -32602, reason: 'params=$params');
         }
       } finally {
         await harness.stop();

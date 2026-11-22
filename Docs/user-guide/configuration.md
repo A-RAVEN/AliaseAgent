@@ -185,6 +185,15 @@ Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单�
 
 日志在 `%USERPROFILE%\.aliasagent\logs\sidecar.log`。
 
+## web 客户端（构建期参数）
+
+web 聊天屏的重连/心跳/贴底参数不是 `config.json` 里的键，而是**构建 web 客户端时**的
+Vite 环境变量（`VITE_BOTTOM_THRESHOLD_PX`、`VITE_RECONNECT_BASE_MS`、
+`VITE_RECONNECT_CAP_MS`、`VITE_HEARTBEAT_PERIOD_MS`、`VITE_HEARTBEAT_TIMEOUT_MS`）。
+默认值、单位与配错时的行为见
+[无头核心与 web 客户端](web-core-shim.md#完整聊天屏参数) 的「完整聊天屏参数」表
+（那份表与 `web/src/tokens.ts` 由文档守卫绑定，这里不复制数值以免两处漂移）。
+
 ## 限制
 
 - **搜索、spill 改完要重启应用**：配置只在启动时读一次，运行中改这些段不生效（Provider 例外：用 `Providers` 页改完立即写回，之后创建或恢复的实例就用新值）。

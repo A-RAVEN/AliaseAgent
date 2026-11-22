@@ -1,7 +1,12 @@
 // 无头核心的线上契约（与 `lib/core/event_serialization.dart` /
 // `lib/core/headless_core.dart` 的序列化形状一一对应）。
 //
-// 只覆盖最小验证页用到的字段；未知字段一律按 unknown 处理（不假装知道）。
+// 只覆盖 web 客户端用到的字段；未知字段一律按 unknown 处理（不假装知道）。
+//
+// change `web-chat-screen` 任务 6.1 增：**断开自动重连（指数退避）+ 心跳
+// （周期 core.ping，超时判死）**。四个参数取 `tokens.ts` 的可配常量，不在本文件
+// 里写数字（design D12）；重连成功由 `onReconnected` 通知 App 重拉当前页。
+import { layoutConfig, type LayoutConfig } from './tokens';
 
 export interface JsonRpcError {
   code: number;
@@ -78,19 +83,48 @@ export interface AgentEvent {
   data: Record<string, unknown>;
 }
 
-export type ConnectionStatus = 'connecting' | 'open' | 'closed';
+export type ConnectionStatus = 'connecting' | 'open' | 'reconnecting' | 'closed';
 
 type Pending = {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
 };
 
+export interface RpcClientOptions {
+  /** 重连/心跳参数（默认取 tokens 的 `layoutConfig`，测试可注入小值）。 */
+  config?: LayoutConfig;
+  /** WebSocket 构造（默认浏览器全局；vitest 里注入 `ws` 的实现）。 */
+  webSocketFactory?: (url: string) => WebSocket;
+}
+
+/** WHATWG WebSocket 的 OPEN 常量（平台值，不是业务魔数）。 */
+const SOCKET_OPEN = 1;
+
 export class RpcClient {
+  constructor(options: RpcClientOptions = {}) {
+    this.config = options.config ?? layoutConfig;
+    this.createSocket =
+      options.webSocketFactory ?? ((url: string) => new WebSocket(url));
+  }
+
+  private readonly config: LayoutConfig;
+  private readonly createSocket: (url: string) => WebSocket;
   private socket: WebSocket | null = null;
+  private url: string | null = null;
   private nextId = 1;
   private readonly pending = new Map<number, Pending>();
   private readonly eventHandlers = new Set<(event: AgentEvent) => void>();
   private readonly statusHandlers = new Set<(status: ConnectionStatus) => void>();
+  private readonly reconnectedHandlers = new Set<() => void>();
+
+  /** 已成功连上一次：之后的成功连接都算"重连"（要触发状态恢复）。 */
+  private hasConnectedBefore = false;
+  /** 用户主动 close()：不再自动重连。 */
+  private closedByUser = false;
+  private reconnectAttempt = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private heartbeatInFlight = false;
 
   onEvent(handler: (event: AgentEvent) => void): () => void {
     this.eventHandlers.add(handler);
@@ -102,29 +136,17 @@ export class RpcClient {
     return () => this.statusHandlers.delete(handler);
   }
 
+  /** 重连成功（不是首次连接）时回调：App 用它重拉当前页恢复状态（design D12）。 */
+  onReconnected(handler: () => void): () => void {
+    this.reconnectedHandlers.add(handler);
+    return () => this.reconnectedHandlers.delete(handler);
+  }
+
   connect(url: string): Promise<void> {
-    this.emitStatus('connecting');
-    return new Promise((resolve, reject) => {
-      const socket = new WebSocket(url);
-      this.socket = socket;
-      socket.onopen = () => {
-        this.emitStatus('open');
-        resolve();
-      };
-      socket.onerror = () => {
-        if (socket.readyState !== WebSocket.OPEN) {
-          reject(new Error(`无法连接核心 WebSocket：${url}`));
-        }
-      };
-      socket.onclose = () => {
-        this.emitStatus('closed');
-        for (const [, pending] of this.pending) {
-          pending.reject(new Error('WebSocket 已断开'));
-        }
-        this.pending.clear();
-      };
-      socket.onmessage = (message) => this.handleMessage(message.data);
-    });
+    this.url = url;
+    this.closedByUser = false;
+    this.emitStatus(this.hasConnectedBefore ? 'reconnecting' : 'connecting');
+    return this.openSocket();
   }
 
   request<T = unknown>(
@@ -132,7 +154,7 @@ export class RpcClient {
     params: Record<string, unknown> = {},
   ): Promise<T> {
     const socket = this.socket;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
+    if (!socket || socket.readyState !== SOCKET_OPEN) {
       return Promise.reject(new Error('WebSocket 未连接'));
     }
     const id = this.nextId++;
@@ -146,12 +168,168 @@ export class RpcClient {
   }
 
   close(): void {
-    this.socket?.close();
+    this.closedByUser = true;
+    this.clearReconnectTimer();
+    this.stopHeartbeat();
+    const socket = this.socket;
     this.socket = null;
+    if (socket) {
+      try {
+        socket.close();
+      } catch {
+        // 关闭失败不影响状态收尾。
+      }
+    }
+    this.rejectPending(new Error('WebSocket 已关闭'));
+    this.emitStatus('closed');
   }
+
+  // -------------------------------------------------------------------------
+  // 连接 / 重连
+  // -------------------------------------------------------------------------
+
+  private openSocket(): Promise<void> {
+    const url = this.url;
+    if (!url) return Promise.reject(new Error('没有 WebSocket 地址'));
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const socket = this.createSocket(url);
+      this.socket = socket;
+
+      socket.onopen = () => {
+        this.emitStatus('open');
+        this.reconnectAttempt = 0;
+        this.startHeartbeat();
+        const isReconnect = this.hasConnectedBefore;
+        this.hasConnectedBefore = true;
+        settled = true;
+        resolve();
+        if (isReconnect) {
+          for (const handler of this.reconnectedHandlers) handler();
+        }
+      };
+      socket.onerror = () => {
+        if (settled) return;
+        settled = true;
+        reject(new Error(`无法连接核心 WebSocket：${url}`));
+      };
+      socket.onclose = () => {
+        this.stopHeartbeat();
+        this.rejectPending(new Error('WebSocket 已断开'));
+        if (this.socket === socket) this.socket = null;
+        if (!settled) {
+          settled = true;
+          reject(new Error(`无法连接核心 WebSocket：${url}`));
+        }
+        this.scheduleReconnect();
+      };
+      socket.onmessage = (message) => this.handleMessage(message.data);
+    });
+  }
+
+  /** 指数退避：base × 2^attempt，封顶 cap；用户主动关闭后不再重连。 */
+  private scheduleReconnect(): void {
+    if (this.closedByUser) {
+      this.emitStatus('closed');
+      return;
+    }
+    this.emitStatus('reconnecting');
+    const delay = Math.min(
+      this.config.reconnectCapMs,
+      this.config.reconnectBaseMs * 2 ** this.reconnectAttempt,
+    );
+    this.reconnectAttempt += 1;
+    this.clearReconnectTimer();
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.closedByUser) return;
+      this.openSocket().catch(() => {
+        // 失败由 onclose 继续排下一次（不吞掉重连链）。
+      });
+    }, delay);
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 心跳：周期 core.ping；超时未回判死 → 关连接 → 触发重连
+  // -------------------------------------------------------------------------
+
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), this.config.heartbeatPeriodMs);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer !== null) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    this.heartbeatInFlight = false;
+  }
+
+  private sendHeartbeat(): void {
+    if (this.heartbeatInFlight) return;
+    const socket = this.socket;
+    if (!socket || socket.readyState !== SOCKET_OPEN) return;
+    this.heartbeatInFlight = true;
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      this.heartbeatInFlight = false;
+      // 超时判死：主动关连接，onclose 会走退避重连。
+      this.markDead();
+    }, this.config.heartbeatTimeoutMs);
+    this.request('core.ping').then(
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        this.heartbeatInFlight = false;
+      },
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        this.heartbeatInFlight = false;
+      },
+    );
+  }
+
+  private markDead(): void {
+    this.stopHeartbeat();
+    this.rejectPending(new Error('心跳超时：判定连接已死'));
+    const socket = this.socket;
+    if (!socket) {
+      this.scheduleReconnect();
+      return;
+    }
+    this.socket = null;
+    try {
+      // 关连接后由 onclose 走同一条退避重连路径（只排一次，避免双倍退避）。
+      socket.close();
+    } catch {
+      this.scheduleReconnect();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 收消息
+  // -------------------------------------------------------------------------
 
   private emitStatus(status: ConnectionStatus): void {
     for (const handler of this.statusHandlers) handler(status);
+  }
+
+  private rejectPending(error: Error): void {
+    for (const [, pending] of this.pending) pending.reject(error);
+    this.pending.clear();
   }
 
   private handleMessage(raw: unknown): void {

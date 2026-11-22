@@ -309,3 +309,5 @@ web 验证页里"很多 agent 回复直接不显示"，并出现大量空的 ASS
 
 完整聊天屏 change（TODO.md 已登记）；或用户要求先给最小页打补丁时。
 
+> **2026-11-22 已修**：change `web-chat-screen` 落地——空正文工具轮每 toolCall 渲染单行折叠卡（不产生空气泡）、toolCalls/thinking 内联渲染、live 与 history 经按 id 合并/归一/去重一致、最终消息聚合 toolCalls 去重。vitest 逻辑用例 + puppeteer 真实渲染用例覆盖。
+

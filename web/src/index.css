@@ -1,15 +1,58 @@
 @import "tailwindcss";
 
+/* 显式声明扫描范围：生产构建（vite root=web）靠自动探测也能扫到 src，但 harness
+   构建的 vite root 是 `test/harness`，自动探测不到 `src/components` —— 不写这一行，
+   布局测试量到的会是"没有 Tailwind 工具类"的裸元素高度（实测 36px 而不是 24px）。 */
+@source "./";
+
+/* 设计 tokens 的 CSS 侧（change `web-chat-screen` 任务 1.1 / design D2~D6）。
+   数值必须与 `src/tokens.ts` 一致：`src/tokens.test.ts` 解析两份逐项比对，
+   改一处不改另一处会红。组件只用这些生成的工具类，不写裸 hex / 任意间距。 */
+@theme {
+  --color-bg: #0b0f19;
+  --color-surface: #111726;
+  --color-surface-2: #1b2333;
+  --color-line: #2a3346;
+  --color-muted: #8b93a7;
+  --color-fg: #e6e9ef;
+  --color-accent: #38bdf8;
+  --color-ok: #34d399;
+  --color-warn: #fbbf24;
+  --color-danger: #f87171;
+
+  --text-xs: 12px;
+  --text-xs--line-height: 16px;
+  --text-sm: 14px;
+  --text-sm--line-height: 20px;
+  --text-base: 16px;
+  --text-base--line-height: 24px;
+  --text-xl: 20px;
+  --text-xl--line-height: 24px;
+  --text-2xl: 25px;
+  --text-2xl--line-height: 32px;
+
+  --radius-card: 8px;
+  --radius-panel: 12px;
+
+  --shadow-e1: 0 1px 2px rgb(0 0 0 / 0.35);
+  --shadow-e2: 0 8px 24px rgb(0 0 0 / 0.45);
+}
+
 html,
 body,
 #root {
   height: 100%;
 }
 
+/* 颜色也钉在 tokens 上：html 不写会保留 UA 默认黑色，审计会把它算成第 7 种颜色。 */
+html {
+  color: var(--color-fg);
+}
+
 body {
   margin: 0;
-  background: #0b0f19;
-  color: #e6e9ef;
+  background: var(--color-bg);
+  color: var(--color-fg);
   font-family:
     ui-sans-serif,
     system-ui,
@@ -17,4 +60,65 @@ body {
     "Segoe UI",
     "Microsoft YaHei",
     sans-serif;
+  font-weight: 400;
+}
+
+/* Markdown 正文：只允许 tokens 里的字号/间距，避免各组件各写一套。 */
+.markdown-body {
+  font-size: var(--text-base);
+  line-height: var(--text-base--line-height);
+  overflow-wrap: anywhere;
+}
+.markdown-body > :first-child {
+  margin-top: 0;
+}
+.markdown-body > :last-child {
+  margin-bottom: 0;
+}
+.markdown-body p,
+.markdown-body ul,
+.markdown-body ol,
+.markdown-body pre,
+.markdown-body blockquote {
+  margin: 8px 0;
+}
+.markdown-body ul,
+.markdown-body ol {
+  padding-left: 24px;
+}
+.markdown-body ul {
+  list-style: disc;
+}
+.markdown-body ol {
+  list-style: decimal;
+}
+.markdown-body code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: var(--text-sm);
+  background: var(--color-surface-2);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.markdown-body pre {
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-card);
+  padding: 12px;
+  overflow-x: auto;
+}
+.markdown-body pre code {
+  background: transparent;
+  padding: 0;
+}
+.markdown-body a {
+  color: var(--color-accent);
+  text-decoration: underline;
+}
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3 {
+  font-size: var(--text-xl);
+  line-height: var(--text-xl--line-height);
+  font-weight: 600;
+  margin: 12px 0 8px;
 }

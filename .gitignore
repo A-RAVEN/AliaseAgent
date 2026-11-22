@@ -85,3 +85,5 @@ live_real_context_output.txt
 # web 客户端（React/Vite）：依赖与构建产物不入库，lockfile 入
 web/node_modules/
 web/dist/
+# 布局/滚动测试用的 harness 构建产物（puppeteer 真实渲染通道）
+web/dist-test/
