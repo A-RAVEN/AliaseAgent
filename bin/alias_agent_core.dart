@@ -95,6 +95,11 @@ Future<void> main(List<String> args) async {
   }
 
   stdout.writeln('AliasAgent 无头核心已启动');
+  final notice = core.startupNotice;
+  if (notice != null) {
+    // change `web-management-ui` D2：空配置启动时把原因写清楚（web 端会显示首启向导）。
+    stdout.writeln('  $notice');
+  }
   stdout.writeln('  URL:       ${core.url}');
   stdout.writeln('  WebSocket: ${core.websocketUrl}');
   stdout.writeln('  RPC:       ${core.rpcMethods.join(', ')}');

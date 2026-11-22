@@ -311,3 +311,25 @@ web 验证页里"很多 agent 回复直接不显示"，并出现大量空的 ASS
 
 > **2026-11-22 已修**：change `web-chat-screen` 落地——空正文工具轮每 toolCall 渲染单行折叠卡（不产生空气泡）、toolCalls/thinking 内联渲染、live 与 history 经按 id 合并/归一/去重一致、最终消息聚合 toolCalls 去重。vitest 逻辑用例 + puppeteer 真实渲染用例覆盖。
 
+## 用户库历史遗留孤儿消息（会话已删、messages 行仍在）
+
+**来源**: web-management-ui §5.3 视觉验收后只读核库（2026-11-22）
+**发现日期**: 2026-11-22
+**相关文件**: `lib/services/database_service.dart`（`_onConfigure` PRAGMA foreign_keys / messages 表 ON DELETE CASCADE）、`lib/services/session_repository.dart`（`delete`）
+
+### 症状
+
+用户真实 `~/.aliasagent/aliasagent.db` 里 256 条 messages 的 session_id 不在 sessions 表（38 个历史会话 id，仅 2 个会话存活）。验收前备份与验收后计数相同（256），属历史遗留，非 web-management-ui 引入。
+
+### 根因
+
+当前删除路径级联正确：`_onConfigure` 每连接 `PRAGMA foreign_keys = ON` + messages/summary_nodes `ON DELETE CASCADE`；实测新建测试会话→删除后按内容全表搜索零残留、孤儿计数不增。历史孤儿应产生于外键强制启用之前的旧版删除（具体版本未追溯，不断言）。
+
+### 期望方向
+
+代码路径无需改（已正确）。数据层可选一次性清理迁移（`DELETE FROM messages WHERE session_id NOT IN (SELECT id FROM sessions)`，summary_nodes 同理）；孤儿行不影响现有查询（均按 session_id 过滤），不清理也无用户可见症状。是否清理需独立 change 拍板。
+
+### 重新考虑时机
+
+下一个动 database_service 迁移版本的 change 顺手评估；或用户要求瘦身库体积时。
+

@@ -114,8 +114,12 @@ class AgentFactory {
   /// provider 引用表（provider 只在创建时解析一次，密钥交给实例当私有依赖）。
   final ProviderResolver? Function() providerResolver;
 
-  /// 当前配置（`spill.preview_chars` 等顶层值）。
-  final AppConfig config;
+  /// 当前配置（`spill.preview_chars` / `tool.parallel_max` 等顶层值）。
+  ///
+  /// **可变**：change `web-management-ui` D1 要求运行中的核心在配置写盘后进程内同步
+  /// （等价物 = Flutter `main.dart._applyProviderConfig`）。已创建的实例仍用自己冻结
+  /// 的那份生效配置（只读这个字段的地方是"此后创建实例"的路径）。
+  AppConfig config;
 
   final ISidecar sidecar;
   final SessionRepository sessionRepo;

@@ -33,6 +33,8 @@ export interface ChatItem {
   text?: string;
   tool?: ToolCardModel;
   thinking?: ThinkingCardModel;
+  /** 用户消息的附件路径（change `web-management-ui` 2.2）。 */
+  attachments?: string[];
 }
 
 export function renderMessages(view: ChatView): ChatItem[] {
@@ -42,7 +44,12 @@ export function renderMessages(view: ChatView): ChatItem[] {
   for (const raw of view.messages) {
     const message = normalizeMessage(raw);
     if (message.role === 'user') {
-      items.push({ key: `user:${message.id}`, kind: 'user', text: message.content });
+      items.push({
+        key: `user:${message.id}`,
+        kind: 'user',
+        text: message.content,
+        attachments: message.attachments,
+      });
       continue;
     }
     for (const block of message.thinking) {

@@ -30,6 +30,34 @@ export interface Session {
   updatedAt: number;
 }
 
+/**
+ * 管理屏只依赖这个最小请求接口（change `web-management-ui` design D14）。
+ *
+ * `RpcClient` 满足它；puppeteer harness / vitest 注入假实现，于是管理屏的交互测试
+ * 不需要起核心进程。
+ */
+export interface CoreClient {
+  request<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T>;
+}
+
+/** `session.create` / `session.rename` 的结果形状（与核心 handler 一致）。 */
+export interface SessionResult {
+  session: Session;
+}
+
+/** `session.delete` 的结果形状。 */
+export interface SessionDeleteResult {
+  sessionId: string;
+  deleted: boolean;
+}
+
+/** `session.switchTemplate` 的结果形状。 */
+export interface SessionSwitchResult {
+  sessionId: string;
+  agentType: string;
+  templateName: string;
+}
+
 export interface Message {
   id: string;
   seq: number | null;
@@ -73,6 +101,10 @@ export interface SnapshotEventData {
   agentType: string;
   breakdown: ContextBreakdown | null;
   messages: unknown[];
+  /** `ContextSnapshot.toRawJson()` 的 system（change `web-management-ui` 2.3）。 */
+  system?: string;
+  /** `ContextSnapshot.toRawJson()` 的 tools（工具定义的 JSON 字符串）。 */
+  tools?: string;
   skillFailures: string[];
   skillFailureNotice: string | null;
 }

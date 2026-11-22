@@ -31,6 +31,13 @@ class AgentTypeRegistry {
     _types[config.name] = config;
   }
 
+  /// 删除一个模板（change `web-management-ui` D10，additive）。
+  ///
+  /// 返回是否真的删掉了：不存在返回 false（调用方据此给可归因结果，不假装成功）。
+  /// **产品层守卫**（general 不可删 / 被会话引用拒删）在调用方实现，这里只做注册表
+  /// 本分：删掉这一条定义，不碰运行中的实例。
+  bool remove(String name) => _types.remove(name) != null;
+
   bool contains(String name) => _types.containsKey(name);
 
   AgentTypeConfig? lookup(String name) => _types[name];

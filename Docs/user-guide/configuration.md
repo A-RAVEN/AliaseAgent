@@ -185,6 +185,19 @@ Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单�
 
 日志在 `%USERPROFILE%\.aliasagent\logs\sidecar.log`。
 
+## 图片上限（不是配置项）
+
+贴进输入框的图片有两条**代码里固定的**规矩，它们**不是** `config.json` 的键（改不了）：
+
+- **单张上限 33554432 字节（32 MiB）**：取自 `lib/services/image_budget.dart` 的
+  常量 `kMaxImageBytes`，出处 `Docs/DeepSeekAPIDoc.md` §6.4.3「单张图片最大大小」。
+  超限的图片在上传时就被拒绝并显示原因（不截断、不静默丢图）。
+- **类型判定看文件头魔数**（PNG / JPEG / GIF / WebP），扩展名与声明的 MIME 都不作数。
+
+一次请求里的图片总预算（单张字节、单边像素、一次请求图片数、base64 负载总量）沿用
+发送期既有规则：超预算的那一张会被换成**可见**的省略说明，其余照发。怎么在 web 端贴图、
+会看到哪些提示，见 [web 管理屏](web-management.md)。
+
 ## web 客户端（构建期参数）
 
 web 聊天屏的重连/心跳/贴底参数不是 `config.json` 里的键，而是**构建 web 客户端时**的

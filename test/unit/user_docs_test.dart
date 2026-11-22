@@ -110,6 +110,15 @@ const _otherCodeNames = <String, String>{
   'head': 'lib/core/headless_core.dart',
   'cursor': 'lib/core/headless_core.dart',
   'before': 'lib/core/headless_core.dart',
+  // web 管理屏的 RPC 参数名与阶段名（change `web-management-ui`）：用户文档讲管理
+  // RPC 参数、模板删除守卫与附件上传时用反引号写出这些名字。它们不是配置键也不是
+  // 工具参数，但确实在解析/产生它们的文件里逐一存在。
+  'attachments': 'lib/core/headless_core.dart',
+  'base64': 'lib/core/headless_core.dart',
+  'filename': 'lib/core/headless_core.dart',
+  'rename_from': 'lib/core/headless_core.dart',
+  // 会话表里的模板引用列名（模板删除守卫讲的"悬空引用"就是它）。
+  'agent_type': 'lib/models/session.dart',
 };
 
 /// 文档里"允许出现的、既不是配置键也不是工具名、但确实是代码里存在的名字"清单。

@@ -168,14 +168,15 @@
 
 - 由 AliasAgent 作为客户端发现外部工具并转成现有工具定义；不要求模型服务支持服务端工具，也不是子 agent 的前置。
 
-### [ ] GUI web 化（路线 C）—— 已定方向，待立项
+### [ ] GUI web 化（路线 C）—— 核心 shim/聊天屏/管理界面已归档，余规模优化/TS 迁移/原生壳
 
 - **2026-11-16 用户拍板**：直接 web 化，原「路线 A（Flutter 内立设计系统）先做」取消（原话「既然web化是目标，就没有A的必要吧」）。方向与理由见 `Docs/RoadMap.md` 三节 GUI 改造条。
 - 形态：Dart 业务层抽成无头进程 + WebSocket/JSON-RPC shim，C++ sidecar 仍由该进程 FFI 加载；界面用 web 技术栈重写（Tauri 壳或内嵌浏览器窗口，立项时定）。周级、多 change、逐屏灰度迁移。
 - F-002（工具/思考卡片默认折叠单行）、F-003（贴底自动跟随）、F-004（跳到底部按钮）并入新界面需求，不在旧 Flutter 界面修（2026-11-16 用户选定；台账 `Docs/feedback.md`）。
-- **第一块基石已实施**：change `web-ui-core-shim`（无头 Dart 核心 + WebSocket/JSON-RPC + 本地静态服务 + 最小 web 验证页）已按 tasks §1~§5 落地，待主循环 §6 验证与归档。
+- **第一块基石已归档**：change `web-ui-core-shim`（无头 Dart 核心 + WebSocket/JSON-RPC + 本地静态服务 + 最小 web 验证页）2026-11-21 归档（提交 `fd9f340`），主 spec `web-core-shim` 已同步。
 - **后继条目（change `web-ui-core-shim` 任务 5.3 登记，2026-11-18）**：
-  - [ ] 完整聊天屏 change：把最小验证页扩成完整聊天屏，含 F-002（卡片折叠）、F-003（自动贴底）、F-004（跳底按钮）、会话列表虚拟滚动、消息分页落地（RPC 读路径的 `message.query` 游标分页已存在，屏上要真正用起来）。**另须修两个已确认缺陷（2026-11-21 用户拍板并入本 change）**：① 工具轮空正文助手消息渲染成空气泡、真回复被淹没（`web/src/App.tsx`，见 `Docs/known-bugs.md`「web 验证页」条）——空正文工具轮不渲染独立空气泡、toolCalls/thinking 折叠成卡、live 与 history 一致；② WS 断开无自动重连（`web/src/protocol.ts` onclose 只置状态）——加自动重连+心跳保活。
+  - [x] 完整聊天屏 change：把最小验证页扩成完整聊天屏，含 F-002（卡片折叠）、F-003（自动贴底）、F-004（跳底按钮）、会话列表虚拟滚动、消息分页落地（RPC 读路径的 `message.query` 游标分页已存在，屏上要真正用起来）。**另须修两个已确认缺陷（2026-11-21 用户拍板并入本 change）**：① 工具轮空正文助手消息渲染成空气泡、真回复被淹没（`web/src/App.tsx`，见 `Docs/known-bugs.md`「web 验证页」条）——空正文工具轮不渲染独立空气泡、toolCalls/thinking 折叠成卡、live 与 history 一致；② WS 断开无自动重连（`web/src/protocol.ts` onclose 只置状态）——加自动重连+心跳保活。**已完成**：change `web-chat-screen` 2026-11-22 归档（提交 `2f57b43`），两缺陷均修，主 spec `web-chat-screen` 已同步。
+  - [x] 管理界面 change（2026-11-22 用户拍板三阶段合一）：① 会话管理（新建/删除/重命名/切换模板）③ 图片输入+上下文占用环 ② provider/模板管理+首启向导；含核心接线（配置进程内同步/空配置启动门/AgentSessionController）。**已完成**：change `web-management-ui` 2026-11-22 归档，22/22 任务、双变异红证据、11 屏视觉验收、live 探测写回核验；主 spec `web-management-ui` 新建 + `agent-template-management`（删除开放）/`web-core-shim`（空配置启动）MODIFIED 同步。
   - [ ] 规模优化 change：`Agent.restore` / `_history` 的内存边界（发送/创建路径仍全量载入历史并常驻属现状；本 change 只落了 `message.query` 读路径分页）。
   - [ ] 核心 Dart→TS 迁移 change（终态 C++ + TS）：Dart 核心是过渡层，架构验证通过后迁移；C++ sidecar 恒留。
 

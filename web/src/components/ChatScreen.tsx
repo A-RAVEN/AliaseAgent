@@ -6,14 +6,18 @@
 //
 // 结构（design D1/D6）：左会话栏（虚拟滚动）· 消息区（虚拟滚动 + 贴底跟随 + 跳底）·
 // 顶部状态 · 底部输入。
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 
 import type { ChatView } from '../chat/model';
+import type { PendingImage } from '../chat/attachments';
 import { renderMessages } from '../chat/render';
+import type { AgentSwitchFailure } from '../manage/logic';
 import type { ConnectionStatus, Session, SnapshotEventData } from '../protocol';
 import { Composer } from './Composer';
 import { ConnectionBadge } from './ConnectionBadge';
+import { ContextRing } from './ContextRing';
 import { MessageList } from './MessageList';
+import { RealContextView } from './RealContextView';
 import { SessionList } from './SessionList';
 
 export interface ChatScreenProps {
@@ -21,6 +25,14 @@ export interface ChatScreenProps {
   sessions: Session[];
   currentSessionId: string | null;
   onSelectSession: (sessionId: string) => void;
+  /** 会话管理（change `web-management-ui` 1.3）：不传 = 隐藏对应入口（详见 SessionList）。 */
+  onCreateSession?: () => void;
+  onRenameSession?: (sessionId: string, title: string) => void;
+  onDeleteSession?: (sessionId: string) => void;
+  templates?: string[];
+  currentAgentType?: string | null;
+  onSwitchTemplate?: (templateName: string) => void;
+  switchFailure?: AgentSwitchFailure | null;
   view: ChatView;
   hasEarlier: boolean;
   loadingEarlier: boolean;
@@ -30,7 +42,14 @@ export interface ChatScreenProps {
   skillFailures: string[];
   snapshot: SnapshotEventData | null;
   metering: Record<string, unknown> | null;
-  onSend: (text: string) => void;
+  onSend: (text: string, images?: PendingImage[]) => void;
+  /** 附件路径 → data URL（null = 取回失败）；来源是 `attachment.read`（design D12）。 */
+  attachments?: Record<string, string | null>;
+  /** 当前模板是否声明 image 模态（null = 未知 ⇒ 不提示「图片未发送」）。 */
+  imagesSupported?: boolean | null;
+  /** 打开管理屏（change `web-management-ui` 3.3 / 3.4）；不传 = 不显示入口。 */
+  onOpenProviders?: () => void;
+  onOpenTemplates?: () => void;
 }
 
 export function ChatScreen({
@@ -38,6 +57,13 @@ export function ChatScreen({
   sessions,
   currentSessionId,
   onSelectSession,
+  onCreateSession,
+  onRenameSession,
+  onDeleteSession,
+  templates = [],
+  currentAgentType = null,
+  onSwitchTemplate,
+  switchFailure = null,
   view,
   hasEarlier,
   loadingEarlier,
@@ -48,19 +74,15 @@ export function ChatScreen({
   snapshot,
   metering,
   onSend,
+  attachments = {},
+  imagesSupported = null,
+  onOpenProviders,
+  onOpenTemplates,
 }: ChatScreenProps) {
   const items = useMemo(() => renderMessages(view), [view]);
+  const [showRealContext, setShowRealContext] = useState(false);
   const currentTitle =
     sessions.find((session) => session.id === currentSessionId)?.title ?? '（未选择会话）';
-
-  const breakdownRows = snapshot?.breakdown
-    ? [
-        { label: '二级摘要', value: snapshot.breakdown.level2Tokens },
-        { label: '一级摘要', value: snapshot.breakdown.level1Tokens },
-        { label: '原文', value: snapshot.breakdown.rawTokens },
-        { label: '系统+工具', value: snapshot.breakdown.fixedOverheadTokens },
-      ]
-    : [];
 
   return (
     <div
@@ -68,9 +90,16 @@ export function ChatScreen({
       data-streaming={view.isStreaming ? 'true' : 'false'}
     >
       <header className="flex items-center justify-between gap-4 border-b border-line px-4 py-3">
-        <div className="min-w-0">
+        {/* min-w-0 + flex-1：让标题列真的被约束住，truncate 才有东西可截 ——
+            只写 min-w-0 时这一列按内容宽度撑开（实测 118 字符标题把 <p> 撑到 1054px，
+            design_audit 判「单行 176 字符」）。 */}
+        <div className="min-w-0 flex-1">
           <h1 className="truncate text-xl font-semibold">AliasAgent</h1>
-          <p className="truncate text-xs text-muted" data-testid="current-session-title">
+          <p
+            className="max-w-sm truncate text-xs text-muted"
+            data-testid="current-session-title"
+            title={currentTitle}
+          >
             {currentTitle}
           </p>
         </div>
@@ -81,19 +110,44 @@ export function ChatScreen({
               {String(metering.output_tokens ?? 0)} tokens
             </span>
           )}
+          {onOpenProviders && (
+            <button
+              type="button"
+              data-testid="open-providers"
+              onClick={onOpenProviders}
+              className="rounded-card border border-line px-2 py-1 text-xs text-muted hover:text-fg"
+            >
+              Providers
+            </button>
+          )}
+          {onOpenTemplates && (
+            <button
+              type="button"
+              data-testid="open-templates"
+              onClick={onOpenTemplates}
+              className="rounded-card border border-line px-2 py-1 text-xs text-muted hover:text-fg"
+            >
+              模板
+            </button>
+          )}
           <ConnectionBadge status={status} />
         </div>
       </header>
 
       <div className="flex min-h-0 flex-1">
         <aside className="flex w-56 shrink-0 flex-col border-r border-line bg-surface">
-          <h2 className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-muted">
-            会话
-          </h2>
           <SessionList
             sessions={sessions}
             currentSessionId={currentSessionId}
             onSelect={onSelectSession}
+            onCreate={onCreateSession ?? (() => {})}
+            onRename={onRenameSession ?? (() => {})}
+            onDelete={onDeleteSession ?? (() => {})}
+            templates={templates}
+            currentAgentType={currentAgentType}
+            onSwitchTemplate={onSwitchTemplate ?? (() => {})}
+            switchFailure={switchFailure}
+            disabled={status !== 'open'}
           />
         </aside>
 
@@ -130,6 +184,8 @@ export function ChatScreen({
             hasEarlier={hasEarlier}
             loadingEarlier={loadingEarlier}
             onLoadEarlier={onLoadEarlier}
+            attachments={attachments}
+            imagesSupported={imagesSupported}
           />
 
           {loadingEarlier && (
@@ -143,16 +199,30 @@ export function ChatScreen({
               data-testid="context-snapshot"
               className="border-t border-line px-4 py-2 text-xs text-muted"
             >
-              上下文窗口 {snapshot.windowTokens} tokens · 模板 {snapshot.agentType}
-              {breakdownRows.length > 0 && (
-                <span className="ml-2 space-x-2">
-                  {breakdownRows.map((row) => (
-                    <span key={row.label}>
-                      {row.label} {row.value}
-                    </span>
-                  ))}
+              <div className="flex items-center justify-between gap-2">
+                <span>
+                  上下文窗口 {snapshot.windowTokens} tokens · 模板 {snapshot.agentType} · 合计{' '}
+                  {snapshot.breakdown?.usedTokens ?? 0}
                 </span>
+                <button
+                  type="button"
+                  data-testid="toggle-real-context"
+                  onClick={() => setShowRealContext((previous) => !previous)}
+                  className="rounded-card border border-line px-2 py-1 text-xs text-muted hover:text-fg"
+                >
+                  {showRealContext ? '收起真实上下文' : '真实上下文'}
+                </button>
+              </div>
+              {snapshot.breakdown ? (
+                <div className="mt-2">
+                  <ContextRing breakdown={snapshot.breakdown} />
+                </div>
+              ) : (
+                <p data-testid="no-breakdown" className="mt-1 text-warn">
+                  本次快照没有占用拆分数据：不渲染占用环（不静默当成 0）。
+                </p>
               )}
+              {showRealContext && <RealContextView snapshot={snapshot} />}
             </section>
           )}
 

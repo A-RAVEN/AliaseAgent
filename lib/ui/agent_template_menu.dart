@@ -1,6 +1,13 @@
 import 'package:flutter/material.dart';
 
 import '../models/agent_type_config.dart';
+import '../services/agent_template_controller.dart';
+
+// 生效时机说明的**唯一正文**住在 `agent_template_controller.dart`（非 UI 文件）：
+// 无头核心也要用它（`template.list` 返回同一句话给 web 模板页），而核心不能依赖
+// Flutter UI。这里重导出，保持既有 import 路径不变。
+export '../services/agent_template_controller.dart'
+    show kAgentTemplateEffectiveNote;
 
 /// Agent 模板列表（change `add-agent-object-and-templates` 任务 3.1）。
 ///
@@ -111,13 +118,3 @@ class AgentTemplateMenu extends StatelessWidget {
     );
   }
 }
-
-/// 菜单底部的生效时机说明（界面与用户文档说同一句话）。
-///
-/// 抽成常量是为了让"界面文案"与"文档验收"能对上同一个字符串：改一处，两边一起变。
-///
-/// 口径（change `model-truth-from-gateway` D7）：**推理强度**每轮装配重解析，所以
-/// 改它对已经跑着的对话从**下一条消息**起就生效；其余字段（窗口、工具、模型、系统
-/// 提示词）仍是实例创建时冻结，只对新会话（之后创建或恢复的实例）生效。
-const String kAgentTemplateEffectiveNote =
-    '只有推理强度从下一条消息起对运行中对话生效，其余字段对新会话生效。';

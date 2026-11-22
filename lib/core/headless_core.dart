@@ -12,22 +12,32 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
+import '../models/agent_type_config.dart';
 import '../models/app_config.dart';
 import '../models/compaction_status.dart';
+import '../models/model_catalog_entry.dart';
+import '../models/provider_config.dart';
 import '../models/session.dart';
 import '../services/agent.dart';
+import '../services/agent_config_resolver.dart';
 import '../services/agent_factory.dart';
 import '../services/agent_registry.dart';
+import '../services/agent_session_controller.dart';
+import '../services/agent_template_controller.dart';
 import '../services/agent_type_registry.dart';
 import '../services/config_service.dart';
 import '../services/database_service.dart';
+import '../services/image_budget.dart';
+import '../services/image_probe.dart';
 import '../services/logging.dart';
 import '../services/message_page.dart';
 import '../services/message_repository.dart';
+import '../services/model_discovery_service.dart';
 import '../services/provider_resolver.dart';
 import '../services/session_repository.dart';
 import '../services/sidecar_bridge.dart';
@@ -35,6 +45,7 @@ import '../services/skills/skill_catalog_service.dart';
 import '../services/subagent_runner.dart';
 import '../services/summary_node_repository.dart';
 import '../services/tool_bootstrap.dart';
+import '../services/tool_catalog.dart';
 import 'core_lock.dart';
 import 'event_serialization.dart';
 import 'json_rpc.dart';
@@ -52,12 +63,28 @@ const String kCoreUrlTemplate = 'http://$kCoreBindHost:<port>';
 const String kCoreEntryCommand = 'dart run bin/alias_agent_core.dart';
 
 /// 暴露的 JSON-RPC 方法名（注册表与文档守卫共用这一份清单）。
+///
+/// change `web-management-ui`：`_registerMethods` 里少一个实现就抛 `StateError`
+/// （清单与实现必须一致）；文档守卫要求每个名字都出现在用户文档的 RPC 表里。
 const List<String> kCoreRpcMethodNames = <String>[
   'core.ping',
   'session.list',
+  'session.create',
+  'session.delete',
+  'session.rename',
+  'session.switchTemplate',
   'message.query',
   'agent.send',
   'agent.cancel',
+  'config.get',
+  'config.save',
+  'provider.probe',
+  'provider.probeFetch',
+  'template.list',
+  'template.save',
+  'template.delete',
+  'attachment.upload',
+  'attachment.read',
 ];
 
 /// WebSocket 路径（与 web 客户端一致）。
@@ -71,6 +98,18 @@ class HeadlessCoreStartupException implements Exception {
 
   @override
   String toString() => message;
+}
+
+/// 运行中核心的 `ProviderResolver` 引用（change `web-management-ui` D1）。
+///
+/// `AgentFactory` / `initSearchAndTools` 拿到的是**读这个盒子**的闭包，而不是某个
+/// 解析器实例：配置写盘后换掉盒子里的值，运行中的核心此后创建的实例就读到新
+/// provider 表 —— Flutter 侧对应的动作是 `main.dart._applyProviderConfig` 里那句
+/// `resolver = ProviderResolver(next)`。
+class ProviderResolverRef {
+  ProviderResolverRef(this.current);
+
+  ProviderResolver current;
 }
 
 /// 一个已装配好的无头核心。
@@ -88,11 +127,48 @@ class HeadlessCore {
     required this.agents,
     required this.factory,
     required this.subagentRunner,
+    required this.providerResolverRef,
+    required this.sessionController,
+    required this.templateController,
+    required this.configPath,
+    required this.attachmentsDir,
+    required this.probe,
     required Future<void> ready,
   }) : _ready = ready;
 
-  final AppConfig config;
+  /// 当前配置（可变：配置写盘后由 [applyConfig] 进程内同步）。
+  AppConfig config;
   final ISidecar sidecar;
+
+  /// provider 表的可替换引用（见 [ProviderResolverRef]）。
+  final ProviderResolverRef providerResolverRef;
+
+  /// 会话模板切换 / 删除互斥的协调者（design D3）。
+  ///
+  /// 组合根构造它并在 RPC 层复用（`session.switchTemplate` / `session.delete`）：
+  /// 没有它就没有 beginDelete/endDelete 守卫，删除进行中的切换会静默穿过。
+  final AgentSessionController sessionController;
+
+  /// 模板编辑 / 删除的协调者（design D9 / D10）。组合根构造，RPC 层复用同一份规则
+  /// （`validate` / `save` / 校验错误字段），不另写一套。
+  final AgentTemplateController templateController;
+
+  /// 核心读写的配置文件路径（design D14 注入点）。
+  ///
+  /// 生产 = `--config` 或产品默认 `~/.aliasagent/config.json`；测试 = `$env:TEMP`
+  /// 下临时目录里的一份 —— **绝不允许**在测试里落到用户真实配置上。
+  final String configPath;
+
+  /// 附件落盘目录（design D12 / D14 注入点）。生产 = `ConfigService.attachmentsDir`。
+  final String attachmentsDir;
+
+  /// 模型目录探测入口（design D7 / D14 注入点）。生产 = 真 HTTP 探测；
+  /// 测试注入假 probe（**绝不联网**）。
+  final ModelCatalogProbe probe;
+
+  /// 启动期给用户看的提示（design D2：配置文件不存在时以空配置启动，这里说明原因）。
+  /// `null` = 正常配置启动，无需提示。
+  String? startupNotice;
   final SessionRepository sessionRepo;
   final MessageRepository messageRepo;
   final SummaryNodeRepository summaryNodeRepo;
@@ -131,6 +207,25 @@ class HeadlessCore {
 
   /// 当前 WS 订阅者数量（测试可观察重连前后的订阅者）。
   int get clientCount => _clients.length;
+
+  /// 组合根配置进程内同步（design D1）。
+  ///
+  /// 等价物是 Flutter `main.dart._applyProviderConfig`：`config.save` /
+  /// `provider.probe` / `template.save` / `template.delete` 成功写盘后调它。
+  ///
+  /// 同步范围与 Flutter 一致：重建 ProviderResolver + 重注册模板表 + 换掉配置快照。
+  /// **已创建**的 Agent 实例不变（实例持有自己冻结的 `ResolvedAgentConfig`，只有
+  /// thinkingEffort 走每轮重解析）；此后创建或恢复的实例读新配置。
+  void applyConfig(AppConfig next) {
+    config = next;
+    providerResolverRef.current = ProviderResolver(next);
+    templates.clear();
+    for (final template in next.agentTypes.values) {
+      templates.register(template);
+    }
+    factory.config = next;
+    templateController.replaceConfig(next);
+  }
 
   /// 绑定回环地址并开始服务。[port] 默认 0 = 由 OS 分配（D7）。
   Future<void> start({int port = 0, String? webRoot}) async {
@@ -324,9 +419,22 @@ class HeadlessCore {
     final handlers = <String, JsonRpcMethod>{
       'core.ping': _handlePing,
       'session.list': _handleSessionList,
+      'session.create': _handleSessionCreate,
+      'session.delete': _handleSessionDelete,
+      'session.rename': _handleSessionRename,
+      'session.switchTemplate': _handleSessionSwitchTemplate,
       'message.query': _handleMessageQuery,
       'agent.send': _handleAgentSend,
       'agent.cancel': _handleAgentCancel,
+      'config.get': _handleConfigGet,
+      'config.save': _handleConfigSave,
+      'provider.probe': _handleProviderProbe,
+      'provider.probeFetch': _handleProviderProbeFetch,
+      'template.list': _handleTemplateList,
+      'template.save': _handleTemplateSave,
+      'template.delete': _handleTemplateDelete,
+      'attachment.upload': _handleAttachmentUpload,
+      'attachment.read': _handleAttachmentRead,
     };
     for (final name in kCoreRpcMethodNames) {
       final handler = handlers[name];
@@ -352,9 +460,142 @@ class HeadlessCore {
     };
   }
 
-  Future<Map<String, dynamic>> _handleMessageQuery(
+  // ---------------------------------------------------------------------------
+  // 会话管理（change `web-management-ui` 任务 1.1 / design D4）
+  // ---------------------------------------------------------------------------
+
+  /// `session.create`：建一条顶层会话（默认 `general`），返回完整会话行。
+  Future<Map<String, dynamic>> _handleSessionCreate(
+      Map<String, dynamic> params) async {
+    final rawTitle = params['title'];
+    if (rawTitle != null && rawTitle is! String) {
+      throw const JsonRpcException(
+          JsonRpcErrorCode.invalidParams, 'Invalid params: title 必须是字符串或省略');
+    }
+    final title = (rawTitle as String?)?.trim();
+    final rawAgentType = params['agentType'];
+    String? agentType;
+    if (rawAgentType != null) {
+      if (rawAgentType is! String || rawAgentType.isEmpty) {
+        throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+            'Invalid params: agentType 必须是非空字符串或省略');
+      }
+      // 建一个引用不存在模板的会话 = 造一条永远建不出实例的记录：入口就拒绝。
+      if (!templates.contains(rawAgentType)) {
+        throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+            'Agent 模板 "$rawAgentType" 不存在：拒绝新建会话（不会退回 general）');
+      }
+      agentType = rawAgentType;
+    }
+    final session = await sessionRepo.create(
+      title: (title == null || title.isEmpty) ? null : title,
+      agentType: agentType,
+    );
+    return {'session': serializeSession(session)};
+  }
+
+  /// `session.rename`：**自查存在性**（`SessionRepository.updateTitle` 对不存在的 id
+  /// 静默 no-op，RPC 层必须自己拒绝，否则界面会以为改成功了）。
+  Future<Map<String, dynamic>> _handleSessionRename(
       Map<String, dynamic> params) async {
     final sessionId = _requireString(params, 'sessionId');
+    final rawTitle = params['title'];
+    if (rawTitle is! String) {
+      throw const JsonRpcException(
+          JsonRpcErrorCode.invalidParams, 'Invalid params: title 必填且必须是字符串');
+    }
+    final title = rawTitle.trim();
+    if (title.isEmpty) {
+      throw const JsonRpcException(
+          JsonRpcErrorCode.invalidParams, '标题不能为空：重命名被拒绝');
+    }
+    final existing = await sessionRepo.get(sessionId);
+    if (existing == null) {
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+          '会话 "$sessionId" 不存在：重命名被拒绝（不静默 no-op）');
+    }
+    await sessionRepo.updateTitle(sessionId, title);
+    final reread = await sessionRepo.get(sessionId);
+    if (reread == null) {
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+          '会话 "$sessionId" 在重命名过程中被删除：未能确认新标题落库');
+    }
+    return {'session': serializeSession(reread)};
+  }
+
+  /// `session.delete`：复刻 Flutter `main.dart._deleteSession` 序列（design D4）：
+  /// beginDelete（登记删除 + 等在途切换 + 重读行）→ cancel → disposeAndRemove
+  /// （底层没证明排空就**放弃删除**，数据库保持不变）→ 最后才删数据库行 → endDelete。
+  Future<Map<String, dynamic>> _handleSessionDelete(
+      Map<String, dynamic> params) async {
+    final sessionId = _requireString(params, 'sessionId');
+    final existing = await sessionRepo.get(sessionId);
+    if (existing == null) {
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+          '会话 "$sessionId" 不存在：删除被拒绝（不静默 no-op）');
+    }
+    try {
+      final fresh = await sessionController.beginDelete(sessionId);
+      if (fresh == null) {
+        debugPrint('[AliasAgent] 删除会话 $sessionId：数据库行已不存在，'
+            '继续清理内存状态与运行实例');
+      }
+      // 切换可能刚换过实例：按 id 重新查一次再 cancel / dispose。
+      agents.lookup(sessionId)?.cancel();
+      try {
+        await agents.disposeAndRemove(sessionId);
+      } catch (e) {
+        // 底层没能证明排空（例如毒化上下文）：资源仍被保留，**不许假装删成功**。
+        throw JsonRpcException(JsonRpcErrorCode.internalError,
+            '删除会话 "$sessionId" 失败：上下文没能证明排空（$e）；'
+            '已放弃删除，数据库记录保持不变');
+      }
+      // 最后才删数据库行：数据库删除晚于所有写入。
+      await sessionRepo.delete(sessionId);
+      return {'sessionId': sessionId, 'deleted': true};
+    } finally {
+      sessionController.endDelete(sessionId);
+    }
+  }
+
+  /// `session.switchTemplate`：复用 [AgentSessionController.switchTemplate]，
+  /// 失败时把**阶段 + 候选名**放进错误消息（只说"切换失败"无法归因）。
+  Future<Map<String, dynamic>> _handleSessionSwitchTemplate(
+      Map<String, dynamic> params) async {
+    final sessionId = _requireString(params, 'sessionId');
+    final templateName = _requireString(params, 'templateName');
+    final session = await sessionRepo.get(sessionId);
+    if (session == null) {
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+          '会话 "$sessionId" 不存在：切换模板被拒绝');
+    }
+    try {
+      final agent = await sessionController.switchTemplate(
+        session,
+        templateName,
+        callbacks: callbacksFor(sessionId),
+      );
+      return {
+        'sessionId': sessionId,
+        'agentType': agent.agentTypeName,
+        'templateName': templateName,
+      };
+    } on AgentSwitchException catch (e) {
+      throw JsonRpcException(
+        JsonRpcErrorCode.invalidParams,
+        '模板切换失败（阶段：${e.stage.name} / ${e.stage.label}，'
+        '候选 "${e.candidateName}"）：${e.message}',
+      );
+    } on JsonRpcException {
+      rethrow;
+    } catch (e) {
+      throw JsonRpcException(
+          JsonRpcErrorCode.internalError, '模板切换失败（候选 "$templateName"）：$e');
+    }
+  }
+
+  Future<Map<String, dynamic>> _handleMessageQuery(
+      Map<String, dynamic> params) async {    final sessionId = _requireString(params, 'sessionId');
     final session = await sessionRepo.get(sessionId);
     if (session == null) {
       throw JsonRpcException(
@@ -442,7 +683,7 @@ class HeadlessCore {
           JsonRpcErrorCode.invalidParams, '会话 "$sessionId" 不存在');
     }
 
-    final callbacks = _callbacksFor(sessionId);
+    final callbacks = callbacksFor(sessionId);
     final Agent agent =
         await factory.ensure(session, callbacks: callbacks);
     // T5：ensure 复用已存在实例时不会重赋 callbacks —— 这里必须把回调指向当前
@@ -482,8 +723,512 @@ class HeadlessCore {
     return {'sessionId': sessionId, 'cancelled': true};
   }
 
-  String _requireString(Map<String, dynamic> params, String key) {
-    final value = params[key];
+  // ---------------------------------------------------------------------------
+  // 配置与 provider（change `web-management-ui` 任务 3.1 / design D6 / D7）
+  // ---------------------------------------------------------------------------
+
+  /// 从盘上重读最新配置（D1：不要拿内存里的旧快照盖掉用户刚写进去的编辑）。
+  ///
+  /// 文件不存在 ⇒ 内存里的配置（空配置启动/首启时就是空表）；malformed ⇒ 可归因失败
+  /// （**不**静默当成空配置，那会在用户不知情时抹掉他的文件）。
+  AppConfig _readLatestConfig() {
+    final result = ConfigService.load(configPath: configPath);
+    switch (result.status) {
+      case ConfigStatus.ok:
+        return result.config!;
+      case ConfigStatus.notFound:
+        return config;
+      case ConfigStatus.malformed:
+        throw JsonRpcException(JsonRpcErrorCode.internalError,
+            '配置文件无法解析：${result.error}');
+    }
+  }
+
+  /// 对外配置视图：**api_key 脱敏**（只报 hasApiKey，不回显任何片段）。
+  Map<String, dynamic> _redactedConfig(AppConfig source) => {
+        'missing': !File(configPath).existsSync(),
+        'configPath': configPath,
+        'providers': {
+          for (final entry in source.providers.entries)
+            entry.key: {
+              'baseUrl': entry.value.baseUrl,
+              'hasApiKey': entry.value.apiKey.isNotEmpty,
+              'models': [for (final model in entry.value.models) model.toJson()],
+              'discoveredAt': entry.value.discoveredAt,
+            },
+        },
+        'agentTypes': {
+          for (final entry in source.agentTypes.entries)
+            entry.key: {...entry.value.toJson(), 'name': entry.key},
+        },
+        'tools': (ToolCatalog.instance.names.toList()..sort()),
+      };
+
+  /// `config.get`：读盘 + 脱敏。文件不存在时 `missing: true`（web 端据此开首启向导）。
+  Future<Map<String, dynamic>> _handleConfigGet(
+      Map<String, dynamic> params) async {
+    return _redactedConfig(_readLatestConfig());
+  }
+
+  /// `config.save`：**整份 provider 表**提交（缺省不传的现存 provider = 删除）。
+  ///
+  /// 校验规则复用 Flutter Providers 页同一套（D6 / D8）：
+  ///   - 名字非空、网关地址必须是绝对 http(s)、新增 provider 必须给密钥；
+  ///   - 已有 provider 传空密钥 = 沿用原密钥（不静默丢密钥）；
+  ///   - `rename_from` 在同一保存动作里级联改写引用模板；
+  ///   - 删除被模板引用的 provider ⇒ 拒绝并点名引用名单。
+  /// 校验全部通过才写盘，然后 [applyConfig] 进程内同步。
+  Future<Map<String, dynamic>> _handleConfigSave(
+      Map<String, dynamic> params) async {
+    final rawProviders = params['providers'];
+    if (rawProviders is! Map) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: providers 必须是对象（键 = provider 名，'
+          '值 = {base_url, api_key?, rename_from?}；缺省的现存 provider 视为删除）');
+    }
+    final current = _readLatestConfig();
+    final nextProviders = <String, ProviderConfig>{};
+    final renames = <String, String>{};
+    for (final entry in rawProviders.entries) {
+      final rawName = entry.key;
+      if (rawName is! String || rawName.trim().isEmpty) {
+        throw const JsonRpcException(
+            JsonRpcErrorCode.invalidParams, 'provider 名不能为空');
+      }
+      final name = rawName.trim();
+      final spec = entry.value;
+      if (spec is! Map) {
+        throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+            'provider "$name" 的配置必须是对象');
+      }
+      final rawBaseUrl = spec['base_url'];
+      if (rawBaseUrl is! String || rawBaseUrl.trim().isEmpty) {
+        throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+            'provider "$name" 缺 base_url');
+      }
+      final baseUrl = rawBaseUrl.trim();
+      final uri = Uri.tryParse(baseUrl);
+      if (uri == null ||
+          !uri.hasScheme ||
+          (uri.scheme != 'http' && uri.scheme != 'https') ||
+          uri.host.isEmpty) {
+        throw JsonRpcException(
+          JsonRpcErrorCode.invalidParams,
+          '网关地址必须是以 http:// 或 https:// 开头的绝对地址'
+          '（provider "$name" 收到 "$baseUrl"）',
+        );
+      }
+      final rawApiKey = spec['api_key'];
+      if (rawApiKey != null && rawApiKey is! String) {
+        throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+            'provider "$name" 的 api_key 必须是字符串或省略');
+      }
+      final rawRename = spec['rename_from'];
+      if (rawRename != null && rawRename is! String) {
+        throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+            'provider "$name" 的 rename_from 必须是字符串或省略');
+      }
+      final renameFrom = (rawRename as String?)?.trim();
+
+      ProviderConfig? before;
+      if (renameFrom != null && renameFrom.isNotEmpty && renameFrom != name) {
+        before = current.providers[renameFrom];
+        if (before == null) {
+          throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+              '被改名的 provider "$renameFrom" 不存在：保存被拒绝');
+        }
+        if (current.providers.containsKey(name)) {
+          throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+              'Provider "$name" 已存在：改名目标被占用，保存被拒绝');
+        }
+        renames[renameFrom] = name;
+      } else {
+        before = current.providers[name];
+      }
+
+      final typedKey = ((rawApiKey as String?) ?? '').trim();
+      final apiKey = typedKey.isEmpty ? (before?.apiKey ?? '') : typedKey;
+      if (apiKey.isEmpty) {
+        throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+            '请填写 API Key（provider "$name" 是新增的，没有可沿用的旧密钥）');
+      }
+      // 向导用：把 probeFetch 探测到的目录随同一次保存写盘（不再联网探测第二次），
+      // 可选；不传 = 保留既有目录与 discovered_at（编辑 provider 不丢目录）。
+      final rawModels = spec['models'];
+      List<ModelCatalogEntry> models = before?.models ?? const [];
+      String? discoveredAt = before?.discoveredAt;
+      if (rawModels != null) {
+        if (rawModels is! List) {
+          throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+              'provider "$name" 的 models 必须是数组或省略');
+        }
+        final parsed = <ModelCatalogEntry>[];
+        for (var index = 0; index < rawModels.length; index++) {
+          final entry = ModelCatalogEntry.fromJson(rawModels[index]);
+          if (entry == null) {
+            throw JsonRpcException(
+              JsonRpcErrorCode.invalidParams,
+              'provider "$name" 的 models[$index] 缺字符串 id：目录条目被拒绝'
+              '（不静默丢弃，也不写半份目录）',
+            );
+          }
+          parsed.add(entry);
+        }
+        models = List<ModelCatalogEntry>.unmodifiable(parsed);
+        final rawDiscoveredAt = spec['discovered_at'];
+        if (rawDiscoveredAt != null && rawDiscoveredAt is! String) {
+          throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+              'provider "$name" 的 discovered_at 必须是字符串或省略');
+        }
+        final typedDiscoveredAt = (rawDiscoveredAt as String?)?.trim();
+        discoveredAt = (typedDiscoveredAt != null && typedDiscoveredAt.isNotEmpty)
+            ? typedDiscoveredAt
+            : DateTime.now().toUtc().toIso8601String();
+      }
+      nextProviders[name] = ProviderConfig(
+        apiKey: apiKey,
+        baseUrl: normalizeBaseUrl(baseUrl),
+        models: models,
+        discoveredAt: discoveredAt,
+      );
+    }
+
+    // 改名：同一保存动作里级联改写引用旧名的模板。
+    final types = Map<String, AgentTypeConfig>.from(current.agentTypes);
+    for (final rename in renames.entries) {
+      for (final template in types.entries.toList()) {
+        if (template.value.provider == rename.key) {
+          types[template.key] = AgentTypeConfig.fromJson(template.key, {
+            ...template.value.toJson(),
+            'provider': rename.value,
+          });
+        }
+      }
+    }
+
+    // 删除：现存但没提交、也不是被改名旧名。被模板引用 ⇒ 拒绝并点名引用名单。
+    final removed = <String>[
+      for (final name in current.providers.keys)
+        if (!nextProviders.containsKey(name) && !renames.containsKey(name)) name,
+    ];
+    for (final name in removed) {
+      final refs = <String>[
+        for (final template in types.entries)
+          if (template.value.provider == name) template.key,
+      ];
+      if (refs.isNotEmpty) {
+        throw JsonRpcException(
+          JsonRpcErrorCode.invalidParams,
+          'provider "$name" 被 ${refs.join("、")} 引用，不能删除'
+          '（删掉会留下悬空的模板引用）',
+        );
+      }
+    }
+
+    final next = current.copyWith(providers: nextProviders, agentTypes: types);
+    ConfigService.save(next, configPath: configPath);
+    applyConfig(next);
+    return {'config': _redactedConfig(next)};
+  }
+
+  /// `provider.probe`：= `ModelDiscoveryService.discover`（要求 provider 已存在，
+  /// 成功写回 catalog + discovered_at）。用**盘上最新配置**探测，避免内存旧快照
+  /// 盖掉刚写的编辑（D1）。
+  Future<Map<String, dynamic>> _handleProviderProbe(
+      Map<String, dynamic> params) async {
+    final providerName = _requireString(params, 'providerName');
+    final latest = _readLatestConfig();
+    if (!latest.providers.containsKey(providerName)) {
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'provider "$providerName" 不存在：探测被拒绝（先保存 provider）');
+    }
+    final discovery =
+        ModelDiscoveryService(probe: probe, configPath: configPath);
+    final report = await discovery.discover(latest, providerName);
+    if (report.success) applyConfig(report.config);
+    return {
+      'ok': report.success,
+      'providerName': report.providerName,
+      'entries': [for (final model in report.entries) model.toJson()],
+      'added': report.added,
+      'updated': report.updated,
+      'removed': report.removed,
+      'dropped': report.dropped,
+      'discoveredAt': report.discoveredAt,
+      'error': report.error,
+      'preview': report.preview,
+      'totalChars': report.totalChars,
+      'omittedChars': report.omittedChars,
+      'errorFilePath': report.errorFilePath,
+    };
+  }
+
+  /// `provider.probeFetch`：= `ModelCatalogProbe.fetch`，**只探测不写盘**（向导用，
+  /// design D7 / D11）。Start 之前失败或放弃都不留半份配置。
+  Future<Map<String, dynamic>> _handleProviderProbeFetch(
+      Map<String, dynamic> params) async {
+    final baseUrl = _requireString(params, 'baseUrl');
+    final apiKey = _requireString(params, 'apiKey');
+    final uri = Uri.tryParse(baseUrl.trim());
+    if (uri == null ||
+        !uri.hasScheme ||
+        (uri.scheme != 'http' && uri.scheme != 'https') ||
+        uri.host.isEmpty) {
+      throw JsonRpcException(
+        JsonRpcErrorCode.invalidParams,
+        '网关地址必须是以 http:// 或 https:// 开头的绝对地址（收到 "$baseUrl"）',
+      );
+    }
+    final result = await probe.fetch(
+      baseUrl: baseUrl.trim(),
+      apiKey: apiKey.trim(),
+      // 预览长度取产品既有配置（spill.preview_chars），不发明第二个数字。
+      previewChars: config.spillPreviewChars,
+    );
+    return {
+      'ok': result.ok,
+      'providerName': params['providerName'] is String
+          ? params['providerName'] as String
+          : null,
+      'entries': [for (final model in result.entries) model.toJson()],
+      'dropped': result.dropped,
+      'error': result.error,
+      'preview': result.preview,
+      'totalChars': result.totalChars,
+      'omittedChars': result.omittedChars,
+      'errorFilePath': result.errorFilePath,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // 模板（change `web-management-ui` 任务 3.2 / design D9 / D10）
+  // ---------------------------------------------------------------------------
+
+  /// `template.list`：模板表 + 工具目录 + provider 名 + 生效时机说明（同一句常量）。
+  Future<Map<String, dynamic>> _handleTemplateList(
+      Map<String, dynamic> params) async {
+    final latest = _readLatestConfig();
+    return {
+      'templates': [
+        for (final entry in latest.agentTypes.entries)
+          {...entry.value.toJson(), 'name': entry.key},
+      ],
+      'tools': (ToolCatalog.instance.names.toList()..sort()),
+      'providers': latest.providers.keys.toList(),
+      // 新模板/向导要用的默认工具清单（产品数据，来源唯一：ToolCatalog）。
+      'defaultTools': ToolCatalog.kBaseToolNames,
+      // 编辑器下拉的选项来源（产品数据，来源唯一：执行层合法集合 / 模态白名单）。
+      // 都是 Set ⇒ 显式转 List（JSON 编码不了 Set，会让整个响应编码失败）。
+      'thinkingEfforts': AgentConfigResolver.kThinkingEfforts.toList(),
+      'allowedModalities': AgentTypeConfig.kAllowedInputModalities.toList(),
+      'effectiveNote': kAgentTemplateEffectiveNote,
+    };
+  }
+
+  /// `template.save`：走 [AgentTemplateController.save]（同一套校验 + 完整配置写回）。
+  ///
+  /// 字段（design D9）：provider / model / tools / systemPrompt / thinkingEffort /
+  /// maxContextTokens / inputModalities / 压缩与等待阈值；模板名创建后不可改。
+  Future<Map<String, dynamic>> _handleTemplateSave(
+      Map<String, dynamic> params) async {
+    final name = _requireString(params, 'name');
+    final rawOriginal = params['originalName'];
+    if (rawOriginal != null && rawOriginal is! String) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: originalName 必须是字符串或省略（省略 = 新增）');
+    }
+    final rawWindow = params['maxContextTokens'];
+    String windowText;
+    if (rawWindow == null) {
+      windowText = '';
+    } else if (rawWindow is int) {
+      windowText = '$rawWindow';
+    } else if (rawWindow is String) {
+      windowText = rawWindow;
+    } else {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: maxContextTokens 必须是整数或字符串（留空 = 用目录窗口）');
+    }
+    final tools = _optionalStringList(params, 'tools');
+    final rawModalities = params['inputModalities'];
+    List<String>? modalities;
+    if (rawModalities != null) {
+      if (rawModalities is! List ||
+          rawModalities.any((item) => item is! String)) {
+        throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+            'Invalid params: inputModalities 必须是字符串数组');
+      }
+      modalities = rawModalities.cast<String>();
+    }
+    final rawCompaction = params['compactionThresholdPercent'];
+    if (rawCompaction != null && rawCompaction is! int) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: compactionThresholdPercent 必须是整数');
+    }
+    final rawWait = params['compactionWaitThresholdPercent'];
+    if (rawWait != null && rawWait is! int) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: compactionWaitThresholdPercent 必须是整数');
+    }
+
+    // 从盘上重读最新配置：不要拿内存旧快照盖掉用户刚写进去的 providers。
+    templateController.replaceConfig(_readLatestConfig());
+    final draft = AgentTemplateDraft(
+      originalName: rawOriginal as String?,
+      name: name,
+      provider: (params['provider'] as String?) ?? '',
+      model: (params['model'] as String?) ?? '',
+      thinkingEffort: (params['thinkingEffort'] as String?) ?? '',
+      systemPrompt: (params['systemPrompt'] as String?) ?? '',
+      tools: tools,
+      maxContextTokensText: windowText,
+      inputModalities: modalities,
+      compactionThresholdPercent: rawCompaction as int?,
+      compactionWaitThresholdPercent: rawWait as int?,
+    );
+    try {
+      final result = templateController.save(draft);
+      applyConfig(result.config);
+      return {
+        'template': {...result.template.toJson(), 'name': result.template.name},
+        'created': result.created,
+      };
+    } on AgentTemplateValidationException catch (e) {
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+          '模板校验失败（${e.field}）：${e.message}');
+    } on DuplicateAgentTypeException catch (e) {
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams, '$e');
+    } on MissingAgentTypeException catch (e) {
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams, '$e');
+    }
+  }
+
+  /// `template.delete`（design D10）：general 不可删；**被会话引用拒删并显示名单**；
+  /// 成功则写回配置 + 组合根同步。
+  Future<Map<String, dynamic>> _handleTemplateDelete(
+      Map<String, dynamic> params) async {
+    final name = _requireString(params, 'templateName');
+    if (name == 'general') {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'general 模板不可删：SessionRepository.create 默认用它，删掉会让新会话失去模板');
+    }
+    final latest = _readLatestConfig();
+    if (!latest.agentTypes.containsKey(name)) {
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+          '模板 "$name" 不存在：删除被拒绝（不静默 no-op）');
+    }
+    // 引用守卫：防 `sessions.agent_type` 悬空（删掉后那些会话再也建不出实例）。
+    final sessions = await sessionRepo.list();
+    final refs = <String>[
+      for (final session in sessions)
+        if (session.agentType == name) '${session.title}（${session.id}）',
+    ];
+    if (refs.isNotEmpty) {
+      throw JsonRpcException(
+        JsonRpcErrorCode.invalidParams,
+        '模板 "$name" 被 ${refs.join("、")} 引用，不能删除'
+        '（先删除这些会话，或把它们切换到别的模板）',
+      );
+    }
+    final types = Map<String, AgentTypeConfig>.from(latest.agentTypes)
+      ..remove(name);
+    final next = latest.copyWith(agentTypes: types);
+    ConfigService.save(next, configPath: configPath);
+    applyConfig(next);
+    return {'templateName': name, 'deleted': true};
+  }
+
+  // ---------------------------------------------------------------------------
+  // 附件（change `web-management-ui` 任务 2.1 / design D12）
+  // ---------------------------------------------------------------------------
+
+  /// `attachment.upload{filename, base64}`：把一张图片写进注入的 `attachmentsDir`。
+  ///
+  /// 两道门都复用产品既有实现，不发明新口径：
+  ///   - 大小上限 [kMaxImageBytes]（32 MiB，出处 `Docs/DeepSeekAPIDoc.md` §6.4.3）；
+  ///   - 类型判定 [probeImageBytes]（**文件头魔数**，扩展名与 MIME 不作数）。
+  /// 超限 / 非图片都**可归因拒绝且不落盘**（不静默截断、不写成坏文件）。
+  Future<Map<String, dynamic>> _handleAttachmentUpload(
+      Map<String, dynamic> params) async {
+    final filename = _requireString(params, 'filename');
+    final base64Text = _requireString(params, 'base64');
+    List<int> decoded;
+    try {
+      decoded = base64Decode(base64Text);
+    } on FormatException catch (e) {
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: base64 解码失败（$e）；上传已拒绝，未落盘');
+    }
+    if (decoded.length > kMaxImageBytes) {
+      throw JsonRpcException(
+        JsonRpcErrorCode.invalidParams,
+        '图片 ${decoded.length} 字节超过单张上限 $kMaxImageBytes 字节（32 MiB，'
+        '出处 Docs/DeepSeekAPIDoc.md §6.4.3）：上传已拒绝，不落盘、不截断',
+      );
+    }
+    final bytes = Uint8List.fromList(decoded);
+    final info = probeImageBytes(bytes);
+    if (info.format == ImageFormat.unknown) {
+      throw const JsonRpcException(
+        JsonRpcErrorCode.invalidParams,
+        '不是支持的图片格式：只认文件头魔数 PNG / JPEG / GIF / WebP，'
+        '扩展名与声明的 MIME 不作数；上传已拒绝，未落盘',
+      );
+    }
+
+    final dir = Directory(attachmentsDir);
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+    // 只保留文件名部分（防目录穿越），再把不安全字符换掉。
+    final rawBase = p.basename(filename);
+    final safeBase = rawBase.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+    final unique = '${DateTime.now().microsecondsSinceEpoch}_'
+        '${safeBase.isEmpty || safeBase == '.' ? 'image' : safeBase}';
+    final file = File(p.join(dir.path, unique));
+    file.writeAsBytesSync(bytes, flush: true);
+    return {
+      'path': file.path,
+      'bytes': bytes.length,
+      'format': info.format.name,
+      'mediaType': info.mediaType,
+      'width': info.width,
+      'height': info.height,
+    };
+  }
+
+  /// `attachment.read{path}`：把附件字节读成 base64 给浏览器（design D12 现状 10）。
+  ///
+  /// 为什么不走静态服务：`_serveStatic` 明确拒绝 web 根之外的文件，而附件在
+  /// `~/.aliasagent/attachments/`。这里只允许读**注入的 attachmentsDir 内**的文件。
+  Future<Map<String, dynamic>> _handleAttachmentRead(
+      Map<String, dynamic> params) async {
+    final path = _requireString(params, 'path');
+    final dirAbs = p.normalize(p.absolute(attachmentsDir));
+    final fileAbs = p.normalize(p.absolute(path));
+    if (fileAbs != dirAbs && !p.isWithin(dirAbs, fileAbs)) {
+      throw JsonRpcException(
+        JsonRpcErrorCode.invalidParams,
+        '只允许读取附件目录（$dirAbs）内的文件：拒绝 "$path"',
+      );
+    }
+    final file = File(fileAbs);
+    if (!file.existsSync()) {
+      // 可见提示（design D12）：历史消息还引用着路径，但文件已经不在了。
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+          '图片已丢失：附件文件不存在（$fileAbs）');
+    }
+    final bytes = file.readAsBytesSync();
+    final info = probeImageBytes(bytes);
+    return {
+      'path': fileAbs,
+      'bytes': bytes.length,
+      'base64': base64Encode(bytes),
+      'mediaType': info.format == ImageFormat.unknown
+          ? 'application/octet-stream'
+          : info.mediaType,
+    };
+  }
+
+  String _requireString(Map<String, dynamic> params, String key) {    final value = params[key];
     if (value is! String || value.isEmpty) {
       throw JsonRpcException(
           JsonRpcErrorCode.invalidParams, 'Invalid params: 缺字符串 $key');
@@ -505,10 +1250,13 @@ class HeadlessCore {
   // AgentCallbacks → agent.event
   // ---------------------------------------------------------------------------
 
-  AgentCallbacks _callbacksFor(String sessionId) {
+  /// 该会话的界面回调：把 `AgentCallbacks` 映射成 `agent.event` 通知（D9）。
+  ///
+  /// 公开（而不是私有）：`session.switchTemplate` / `session.delete` 必须把**当前**
+  /// 回调交给新实例，组合根之外（测试）也要能核对"事件到底发往谁"。
+  AgentCallbacks callbacksFor(String sessionId) {
     void event(String type, Map<String, dynamic> data) =>
         _sendEvent(sessionId, type, data);
-
     return AgentCallbacks(
       onUserMessage: (message) =>
           event('user.message', serializeMessage(message)),
@@ -604,6 +1352,9 @@ Future<HeadlessCore> buildHeadlessCore({
   MessageRepository? messageRepository,
   SessionRepository? sessionRepository,
   bool backgroundFoldEnabled = true,
+  String? configPath,
+  String? attachmentsDir,
+  ModelCatalogProbe? probe,
 }) async {
   if (openDatabase != null) await openDatabase();
 
@@ -611,8 +1362,7 @@ Future<HeadlessCore> buildHeadlessCore({
   for (final template in config.agentTypes.values) {
     templates.register(template);
   }
-  final providers = ProviderResolver(config);
-  final sessionRepo = sessionRepository ?? SessionRepository();
+  final providers = ProviderResolverRef(ProviderResolver(config));  final sessionRepo = sessionRepository ?? SessionRepository();
   final messageRepo = messageRepository ?? MessageRepository();
   final summaryNodeRepo = SummaryNodeRepository();
   final agents = AgentRegistry();
@@ -624,7 +1374,7 @@ Future<HeadlessCore> buildHeadlessCore({
               config: config,
               sidecar: sidecar,
               templates: templates,
-              providerResolver: () => providers,
+              providerResolver: () => providers.current,
             ))();
     for (final line in result.skillNoticeLines) {
       debugPrint('[AliasAgent] $line');
@@ -642,7 +1392,7 @@ Future<HeadlessCore> buildHeadlessCore({
       SubagentRunner(factory: () => factory, sidecar: sidecar);
   factory = AgentFactory(
     templates: templates,
-    providerResolver: () => providers,
+    providerResolver: () => providers.current,
     config: config,
     sidecar: sidecar,
     sessionRepo: sessionRepo,
@@ -655,6 +1405,21 @@ Future<HeadlessCore> buildHeadlessCore({
     subagentRunner: subagentRunner,
   );
 
+  // 会话模板切换 / 删除互斥的协调者（design D3）。组合根构造一次，RPC 层复用；
+  // 注入 factory + sessionRepo，退役动作走 Agent.retire 的产品默认值。
+  final sessionController = AgentSessionController(
+    factory: factory,
+    sessionRepo: sessionRepo,
+  );
+
+  // 模板编辑 / 删除的协调者（design D9 / D10）：写盘路径与校验规则与 Flutter 侧同一份。
+  final templateController = AgentTemplateController(
+    registry: templates,
+    config: config,
+    knownTools: () => ToolCatalog.instance.nameSet,
+    configPath: configPath,
+  );
+
   return HeadlessCore(
     config: config,
     sidecar: sidecar,
@@ -665,6 +1430,12 @@ Future<HeadlessCore> buildHeadlessCore({
     agents: agents,
     factory: factory,
     subagentRunner: subagentRunner,
+    providerResolverRef: providers,
+    sessionController: sessionController,
+    templateController: templateController,
+    configPath: configPath ?? ConfigService.configPath,
+    attachmentsDir: attachmentsDir ?? ConfigService.attachmentsDir,
+    probe: probe ?? HttpModelCatalogProbe(),
     ready: toolsReady.future,
   );
 }
@@ -684,6 +1455,8 @@ class HeadlessCoreRunner {
     ISidecar Function()? sidecarLoader,
     Future<void> Function()? openDatabaseOverride,
     bool backgroundFoldEnabled = true,
+    String? attachmentsDir,
+    ModelCatalogProbe? probe,
   }) async {
     // ① 单实例守卫必须在任何 DB / spill 操作之前。
     final lock = CoreInstanceLock(lockPath ?? defaultCoreLockPath);
@@ -695,6 +1468,7 @@ class HeadlessCoreRunner {
     HeadlessCore? core;
     try {
       final AppConfig config;
+      String? startupNotice;
       if (configOverride != null) {
         config = configOverride;
       } else {
@@ -703,12 +1477,19 @@ class HeadlessCoreRunner {
           case ConfigStatus.ok:
             config = result.config!;
           case ConfigStatus.notFound:
-            throw HeadlessCoreStartupException(
-                '配置文件不存在：${configPath ?? ConfigService.configPath}\n'
-                '先运行一次 Flutter 应用完成首启配置，或用 --config 指定路径。');
+            // design D2（change `web-management-ui`）：配置文件不存在时以**空配置**
+            // 启动并 serve 首启向导，而不是拒启动。原「先运行一次 Flutter 应用完成
+            // 首启配置」的门把 web 独立首启挡死了。
+            config = const AppConfig(version: 1);
+            startupNotice = '配置文件不存在：${configPath ?? ConfigService.configPath}\n'
+                '以空配置启动：web 端会显示首启向导（填 provider 三要素 → 探测 → '
+                '建 general 模板）。配置写回后运行中的核心会进程内同步。';
           case ConfigStatus.malformed:
+            // 坏配置不静默当成空配置：那样会在用户不知情时用空表覆盖他的文件。
             throw HeadlessCoreStartupException(
-                '配置文件无法解析：${result.error}');
+                '配置文件无法解析：${result.error}\n'
+                '（配置文件损坏不会静默当成空配置；先备份并修正它，或把它移走后'
+                '重新启动以走首启向导。）');
         }
       }
 
@@ -736,8 +1517,12 @@ class HeadlessCoreRunner {
         config: config,
         sidecar: sidecar,
         backgroundFoldEnabled: backgroundFoldEnabled,
+        configPath: configPath,
+        attachmentsDir: attachmentsDir,
+        probe: probe,
       );
       core._lock = lock;
+      core.startupNotice = startupNotice;
       await core.start(
         port: port,
         webRoot: webRoot ?? p.join(Directory.current.path, 'web', 'dist'),

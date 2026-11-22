@@ -11,6 +11,7 @@ import { ChevronDown } from 'lucide-react';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 
 import type { ChatItem } from '../chat/render';
+import { attachmentRowModel } from '../chat/attachments';
 import { layoutConfig } from '../tokens';
 import { Markdown } from './Markdown';
 import { ThinkingCard } from './ThinkingCard';
@@ -21,6 +22,10 @@ export interface MessageListProps {
   hasEarlier: boolean;
   loadingEarlier: boolean;
   onLoadEarlier: () => void;
+  /** 附件路径 → data URL（null = 取回失败/文件丢失；键不存在 = 还没取）。 */
+  attachments?: Record<string, string | null>;
+  /** 当前模板是否声明了 image 输入模态（null = 未知，不提示）。 */
+  imagesSupported?: boolean | null;
 }
 
 /** 估算行高（真实高度由 measureElement 量出来；估算只影响未测量区域）。 */
@@ -41,9 +46,22 @@ function estimateSize(item: ChatItem): number {
   }
 }
 
-function MessageItem({ item }: { item: ChatItem }) {
+function MessageItem({
+  item,
+  attachments,
+  imagesSupported,
+}: {
+  item: ChatItem;
+  attachments: Record<string, string | null>;
+  imagesSupported: boolean | null;
+}) {
   switch (item.kind) {
-    case 'user':
+    case 'user': {
+      const rowModel = attachmentRowModel({
+        attachments: item.attachments ?? [],
+        dataUrls: attachments,
+        imagesSupported,
+      });
       return (
         <article
           data-testid="user-message"
@@ -51,8 +69,34 @@ function MessageItem({ item }: { item: ChatItem }) {
         >
           <div className="mb-1 text-xs uppercase tracking-wide text-muted">You</div>
           <Markdown text={item.text ?? ''} />
+          {rowModel.thumbnails.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-2">
+              {rowModel.thumbnails.map((thumbnail) => (
+                <img
+                  key={thumbnail.path}
+                  data-testid="attachment-thumbnail"
+                  src={thumbnail.dataUrl}
+                  alt={`附件 ${thumbnail.path}`}
+                  title={thumbnail.path}
+                  className="h-16 w-16 rounded-card border border-line object-cover"
+                />
+              ))}
+            </div>
+          )}
+          {rowModel.notices.map((line) => (
+            <p
+              key={line}
+              data-testid={
+                line.includes('图片未发送') ? 'attachment-not-sent' : 'attachment-missing'
+              }
+              className="mt-1 text-xs text-warn"
+            >
+              {line}
+            </p>
+          ))}
         </article>
       );
+    }
     case 'assistant':
       return (
         <article
@@ -90,7 +134,14 @@ function MessageItem({ item }: { item: ChatItem }) {
   }
 }
 
-export function MessageList({ items, hasEarlier, loadingEarlier, onLoadEarlier }: MessageListProps) {
+export function MessageList({
+  items,
+  hasEarlier,
+  loadingEarlier,
+  onLoadEarlier,
+  attachments = {},
+  imagesSupported = null,
+}: MessageListProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [atBottom, setAtBottom] = useState(true);
   // 上翻加载更早页前记下"距底距离"：插入更早内容后用它还原，阅读位置不跳。
@@ -198,7 +249,11 @@ export function MessageList({ items, hasEarlier, loadingEarlier, onLoadEarlier }
                   }}
                 >
                   <div data-testid="message-row" className="pb-4">
-                    <MessageItem item={item} />
+                    <MessageItem
+                      item={item}
+                      attachments={attachments}
+                      imagesSupported={imagesSupported}
+                    />
                   </div>
                 </div>
               );

@@ -17,8 +17,10 @@
 
 ## 前置条件
 
-1. 至少运行过一次 Flutter 应用，让 `~/.aliasagent/config.json` 有可用的 general 模板与
-   provider（本入口不提供首启配置界面）。
+1. **首次启动不再需要先运行 Flutter 应用**：配置文件不存在时核心以**空配置**启动，
+   web 页会显示首启向导（填 provider 三要素 → 探测 → 建 general），见
+   [web 管理屏](web-management.md) 的「首启向导」。配置文件存在但 JSON 坏掉（malformed）
+   时核心仍**可归因失败**（打印「配置文件无法解析」并退出），不会静默当成空配置覆盖它。
 2. **进程 CWD 必须是仓库根**：sidecar 以裸名字 `DynamicLibrary.open('sidecar.dll')` 加载，
    DLL 就在仓库根。CWD 不对会在启动时报「sidecar 加载失败 … CWD=…」。
 3. web 构建产物存在：
@@ -67,7 +69,8 @@ AliasAgent 无头核心已启动
    - 工具卡片（**每个工具一张**，默认折叠成单行；点一下展开看完整输入/结果）；
    - 思考卡片（默认折叠成单行，展开看全文）；
    - 上下文窗口、token 计量；整轮失败/技能未生效会有明确提示条。
-4. 当前版本**没有新建会话入口**：数据库里没有任何会话时页面会提示先用 Flutter 应用建一个。
+4. 当前版本**可以在 web 里新建会话**：左侧会话栏标题右侧的 +（还支持改名 / 删除 /
+   切换模板，见 [web 管理屏](web-management.md)）。数据库里没有任何会话时页面会提示新建一个。
 
 ## 完整聊天屏怎么用
 
@@ -157,9 +160,25 @@ web 客户端本身是独立子项目，回退到最少形态就是恢复 `web/s
 |---|---|---|
 | `core.ping` | 无 | `{ok, service, protocolVersion, pid}` |
 | `session.list` | 无 | `{sessions: [{id,title,agentType,parentSessionId,createdAt,updatedAt}]}`（只含顶层会话，按最近更新倒序） |
+| `session.create` | `{title?, agentType?}` | `{session}`；`agentType` 必须是已存在的模板 |
+| `session.delete` | `{sessionId}` | `{sessionId, deleted}`；删除进行中的切换被拒（阶段 deleting） |
+| `session.rename` | `{sessionId, title}` | `{session}`；不存在的会话 → 可归因 `-32602` |
+| `session.switchTemplate` | `{sessionId, templateName}` | `{sessionId, agentType, templateName}`；失败消息含阶段与候选名 |
 | `message.query` | `{sessionId, pageSize, anchor?, cursor?, before?}` | `{sessionId,pageSize,messages,nextCursor,prevCursor}`。`pageSize` **请求方必填且为正整数**，缺参/非法返回 `-32602`；核心不提供默认页大小，也不发明上限。`anchor`：`tail`（缺省，取**最新一页**）或 `head`（从最旧开始）；`cursor` = 上一页的 `nextCursor`（前向，seq 升序）；`before` = 上一页的 `prevCursor`（反向，取更早一页）；`cursor` 与 `before` 不能同时出现。`prevCursor` 是本页首条 seq（没有更早页时为 null）。 |
 | `agent.send` | `{sessionId, text, attachments?}` | `{sessionId,status,finalText,error,metering}`；复用 `Agent.send` / `AgentFactory.ensure`。 |
 | `agent.cancel` | `{sessionId}` | `{sessionId,cancelled,reason?}`。 |
+| `config.get` | 无 | `{missing, configPath, providers, agentTypes, tools}`；**api_key 不回显**（只给 hasApiKey） |
+| `config.save` | `{providers}` | `{config}`；整份 provider 表（没提交的现存 provider = 删除），支持 `rename_from` 改名级联与向导写目录 |
+| `provider.probe` | `{providerName}` | 探测报告（新增/更新/移除/丢弃 + `discovered_at`），成功写回目录 |
+| `provider.probeFetch` | `{providerName?, baseUrl, apiKey}` | 探测结果，**只探测不写盘**（首启向导用） |
+| `template.list` | 无 | `{templates, tools, providers, defaultTools, thinkingEfforts, allowedModalities, effectiveNote}` |
+| `template.save` | `{originalName?, name, provider, model, thinkingEffort, systemPrompt, tools, maxContextTokens, inputModalities, compactionThresholdPercent?, compactionWaitThresholdPercent?}` | `{template, created}`；校验失败可归因（含字段名） |
+| `template.delete` | `{templateName}` | `{templateName, deleted}`；general 不可删、被会话引用拒删（名单在错误里） |
+| `attachment.upload` | `{filename, base64}` | `{path, bytes, format, mediaType, width, height}`；单张上限与文件头魔数校验见管理屏文档 |
+| `attachment.read` | `{path}` | `{path, bytes, base64, mediaType}`；只读附件目录内文件 |
+
+> 管理类方法的参数 / 返回细节、以及各管理屏怎么操作，见
+> [web 管理屏](web-management.md) 的「管理 RPC 表」。
 
 ## 事件（服务端 → 客户端 notification）
 
@@ -213,7 +232,8 @@ flutter test --tags live --run-skipped test/live/web_core_shim_live_test.dart
 - **断线期间的事件没有重放缓冲**：重连只重拉当前页消息；断线瞬间正在流式的事件不补发
   （核心无事件重放/订阅游标）。已落库的消息会补上。
 - **本机回环、无鉴权**：只绑 `127.0.0.1`，本机信任边界内可接受；不要把它暴露到网络。
-- **页面不能新建会话**：要在 Flutter 应用里先建一个（同库可见）。
+- **配置文件不存在时是空配置启动**：首启向导完成前没有任何模板 / provider，此时发消息
+  会失败（可归因）；完成向导后组合根立即同步，不用重启核心。
 - **发送路径仍全量载入历史**：`Agent.restore` 现有行为不变；分页只落在
   `message.query` 读路径（SQL 层 `limit`），「核心进程内存只留活跃投影」是后续规模优化
   的目标，不是本 change 的承诺。

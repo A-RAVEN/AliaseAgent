@@ -601,6 +601,768 @@ await run('消息分页：首屏最新页（非最旧）+ 上翻加载更早位�
 });
 
 // ---------------------------------------------------------------------------
+// 1.3 会话侧栏交互（change `web-management-ui` 任务 1.3 / design D7）
+// ---------------------------------------------------------------------------
+
+const sidebarScenario = {
+  sessions: [
+    { id: 's-1', title: '原始会话', agentType: 'general', parentSessionId: null, createdAt: 1, updatedAt: 1 },
+  ],
+  messages: [{ id: 'm-1', role: 'user', content: '会话管理用例' }],
+  templates: ['general', 'alt'],
+  switchFailure: {
+    templateName: 'alt',
+    message:
+      '模板切换失败（阶段：preflight / 候选预检，候选 "alt"）：' +
+      'Agent 模板 "alt" 引用的 provider "q" 未定义：拒绝创建实例。',
+  },
+};
+
+await run('会话侧栏：新建 / 内联重命名 / 删除确认 / 切换模板失败显示阶段与候选名', async () => {
+  const page = await openPage(sidebarScenario);
+  try {
+    await page.waitForSelector('[data-testid="session-row"]', { timeout: 15000 });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    const snapshot = () =>
+      page.evaluate(() => ({
+        calls: window.__harness.calls(),
+        titles: window.__harness.sessionTitles(),
+      }));
+
+    // ① 新建
+    await page.click('[data-testid="session-create"]');
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    let state = await snapshot();
+    obs('新建后的标题 / 调用', state);
+    assert(state.calls.includes('session.create'), '新建必须调用 session.create');
+    assert(state.titles.length === 2, `新建后应有 2 条会话，实测 ${state.titles.length}`);
+    assert(
+      state.titles[0].includes('新建会话'),
+      `新会话应出现在列表首位，实测首位「${state.titles[0]}」`,
+    );
+
+    // ② 内联重命名（第一行 = 刚建的新会话）
+    await page.click('[data-testid="session-rename"]');
+    await page.waitForSelector('[data-testid="session-rename-input"]', { timeout: 5000 });
+    await page.click('[data-testid="session-rename-input"]');
+    await page.keyboard.down('Control');
+    await page.keyboard.press('KeyA');
+    await page.keyboard.up('Control');
+    await page.type('[data-testid="session-rename-input"]', '改名的会话');
+    await page.keyboard.press('Enter');
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    state = await snapshot();
+    obs('重命名后的标题 / 调用', state);
+    assert(
+      state.calls.some((call) => call.startsWith('session.rename:')),
+      '重命名必须调用 session.rename',
+    );
+    assert(state.titles.includes('改名的会话'), '列表必须显示新标题');
+
+    // ③ 删除需要确认：先弹浮层，取消不删
+    await page.click('[data-testid="session-delete"]');
+    await page.waitForSelector('[data-testid="delete-confirm"]', { timeout: 5000 });
+    const confirmText = await page.$eval('[data-testid="delete-confirm"]', (node) => node.innerText);
+    obs('删除确认浮层文案', confirmText);
+    assert(confirmText.includes('删除会话'), '删除必须先弹确认浮层（不能直接删）');
+    await page.click('[data-testid="delete-cancel"]');
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert(
+      (await page.$('[data-testid="delete-confirm"]')) === null,
+      '取消后确认浮层必须消失',
+    );
+    state = await snapshot();
+    assert(!state.calls.some((call) => call.startsWith('session.delete:')), '取消后不得发起删除');
+
+    // ④ 确认删除
+    await page.click('[data-testid="session-delete"]');
+    await page.waitForSelector('[data-testid="delete-confirm-button"]', { timeout: 5000 });
+    await page.click('[data-testid="delete-confirm-button"]');
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    state = await snapshot();
+    obs('删除后的标题 / 调用', state);
+    assert(
+      state.calls.some((call) => call.startsWith('session.delete:')),
+      '确认后必须调用 session.delete',
+    );
+    assert(state.titles.length === 1, `删除后应剩 1 条会话，实测 ${state.titles.length}`);
+    assert(state.titles.includes('原始会话'), '剩下的必须是被删之外的那条');
+
+    // ⑤ 切换模板失败：界面显示阶段 + 候选名
+    await page.select('[data-testid="template-select"]', 'alt');
+    await page.waitForSelector('[data-testid="switch-failure"]', { timeout: 5000 });
+    const failure = await page.$eval('[data-testid="switch-failure"]', (node) => node.innerText);
+    obs('切换失败提示', failure);
+    assert(failure.includes('切换失败'), `失败提示必须出现，实测「${failure}」`);
+    assert(failure.includes('候选预检'), `必须显示失败阶段，实测「${failure}」`);
+    assert(failure.includes('alt'), `必须显示候选模板名，实测「${failure}」`);
+    state = await snapshot();
+    assert(
+      state.calls.includes('session.switchTemplate:alt'),
+      '必须真的调用 session.switchTemplate',
+    );
+  } finally {
+    await page.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 2.2 图片输入与渲染（change `web-management-ui` 任务 2.2 / design D12）
+// ---------------------------------------------------------------------------
+
+const PIXEL_PNG = path.join(ROOT, 'test', 'fixtures', 'pixel.png');
+const PIXEL_DATA_URL =
+  'data:image/png;base64,' +
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/wD/2y6JAAAAAElFTkSuQmCC';
+
+await run('图片输入：选择图片→预览→可移除→发送带附件→消息渲染缩略图', async () => {
+  const page = await openPage({
+    sessions: [
+      { id: 's-1', title: '图片用例', agentType: 'general', parentSessionId: null, createdAt: 1, updatedAt: 1 },
+    ],
+    messages: [],
+    imagesSupported: true,
+    attachments: {},
+  });
+  try {
+    await page.waitForSelector('[data-testid="image-input"]', { timeout: 15000 });
+    const input = await page.$('[data-testid="image-input"]');
+    await input.uploadFile(PIXEL_PNG);
+    await page.waitForSelector('[data-testid="pending-image"]', { timeout: 5000 });
+    let count = await page.$$eval('[data-testid="pending-image"]', (nodes) => nodes.length);
+    obs('选择图片后的预览数', count);
+    assert(count === 1, `选一张图片应出现 1 个预览，实测 ${count}`);
+    const previewSrc = await page.$eval('[data-testid="pending-image"] img', (node) =>
+      node.getAttribute('src'),
+    );
+    assert(
+      typeof previewSrc === 'string' && previewSrc.startsWith('data:image/png'),
+      `预览必须是本地 data URL，实测 ${String(previewSrc).slice(0, 30)}`,
+    );
+
+    // 移除
+    await page.click('[data-testid="pending-image-remove"]');
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    count = await page.$$eval('[data-testid="pending-image"]', (nodes) => nodes.length);
+    obs('移除后的预览数', count);
+    assert(count === 0, '点移除后预览必须消失');
+
+    // 重新选择 + 发送
+    await input.uploadFile(PIXEL_PNG);
+    await page.waitForSelector('[data-testid="pending-image"]', { timeout: 5000 });
+    await page.type('[data-testid="composer"]', '看这张图');
+    await page.click('[data-testid="send"]');
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const state = await page.evaluate(() => ({ calls: window.__harness.calls() }));
+    obs('发送调用', state.calls);
+    assert(
+      state.calls.some((call) => call === 'agent.send:看这张图:1'),
+      `发送必须带 1 张图片，实测 ${JSON.stringify(state.calls)}`,
+    );
+    const thumbnails = await page.$$eval('[data-testid="attachment-thumbnail"]', (nodes) => nodes.length);
+    obs('消息里的缩略图数', thumbnails);
+    assert(thumbnails === 1, `发送后用户消息必须渲染附件缩略图，实测 ${thumbnails}`);
+    assert(
+      (await page.$$eval('[data-testid="pending-image"]', (nodes) => nodes.length)) === 0,
+      '发送后预览必须清空',
+    );
+  } finally {
+    await page.close();
+  }
+});
+
+await run('模型未声明 image：消息下方显示「图片未发送」提示行（不静默丢图）', async () => {
+  const page = await openPage({
+    sessions: [
+      { id: 's-1', title: '模态用例', agentType: 'general', parentSessionId: null, createdAt: 1, updatedAt: 1 },
+    ],
+    messages: [{ id: 'u-1', role: 'user', content: '贴了张图', attachments: ['/x/a.png'] }],
+    attachments: { '/x/a.png': PIXEL_DATA_URL },
+    imagesSupported: false,
+  });
+  try {
+    await page.waitForSelector('[data-testid="attachment-not-sent"]', { timeout: 15000 });
+    const text = await page.$eval('[data-testid="attachment-not-sent"]', (node) => node.innerText);
+    obs('未发送提示', text);
+    assert(text.includes('图片未发送'), `提示必须写明图片未发送，实测「${text}」`);
+    const thumbnails = await page.$$eval('[data-testid="attachment-thumbnail"]', (nodes) => nodes.length);
+    assert(thumbnails === 1, '本地有字节时仍显示缩略图（提示是附加信息，不是隐藏图片）');
+  } finally {
+    await page.close();
+  }
+});
+
+await run('附件文件丢失：消息下方显示「图片已丢失」提示行', async () => {
+  const page = await openPage({
+    sessions: [
+      { id: 's-1', title: '丢失用例', agentType: 'general', parentSessionId: null, createdAt: 1, updatedAt: 1 },
+    ],
+    messages: [{ id: 'u-1', role: 'user', content: '这张图没了', attachments: ['/x/gone.png'] }],
+    attachments: { '/x/gone.png': null },
+    imagesSupported: true,
+  });
+  try {
+    await page.waitForSelector('[data-testid="attachment-missing"]', { timeout: 15000 });
+    const text = await page.$eval('[data-testid="attachment-missing"]', (node) => node.innerText);
+    obs('丢失提示', text);
+    assert(text.includes('图片已丢失'), `提示必须写明图片已丢失，实测「${text}」`);
+  } finally {
+    await page.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 2.3 占用环 + 真实上下文视图（change `web-management-ui` 任务 2.3 / design D13）
+// ---------------------------------------------------------------------------
+
+const FULL_TURN = Math.PI * 2;
+
+const ringScenario = {
+  sessions: [
+    { id: 's-1', title: '占用环用例', agentType: 'general', parentSessionId: null, createdAt: 1, updatedAt: 1 },
+  ],
+  messages: [{ id: 'm-1', role: 'user', content: '环用例' }],
+  snapshot: {
+    sessionId: 's-1',
+    model: 'm',
+    thinkingMode: 'thinking',
+    thinkingEffort: 'max',
+    capturedAt: '2026-11-22T00:00:00.000Z',
+    windowTokens: 100,
+    agentType: 'general',
+    breakdown: {
+      level2Tokens: 80,
+      level1Tokens: 80,
+      rawTokens: 80,
+      fixedOverheadTokens: 10,
+      windowTokens: 100,
+      usedTokens: 250,
+      conversationTokens: 240,
+    },
+    messages: [{ role: 'user', content: 'hello' }],
+    system: 'SYSTEM_PROMPT_MARK_777',
+    tools: '[{"name":"read_file"}]',
+    skillFailures: [],
+    skillFailureNotice: null,
+  },
+};
+
+await run('占用环：三瓣比例 + 超窗口整圈钳制（超出不画、tokens 保留）', async () => {
+  const page = await openPage(ringScenario);
+  try {
+    await page.waitForSelector('[data-testid="context-ring"]', { timeout: 15000 });
+    const svgBox = await page.$eval('[data-testid="context-ring"]', (node) => {
+      const rect = node.getBoundingClientRect();
+      return { width: rect.width, height: rect.height };
+    });
+    obs('环的尺寸', svgBox);
+    assert(svgBox.width > 0 && svgBox.height > 0, '占用环必须有可见尺寸');
+
+    const slices = await page.$$eval('[data-testid="ring-slice"]', (nodes) =>
+      nodes.map((node) => ({
+        tokens: Number(node.dataset.tokens),
+        sweep: Number(node.dataset.sweep),
+        hasPath: (node.getAttribute('d') ?? '').length > 0,
+      })),
+    );
+    obs('三瓣实测', slices);
+    const sweeps = slices.map((slice) => slice.sweep);
+    const total = sweeps.reduce((sum, value) => sum + value, 0);
+    obs('弧度之和 / 整圈', { total, FULL_TURN });
+    assert(total <= FULL_TURN + 1e-6, `整圈不得被画过：实测总弧度 ${total} > 2π`);
+    assert(
+      Math.abs(total - FULL_TURN) < 1e-6,
+      `三段之和超窗口时必须累加到整圈为止（总弧度 ${total}）`,
+    );
+    assert(slices.every((slice) => slice.hasPath), '画出来的每一瓣都必须有路径');
+    assert(slices[0].tokens === 80, `第一瓣 tokens 必须保留原值，实测 ${slices[0].tokens}`);
+    assert(
+      slices.length === 2,
+      `第三段被钳制成 0 弧度不应画出来，实测 ${slices.length} 瓣`,
+    );
+
+    const legend = await page.$$eval('[data-testid="ring-legend"]', (nodes) =>
+      nodes.map((node) => ({ tokens: Number(node.dataset.tokens), text: node.innerText })),
+    );
+    obs('图例', legend);
+    assert(legend.length === 3, `图例必须三瓣（tokens 保留原值），实测 ${legend.length}`);
+    assert(
+      legend.map((item) => item.tokens).join(',') === '80,80,80',
+      `tokens 原值必须保留，实测 ${legend.map((item) => item.tokens).join(',')}`,
+    );
+    const totalText = await page.$eval('[data-testid="ring-total"]', (node) => node.innerText);
+    obs('合计文案', totalText);
+    assert(totalText.includes('240'), `合计应显示对话 240 tokens，实测「${totalText}」`);
+    assert(totalText.includes('100'), `合计应显示窗口 100 tokens，实测「${totalText}」`);
+  } finally {
+    await page.close();
+  }
+});
+
+await run('真实上下文视图：显示 system/messages/tools 原始 JSON 且可复制', async () => {
+  const page = await openPage(ringScenario);
+  try {
+    await page.waitForSelector('[data-testid="toggle-real-context"]', { timeout: 15000 });
+    assert(
+      (await page.$('[data-testid="real-context"]')) === null,
+      '真实上下文视图默认收起（不占屏）',
+    );
+    await page.click('[data-testid="toggle-real-context"]');
+    await page.waitForSelector('[data-testid="real-context"]', { timeout: 5000 });
+    const json = await page.$eval('[data-testid="real-context-json"]', (node) => node.innerText);
+    obs('真实上下文 JSON（前 120 字）', json.slice(0, 120));
+    for (const anchor of ['"system"', '"messages"', '"tools"', 'SYSTEM_PROMPT_MARK_777', 'read_file']) {
+      assert(json.includes(anchor), `真实上下文 JSON 必须包含 ${anchor}`);
+    }
+    const copyButton = await page.$('[data-testid="copy-real-context"]');
+    assert(copyButton !== null, '真实上下文必须提供复制按钮');
+    const scrollable = await page.$eval('[data-testid="real-context-json"]', (node) => {
+      const style = getComputedStyle(node);
+      return { overflow: style.overflow, maxHeight: style.maxHeight };
+    });
+    obs('真实上下文滚动样式', scrollable);
+    assert(scrollable.overflow === 'auto', `内容区必须可滚，实测 overflow=${scrollable.overflow}`);
+  } finally {
+    await page.close();
+  }
+});
+
+await run('快照没有 breakdown：显式提示不渲染环（不静默当成 0）', async () => {
+  const page = await openPage({
+    sessions: [
+      { id: 's-1', title: '无拆解用例', agentType: 'general', parentSessionId: null, createdAt: 1, updatedAt: 1 },
+    ],
+    messages: [{ id: 'm-1', role: 'user', content: 'hi' }],
+    snapshot: {
+      sessionId: 's-1',
+      model: 'm',
+      thinkingMode: 'thinking',
+      thinkingEffort: 'max',
+      capturedAt: '2026-11-22T00:00:00.000Z',
+      windowTokens: 100,
+      agentType: 'general',
+      breakdown: null,
+      messages: [],
+      skillFailures: [],
+      skillFailureNotice: null,
+    },
+  });
+  try {
+    await page.waitForSelector('[data-testid="no-breakdown"]', { timeout: 15000 });
+    assert((await page.$('[data-testid="context-ring"]')) === null, '没有拆解时不得渲染环');
+  } finally {
+    await page.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 3.3 Provider 管理页（change `web-management-ui` 任务 3.3 / design D8）
+// ---------------------------------------------------------------------------
+
+const providersScenario = {
+  mode: 'providers',
+  fake: {
+    config: {
+      missing: false,
+      configPath: 'C:\\tmp\\config.json',
+      providers: {
+        p: {
+          baseUrl: 'http://127.0.0.1:1',
+          hasApiKey: true,
+          models: [{ id: 'm1' }],
+          discoveredAt: '2026-01-01T00:00:00Z',
+        },
+        q: {
+          baseUrl: 'http://127.0.0.1:2',
+          hasApiKey: true,
+          models: [],
+          discoveredAt: null,
+        },
+      },
+      agentTypes: { general: { provider: 'p' } },
+      tools: ['read_file'],
+    },
+    templates: {
+      templates: [{ name: 'general', provider: 'p' }],
+      tools: ['read_file'],
+      providers: ['p', 'q'],
+      defaultTools: ['read_file'],
+      thinkingEfforts: ['max'],
+      allowedModalities: ['text', 'image'],
+      effectiveNote: '',
+    },
+    probeResults: {
+      p: {
+        ok: true,
+        providerName: 'p',
+        entries: [{ id: 'm3' }, { id: 'm4' }],
+        added: 2,
+        updated: 0,
+        removed: 0,
+        dropped: 0,
+        discoveredAt: '2026-11-22T00:00:00Z',
+        error: null,
+      },
+    },
+  },
+};
+
+await run('Provider 页：列表（密钥不回显）+ 探测 + 编辑留空沿用 + 删除被引用拒绝显示名单', async () => {
+  const page = await openPage(providersScenario);
+  try {
+    await page.waitForSelector('[data-testid="provider-row"]', { timeout: 15000 });
+    const rows = await page.$$eval('[data-testid="provider-row"]', (nodes) =>
+      nodes.map((node) => ({ name: node.dataset.name, text: node.innerText })),
+    );
+    obs('provider 行', rows.map((row) => row.name));
+    assert(rows.length === 2, `应有 2 个 provider，实测 ${rows.length}`);
+    const pageText = await page.$eval('[data-testid="providers-page"]', (node) => node.innerText);
+    assert(pageText.includes('已配置（不回显）'), '列表必须说明密钥不回显');
+    assert(!pageText.includes('key-'), '列表不得出现任何密钥内容');
+
+    // 探测
+    await page.click('[data-testid="provider-row"][data-name="p"] [data-testid="provider-probe"]');
+    await page.waitForSelector('[data-testid="provider-report"]', { timeout: 5000 });
+    const report = await page.$eval('[data-testid="provider-report"]', (node) => node.innerText);
+    obs('探测报告', report);
+    assert(report.includes('新增 2'), `探测报告必须显示四类计数，实测「${report}」`);
+    assert(report.includes('discovered_at'), '探测成功必须显示 discovered_at');
+
+    // 编辑：密钥框不回填原值；留空保存 = payload 不带 api_key
+    await page.click('[data-testid="provider-row"][data-name="p"] [data-testid="provider-edit"]');
+    await page.waitForSelector('[data-testid="provider-form-api-key"]', { timeout: 5000 });
+    const prefilled = await page.$eval('[data-testid="provider-form-api-key"]', (node) => node.value);
+    obs('编辑时密钥框的值长度', prefilled.length);
+    assert(prefilled === '', '编辑时密钥框不得回填原密钥');
+    await page.click('[data-testid="provider-form-base-url"]');
+    await page.keyboard.down('Control');
+    await page.keyboard.press('KeyA');
+    await page.keyboard.up('Control');
+    await page.type('[data-testid="provider-form-base-url"]', 'http://127.0.0.1:5');
+    await page.click('[data-testid="provider-form-save"]');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const afterSave = await page.evaluate(() => window.__harness.calls());
+    const saveCall = afterSave.find((call) => call.startsWith('config.save:'));
+    obs('config.save 调用', saveCall);
+    assert(saveCall !== undefined, '保存必须调用 config.save');
+    assert(saveCall.includes('http://127.0.0.1:5'), '保存必须带上新的 base_url');
+    assert(!saveCall.includes('api_key'), '密钥留空时 payload 不得带 api_key（核心沿用原密钥）');
+    assert(
+      afterSave.some((call) => call.startsWith('provider.probe:')),
+      '保存成功后必须自动探测一次（D8）',
+    );
+
+    // 删除无引用 provider（q）
+    await page.click('[data-testid="provider-row"][data-name="q"] [data-testid="provider-delete"]');
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert(
+      (await page.$('[data-testid="provider-row"][data-name="q"]')) === null,
+      '无引用 provider 删除后必须从列表消失',
+    );
+
+    // 删除被 general 引用的 p：拒绝并显示引用名单
+    await page.click('[data-testid="provider-row"][data-name="p"] [data-testid="provider-delete"]');
+    await page.waitForSelector('[data-testid="provider-delete-error"]', { timeout: 5000 });
+    const deleteError = await page.$eval(
+      '[data-testid="provider-delete-error"]',
+      (node) => node.innerText,
+    );
+    obs('删除被引用 provider 的提示', deleteError);
+    assert(deleteError.includes('general'), `必须显示引用名单，实测「${deleteError}」`);
+    assert(deleteError.includes('不能删除'), '必须说明为什么不能删');
+  } finally {
+    await page.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 3.4 模板编辑页（change `web-management-ui` 任务 3.4 / design D9）
+// ---------------------------------------------------------------------------
+
+const templatesScenario = {
+  mode: 'templates',
+  fake: {
+    config: {
+      missing: false,
+      configPath: 'C:\\tmp\\config.json',
+      providers: {
+        p: {
+          baseUrl: 'http://127.0.0.1:1',
+          hasApiKey: true,
+          models: [
+            {
+              id: 'catalog-model',
+              display_name: '目录模型',
+              context_window: 1048576,
+              modalities: { input: ['text', 'image'] },
+            },
+          ],
+          discoveredAt: null,
+        },
+      },
+      agentTypes: { general: { provider: 'p' } },
+      tools: ['read_file'],
+    },
+    templates: {
+      templates: [
+        {
+          name: 'general',
+          provider: 'p',
+          model: 'm',
+          thinking_effort: 'low',
+          tools: ['read_file'],
+          input_modalities: ['text'],
+        },
+        {
+          name: 'alt',
+          provider: 'p',
+          model: 'm2',
+          thinking_effort: 'max',
+          tools: ['read_file'],
+          input_modalities: ['text', 'image'],
+        },
+      ],
+      tools: ['read_file', 'list_dir'],
+      providers: ['p'],
+      defaultTools: ['read_file'],
+      thinkingEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+      allowedModalities: ['text', 'image'],
+      effectiveNote: '只有推理强度从下一条消息起对运行中对话生效，其余字段对新会话生效。',
+    },
+  },
+};
+
+await run('模板页：字段齐全 + 生效时机提示 + 目录回填 + 模态勾选 + general 不可删', async () => {
+  const page = await openPage(templatesScenario);
+  try {
+    await page.waitForSelector('[data-testid="template-row"]', { timeout: 15000 });
+    const rows = await page.$$eval('[data-testid="template-row"]', (nodes) =>
+      nodes.map((node) => node.dataset.name),
+    );
+    obs('模板行', rows);
+    assert(rows.length === 2, `应有 2 个模板，实测 ${rows.length}`);
+    const note = await page.$eval('[data-testid="template-effective-note"]', (node) => node.innerText);
+    obs('生效时机提示', note);
+    assert(note.includes('只有推理强度'), '必须显示生效时机提示（复刻 kAgentTemplateEffectiveNote）');
+
+    // 编辑 general：名字只读；模态勾选存在
+    await page.click('[data-testid="template-row"][data-name="general"] [data-testid="template-edit"]');
+    await page.waitForSelector('[data-testid="template-form-name"]', { timeout: 5000 });
+    const readonly = await page.$eval('[data-testid="template-form-name"]', (node) => ({
+      ro: node.getAttribute('readonly'),
+      flag: node.dataset.readonly,
+    }));
+    obs('模板名只读状态', readonly);
+    assert(readonly.ro !== null && readonly.flag === 'true', '编辑既有模板时模板名必须只读');
+    assert(
+      (await page.$('[data-testid="template-modality-image"]')) !== null,
+      '必须有 input_modalities 的 image 勾选框',
+    );
+
+    // 目录选模型 → 回填窗口 + 模态
+    await page.select('[data-testid="template-form-catalog-model"]', 'catalog-model');
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const filled = await page.evaluate(() => ({
+      model: document.querySelector('[data-testid="template-form-model"]').value,
+      window: document.querySelector('[data-testid="template-form-max-context"]').value,
+      image: document.querySelector('[data-testid="template-modality-image"]').checked,
+    }));
+    obs('目录回填结果', filled);
+    assert(filled.model === 'catalog-model', '选目录模型必须填模型名');
+    assert(filled.window === '1048576', `必须回填目录窗口，实测「${filled.window}」`);
+    assert(filled.image === true, '目录声明 image 时必须勾上 image 模态');
+
+    // 取消 image + 改推理强度 → 保存 payload
+    await page.click('[data-testid="template-modality-image"]');
+    await page.select('[data-testid="template-form-thinking"]', 'max');
+    await page.click('[data-testid="template-form-save"]');
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const calls = await page.evaluate(() => window.__harness.calls());
+    const saveCall = calls.find((call) => call.startsWith('template.save:'));
+    obs('template.save 调用', saveCall);
+    assert(saveCall !== undefined, '保存必须调用 template.save');
+    assert(saveCall.includes('"model":"catalog-model"'), 'payload 必须带模型名');
+    assert(saveCall.includes('"thinkingEffort":"max"'), 'payload 必须带推理强度');
+    assert(saveCall.includes('"inputModalities":["text"]'), '取消勾选后 modal 只能剩 text');
+    assert(saveCall.includes('"originalName":"general"'), '编辑必须带 originalName');
+
+    // 删除 general 被拒
+    await page.click('[data-testid="template-row"][data-name="general"] [data-testid="template-delete"]');
+    await page.waitForSelector('[data-testid="template-delete-error"]', { timeout: 5000 });
+    const deleteError = await page.$eval(
+      '[data-testid="template-delete-error"]',
+      (node) => node.innerText,
+    );
+    obs('删 general 提示', deleteError);
+    assert(deleteError.includes('不可删'), `general 必须不可删，实测「${deleteError}」`);
+
+    // 删除 alt 成功
+    await page.click('[data-testid="template-row"][data-name="alt"] [data-testid="template-delete"]');
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert(
+      (await page.$('[data-testid="template-row"][data-name="alt"]')) === null,
+      '删除后模板必须从列表消失',
+    );
+  } finally {
+    await page.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 3.5 首启向导（change `web-management-ui` 任务 3.5 / design D11）
+// ---------------------------------------------------------------------------
+
+function wizardScenario(firstModelId) {
+  return {
+    mode: 'wizard',
+    fake: {
+      config: {
+        missing: true,
+        configPath: 'C:\\tmp\\config.json',
+        providers: {},
+        agentTypes: {},
+        tools: [],
+      },
+      templates: {
+        templates: [],
+        tools: ['read_file', 'list_dir'],
+        providers: [],
+        defaultTools: ['read_file', 'list_dir'],
+        thinkingEfforts: ['max'],
+        allowedModalities: ['text', 'image'],
+        effectiveNote: '',
+      },
+      probeFetchQueue: [
+        {
+          ok: true,
+          entries: [{ id: firstModelId }, { id: 'another-model' }],
+          dropped: 0,
+          error: null,
+        },
+      ],
+    },
+  };
+}
+
+async function fillWizard(page) {
+  await page.waitForSelector('[data-testid="wizard"]', { timeout: 15000 });
+  await page.click('[data-testid="wizard-base-url"]');
+  await page.type('[data-testid="wizard-base-url"]', 'http://127.0.0.1:3425');
+  await page.click('[data-testid="wizard-api-key"]');
+  await page.type('[data-testid="wizard-api-key"]', 'wizard-key');
+  await page.click('[data-testid="wizard-next"]');
+  await page.waitForSelector('[data-testid="wizard-model-select"]', { timeout: 5000 });
+}
+
+await run('首启向导：probeFetch 首项即默认模型 + Start 一次写盘（config.save + template.save）', async () => {
+  const page = await openPage(wizardScenario('model-alpha'));
+  try {
+    await page.waitForSelector('[data-testid="wizard-provider-name"]', { timeout: 15000 });
+    const defaultName = await page.$eval(
+      '[data-testid="wizard-provider-name"]',
+      (node) => node.value,
+    );
+    obs('默认 provider 名', defaultName);
+    assert(defaultName === 'magpie', `默认 provider 名应为 magpie（可改），实测「${defaultName}」`);
+
+    await fillWizard(page);
+    const selected = await page.$eval('[data-testid="wizard-model-select"]', (node) => node.value);
+    obs('默认选中的模型', selected);
+    assert(selected === 'model-alpha', `默认必须选目录首项 model-alpha，实测「${selected}」`);
+
+    await page.click('[data-testid="wizard-include-image"]');
+    await page.click('[data-testid="wizard-start"]');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const calls = await page.evaluate(() => window.__harness.calls());
+    obs('向导调用序列', calls.map((call) => call.slice(0, 40)));
+    const configCall = calls.find((call) => call.startsWith('config.save:'));
+    const templateCall = calls.find((call) => call.startsWith('template.save:'));
+    assert(configCall !== undefined, 'Start 必须写 provider（config.save）');
+    assert(configCall.includes('"models":[{"id":"model-alpha"}'), 'config.save 必须带上探测到的目录');
+    assert(templateCall !== undefined, 'Start 必须建 general（template.save）');
+    assert(templateCall.includes('"name":"general"'), 'Start 必须建 general 模板');
+    assert(templateCall.includes('"model":"model-alpha"'), 'general 的模型必须取目录首项');
+    assert(templateCall.includes('"inputModalities":["text","image"]'), '勾选后模态必须含 image');
+    assert(calls.includes('wizard.done'), 'Start 成功后必须通知上层重载');
+  } finally {
+    await page.close();
+  }
+});
+
+await run('首启向导：假 catalog 首项变化 ⇒ 选中模型跟着变（不写死，变异②红靶）', async () => {
+  const page = await openPage(wizardScenario('model-x'));
+  try {
+    await fillWizard(page);
+    const selected = await page.$eval('[data-testid="wizard-model-select"]', (node) => node.value);
+    obs('第二份 catalog 的首项 / 选中', selected);
+    assert(selected === 'model-x', `选中模型必须跟随 catalog 首项 model-x，实测「${selected}」`);
+    assert(selected !== 'model-alpha', '不得写死任何模型名');
+
+    // 探测阶段（还没点 Start）不得写盘。注意：这条必须在点 Start **之前**断言 ——
+    // 点 Start 之后写盘是正确行为。
+    const beforeStart = await page.evaluate(() => window.__harness.calls());
+    const probeCall = beforeStart.find((call) => call.startsWith('provider.probeFetch:'));
+    assert(probeCall !== undefined, '下一步必须走 probeFetch（只探测不写盘）');
+    assert(
+      !beforeStart.some((call) => call.startsWith('config.save:')),
+      '仅探测阶段不得写盘（不写半份配置）',
+    );
+
+    // 红靶的真正判据在 **payload 通道**：React 受控 select 的 DOM value 在"state 与
+    // 选项不匹配"时会自动回退显示首项，`node.value` 会被 DOM 掩盖（实测：把
+    // pickDefaultModel 写死返回 model-alpha 后，这里仍读到 model-x 而全绿）。真实损害
+    // 是 state 里的 selectedModel 被写进 general —— 所以必须点 Start 后查 payload。
+    await page.click('[data-testid="wizard-start"]');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const calls = await page.evaluate(() => window.__harness.calls());
+    obs('向导调用序列', calls.map((call) => call.slice(0, 48)));
+    const configCall = calls.find((call) => call.startsWith('config.save:'));
+    const templateCall = calls.find((call) => call.startsWith('template.save:'));
+    assert(configCall !== undefined, 'Start 必须写 provider（config.save）');
+    assert(
+      configCall.includes('"models":[{"id":"model-x"},{"id":"another-model"}]'),
+      `config.save 必须带上第二份 catalog（首项 model-x），实测：${configCall}`,
+    );
+    assert(templateCall !== undefined, 'Start 必须建 general（template.save）');
+    assert(
+      templateCall.includes('"model":"model-x"'),
+      `general 的模型必须取第二份 catalog 的首项 model-x（payload 通道，实测：${templateCall}）`,
+    );
+    assert(
+      !templateCall.includes('"model":"model-alpha"'),
+      '不得把写死的模型名写进 general',
+    );
+    assert(calls.includes('wizard.done'), 'Start 成功后必须通知上层重载');
+  } finally {
+    await page.close();
+  }
+});
+
+await run('首启向导：探测失败可归因且不写盘', async () => {
+  const failureScenario = wizardScenario('model-alpha');
+  failureScenario.fake.probeFetchQueue = [
+    { ok: false, entries: [], dropped: 0, error: 'HTTP 500', errorFilePath: 'C:/tmp/e.txt' },
+  ];
+  const page = await openPage(failureScenario);
+  try {
+    await fillWizard(page).catch(() => {});
+    await page.waitForSelector('[data-testid="wizard-error"]', { timeout: 5000 });
+    const error = await page.$eval('[data-testid="wizard-error"]', (node) => node.innerText);
+    obs('探测失败提示', error);
+    assert(error.includes('HTTP 500'), `错误必须可归因，实测「${error}」`);
+    assert(error.includes('C:/tmp/e.txt'), '必须回显错误落盘路径');
+    const calls = await page.evaluate(() => window.__harness.calls());
+    assert(
+      !calls.some((call) => call.startsWith('config.save:')),
+      '探测失败不得写盘',
+    );
+  } finally {
+    await page.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
 
 await browser.close();
 await staticServer.close();

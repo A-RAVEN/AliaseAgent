@@ -39,6 +39,8 @@ export interface RawMessage {
   thinking?: unknown;
   createdAt?: number;
   isFinal?: boolean;
+  /** 附件路径（change `web-management-ui` 2.2）：渲染缩略图要靠 `attachment.read`。 */
+  attachments?: string[];
 }
 
 export interface NormalizedMessage {
@@ -48,6 +50,7 @@ export interface NormalizedMessage {
   seq: number | null;
   toolCalls: ToolCardModel[];
   thinking: ThinkingCardModel[];
+  attachments: string[];
 }
 
 export interface ChatView {
@@ -139,6 +142,9 @@ export function normalizeMessage(raw: RawMessage): NormalizedMessage {
     seq: typeof raw.seq === 'number' ? raw.seq : null,
     toolCalls: normalizeToolCalls(raw.toolCalls),
     thinking: normalizeThinking(raw.thinking),
+    attachments: Array.isArray(raw.attachments)
+      ? raw.attachments.filter((path): path is string => typeof path === 'string')
+      : [],
   };
 }
 

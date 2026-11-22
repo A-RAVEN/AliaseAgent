@@ -7,7 +7,7 @@
 ## Requirements
 
 ### Requirement: 无头核心进程独立启动并回显访问地址
-系统 SHALL 提供一个不依赖 Flutter 渲染的无头 Dart 核心入口，复用现有业务 services 与 dart:ffi 加载的 C++ sidecar。核心 SHALL 仅绑定回环地址，监听端口由 OS 分配（port 0），并在启动输出中回显实际可访问的 `http://127.0.0.1:<port>` 地址。系统 MUST NOT 写死固定端口魔数。
+系统 SHALL 提供一个不依赖 Flutter 渲染的无头 Dart 核心入口，复用现有业务 services 与 dart:ffi 加载的 C++ sidecar。核心 SHALL 仅绑定回环地址，监听端口由 OS 分配（port 0），并在启动输出中回显实际可访问的 `http://127.0.0.1:<port>` 地址。系统 MUST NOT 写死固定端口魔数。**配置文件不存在时 SHALL 以空配置启动并 serve 首启向导**（web-management-ui 引入，修改原 notFound 拒启动门），使 web 端能独立完成首启；配置 malformed 仍 SHALL 可归因失败。
 
 #### Scenario: 启动无头核心
 - **WHEN** 以无头入口启动核心进程
@@ -16,6 +16,14 @@
 #### Scenario: 端口由 OS 分配
 - **WHEN** 核心启动时请求监听端口
 - **THEN** 使用 port 0 让 OS 分配可用端口，回显的端口与实际监听端口一致，而非任何写死的常量
+
+#### Scenario: 空配置启动供向导
+- **WHEN** 配置文件不存在时启动无头核心
+- **THEN** 核心以空配置启动并 serve 首启向导（而非拒启动退出），web 可打开完成首启配置
+
+#### Scenario: 坏配置仍可归因失败
+- **WHEN** 配置文件存在但 malformed
+- **THEN** 核心可归因失败（指明配置损坏），不静默以空配置覆盖
 
 ### Requirement: 核心业务层与 Flutter foundation 解耦且行为不变
 核心 services **及其传递依赖的 models** SHALL 能在纯 Dart VM（`dart run`）下运行，不依赖 `package:flutter`。解耦 SHALL 仅替换 `debugPrint` 与 `@visibleForTesting` 的来源（日志 shim + `package:meta`），MUST NOT 改变任何业务逻辑。debugPrint shim SHALL 是与 foundation 同签名 `(String?, {int? wrapWidth})` 的**可重赋值全局函数变量**，以保住既有日志捕获测试。解耦后既有全量测试 MUST 原样全部通过。

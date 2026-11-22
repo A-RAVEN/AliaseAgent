@@ -16,7 +16,6 @@ import 'package:alias_agent/services/config_service.dart';
 import 'package:alias_agent/services/provider_resolver.dart';
 import 'package:alias_agent/services/summary_node_repository.dart';
 import 'package:alias_agent/services/tool_catalog.dart';
-import 'package:alias_agent/ui/agent_template_menu.dart';
 
 import '../widget/helpers/fakes.dart';
 import 'helpers/fake_sidecar.dart';

@@ -310,7 +310,15 @@ class FakeSidecar implements ISidecar {
   @override
   Future<void> disposeContext(String sessionId) async {
     disposeContextCalls.add(sessionId);
+    // 需要"删除进行中"这个窗口时，用例先设一个 Completer（change
+    // `web-management-ui` 1.2 的 deleting 守卫用例）：删除流程会在销毁上下文这一步
+    // 停住，beginDelete 已经登记、endDelete 还没执行。
+    final gate = disposeContextGate;
+    if (gate != null) await gate.future;
   }
+
+  /// 非空时 `disposeContext()` 会等它完成才返回 —— 把"删除进行中"的窗口摆出来。
+  Completer<void>? disposeContextGate;
 
   /// The last request's JSON + profile (for asserting the compaction projection
   /// and the summary profile mode are actually sent).

@@ -4,6 +4,18 @@ import 'agent_config_resolver.dart';
 import 'agent_type_registry.dart';
 import 'config_service.dart';
 
+/// 模板生效时机的唯一正文（界面与用户文档说同一句话）。
+///
+/// 抽成常量是为了让"界面文案"与"文档验收"能对上同一个字符串：改一处，两边一起变。
+/// 它住在**非 UI 文件**里：无头核心的 `template.list` 也返回同一句话给 web 模板页，
+/// 而核心不能依赖 Flutter UI（`ui/agent_template_menu.dart` 只是重导出）。
+///
+/// 口径（change `model-truth-from-gateway` D7）：**推理强度**每轮装配重解析，所以
+/// 改它对已经跑着的对话从**下一条消息**起就生效；其余字段（窗口、工具、模型、系统
+/// 提示词）仍是实例创建时冻结，只对新会话（之后创建或恢复的实例）生效。
+const String kAgentTemplateEffectiveNote =
+    '只有推理强度从下一条消息起对运行中对话生效，其余字段对新会话生效。';
+
 /// 模板编辑器提交的一份草稿。
 ///
 /// 窗口用文本传进来（界面上就是一个输入框），因为"非整数"本身要作为一条可显示的
@@ -30,6 +42,13 @@ class AgentTemplateDraft {
   /// 取值只能是 `text` / `image`；目录里的 `video` 等由编辑器回填时剔除，不进这里。
   final List<String>? inputModalities;
 
+  /// 压缩阈值百分比（change `web-management-ui` D9）：1..100 的整数；null = 沿用
+  /// 既有值（既有模板）或 general 的当前值（新增模板）。web 模板页显式编辑它。
+  final int? compactionThresholdPercent;
+
+  /// 等待阈值百分比（同上）：1..100；null = 沿用既有值。
+  final int? compactionWaitThresholdPercent;
+
   const AgentTemplateDraft({
     this.originalName,
     required this.name,
@@ -40,6 +59,8 @@ class AgentTemplateDraft {
     required this.tools,
     required this.maxContextTokensText,
     this.inputModalities,
+    this.compactionThresholdPercent,
+    this.compactionWaitThresholdPercent,
   });
 
   bool get isNew => originalName == null;
@@ -209,10 +230,18 @@ class AgentTemplateController {
       tools: List<String>.unmodifiable(draft.tools),
       thinkingEffort: effort.isEmpty ? null : effort,
       maxContextTokens: window,
-      compactionThresholdPercent: base?.compactionThresholdPercent ??
-          AgentTypeConfig.kDefaultCompactionThresholdPercent,
-      compactionWaitThresholdPercent: base?.compactionWaitThresholdPercent ??
-          AgentTypeConfig.kDefaultCompactionWaitThresholdPercent,
+      compactionThresholdPercent: _compactionPercent(
+        draft.compactionThresholdPercent,
+        base?.compactionThresholdPercent ??
+            AgentTypeConfig.kDefaultCompactionThresholdPercent,
+        '压缩阈值',
+      ),
+      compactionWaitThresholdPercent: _compactionPercent(
+        draft.compactionWaitThresholdPercent,
+        base?.compactionWaitThresholdPercent ??
+            AgentTypeConfig.kDefaultCompactionWaitThresholdPercent,
+        '等待阈值',
+      ),
       inputModalities: List<String>.unmodifiable(modalities),
       commandTimeoutMs:
           base?.commandTimeoutMs ?? AgentTypeConfig.kDefaultCommandTimeoutMs,
@@ -220,6 +249,16 @@ class AgentTemplateController {
           AgentTypeConfig.kDefaultCommandMaxTimeoutMs,
       standingRequirements: base?.standingRequirements ?? const [],
     );
+  }
+
+  /// 校验一个压缩百分比草稿值：null = 沿用 [fallback]；非 1..100 整数 = 可归因拒绝。
+  int _compactionPercent(int? draft, int fallback, String fieldLabel) {
+    if (draft == null) return fallback;
+    if (draft < 1 || draft > 100) {
+      throw AgentTemplateValidationException(
+          fieldLabel, '$fieldLabel 必须是 1 到 100 的整数（当前 $draft）');
+    }
+    return draft;
   }
 
   /// 校验并保存。写回的是**完整** `AppConfig`（providers / search / spill / 其它模板
