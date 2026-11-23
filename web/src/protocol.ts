@@ -530,6 +530,11 @@ export interface GroupChainResult {
   rounds: number;
   /** 运行中为 null；终态 ∈ {all_passed, round_cap, cancelled, failed, no_members}。 */
   stopReason: string | null;
+  /**
+   * 失败真因（change `group-chat-layout` R.15）：`failed` 时非空且含可归因文本；
+   * 其余状态为 null。界面以独立提示 `group-chain-error` 显示，一过性（下次发送清除）。
+   */
+  error?: string | null;
   steps: GroupSendStep[];
 }
 

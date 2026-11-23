@@ -1,10 +1,14 @@
-// web 客户端入口装配（change `web-chat-screen`）：RPC ↔ 聊天视图状态 ↔ ChatScreen。
+// web 客户端入口装配（change `web-chat-screen`）：RPC ↔ 聊天视图状态 ↔ 壳层。
 //
 // 分工：
 //   - 事件归约在 `chat/events.ts`（纯函数，vitest 覆盖流式语义与归一）；
 //   - 渲染在 `chat/render.ts`（纯函数，修空气泡/去重）；
 //   - 布局/滚动在 `components/MessageList.tsx`（puppeteer 覆盖）；
+//   - 主区判定在 `layout/model.ts`（vitest）；
 //   - 这里只做"接线"：连 WS、拉会话/分页、把事件塞进归约、把状态交给组件。
+//
+// change `group-chat-layout`：会话列表的宿主上提到 `ChatShell`（常驻左列），主区
+// 按选中会话的 `kind` 切换；群加载带代次守卫，激活会话按统一清单重置旧状态。
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { applyAgentEvent, type AgentEventLike } from './chat/events';
@@ -17,8 +21,11 @@ import {
 } from './chat/paging';
 import { emptyChatView, type ChatView } from './chat/render';
 import { ChatScreen } from './components/ChatScreen';
+import { ChatShell } from './components/ChatShell';
+import { SessionList } from './components/SessionList';
 import { GroupView } from './group/GroupView';
-import { splitGroupMessages } from './group/model';
+import { loadingMemberSnapshot, splitGroupMessages, type MemberSnapshotState } from './group/model';
+import { workspaceMode } from './layout/model';
 import { ProvidersPage } from './components/ProvidersPage';
 import { TemplatesPage } from './components/TemplatesPage';
 import { Wizard } from './components/Wizard';
@@ -51,6 +58,32 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * 群聊主区占位（change `group-chat-layout` D2）：摘要或首屏消息未齐时显示。
+ *
+ * `message.query` 失败时占位保留、错误可归因；不得用空时间线冒充加载完成。
+ */
+function GroupLoading({ error }: { error: string | null }) {
+  return (
+    <div className="flex h-full min-h-0 flex-col bg-bg text-fg">
+      {error && (
+        <div
+          data-testid="group-loading-error"
+          className="border-b border-danger/40 bg-danger/10 px-4 py-2 text-sm text-danger"
+        >
+          {error}
+        </div>
+      )}
+      <div
+        data-testid="group-loading"
+        className="flex min-h-0 flex-1 items-center justify-center px-4 py-3 text-sm text-muted"
+      >
+        正在加载群聊…
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   // 重连/心跳四参数来自 tokens（可配、有文档键表），不在这里写数字。
   const client = useMemo(() => new RpcClient({ config: layoutConfig }), []);
@@ -72,17 +105,19 @@ export default function App() {
   const [panel, setPanel] = useState<'providers' | 'templates' | null>(null);
   const [configMissing, setConfigMissing] = useState(false);
   // 群视图状态（change `agent-group-chat`）：组成员、**原始消息列表**（分页的单一来源）、
-  // 成员快照。时间线与私有分栏由 `splitGroupMessages` 从同一份列表派生 —— 上翻补页时
-  // 两栏同步补、按 author/visibility 归位、不丢不重。
+  // 成员快照。时间线与成员视图由 `splitGroupMessages` 从同一份列表派生 —— 上翻补页时
+  // 两处同步补、按 author/visibility 归位、不丢不重。
   const [groupSummary, setGroupSummary] = useState<GroupSummary | null>(null);
   const [groupMessages, setGroupMessages] = useState<Message[]>([]);
   const [groupEarlierCursor, setGroupEarlierCursor] = useState<number | null>(null);
   const [groupLoadingEarlier, setGroupLoadingEarlier] = useState(false);
-  const [groupSnapshots, setGroupSnapshots] = useState<Record<string, SnapshotEventData | null>>({});
+  const [groupSnapshots, setGroupSnapshots] = useState<Record<string, MemberSnapshotState>>({});
+  // 首屏消息是否已就绪：与 `groupSummary` 一起提交，占位以它为准（D2）。
+  const [groupFirstPageReady, setGroupFirstPageReady] = useState(false);
   const [groupToolNames, setGroupToolNames] = useState<string[]>([]);
   const [groupEfforts, setGroupEfforts] = useState<string[]>([]);
   // 正在流式的成员 id（change `group-reactive-mode` D10）：`agent.streaming` 事件按
-  // `memberId` 记，驱动分栏的「正在反应…」与取消按钮的可用性。断线重连后它清空，
+  // `memberId` 记，驱动成员卡片的「正在反应…」与取消按钮的可用性。断线重连后它清空，
   // 但 `group.list` 的 `busy` / `runningMemberId` 仍能恢复「链在跑」的判断。
   const [groupStreamingMembers, setGroupStreamingMembers] = useState<string[]>([]);
   // 当前 / 最近一条链（change `group-reactive-mode` R.4）：`group.chain` 重拉 + 事件驱动。
@@ -91,6 +126,8 @@ export default function App() {
   // `group.chain.completed` 事件计数：只在事件到达时给一次性提示（刷新不显示）。
   const [groupChainCompletedTick, setGroupChainCompletedTick] = useState(0);
   const currentSessionIdRef = useRef<string | null>(null);
+  // 群加载请求代次（D2）：每次 `loadGroup` 自增，过期响应在每个 await 后丢弃。
+  const loadGenerationRef = useRef(0);
   const requestedAttachments = useRef<Set<string>>(new Set());
 
   currentSessionIdRef.current = currentSessionId;
@@ -160,14 +197,23 @@ export default function App() {
   /** 首屏锚定最新一页（design D10：anchor=tail，不是最旧页）。 */
   const loadLatestPage = useCallback(
     async (sessionId: string) => {
-      const page = await loadInitialPage(
-        (method, params) => client.request(method, params),
-        sessionId,
-        HISTORY_PAGE_SIZE,
-      );
-      setView({ ...emptyChatView, messages: page.messages });
-      setEarlierCursor(page.earlierCursor);
-      setLoadingEarlier(false);
+      try {
+        const page = await loadInitialPage(
+          (method, params) => client.request(method, params),
+          sessionId,
+          HISTORY_PAGE_SIZE,
+        );
+        // 切会话竞态：晚到的旧页不得挂到新会话下（change `group-chat-layout` D2）。
+        if (currentSessionIdRef.current !== sessionId) return;
+        setView({ ...emptyChatView, messages: page.messages });
+        setEarlierCursor(page.earlierCursor);
+        setLoadingEarlier(false);
+      } catch (loadError: unknown) {
+        // R.1：加载失败必须有可归因出口（不能变成 unhandled rejection 或静默空白）。
+        // catch 里同样核对当前会话：旧会话的失败不得挂到新会话。
+        if (currentSessionIdRef.current !== sessionId) return;
+        setError(`加载会话失败：${errorText(loadError)}`);
+      }
     },
     [client],
   );
@@ -184,6 +230,7 @@ export default function App() {
         HISTORY_PAGE_SIZE,
         earlierCursor,
       );
+      if (currentSessionIdRef.current !== sessionId) return;
       setView((previous) => ({
         ...previous,
         messages: prependOlder(previous.messages, page.messages),
@@ -196,75 +243,150 @@ export default function App() {
     }
   }, [client, earlierCursor, loadingEarlier]);
 
-  const loadSessions = useCallback(async () => {
-    const result = await client.request<{ sessions: Session[] }>('session.list');
-    setSessions(result.sessions);
-    if (result.sessions.length === 0) {
-      setCurrentSessionId(null);
-      setView(emptyChatView);
-      setEarlierCursor(null);
-      setNotice('还没有会话：点左侧的 + 新建一个。');
-      return;
-    }
-    setNotice(null);
-    const first = result.sessions[0];
-    setCurrentSessionId(first.id);
-    if (first.kind === 'group') {
-      await loadGroup(first.id);
-    } else {
-      await loadLatestPage(first.id);
-    }
-  }, [client, loadLatestPage]);
-
   const groupSplit = useMemo(
     () => splitGroupMessages(groupMessages, groupSummary?.members ?? []),
     [groupMessages, groupSummary],
   );
 
-  /** 拉一个组的全部视图数据（成员 / 尾锚一页原始消息 / 每成员快照）。 */
+  /**
+   * 拉一个组的全部视图数据（成员 / 尾锚一页原始消息 / 每成员快照 / 链状态）。
+   *
+   * change `group-chat-layout` D2：请求代次 + `currentSessionIdRef` 双重守卫，
+   * 每个 await 之后核对，过期结果直接丢弃；`group.list` 与首屏 `message.query`
+   * 成功后一次性提交摘要/消息/游标 + 全部成员的 `loading` 快照，随后逐成员提交。
+   */
   const loadGroup = useCallback(
-    async (sessionId: string) => {
+    async (
+      sessionId: string,
+      options: { preserveLoadedContent?: boolean } = {},
+    ): Promise<boolean> => {
+      // R.2：入口先判归属，再自增代次。旧群 `onReload` 的续体（以及
+      // `refreshAfterReconnect` 用旧 sessionId 发起的加载）在切走后进入这里时
+      // 必须直接返回 —— 否则它会把新群在途加载的代次顶掉，新群永久占位。
+      if (currentSessionIdRef.current !== sessionId) return false;
+      const preserveLoadedContent = options.preserveLoadedContent === true;
+      const generation = ++loadGenerationRef.current;
+      const isCurrent = () =>
+        generation === loadGenerationRef.current &&
+        currentSessionIdRef.current === sessionId;
       try {
-        // 成功拉到组数据 ⇒ 清掉上一次的错误横幅（组模式下它就是唯一错误出口）。
+        // 成功拉到组数据前先清掉上一次的错误横幅（组模式下它是唯一错误出口）。
         setError(null);
         const list = await client.request<GroupListResult>('group.list');
+        if (!isCurrent()) return false;
         const summary = list.groups.find((entry) => entry.id === sessionId) ?? null;
-        setGroupSummary(summary);
         const page = await loadInitialPage(
           (method, params) => client.request(method, params),
           sessionId,
           HISTORY_PAGE_SIZE,
         );
-        // 分页 helper 的 RawMessage 是聊天屏的窄类型；组视图需要 author/visibility，
-        // 线上的核心响应本来就带这些字段（message.query 的序列化契约）。
+        if (!isCurrent()) return false;
+        // 分段提交（D2）：摘要只在首屏消息成功后提交，占位以 firstPageReady 为准。
+        setGroupSummary(summary);
         setGroupMessages(page.messages as Message[]);
         setGroupEarlierCursor(page.earlierCursor);
-        const snapshots: Record<string, SnapshotEventData | null> = {};
+        const snapshots: Record<string, MemberSnapshotState> = {};
+        for (const member of summary?.members ?? []) {
+          snapshots[member.id] = loadingMemberSnapshot();
+        }
+        setGroupSnapshots(snapshots);
+        setGroupFirstPageReady(true);
+        // 逐成员快照：成功/失败各自守卫提交该成员的状态，不阻断首屏。
         for (const member of summary?.members ?? []) {
           try {
-            const view = await client.request<GroupViewResult>('group.view', {
+            const memberView = await client.request<GroupViewResult>('group.view', {
               groupId: sessionId,
               memberId: member.id,
             });
-            snapshots[member.id] = view.snapshot;
-          } catch {
-            snapshots[member.id] = null;
+            if (!isCurrent()) return false;
+            setGroupSnapshots((previous) => ({
+              ...previous,
+              [member.id]: memberView.snapshot
+                ? { status: 'ok', snapshot: memberView.snapshot, error: null }
+                : { status: 'empty', snapshot: null, error: null },
+            }));
+          } catch (viewError: unknown) {
+            if (!isCurrent()) return false;
+            setGroupSnapshots((previous) => ({
+              ...previous,
+              [member.id]: {
+                status: 'error',
+                snapshot: null,
+                error: errorText(viewError),
+              },
+            }));
           }
         }
-        setGroupSnapshots(snapshots);
         // 链状态（R.4 / D10）：重连后本地 `sending` 已丢，靠 `group.chain` 恢复
         // 「链在跑」与取消按钮；核心重启后它是 `idle`（既定语义）。
         try {
-          setGroupChain(
-            await client.request<GroupChainResult>('group.chain', {
-              groupId: sessionId,
-            }),
-          );
+          const chain = await client.request<GroupChainResult>('group.chain', {
+            groupId: sessionId,
+          });
+          if (!isCurrent()) return false;
+          setGroupChain(chain);
         } catch {
+          if (!isCurrent()) return false;
           setGroupChain(null);
         }
+        return true;
       } catch (groupError: unknown) {
+        if (!isCurrent()) return false;
         setError(`加载组视图失败：${errorText(groupError)}`);
+        // R.4 / R.8：重载失败（以及首屏失败）都清链与流式状态，防止旧链让取消按钮
+        // 误启用、成员卡片显示假的「正在反应…」。
+        setGroupChain(null);
+        setGroupStreamingMembers([]);
+        if (!preserveLoadedContent) {
+          // 首屏首次失败：清空并保留 GroupLoading 占位（不得用空时间线冒充完成）。
+          setGroupSummary(null);
+          setGroupMessages([]);
+          setGroupEarlierCursor(null);
+          setGroupSnapshots({});
+          setGroupFirstPageReady(false);
+        }
+        // 重载失败：时间线 / 成员 / 游标 / 快照原样保留，只显示错误。
+        return false;
+      }
+    },
+    [client],
+  );
+
+  /** 只重拉一个成员的快照（成员视图的「重试」，不重载整条时间线）。 */
+  const reloadMemberSnapshot = useCallback(
+    async (memberId: string) => {
+      const sessionId = currentSessionIdRef.current;
+      if (!sessionId) return;
+      const generation = loadGenerationRef.current;
+      const isCurrent = () =>
+        generation === loadGenerationRef.current &&
+        currentSessionIdRef.current === sessionId;
+      setGroupSnapshots((previous) => ({
+        ...previous,
+        [memberId]: loadingMemberSnapshot(),
+      }));
+      try {
+        const memberView = await client.request<GroupViewResult>('group.view', {
+          groupId: sessionId,
+          memberId,
+        });
+        if (!isCurrent()) return;
+        setGroupSnapshots((previous) => ({
+          ...previous,
+          [memberId]: memberView.snapshot
+            ? { status: 'ok', snapshot: memberView.snapshot, error: null }
+            : { status: 'empty', snapshot: null, error: null },
+        }));
+      } catch (viewError: unknown) {
+        if (!isCurrent()) return;
+        setGroupSnapshots((previous) => ({
+          ...previous,
+          [memberId]: {
+            status: 'error',
+            snapshot: null,
+            error: errorText(viewError),
+          },
+        }));
       }
     },
     [client],
@@ -282,6 +404,7 @@ export default function App() {
         HISTORY_PAGE_SIZE,
         groupEarlierCursor,
       );
+      if (currentSessionIdRef.current !== sessionId) return;
       setGroupMessages(
         (previous) => prependOlder(previous, page.messages) as Message[],
       );
@@ -292,6 +415,67 @@ export default function App() {
       setGroupLoadingEarlier(false);
     }
   }, [client, groupEarlierCursor, groupLoadingEarlier]);
+
+  /**
+   * 激活一个会话（D2 的统一重置清单；选中 / 首屏自动选中 / 删除后下一条都用它）。
+   *
+   * 清空上一条会话的聊天视图、快照、计量、技能失败、提示、群流式与群链状态；
+   * **不重置** `groupChainCompletedTick`（它必须单调，否则一次性提示会卡住）。
+   * 按传入 `session` 的 `kind` 分支加载，禁止按上一条的类型猜。
+   */
+  const activateSession = useCallback(
+    async (session: Session | null) => {
+      // 先同步写 ref，再写 state：守卫读的是 ref，不能读到旧 id。
+      currentSessionIdRef.current = session?.id ?? null;
+      setCurrentSessionId(session?.id ?? null);
+      loadGenerationRef.current += 1; // 让在途的单聊/群聊加载全部过期
+      // 聊天侧
+      setView(emptyChatView);
+      setEarlierCursor(null);
+      setLoadingEarlier(false);
+      setSnapshot(null);
+      setSkillFailures([]);
+      setMetering(null);
+      setError(null);
+      setNotice(null);
+      // 群侧
+      setGroupStreamingMembers([]);
+      setGroupChain(null);
+      setGroupSummary(null);
+      setGroupMessages([]);
+      setGroupEarlierCursor(null);
+      setGroupLoadingEarlier(false);
+      setGroupSnapshots({});
+      setGroupFirstPageReady(false);
+      if (!session) return;
+      try {
+        if (session.kind === 'group') {
+          await loadGroup(session.id);
+        } else {
+          await loadLatestPage(session.id);
+        }
+      } catch (activateError: unknown) {
+        // R.1：激活函数**不向调用方抛错**（`void createSession/deleteSession/selectSession`
+        // 不能产生 unhandled rejection）。加载函数自己已 catch 并 setError，这里是兜底。
+        if (currentSessionIdRef.current === session.id) {
+          setError(`加载会话失败：${errorText(activateError)}`);
+        }
+      }
+    },
+    [loadGroup, loadLatestPage],
+  );
+
+  const loadSessions = useCallback(async () => {
+    const result = await client.request<{ sessions: Session[] }>('session.list');
+    setSessions(result.sessions);
+    if (result.sessions.length === 0) {
+      await activateSession(null);
+      setNotice('还没有会话：点左侧的 + 新建一个。');
+      return;
+    }
+    setNotice(null);
+    await activateSession(result.sessions[0]);
+  }, [client, activateSession]);
 
   /** 模板 / 工具目录 / 思考档位（覆盖层编辑器用）。 */
   const loadGroupOptions = useCallback(async () => {
@@ -308,25 +492,25 @@ export default function App() {
     }
   }, [client]);
 
-  /** 新建组（会话列表的「＋ 组」入口）。 */
-  const createGroup = async () => {
-    setError(null);
-    try {
-      const created = await client.request<{ group: Session }>('group.create', {});
-      const result = await client.request<{ sessions: Session[] }>('session.list');
-      setSessions(result.sessions);
-      setCurrentSessionId(created.group.id);
-      setGroupMessages([]);
-      setGroupEarlierCursor(null);
-      await loadGroup(created.group.id);
-    } catch (createError: unknown) {
-      setError(`新建组失败：${errorText(createError)}`);
-    }
-  };
   const onEvent = useCallback((event: AgentEvent) => {
     if (event.sessionId !== currentSessionIdRef.current) return;
+    const data = event.data ?? {};
+    // 标题事件同时更新列表与当前群摘要（change `group-chat-layout` D2）：群的
+    // 第一条用户消息自动命名也走这条，群主区标题不许停在旧值。
+    if (event.type === 'session.title') {
+      const title = String(data.title ?? '');
+      setSessions((previous) =>
+        previous.map((session) =>
+          session.id === event.sessionId ? { ...session, title } : session,
+        ),
+      );
+      setGroupSummary((previous) =>
+        previous && previous.id === event.sessionId ? { ...previous, title } : previous,
+      );
+      return;
+    }
     // 组事件按 payload（groupId/memberId）归位：消息类事件到达时重拉组数据，
-    // 不依赖 DOM 选中的分栏（design D11 的 payload 判据）。
+    // 不依赖 DOM 选中的标签（design D11 的 payload 判据）。
     if (event.groupId && event.groupId === currentSessionIdRef.current) {
       if (event.type === 'agent.streaming') {
         // 流式指示按 `memberId` 归位（change `group-reactive-mode` D10）：
@@ -349,22 +533,24 @@ export default function App() {
         // 保证提示读到的 `chain` 是本次终态（change `group-reactive-mode` R.4）。
         const groupId = event.groupId;
         void (async () => {
-          await loadGroup(groupId);
-          setGroupChainCompletedTick((tick) => tick + 1);
+          const loaded = await loadGroup(groupId, { preserveLoadedContent: true });
+          // R.8：只有「这次重拉成功」且「用户还停在这个群」才 bump 提示游标；
+          // 过期/失败的重载不得让别的群或重挂后的视图误触发一次性提示。
+          if (loaded && currentSessionIdRef.current === groupId) {
+            setGroupChainCompletedTick((tick) => tick + 1);
+          }
         })();
         return;
       }
       if (
         event.type === 'user.message' ||
         event.type === 'assistant.message' ||
-        event.type === 'turn.completed' ||
-        event.type === 'session.title'
+        event.type === 'turn.completed'
       ) {
-        void loadGroup(event.groupId);
+        void loadGroup(event.groupId, { preserveLoadedContent: true });
       }
       return;
     }
-    const data = event.data ?? {};
     switch (event.type) {
       case 'user.message':
       case 'assistant.message':
@@ -385,15 +571,6 @@ export default function App() {
       }
       case 'agent.metering': {
         setMetering(data);
-        break;
-      }
-      case 'session.title': {
-        const title = String(data.title ?? '');
-        setSessions((previous) =>
-          previous.map((session) =>
-            session.id === event.sessionId ? { ...session, title } : session,
-          ),
-        );
         break;
       }
       case 'turn.failed': {
@@ -426,7 +603,7 @@ export default function App() {
       const current = sessionsResult.sessions.find((session) => session.id === sessionId);
       if (current?.kind === 'group') {
         setGroupStreamingMembers([]);
-        await loadGroup(sessionId);
+        await loadGroup(sessionId, { preserveLoadedContent: true });
         return;
       }
       const page = await loadInitialPage(
@@ -434,6 +611,7 @@ export default function App() {
         sessionId,
         HISTORY_PAGE_SIZE,
       );
+      if (currentSessionIdRef.current !== sessionId) return;
       setView((previous) => ({
         ...previous,
         messages: restoreMessages(previous.messages, page.messages),
@@ -469,27 +647,10 @@ export default function App() {
   }, [client, loadSessions, loadTemplates, checkConfig, onEvent, refreshAfterReconnect]);
 
   const selectSession = async (sessionId: string) => {
-    setCurrentSessionId(sessionId);
-    setView(emptyChatView);
-    setEarlierCursor(null);
-    setSnapshot(null);
-    setSkillFailures([]);
-    setMetering(null);
-    setError(null);
-    setGroupStreamingMembers([]);
-    // 链状态由 loadGroup 重拉重置；`groupChainCompletedTick` 是**单调计数**，不在这里
-    // 归零（归零会让组视图的"上次已提示"游标卡住，事件再也不会触发一次性提示）。
-    setGroupChain(null);
-    try {
-      const selected = sessions.find((session) => session.id === sessionId);
-      if (selected?.kind === 'group') {
-        await loadGroup(sessionId);
-        return;
-      }
-      await loadLatestPage(sessionId);
-    } catch (loadError: unknown) {
-      setError(errorText(loadError));
-    }
+    const selected = sessions.find((session) => session.id === sessionId) ?? null;
+    if (!selected) return;
+    setPanel(null);
+    await activateSession(selected);
   };
 
   const send = async (text: string, images: PendingImage[] = []) => {
@@ -518,7 +679,8 @@ export default function App() {
   };
 
   // ---------------------------------------------------------------------------
-  // 会话管理（change `web-management-ui` 任务 1.3 / design D7）
+  // 会话管理（change `web-management-ui` 任务 1.3 / design D7；
+  // change `group-chat-layout` D2/D8：按 kind 删除、删除后按 kind 激活）
   // ---------------------------------------------------------------------------
 
   const reloadSessions = useCallback(async (): Promise<Session[]> => {
@@ -530,19 +692,46 @@ export default function App() {
   const createSession = async () => {
     setError(null);
     setSwitchFailure(null);
+    setPanel(null);
+    let created: SessionResult;
     try {
-      const created = await client.request<SessionResult>('session.create', {});
-      await reloadSessions();
-      setCurrentSessionId(created.session.id);
-      setView(emptyChatView);
-      setEarlierCursor(null);
-      setSnapshot(null);
-      setSkillFailures([]);
-      setMetering(null);
-      setNotice(null);
+      // 操作 try **只包操作 RPC**（R.1）：加载失败/列表刷新失败不得被误报成「新建失败」。
+      created = await client.request<SessionResult>('session.create', {});
     } catch (createError: unknown) {
       setError(`新建会话失败：${errorText(createError)}`);
+      return;
     }
+    // 列表刷新单独报错（R.1）：session.list 挂了不影响激活新会话。
+    let listError: string | null = null;
+    try {
+      await reloadSessions();
+    } catch (refreshError: unknown) {
+      listError = `列表刷新失败：${errorText(refreshError)}`;
+    }
+    await activateSession(created.session);
+    if (listError !== null) setError(listError);
+  };
+
+  /** 新建组（会话列表的「＋ 组」入口）。 */
+  const createGroup = async () => {
+    setError(null);
+    setSwitchFailure(null);
+    setPanel(null);
+    let created: { group: Session };
+    try {
+      created = await client.request<{ group: Session }>('group.create', {});
+    } catch (createError: unknown) {
+      setError(`新建组失败：${errorText(createError)}`);
+      return;
+    }
+    let listError: string | null = null;
+    try {
+      await reloadSessions();
+    } catch (refreshError: unknown) {
+      listError = `列表刷新失败：${errorText(refreshError)}`;
+    }
+    await activateSession(created.group);
+    if (listError !== null) setError(listError);
   };
 
   const renameSession = async (sessionId: string, title: string) => {
@@ -555,35 +744,55 @@ export default function App() {
       setSessions((previous) =>
         previous.map((session) => (session.id === sessionId ? result.session : session)),
       );
+      // 当前群的主区标题同步（D2）：否则行已改名、主区还是旧标题。
+      setGroupSummary((previous) =>
+        previous && previous.id === sessionId
+          ? { ...previous, title: result.session.title }
+          : previous,
+      );
     } catch (renameError: unknown) {
       setError(`重命名失败：${errorText(renameError)}`);
     }
   };
 
-  const deleteSession = async (sessionId: string) => {
+  /** 删除会话：群行走 `group.delete`，单聊行走 `session.delete`（D2 / D8）。 */
+  const deleteSession = async (session: Session) => {
     setError(null);
     setSwitchFailure(null);
     try {
-      await client.request('session.delete', { sessionId });
-      const remaining = await reloadSessions();
-      if (currentSessionIdRef.current === sessionId) {
-        const next = remaining.length > 0 ? remaining[0] : null;
-        setCurrentSessionId(next?.id ?? null);
-        setView(emptyChatView);
-        setEarlierCursor(null);
-        setSnapshot(null);
-        setSkillFailures([]);
-        setMetering(null);
-        if (next) await loadLatestPage(next.id);
+      // 操作 try **只包操作 RPC**（R.1）：删除成功后的加载失败不得误报成「删除失败」。
+      if (session.kind === 'group') {
+        await client.request('group.delete', { groupId: session.id });
+      } else {
+        await client.request('session.delete', { sessionId: session.id });
       }
     } catch (deleteError: unknown) {
       setError(`删除会话失败：${errorText(deleteError)}`);
+      return;
     }
+    // R.10：删除**成功**分支关管理面板（失败分支已 return，保留面板与错误）。
+    setPanel(null);
+    let remaining: Session[] | null = null;
+    let listError: string | null = null;
+    try {
+      remaining = await reloadSessions();
+    } catch (refreshError: unknown) {
+      listError = `列表刷新失败：${errorText(refreshError)}`;
+    }
+    if (currentSessionIdRef.current === session.id) {
+      // 删除后按**下一条会话**的 kind 激活；列表刷新失败时退到本地已知顺序。
+      const pool = remaining ?? sessions.filter((entry) => entry.id !== session.id);
+      await activateSession(pool.length > 0 ? pool[0] : null);
+    }
+    if (listError !== null) setError(listError);
   };
 
   const switchTemplate = async (templateName: string) => {
     const sessionId = currentSessionIdRef.current;
     if (!sessionId) return;
+    // 群聊模板由各成员决定：界面已禁用，这里再兜一层，绝不对群发切换（D8）。
+    const current = sessions.find((session) => session.id === sessionId);
+    if (current?.kind === 'group') return;
     setSwitchFailure(null);
     setError(null);
     try {
@@ -604,7 +813,7 @@ export default function App() {
 
   const currentSession = sessions.find((session) => session.id === currentSessionId) ?? null;
   const currentAgentType = currentSession?.agentType ?? null;
-  const currentSessionKind = currentSession?.kind ?? null;
+  const mode = workspaceMode(currentSession);
 
   // 图片模态（决定「图片未发送」提示）随当前模板变化重查；附件字节随消息补取。
   useEffect(() => {
@@ -620,72 +829,41 @@ export default function App() {
     if (paths.length > 0) void resolveAttachments(paths);
   }, [view.messages, resolveAttachments]);
 
+  if (configMissing) {
+    return (
+      <Wizard
+        client={client}
+        onDone={() => {
+          setConfigMissing(false);
+          void (async () => {
+            await loadSessions();
+            await loadTemplates();
+          })();
+        }}
+      />
+    );
+  }
+
   return (
-    <div className="relative h-full">
-      {configMissing ? (
-        <Wizard
-          client={client}
-          onDone={() => {
-            setConfigMissing(false);
-            void (async () => {
-              await loadSessions();
-              await loadTemplates();
-            })();
-          }}
-        />
-      ) : currentSessionKind === 'group' && groupSummary ? (
-        <GroupView
-          client={client}
-          group={groupSummary}
-          members={groupSummary.members}
-          timeline={groupSplit.timeline}
-          lanes={groupSplit.lanes}
-          hasEarlier={groupEarlierCursor !== null}
-          loadingEarlier={groupLoadingEarlier}
-          onLoadEarlier={() => void loadGroupEarlier()}
-          snapshots={groupSnapshots}
+    <ChatShell
+      sidebar={
+        <SessionList
+          sessions={sessions}
+          currentSessionId={currentSessionId}
+          onSelect={(sessionId) => void selectSession(sessionId)}
+          onCreate={() => void createSession()}
+          onCreateGroup={() => void createGroup()}
+          onRename={(sessionId, title) => void renameSession(sessionId, title)}
+          onDelete={(session) => void deleteSession(session)}
           templates={templates}
-          thinkingEfforts={groupEfforts}
-          toolNames={groupToolNames}
-          streamingMembers={groupStreamingMembers}
-          chain={groupChain}
-          chainCompletedTick={groupChainCompletedTick}
-          error={error}
-          onReload={() => loadGroup(groupSummary.id)}
-          onError={(message) => setError(message)}
+          currentAgentType={currentAgentType}
+          onSwitchTemplate={(templateName) => void switchTemplate(templateName)}
+          switchFailure={switchFailure}
+          disabled={status !== 'open'}
         />
-      ) : (
-        <ChatScreen
-      status={status}
-      sessions={sessions}
-      currentSessionId={currentSessionId}
-      onSelectSession={(sessionId) => void selectSession(sessionId)}
-      onCreateSession={() => void createSession()}
-      onCreateGroup={() => void createGroup()}
-      onRenameSession={(sessionId, title) => void renameSession(sessionId, title)}
-      onDeleteSession={(sessionId) => void deleteSession(sessionId)}
-      templates={templates}
-      currentAgentType={currentAgentType}
-      onSwitchTemplate={(templateName) => void switchTemplate(templateName)}
-      switchFailure={switchFailure}
-      view={view}
-      hasEarlier={earlierCursor !== null}
-      loadingEarlier={loadingEarlier}
-      onLoadEarlier={() => void loadEarlier()}
-      error={error}
-      notice={notice}
-      skillFailures={skillFailures}
-      snapshot={snapshot}
-      metering={metering}
-      onSend={(text, images) => void send(text, images)}
-      attachments={attachmentDataUrls}
-      imagesSupported={imagesSupported}
-      onOpenProviders={() => setPanel('providers')}
-      onOpenTemplates={() => setPanel('templates')}
-    />
-      )}
-      {panel === 'providers' && (
-        <div className="absolute inset-0 z-20 bg-bg">
+      }
+      overlay={
+        panel === 'providers' ? (
           <ProvidersPage
             client={client}
             onClose={() => setPanel(null)}
@@ -694,10 +872,7 @@ export default function App() {
               void loadImagesSupported(currentAgentType);
             }}
           />
-        </div>
-      )}
-      {panel === 'templates' && (
-        <div className="absolute inset-0 z-20 bg-bg">
+        ) : panel === 'templates' ? (
           <TemplatesPage
             client={client}
             onClose={() => setPanel(null)}
@@ -706,8 +881,58 @@ export default function App() {
               void loadImagesSupported(currentAgentType);
             }}
           />
-        </div>
+        ) : null
+      }
+    >
+      {mode === 'group' ? (
+        groupSummary !== null && groupFirstPageReady ? (
+          <GroupView
+            // 换群重置由 `groupFirstPageReady` 门保证：`activateSession` 会先把它置假，
+            // 主区经 GroupLoading 卸载再重挂（R.8：`key` 是冗余的，且不是重放修复手段）。
+            client={client}
+            group={groupSummary}
+            members={groupSummary.members}
+            timeline={groupSplit.timeline}
+            lanes={groupSplit.lanes}
+            hasEarlier={groupEarlierCursor !== null}
+            loadingEarlier={groupLoadingEarlier}
+            onLoadEarlier={() => void loadGroupEarlier()}
+            snapshots={groupSnapshots}
+            templates={templates}
+            thinkingEfforts={groupEfforts}
+            toolNames={groupToolNames}
+            streamingMembers={groupStreamingMembers}
+            chain={groupChain}
+            chainCompletedTick={groupChainCompletedTick}
+            error={error}
+            onReload={() => loadGroup(groupSummary.id, { preserveLoadedContent: true })}
+            onReloadMemberSnapshot={(memberId) => void reloadMemberSnapshot(memberId)}
+            onError={(message) => setError(message)}
+          />
+        ) : (
+          <GroupLoading error={error} />
+        )
+      ) : (
+        <ChatScreen
+          status={status}
+          sessionTitle={currentSession?.title ?? null}
+          sessionSelected={mode === 'chat'}
+          view={view}
+          hasEarlier={earlierCursor !== null}
+          loadingEarlier={loadingEarlier}
+          onLoadEarlier={() => void loadEarlier()}
+          error={error}
+          notice={notice}
+          skillFailures={skillFailures}
+          snapshot={snapshot}
+          metering={metering}
+          onSend={(text, images) => void send(text, images)}
+          attachments={attachmentDataUrls}
+          imagesSupported={imagesSupported}
+          onOpenProviders={() => setPanel('providers')}
+          onOpenTemplates={() => setPanel('templates')}
+        />
       )}
-    </div>
+    </ChatShell>
   );
 }

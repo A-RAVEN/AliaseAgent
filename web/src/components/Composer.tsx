@@ -143,6 +143,7 @@ export function Composer({ disabled, onSend }: ComposerProps) {
         <textarea
           data-testid="composer"
           value={input}
+          disabled={disabled}
           onChange={(event) => setInput(event.target.value)}
           onKeyDown={onKeyDown}
           onPaste={onPaste}

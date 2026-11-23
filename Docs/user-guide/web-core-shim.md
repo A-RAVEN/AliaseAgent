@@ -62,7 +62,8 @@ AliasAgent 无头核心已启动
 ## 打开聊天屏
 
 1. 用浏览器打开启动输出里的 `http://127.0.0.1:<port>`。
-2. 页面左上角显示「已连接」后，左侧会话列表里选择会话（**会话来自与 Flutter 共用的数据库**）。
+2. 页面左上角显示「已连接」后，左侧**会话列表常驻**：单聊与群聊混排（群聊行有「群」标记），
+   列表来自与 Flutter 共用的数据库；点哪一条就把**主区**切到哪一条会话，列表本身不动。
 3. 在底部输入一句话，按 `Enter`（或点「发送」）。页面会显示：
    - 你发的消息；
    - 流式回复（Markdown 渲染）；
@@ -71,9 +72,15 @@ AliasAgent 无头核心已启动
    - 上下文窗口、token 计量；整轮失败/技能未生效会有明确提示条。
 4. 当前版本**可以在 web 里新建会话**：左侧会话栏标题右侧的 +（还支持改名 / 删除 /
    切换模板，见 [web 管理屏](web-management.md)）。数据库里没有任何会话时页面会提示新建一个。
+5. **空选中是空聊天屏**：没有任何会话（例如删除了最后一条）时，主区标题是
+   「（未选择会话）」、输入禁用、消息为空，不残留上一条会话的快照 / 计量 / 提示条。
+6. **管理入口在单聊顶栏**（`Providers` 与「模板」）：群聊打开时没有这两个按钮，要先点回
+   一个单聊再打开管理页。管理页只覆盖主区，左侧会话列表仍可见、可点。
 
 ## 完整聊天屏怎么用
 
+- **群聊是普通会话**：点开群聊只切换右侧**主区**，左侧会话列表不消失；群聊主区是
+  `[群聊 | 成员视图]` 双标签（见 [群聊](group-chat.md)）。
 - **工具/思考卡片折叠**：默认折叠，折叠态严格只占一行（工具名 + 状态 + 输入摘要；
   多工具消息就是多张单行卡）。点卡片展开完整输入与结果（结果区域可滚），折叠不等于丢弃。
 - **空气泡已修**：工具轮里「正文为空、只有工具调用」的助手消息不再渲染成空气泡，
@@ -90,6 +97,15 @@ AliasAgent 无头核心已启动
   核心的后续事件仍会广播到新连接（核心没有"重新订阅"接口）。
 - **流式语义**：每条助手消息（含工具轮中间消息）落定自己那一轮的文本；「正在生成」
   指示以 `agent.streaming` 事件为准，工具执行期间不会闪断。
+- **单聊加载失败有错误横幅**：点开一个单聊时如果 `message.query` 失败（断线、会话被删等），
+  主区顶部显示 `error-banner` 的「加载会话失败：…」，不会静默变成空白主区，也不会产生
+  未捕获的页面异常；失败横幅带当前会话守卫，晚到的旧会话失败不会挂到刚切过去的新会话上。
+- **操作错误与加载错误分开**：「新建会话 / 删除会话 / 删群」成功后如果紧接着的加载失败，
+  显示的是「加载会话失败：…」，**不误报**成「新建/删除失败」；会话列表刷新失败（`session.list`）
+  单独显示「列表刷新失败：…」。也就是说，**操作成功**但加载失败时，错误文案不会张冠李戴。
+- **链失败显示真因**：群聊反应链进入 `failed` 时，主区顶部显示独立的「反应链失败：<真因>」
+  （`group-chain-error`，不复用加载 / 视图错误横幅）；真因来自 `group.chain` 的 `error`。
+  它是一过性提示，下一次发送即清除，`completed` / `cancelled` 不显示旧错。
 
 ## 完整聊天屏参数
 
@@ -178,7 +194,7 @@ web 客户端本身是独立子项目，回退到最少形态就是恢复 `web/s
 | `attachment.read` | `{path}` | `{path, bytes, base64, mediaType}`；只读附件目录内文件 |
 | `group.create` | `{title?, workspace?, reactionsEnabled?, maxRounds?}` | `{group}`；建组并建立组上下文（「workspace」 缺省 = 产品既有缺省工作区）；`reactionsEnabled` 省略 = 新建组**开启**自发反应（取布尔 true），显式 false 落 0；`maxRounds` 省略 / 显式 null = 产品默认 8，范围 1..50，越界 / 非整数 ⇒ `-32602` |
 | `group.update` | `{groupId, reactionsEnabled?, maxRounds?}` | `{group}`；改组的运行设置（**至少给一个字段**）。`reactionsEnabled` 必须布尔；`maxRounds` 必须是 1..50 的整数或**显式 null**（恢复默认；字段缺席 = 不改）。缺字段 / 类型不对 / 越界 ⇒ `-32602`（指明字段）；组不存在 ⇒ 带 `groupId` 的可归因错误；反应链运行中 ⇒ 可归因 busy（不排队、值不变） |
-| `group.chain` | `{groupId}` | `{groupId, sessionId, status, triggerSeq, rounds, stopReason, steps}`；当前 / 最近一条链的只读状态。`status ∈ {idle, running, completed, cancelled, failed}`（`idle` = 本进程内还没有链，核心重启后回到它）；`stopReason ∈ {all_passed, round_cap, cancelled, failed, no_members}`（运行中为 null）；`rounds` 只计反应轮；`steps` 是 0..N 条观察数据（**不是第二份消息存储**） |
+| `group.chain` | `{groupId}` | `{groupId, sessionId, status, triggerSeq, rounds, stopReason, error, steps}`；当前 / 最近一条链的只读状态。`status ∈ {idle, running, completed, cancelled, failed}`（`idle` = 本进程内还没有链，核心重启后回到它）；`stopReason ∈ {all_passed, round_cap, cancelled, failed, no_members}`（运行中为 null）；`error` 为失败真因：`failed` 时非空且含可归因文本，`completed` / `cancelled` / 运行中为 null；`rounds` 只计反应轮；`steps` 是 0..N 条观察数据（**不是第二份消息存储**） |
 | `group.list` | 无 | `{groups:[{...session, reactionsEnabled, maxRounds, busy, runningMemberId, members:[{id,name,template,removedAt,overrides,effective}]}]}`；含已移除成员；`maxRounds` 是整数或 null；`busy` 是布尔、`runningMemberId` 是当前运行成员或 null（成员间隙为 null），供断线重连后恢复「链在跑」 |
 | `group.delete` | `{groupId}` | `{groupId, deleted:true}`；先停反应链、再取消并销毁成员实例，成员/消息/摘要随外键级联删除 |
 | `group.member.add` | `{groupId, name, templateName, overrides?}` | `{groupId, member}`；重名/空名/未知模板/非法覆盖层都可归因拒绝 |

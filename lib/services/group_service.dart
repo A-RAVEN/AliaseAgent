@@ -134,6 +134,7 @@ class GroupChainSnapshot {
     required this.steps,
     this.triggerSeq,
     this.stopReason,
+    this.error,
   });
 
   final String groupId;
@@ -153,6 +154,13 @@ class GroupChainSnapshot {
   /// 运行中为 null；封闭枚举见 `kGroupChainStopReasons`。
   final String? stopReason;
 
+  /// 失败真因（change `group-chat-layout` R.15 / design D13）。
+  ///
+  /// `failed` 时非空且含可归因文本（provider 错误 / `unknown_context` / 成员轮异常
+  /// 原因）；`completed` / `cancelled` / `running` / `idle` 时为 null。界面与测试据它
+  /// 显示失败原因，**MUST NOT** 只回 `failed` 把原因吞掉。
+  final String? error;
+
   bool get isRunning => status == 'running';
 
   Map<String, dynamic> toJson() => {
@@ -162,6 +170,7 @@ class GroupChainSnapshot {
         'triggerSeq': triggerSeq,
         'rounds': rounds,
         'stopReason': stopReason,
+        'error': error,
         'steps': [for (final step in steps) step.toJson()],
       };
 }
@@ -281,6 +290,7 @@ class _GroupExecutorState {
         steps: List<GroupSendStep>.unmodifiable(steps),
         triggerSeq: triggerSeq,
         stopReason: stopReason,
+        error: error,
       );
 }
 
@@ -386,9 +396,38 @@ class GroupService {
         (workspace == null || workspace.trim().isEmpty)
             ? ConfigService.homeDir
             : workspace.trim();
-    await sidecar.ensureContext(session.id,
-        defaultWorkspace: resolvedWorkspace);
+    await ensureGroupContext(session.id, workspace: resolvedWorkspace);
     return session;
+  }
+
+  /// 确保组上下文已注册（按需重注册）的**统一入口**（change `group-chat-layout`
+  /// R.14 / design D13）。
+  ///
+  /// 群上下文只在 `group.create` 时经 `sidecar.ensureContext` 登记进 sidecar **内存**；
+  /// 核心重启后 sidecar 是全新进程，存量群的上下文全丢。任何"取组工作区"的路径都必须
+  /// 先经过这里，否则 `getWorkspace` 会返回 `unknown_context`，成员轮在调模型前就失败。
+  ///
+  /// 返回 sidecar 的 `created` 语义：`true` = 本次新建上下文（工作区由 [workspace]
+  /// 落定）；`false` = 上下文已存在（**不覆盖**已有工作区，同进程幂等）。
+  ///
+  /// [workspace] 省略 / 空串 = 产品既有缺省 `ConfigService.homeDir`（不发明第二个
+  /// 缺省）。`createGroup` 传自己的 resolvedWorkspace；`ensureMemberAgent` 用缺省 ——
+  /// 后者在 `created:false` 时不会吞掉自定义工作区。
+  ///
+  /// `sidecar.ensureContext` 的 `StateError` 在这里包成可归因 [GroupException]：
+  /// 否则 member.add / send 的 `on GroupException` 接不住，会变成 -32603。
+  Future<bool> ensureGroupContext(String groupId, {String? workspace}) async {
+    final resolvedWorkspace = (workspace == null || workspace.trim().isEmpty)
+        ? ConfigService.homeDir
+        : workspace.trim();
+    try {
+      return await sidecar.ensureContext(groupId,
+          defaultWorkspace: resolvedWorkspace);
+    } on StateError catch (error) {
+      throw GroupException(
+          'workspace_unavailable',
+          '注册组 "$groupId" 的工作区上下文失败（ensureContext）：$error');
+    }
   }
 
   /// 全部组（含成员清单，成员含已移除行）。
@@ -553,6 +592,11 @@ class GroupService {
     final existing = agents.lookup(member.handle);
     if (existing != null) return existing;
     final group = await requireGroup(member.groupSessionId);
+    // R.14：核心重启后 sidecar 内存上下文丢失，存量群必须先按需重注册，否则下面的
+    // getWorkspace 会 unknown_context（成员轮在调模型前就失败、steps 一条都没有）。
+    // 统一入口传缺省工作区：上下文已存在（created:false）时不会覆盖 createGroup 设的
+    // 自定义工作区；重启后必然新建（created:true）⇒ 回落缺省（已知限制，见 design D13）。
+    await ensureGroupContext(group.id);
     // 成员工作区 = 组上下文保存的工作区（只读读取，不给成员私有工作区）。
     final workspace = sidecar.getWorkspace(group.id);
     if (!workspace.ok) {
@@ -561,10 +605,17 @@ class GroupService {
           '读取组 "${group.id}" 的工作区失败（${workspace.code}）：${workspace.error}'
               ' —— 成员不能用别的目录顶替');
     }
+    final resolvedWorkspace = workspace.workspace ?? '';
+    if (resolvedWorkspace.trim().isEmpty) {
+      throw GroupException(
+          'workspace_unavailable',
+          '组 "${group.id}" 的工作区为空（get_workspace 返回 ok 但 workspace 为空串）：'
+              '拒绝用空工作区创建成员，不能用别的目录顶替');
+    }
     final agent = await factory.createMember(
       group: group,
       member: member,
-      workspace: workspace.workspace ?? '',
+      workspace: resolvedWorkspace,
       viewLoader: loaderFor(group.id),
       displayNamesResolver: () => displayNamesOf(group.id),
       // 群成员名单**每轮现读**（change `group-member-identity`）：成员增减下一轮

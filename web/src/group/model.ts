@@ -4,7 +4,12 @@
 //   - `splitGroupMessages`：一份原文 → 公开时间线 + 每成员私有分栏（含「已移除」栏）；
 //   - `validateSpeaker`：空视图 / 本人 assistant 结尾两种退化发送的前置拒绝；
 //   - `ringDenominator`：占用环分母 = **该成员自己**实例的窗口。
-import type { ContextBreakdown, GroupMemberSummary, Message } from '../protocol';
+import type {
+  ContextBreakdown,
+  GroupMemberSummary,
+  Message,
+  SnapshotEventData,
+} from '../protocol';
 
 export interface GroupLane {
   memberId: string;
@@ -24,6 +29,23 @@ export interface GroupTimelineItem {
 export interface GroupSplit {
   timeline: GroupTimelineItem[];
   lanes: GroupLane[];
+}
+
+/**
+ * 成员快照的四态（change `group-chat-layout` 任务 2.2 / design D4）。
+ *
+ * `null` 同时表示「读取失败」与「本次运行内没发过言」，界面无法区分；四态把
+ * 错误与空明确分开：`error` 显示可重试提示，`empty` 才显示「没发过言」。
+ */
+export type MemberSnapshotState =
+  | { status: 'loading'; snapshot: null; error: null }
+  | { status: 'empty'; snapshot: null; error: null }
+  | { status: 'ok'; snapshot: SnapshotEventData; error: null }
+  | { status: 'error'; snapshot: null; error: string };
+
+/** 载入中的成员快照（`group.view` 还没回来）。 */
+export function loadingMemberSnapshot(): MemberSnapshotState {
+  return { status: 'loading', snapshot: null, error: null };
 }
 
 /** 成员 id → 显示名（含已移除成员：历史行一直要有归属）。 */

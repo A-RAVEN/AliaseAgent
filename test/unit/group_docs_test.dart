@@ -249,4 +249,88 @@ void main() {
       expect(markdown, contains(anchor), reason: '文档缺少已知限制锚点「$anchor」');
     }
   });
+
+  test('⑦ 布局重构锚点与旧句（change `group-chat-layout`）', () {
+    final markdown = doc.readAsStringSync();
+    // 正向锚点：常驻列表、双标签、成员右置、抽屉、成员视图四态/空态/未知作者、
+    // 群行删除与模板口径都必须写进用户文档。
+    for (final anchor in <String>[
+      '会话列表',
+      '群聊',
+      '成员视图',
+      '成员名单',
+      '右侧',
+      '抽屉',
+      '底部分栏',
+      '未知作者',
+      '本次已加载页里没有私有行',
+      '群聊模板由各成员决定',
+      'group.delete',
+      '空聊天屏',
+    ]) {
+      _obs('布局锚点', anchor);
+      expect(markdown, contains(anchor), reason: '文档缺少布局锚点「$anchor」');
+    }
+    // 负向：旧布局句子必须删掉（底部私有分栏不再是布局的一部分）。
+    for (final old in <String>[
+      '公开时间线与成员私有分栏会一起补更早的一页',
+      '每个成员一栏',
+      '分栏里的「真实上下文」',
+    ]) {
+      _obs('旧句（必须不存在）', old);
+      expect(
+        markdown,
+        isNot(contains(old)),
+        reason: '旧布局句「$old」必须删掉（成员视图已取代底部分栏）',
+      );
+    }
+    // 窄屏「成员」按钮的文本必须恰为「成员」：用 testid 邻域正则，不拿通用子串冒充。
+    final viewSource = File('web/src/group/GroupView.tsx').readAsStringSync();
+    final toggleText = RegExp(
+      r'data-testid="group-members-toggle"[\s\S]{0,600}?>\s*成员\s*<',
+    );
+    expect(
+      toggleText.hasMatch(viewSource),
+      isTrue,
+      reason: 'group-members-toggle 的按钮文本必须恰为「成员」（testid 邻域正则）',
+    );
+  });
+
+  test('⑧ 返工后的行为锚点：重载失败保留内容 / 抽屉跨断点 / 成员按钮只在群聊标签 / 旧链提示不重放（change `group-chat-layout` 3.5）', () {
+    final markdown = doc.readAsStringSync();
+    for (final anchor in <String>[
+      '重载失败保留已加载内容',
+      '抽屉跨断点',
+      '成员按钮只在群聊标签',
+      '换群不重放旧链提示',
+      '滚动位置',
+    ]) {
+      _obs('返工锚点', anchor);
+      expect(markdown, contains(anchor), reason: '群聊文档缺少返工行为锚点「$anchor」');
+    }
+  });
+
+  test('⑨ R.14/R.15 用户可见行为：group.chain 行含 error / 链失败显示真因 / 重启后工作区回落缺省（change `group-chat-layout` R.17）', () {
+    final markdown = doc.readAsStringSync();
+    // **按表行**断言：整篇出现 `error` 早就成立（`steps` 段就写了），那种锚点修前也红不了。
+    final rows = tableRows(markdown);
+    final chainRows = rows
+        .where((row) =>
+            row.isNotEmpty && row.first.replaceAll('`', '') == 'group.chain')
+        .toList();
+    _obs('group.chain 表行', chainRows);
+    expect(chainRows, isNotEmpty,
+        reason: 'group.chain 必须是群聊 RPC 表里的独立一行（第一列）');
+    final hasErrorField = chainRows.any(
+      (row) => row.any((cell) => RegExp(r'\berror\b').hasMatch(cell)),
+    );
+    _obs('group.chain 行是否写出 error 字段', hasErrorField);
+    expect(hasErrorField, isTrue,
+        reason: 'group.chain 表行必须写出 error 字段（失败真因；整篇子串 `error` 不算过）');
+
+    for (final anchor in <String>['链失败显示真因', '重启后工作区回落缺省']) {
+      _obs('R.14/R.15 文档锚点', anchor);
+      expect(markdown, contains(anchor), reason: '群聊文档缺少锚点「$anchor」');
+    }
+  });
 }

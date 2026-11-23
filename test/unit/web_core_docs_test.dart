@@ -23,6 +23,27 @@ void _obs(String label, Object? value) {
   print('[文档守卫] $label: $value');
 }
 
+/// 解析一份 markdown 里的**表格行**：返回每行去掉首尾 `|` 后按 `|` 切出的单元格。
+///
+/// 只认以 `|` 开头、以 `|` 结尾的行；表头分隔行（`---`）跳过。这不是"整份文档
+/// 子串包含"——方法名必须出现在第一列（change `group-chat-layout` R.17：原先对
+/// `kCoreRpcMethodNames` 只查整篇子串，正文提一句也能过）。
+List<List<String>> tableRows(String markdown) {
+  final rows = <List<String>>[];
+  for (final line in markdown.split('\n')) {
+    final trimmed = line.trim();
+    if (!trimmed.startsWith('|') || !trimmed.endsWith('|')) continue;
+    final cells = trimmed
+        .substring(1, trimmed.length - 1)
+        .split('|')
+        .map((cell) => cell.trim())
+        .toList();
+    if (cells.every((cell) => RegExp(r'^:?-{2,}:?$').hasMatch(cell))) continue;
+    rows.add(cells);
+  }
+  return rows;
+}
+
 void main() {
   final doc = File('Docs/user-guide/web-core-shim.md');
   final readme = File('README.md').readAsStringSync();
@@ -53,15 +74,22 @@ void main() {
     expect(missing, isEmpty, reason: '文档缺少以下代码常量原文：$missing');
   });
 
-  test('RPC 方法清单与代码常量一致', () {
+  test('RPC 方法清单与代码常量一致（按 RPC 表行解析，整篇子串不算过）', () {
     final text = doc.readAsStringSync();
+    final rows = tableRows(text);
+    final firstColumn = {
+      for (final row in rows)
+        if (row.isNotEmpty) row.first.replaceAll('`', ''),
+    };
     final missing = [
       for (final method in kCoreRpcMethodNames)
-        if (!text.contains(method)) method,
+        if (!firstColumn.contains(method)) method,
     ];
     _obs('代码里的 RPC 方法', kCoreRpcMethodNames);
-    _obs('文档里缺少的方法', missing);
-    expect(missing, isEmpty, reason: '文档没有列出这些方法：$missing');
+    _obs('RPC 表第一列', firstColumn);
+    _obs('文档里缺少的方法（按表行）', missing);
+    expect(missing, isEmpty,
+        reason: '文档 RPC 表必须逐行列出这些方法（第一列）；整篇子串出现不算过：$missing');
   });
 
   test('JSON-RPC 规范错误码全部写进文档', () {
@@ -110,5 +138,56 @@ void main() {
       _obs('边界锚点', anchor);
       expect(text, contains(anchor), reason: '已知限制缺少锚点 "$anchor"');
     }
+  });
+
+  test('布局锚点：会话列表常驻 / 群聊只换主区 / 空聊天屏 / 管理入口在单聊（change `group-chat-layout`）', () {
+    final text = doc.readAsStringSync();
+    for (final anchor in const [
+      '会话列表常驻',
+      '群聊',
+      '主区',
+      '空聊天屏',
+      '管理入口在单聊',
+    ]) {
+      _obs('布局锚点', anchor);
+      expect(text, contains(anchor), reason: '文档缺少布局锚点 "$anchor"');
+    }
+  });
+
+  test('返工后的错误分流锚点：加载会话失败 / 列表刷新失败 / 不误报（change `group-chat-layout` 3.5）', () {
+    final text = doc.readAsStringSync();
+    for (final anchor in const [
+      '加载会话失败',
+      '列表刷新失败',
+      '不误报',
+      '操作成功',
+    ]) {
+      _obs('错误分流锚点', anchor);
+      expect(text, contains(anchor), reason: '文档缺少返工错误分流锚点 "$anchor"');
+    }
+  });
+
+  test('R.14/R.15 行为同步：group.chain 表行含 error / 链失败显示真因（change `group-chat-layout` R.17）', () {
+    final text = doc.readAsStringSync();
+    // 与 `group_docs_test.dart` 同口径：按表行断言，整篇出现 `error` 不算过
+    // （steps 段早就有 error，修前也不会红）。
+    final rows = tableRows(text);
+    final chainRows = rows
+        .where((row) =>
+            row.isNotEmpty && row.first.replaceAll('`', '') == 'group.chain')
+        .toList();
+    _obs('group.chain 表行', chainRows);
+    expect(chainRows, isNotEmpty,
+        reason: 'group.chain 必须是无头核心 RPC 表里的独立一行（第一列）');
+    final hasErrorField = chainRows.any(
+      (row) => row.any((cell) => RegExp(r'\berror\b').hasMatch(cell)),
+    );
+    _obs('group.chain 行是否写出 error 字段', hasErrorField);
+    expect(hasErrorField, isTrue,
+        reason: 'group.chain 表行必须写出 error 字段（失败真因；整篇子串不算过）');
+    _obs('链失败真因锚点', '链失败显示真因');
+    expect(text, contains('链失败显示真因'),
+        reason: '无头核心文档必须写明链失败时界面显示真因');
+    // 工作区回落缺省只属 group-chat.md（本文件没有工作区段），不在这里加锚点。
   });
 }

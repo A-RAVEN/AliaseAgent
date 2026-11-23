@@ -36,6 +36,19 @@ import {
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const INDEX_CSS = fs.readFileSync(path.join(SRC_DIR, 'index.css'), 'utf8');
 
+/**
+ * 受 token 守卫约束的源文件（change `group-chat-layout` 任务 0.3：扫描范围补
+ * `src/group/**` 与 `src/layout/**`，否则 `GroupView` 的裸值不会被抓到）。
+ */
+function guardedSourceFiles(): string[] {
+  return [
+    ...listFiles(path.join(SRC_DIR, 'components')),
+    ...listFiles(path.join(SRC_DIR, 'group')),
+    ...listFiles(path.join(SRC_DIR, 'layout')),
+    path.join(SRC_DIR, 'App.tsx'),
+  ].filter((file) => fs.existsSync(file));
+}
+
 function obs(label: string, value: unknown): void {
   console.log(`[tokens] ${label}: ${JSON.stringify(value)}`);
 }
@@ -108,12 +121,13 @@ describe('设计 tokens 与 CSS @theme 一致', () => {
 
 describe('组件只用 tokens（禁裸 hex / 任意值）', () => {
   it('组件与 App 里没有裸 hex、没有 Tailwind 任意值', () => {
-    const files = [
-      ...listFiles(path.join(SRC_DIR, 'components')),
-      path.join(SRC_DIR, 'App.tsx'),
-    ].filter((file) => fs.existsSync(file));
+    const files = guardedSourceFiles();
     obs('扫描的文件', files.map((file) => path.relative(SRC_DIR, file)));
     expect(files.length, 'app 至少要有 App.tsx 与一个组件').toBeGreaterThan(1);
+    expect(
+      files.some((file) => path.basename(file) === 'GroupView.tsx'),
+      '扫描范围必须包含 src/group/GroupView.tsx（群聊主区）',
+    ).toBe(true);
 
     const violations: string[] = [];
     for (const file of files) {
@@ -134,10 +148,7 @@ describe('组件只用 tokens（禁裸 hex / 任意值）', () => {
 
   it('间距类只取 tokens 的 spacing scale（4/8/12/16/24/32/48/64，禁任意值）', () => {
     const allowedPx = new Set<number>(spacingScale);
-    const files = [
-      ...listFiles(path.join(SRC_DIR, 'components')),
-      path.join(SRC_DIR, 'App.tsx'),
-    ].filter((file) => fs.existsSync(file));
+    const files = guardedSourceFiles();
     const spacingPattern =
       /(?<![\w-])(?:p|px|py|pt|pb|pl|pr|m|mx|my|mt|mb|ml|mr|gap|gap-x|gap-y|space-x|space-y)-([0-9.]+)(?![\w-])/g;
     const violations: string[] = [];

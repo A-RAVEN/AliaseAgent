@@ -687,4 +687,69 @@ void main() {
       expect(kReactionStepStatuses, contains((step as Map)['status']));
     }
   }, timeout: Timeout(kRpcChainTimeout));
+
+  test('R.15 失败链 group.chain 带可归因 error（provider boom）', () async {
+    final seeded = await seed(reactionsEnabled: true);
+    // 模型请求硬失败（done code=1 + error 文本）：链进入 failed，真因必须能读到。
+    harness.sidecar.queueDone(code: 1, error: 'provider boom');
+    await harness.ws.request('group.send', {
+      'groupId': seeded.groupId,
+      'text': '这条链会失败',
+    });
+    final chain = await harness.waitForChain(seeded.groupId);
+    _obs('失败链的 group.chain', chain);
+    expect(chain['status'], 'failed');
+    expect(chain['stopReason'], 'failed');
+    expect('${chain['error']}', contains('provider boom'),
+        reason: 'group.chain 必须带失败真因，不能只回 failed 把原因吞掉');
+    final steps = chain['steps'] as List;
+    _obs('失败链 steps', steps);
+    expect(steps.any((step) => (step as Map)['status'] == 'failed'), isTrue);
+  }, timeout: Timeout(kRpcChainTimeout));
+
+  test('R.15 completed / cancelled 链的 error 为 null（回归守卫）', () async {
+    final seeded = await seed(reactionsEnabled: true);
+    queueSpeak('甲的公开回复');
+
+    queuePass();
+
+    queuePass();
+
+    await harness.ws.request('group.send', {
+      'groupId': seeded.groupId,
+      'text': '先跑一条成功的链',
+    });
+    final completed = await harness.waitForChain(seeded.groupId);
+    _obs('completed 链的 error', completed['error']);
+    expect(completed['status'], 'completed');
+    expect(completed['error'], isNull,
+        reason: 'completed 链不得带任何失败真因');
+
+    // 第二条链跑到一半取消：cancelled 也不许带旧 error。
+    final sendsBefore = harness.sidecar.sendRequests.length;
+    queueSpeak('乙不该跑完');
+    harness.sidecar.gateNextSend();
+    await harness.ws.request('group.send', {
+      'groupId': seeded.groupId,
+      'text': '这条链会被取消',
+    });
+    final deadline = DateTime.now().add(const Duration(seconds: 5));
+    while (harness.sidecar.sendRequests.length <= sendsBefore) {
+      if (DateTime.now().isAfter(deadline)) {
+        throw StateError('等待第二次模型请求超时'
+            '（实际 ${harness.sidecar.sendRequests.length}）');
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 2));
+    }
+    final cancelledResponse = await harness.ws.request('agent.cancel', {
+      'sessionId': seeded.groupId,
+    });
+    _obs('取消回包', cancelledResponse['result']);
+    harness.sidecar.releaseGate();
+    final cancelled = await harness.waitForChain(seeded.groupId);
+    _obs('cancelled 链的 error', cancelled['error']);
+    expect(cancelled['status'], 'cancelled');
+    expect(cancelled['error'], isNull,
+        reason: 'cancelled 链不得带失败真因（旧 error 不许残留）');
+  }, timeout: Timeout(kRpcChainTimeout));
 }

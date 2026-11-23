@@ -148,9 +148,9 @@ console.log(
 );
 
 /** 打开一次 harness 页面（每条用例新开页，避免状态串味）。 */
-async function openPage(scenario = null) {
+async function openPage(scenario = null, width = 1280, height = 900) {
   const page = await browser.newPage();
-  await page.setViewport({ width: 1280, height: 900 });
+  await page.setViewport({ width, height });
   if (scenario) {
     await page.evaluateOnNewDocument((data) => {
       window.__HARNESS_SCENARIO__ = data;
@@ -494,6 +494,131 @@ await run('会话列表虚拟滚动：500 条会话只渲染可视区', async ()
     );
   } finally {
     await page.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 1.1 应用壳层：常驻会话列表 + 主区（change `group-chat-layout`）
+// ---------------------------------------------------------------------------
+
+const shellScenario = {
+  sessions: Array.from({ length: 500 }, (_, index) => ({
+    id: `s-${index}`,
+    title: `壳层会话 ${index}`,
+    agentType: 'general',
+    parentSessionId: null,
+    createdAt: index,
+    updatedAt: index,
+    kind: index % 5 === 0 ? 'group' : 'single',
+  })),
+  messages: [{ id: 'shell-m-1', role: 'user', content: '壳层用例消息' }],
+  error: '壳层错误横幅',
+  notice: '壳层提示横幅',
+  skillFailures: ['技能 A 未生效'],
+};
+
+await run('壳层：列表常驻唯一在左、主区在右、唯一 main、滚动/选中不丢、三横幅保留', async () => {
+  for (const width of [1280, 720]) {
+    const page = await openPage(shellScenario, width, 900);
+    try {
+      await page.waitForSelector('[data-testid="session-list"]', { timeout: 15000 });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const shell = await page.evaluate(() => {
+        const lists = [...document.querySelectorAll('[data-testid="session-list"]')];
+        const list = lists[0] ?? null;
+        const sidebar = document.querySelector('[data-testid="session-sidebar"]');
+        const main = document.querySelector('[data-testid="main-area"]');
+        const sidebarRect = sidebar?.getBoundingClientRect();
+        const mainRect = main?.getBoundingClientRect();
+        const row = document.querySelector('[data-testid="session-row"]');
+        const rowRect = row?.getBoundingClientRect();
+        const hit = rowRect
+          ? document.elementFromPoint(
+              rowRect.left + rowRect.width / 2,
+              rowRect.top + rowRect.height / 2,
+            )
+          : null;
+        return {
+          listCount: lists.length,
+          inSidebar: list !== null && list.closest('[data-testid="session-sidebar"]') !== null,
+          sidebarWidth: sidebarRect?.width ?? null,
+          sidebarRight: sidebarRect?.right ?? null,
+          mainLeft: mainRect?.left ?? null,
+          mainCount: document.querySelectorAll('main').length,
+          hitInList: hit !== null && list?.contains(hit) === true,
+          hitTestId: hit?.getAttribute('data-testid') ?? hit?.tagName ?? null,
+          scrollWidth: document.documentElement.scrollWidth,
+          innerWidth: window.innerWidth,
+          errorBanner: document.querySelector('[data-testid="error-banner"]') !== null,
+          noticeBanner: document.querySelector('[data-testid="notice-banner"]') !== null,
+          skillFailures: document.querySelector('[data-testid="skill-failures"]') !== null,
+        };
+      });
+      obs(`${width}px 壳层`, shell);
+      assert(shell.listCount === 1, `${width}px：全页必须恰好一个 session-list，实测 ${shell.listCount}`);
+      assert(shell.inSidebar, `${width}px：session-list 的祖先链必须含 session-sidebar`);
+      assertNumber(shell.sidebarWidth, 224, `${width}px 左侧会话列表宽度`, 0.5);
+      assert(shell.sidebarRight !== null && shell.mainLeft !== null, `${width}px：左列与主区都必须存在`);
+      assert(
+        shell.mainLeft >= shell.sidebarRight - 0.5,
+        `${width}px：主区必须从列表右侧开始（mainLeft=${shell.mainLeft} / sidebarRight=${shell.sidebarRight}）`,
+      );
+      assert(shell.mainCount === 1, `${width}px：页面必须恰好一个 main，实测 ${shell.mainCount}`);
+      assert(
+        shell.hitInList,
+        `${width}px：elementFromPoint 必须命中会话列表（实测 ${shell.hitTestId}）`,
+      );
+      assert(
+        shell.scrollWidth <= shell.innerWidth + 1,
+        `${width}px：出现横向溢出（scrollWidth=${shell.scrollWidth} > innerWidth=${shell.innerWidth}）`,
+      );
+      assert(shell.errorBanner, `${width}px：ChatScreen 的 error 横幅不得被壳吞掉`);
+      assert(shell.noticeBanner, `${width}px：ChatScreen 的 notice 横幅不得被壳吞掉`);
+      assert(shell.skillFailures, `${width}px：ChatScreen 的 skillFailures 横幅不得被壳吞掉`);
+
+      // 列表滚到中段 → 切会话 → scrollTop 不变、选中态跟随。
+      await page.evaluate(() => {
+        const list = document.querySelector('[data-testid="session-list"]');
+        list.scrollTop = 600;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const scrollBefore = await page.$eval(
+        '[data-testid="session-list"]',
+        (element) => element.scrollTop,
+      );
+      const clicked = await page.evaluate(() => {
+        const rows = [...document.querySelectorAll('[data-testid="session-row"]')];
+        const target = rows[Math.min(2, rows.length - 1)];
+        const label = target?.getAttribute('data-session-id') ?? null;
+        target?.click();
+        return label;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const afterClick = await page.evaluate(() => {
+        const list = document.querySelector('[data-testid="session-list"]');
+        const selected = [...document.querySelectorAll('[data-testid="session-row"][aria-current="true"]')];
+        return {
+          scrollTop: list?.scrollTop ?? null,
+          selectedIds: selected.map((row) => row.getAttribute('data-session-id')),
+          title: document.querySelector('[data-testid="current-session-title"]')?.textContent ?? '',
+        };
+      });
+      obs(`${width}px 切会话后`, { scrollBefore, ...afterClick, clicked });
+      assert(
+        afterClick.scrollTop === scrollBefore,
+        `${width}px：切会话不得重置列表滚动位置（前 ${scrollBefore} / 后 ${afterClick.scrollTop}）`,
+      );
+      assert(
+        clicked !== null && afterClick.selectedIds.includes(clicked),
+        `${width}px：选中态必须跟随被点的会话（点了 ${clicked}，选中 ${JSON.stringify(afterClick.selectedIds)}）`,
+      );
+      assert(
+        afterClick.title.includes(clicked.replace('s-', '壳层会话 ')),
+        `${width}px：主区标题必须跟着切到被点会话，实测「${afterClick.title}」`,
+      );
+    } finally {
+      await page.close();
+    }
   }
 });
 

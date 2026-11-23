@@ -1,6 +1,7 @@
 // 自发反应的**真实核心**页驱动：无头 Edge 打开真实 web 页面，先确认「自发反应」开关
 // 为开启，再通过**界面**发两条消息（都不选发言人）：一条普通触发、一条 `@乙` 定向，
-// 等链收敛后收集时间线/分栏/steps 并截图。
+// 等链收敛后收集时间线/steps，并切「成员视图」统计私有行后截图（change
+// `group-chat-layout` 4.3：不再依赖已删除的 `lane-*`；私有行读不到即失败）。
 //
 // change `group-reactive-mode` 任务 5.3。它**只用于真实核心**（不是假核心 e2e）：
 //   - 页面上的选择器与真实 `GroupView` 不一致时必须失败；
@@ -265,21 +266,113 @@ async function main() {
       log('注意：出现 forced_* 步骤', forced);
     }
 
-    // 时间线 / 分栏读数（视觉验收的人读材料）。
+    // 公开时间线读数（视觉验收的人读材料；成员视图切换后仍可读文本）。
     const timeline = await page.$$eval('[data-testid="timeline-item"]', (nodes) =>
       nodes.map((node) => node.textContent ?? ''),
     );
-    const lanes = await page.$$eval('[data-testid="lane-item"]', (nodes) => nodes.length);
-    const laneHeaders = await page.$$eval(
-      '[data-testid^="lane-mem"], [data-testid^="lane-"]',
-      (nodes) =>
-        nodes
-          .filter((node) => node.getAttribute('data-testid')?.startsWith('lane-mem') ||
-            node.tagName === 'ARTICLE')
-          .map((node) => node.querySelector('header')?.textContent ?? ''),
-    );
     log('公开时间线', timeline);
-    log('私有分栏行数', lanes);
+
+    // change `group-chat-layout`：私有行改在「成员视图」里读（`lane-*` 已删除）。
+    // 切标签 + 选中一个成员后必须至少有一行私有行，否则说明选择器空转（硬断言）。
+    const detail = await groupSummary(rpc, group.id);
+    // 优先选**本次刚回复过**的成员（私有行一定在已加载的尾页里），否则退回第一个未移除成员。
+    const repliedMemberId =
+      second.steps.find((step) => step.status === 'replied')?.memberId ?? null;
+    const member =
+      detail?.members?.find((entry) => entry.id === repliedMemberId) ??
+      detail?.members?.find((entry) => entry.removedAt === null) ??
+      null;
+    if (!member) throw new Error('组里没有未移除成员：无法验证成员视图的私有行');
+    await page.click('[data-testid="group-tab-members"]');
+    await page.waitForSelector(`[data-testid="member-select-${member.id}"]`, { timeout: 30000 });
+
+    // R.13 作者负控：`data-author` 必须是 `message.author`（写 `lane.memberId` 会恒真自证）。
+    // 独立 oracle 用脚本自己的 `message.query` 原始行按作者计数，避免拿 DOM 自证。
+    // pageSize 与产品 `web/src/App.tsx` 的 HISTORY_PAGE_SIZE 一致（尾页 30 条）。
+    const messagePage = await rpc.request('message.query', {
+      sessionId: group.id,
+      pageSize: 30,
+    });
+    const authorOracle = {};
+    for (const message of messagePage.messages ?? []) {
+      if (message.visibility !== 'private-to-author' || message.author === null) continue;
+      authorOracle[message.author] = (authorOracle[message.author] ?? 0) + 1;
+    }
+    log('作者 oracle（按 message.author 统计私有行）', authorOracle);
+    const observedAuthors = () =>
+      page.$$eval('[data-testid="member-private-row"]', (nodes) =>
+        nodes.map((node) => node.getAttribute('data-author')),
+      );
+    const selectAndWait = async (memberId) => {
+      await page.click(`[data-testid="member-select-${memberId}"]`);
+      await page.waitForSelector('[data-testid="member-private-section"]', { timeout: 30000 });
+      await new Promise((done) => setTimeout(done, 150));
+    };
+
+    await selectAndWait(member.id);
+    const memberAuthors = await observedAuthors();
+    log('选中成员的私有行 data-author', { member: member.name, authors: memberAuthors });
+    if (memberAuthors.length <= 0) {
+      throw new Error(
+        `成员视图里读不到任何私有行（成员 ${member.name}）：选择器可能空转，视觉验收不准通过`,
+      );
+    }
+    if (!memberAuthors.every((author) => author === member.id)) {
+      throw new Error(
+        `成员 ${member.name} 的私有行 data-author 不全是它自己：${JSON.stringify(memberAuthors)}`,
+      );
+    }
+    if ((authorOracle[member.id] ?? 0) <= 0) {
+      throw new Error(`独立 oracle 查不到成员 ${member.name} 的私有行（oracle=${JSON.stringify(authorOracle)}）`);
+    }
+    if (memberAuthors.length !== authorOracle[member.id]) {
+      throw new Error(
+        `成员 ${member.name} 的私有行数 ${memberAuthors.length} 与独立 oracle ${authorOracle[member.id]} 不一致`,
+      );
+    }
+
+    // 甲乙切换：选另一个有私有行的成员，data-author 必须随选择变成它自己。
+    const secondMember =
+      detail?.members?.find(
+        (entry) => entry.id !== member.id && (authorOracle[entry.id] ?? 0) > 0,
+      ) ?? null;
+    if (!secondMember) {
+      throw new Error(
+        `没有第二个成员有私有行（oracle=${JSON.stringify(authorOracle)}）：无法验证作者随选择变化`,
+      );
+    }
+    await selectAndWait(secondMember.id);
+    const secondAuthors = await observedAuthors();
+    log('切换成员后的私有行 data-author', {
+      member: secondMember.name,
+      authors: secondAuthors,
+    });
+    if (secondAuthors.length <= 0) {
+      throw new Error(`切到成员 ${secondMember.name} 后读不到私有行`);
+    }
+    if (!secondAuthors.every((author) => author === secondMember.id)) {
+      throw new Error(
+        `切到成员 ${secondMember.name} 后 data-author 不全是它自己：${JSON.stringify(secondAuthors)}`,
+      );
+    }
+    if (secondAuthors.length !== authorOracle[secondMember.id]) {
+      throw new Error(
+        `成员 ${secondMember.name} 的私有行数 ${secondAuthors.length} 与独立 oracle ${authorOracle[secondMember.id]} 不一致`,
+      );
+    }
+    const memberPrivateRows = memberAuthors.length;
+    const memberWindow = await page
+      .$eval('[data-testid="member-window"]', (element) => element.textContent ?? '')
+      .catch(() => '');
+    log('成员视图私有行', { member: member.name, rows: memberPrivateRows, window: memberWindow });
+    if (memberPrivateRows <= 0) {
+      throw new Error(
+        `成员视图里读不到任何私有行（成员 ${member.name}）：选择器可能空转，视觉验收不准通过`,
+      );
+    }
+
+    // 截图回到第一个成员（summary 的 `memberView` 指它；第二成员只用于作者负控）。
+    await selectAndWait(member.id);
 
     fs.mkdirSync(path.dirname(SHOT_PATH), { recursive: true });
     await page.screenshot({ path: SHOT_PATH, fullPage: false });
@@ -296,8 +389,14 @@ async function main() {
       mentionSteps,
       forcedSteps: forced,
       timeline,
-      laneRows: lanes,
-      laneHeaders,
+      memberPrivateRows,
+      authorOracle,
+      memberView: { memberId: member.id, memberName: member.name, window: memberWindow },
+      secondMemberView: {
+        memberId: secondMember.id,
+        memberName: secondMember.name,
+        privateRows: secondAuthors.length,
+      },
       shotPath: SHOT_PATH,
       shotBytes: size,
     };

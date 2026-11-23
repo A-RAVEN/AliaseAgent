@@ -160,6 +160,15 @@ const _otherCodeNames = <String, String>{
   'rounds': 'lib/services/group_service.dart',
   'status': 'lib/services/group_service.dart',
   'error': 'lib/services/group_service.dart',
+  // 成员快照的 JSON 字段（change `group-chat-layout` 成员视图）：用户文档讲「真实上下文」
+  // 时用反引号写出 `system` / `messages` / `tools`；`tools` 同时是配置键，另两个到产生
+  // 它们（ContextSnapshot.toJson）的文件里核对存在性。
+  'system': 'lib/services/context_snapshot.dart',
+  'messages': 'lib/services/context_snapshot.dart',
+  // 组上下文随核心重启丢失时的 sidecar 错误码（change `group-chat-layout` R.14）：
+  // 用户文档讲「重启后回落缺省、不会报 unknown_context」时用反引号写出它；到定义
+  // getWorkspace 契约（未知句柄返回什么）的文件里核对。
+  'unknown_context': 'lib/services/sidecar_bridge.dart',
   // 结构化 PASS（change group-reactive-mode R.10）：终态工具名、可归因错误码与 steps
   // 状态都由 group_reaction.dart / group_service.dart 产生；用户文档讲「怎么沉默」时
   // 会用反引号写出它们。

@@ -102,21 +102,37 @@ class GroupCoreHarness {
     required this.sidecar,
   });
 
-  final HeadlessCore core;
-  final WsRpcClient ws;
+  /// 当前核心实例。**可变**：`restart()` 会在同一个临时根目录上重建它
+  /// （change `group-chat-layout` R.14）。
+  HeadlessCore core;
+
+  /// 当前 WS 客户端（与 [core] 同代；`restart()` 后重连）。
+  WsRpcClient ws;
+
   final Directory root;
   final FakeSidecar sidecar;
 
-  static Future<GroupCoreHarness> start({FakeSidecar? sidecar}) async {
+  static Future<GroupCoreHarness> start({
+    FakeSidecar? sidecar,
+    Directory? root,
+  }) async {
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
-    final root = Directory.systemTemp.createTempSync('group_rpc_');
+    final tempRoot = root ?? Directory.systemTemp.createTempSync('group_rpc_');
     final fake = sidecar ?? FakeSidecar();
     ToolCatalog.instance.seed({
       'read_file': {'name': 'read_file'},
       'list_dir': {'name': 'list_dir'},
       'run_command': {'name': 'run_command'},
     });
+    final core = await _build(tempRoot, fake);
+    final ws = await WsRpcClient.connect(core.websocketUrl);
+    return GroupCoreHarness._(
+        core: core, ws: ws, root: tempRoot, sidecar: fake);
+  }
+
+  /// 在 [root] 上构建并启动一个无头核心（真 sqlite 路径 / 真 WS / 给定假 sidecar）。
+  static Future<HeadlessCore> _build(Directory root, FakeSidecar fake) async {
     final core = await buildHeadlessCore(
       config: kGroupTestConfig,
       sidecar: fake,
@@ -125,9 +141,24 @@ class GroupCoreHarness {
       attachmentsDir: '${root.path}${Platform.pathSeparator}attachments',
     );
     await core.start();
-    final ws = await WsRpcClient.connect(core.websocketUrl);
-    return GroupCoreHarness._(
-        core: core, ws: ws, root: root, sidecar: fake);
+    return core;
+  }
+
+  /// 模拟**核心 + sidecar 重启**（change `group-chat-layout` R.14）：
+  /// 等链终态 → 断 WS、停旧核心（关库）→ 清 sidecar 内存上下文（对齐 DLL 重启后
+  /// 上下文全丢）→ **同一个临时根目录**上重建核心并重连 WS。
+  ///
+  /// 不删 [root]：存量群 / 成员 / 消息必须还在，才能验"重启后存量群仍可反应"。
+  /// 也不碰用户真实 `~/.aliasagent`：数据库路径仍是临时目录。
+  Future<void> restart() async {
+    for (final groupId in core.groups.runningGroupIds) {
+      await core.groups.waitForChain(groupId).timeout(kTestChainTimeout);
+    }
+    await ws.close();
+    await core.stop();
+    sidecar.simulateSidecarRestart();
+    core = await _build(root, sidecar);
+    ws = await WsRpcClient.connect(core.websocketUrl);
   }
 
   /// 建组（可带 workspace / 自发反应开关）。

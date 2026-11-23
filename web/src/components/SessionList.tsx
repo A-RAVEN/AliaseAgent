@@ -8,6 +8,7 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import { Plus } from 'lucide-react';
 import { useRef, useState } from 'react';
 
+import { sessionKindBadge, sessionKindLabel } from '../layout/model';
 import { formatSwitchFailure, type AgentSwitchFailure } from '../manage/logic';
 import type { Session } from '../protocol';
 
@@ -24,8 +25,8 @@ export interface SessionListProps {
   onCreateGroup?: () => void;
   /** 重命名（核心 `session.rename`）；页面负责继续拼 `session.title`。 */
   onRename: (sessionId: string, title: string) => void;
-  /** 删除（核心 `session.delete`）；确认浮层由本组件负责。 */
-  onDelete: (sessionId: string) => void;
+  /** 删除（核心 `session.delete` / 群聊 `group.delete`）；确认浮层由本组件负责。 */
+  onDelete: (session: Session) => void;
   /** 可选模板名（核心 `template.list`）；空数组 = 不显示切换下拉。 */
   templates: string[];
   /** 当前会话的模板名（下拉的选中值）。 */
@@ -65,6 +66,8 @@ export function SessionList({
   });
 
   const pendingDelete = sessions.find((session) => session.id === pendingDeleteId) ?? null;
+  const currentSession = sessions.find((session) => session.id === currentSessionId) ?? null;
+  const currentIsGroup = currentSession?.kind === 'group';
 
   const beginRename = (session: Session) => {
     if (disabled) return;
@@ -130,6 +133,7 @@ export function SessionList({
               const session = sessions[virtualItem.index];
               const selected = session.id === currentSessionId;
               const editing = session.id === editingId;
+              const badge = sessionKindBadge(session);
               return (
                 <div
                   key={session.id}
@@ -163,7 +167,10 @@ export function SessionList({
                     <button
                       type="button"
                       data-testid="session-row"
-                      title={`${session.title}（${session.agentType}）`}
+                      data-kind={session.kind}
+                      data-session-id={session.id}
+                      aria-current={selected ? 'true' : undefined}
+                      title={`${session.title}（${sessionKindLabel(session)} · ${session.agentType}）`}
                       onClick={() => onSelect(session.id)}
                       className={
                         selected
@@ -171,11 +178,21 @@ export function SessionList({
                           : 'h-full min-w-0 flex-1 truncate rounded-card px-2 text-left text-sm text-muted hover:bg-surface-2'
                       }
                     >
-                      <span
-                        data-testid="session-title"
-                        className="block min-w-0 truncate"
-                      >
-                        {session.title}
+                      <span className="flex min-w-0 items-center gap-1">
+                        {badge !== null && (
+                          <span
+                            data-testid="session-kind-badge"
+                            className="shrink-0 text-xs text-accent"
+                          >
+                            {badge}
+                          </span>
+                        )}
+                        <span
+                          data-testid="session-title"
+                          className="min-w-0 truncate"
+                        >
+                          {session.title}
+                        </span>
                       </span>
                     </button>
                   )}
@@ -211,7 +228,7 @@ export function SessionList({
         )}
       </div>
 
-      {(templates.length > 0 || switchFailure) && (
+      {(templates.length > 0 || switchFailure || currentIsGroup) && (
         <div className="border-t border-line px-3 py-2">
           {templates.length > 0 && (
             <label className="flex items-center gap-2 text-xs text-muted">
@@ -219,8 +236,13 @@ export function SessionList({
               <select
                 data-testid="template-select"
                 value={currentAgentType ?? ''}
-                disabled={disabled || currentSessionId === null}
-                onChange={(event) => onSwitchTemplate(event.target.value)}
+                disabled={disabled || currentSessionId === null || currentIsGroup}
+                onChange={(event) => {
+                  // 群聊的模板由各成员决定（change `group-chat-layout` D8）：
+                  // 即使有人程序化派发 change，也不得发起 session.switchTemplate。
+                  if (currentIsGroup) return;
+                  onSwitchTemplate(event.target.value);
+                }}
                 className="h-7 min-w-0 flex-1 rounded-card border border-line bg-surface px-1 text-xs text-fg outline-none disabled:opacity-40"
               >
                 {/* 当前模板不在候选里（例如已被删除）时也显示它，不假装它不存在。 */}
@@ -234,6 +256,11 @@ export function SessionList({
                 ))}
               </select>
             </label>
+          )}
+          {currentIsGroup && (
+            <p data-testid="group-template-note" className="mt-2 text-xs text-muted">
+              群聊模板由各成员决定（成员的模板在右侧成员名单里编辑）。
+            </p>
           )}
           {switchFailure && (
             <p
@@ -252,7 +279,9 @@ export function SessionList({
           className="absolute inset-x-2 top-8 z-10 rounded-card border border-danger/40 bg-surface p-3 text-xs text-fg shadow-e2"
         >
           <p className="mb-2">
-            删除会话「{pendingDelete.title}」？该会话的运行实例与数据库记录都会被删除。
+            {pendingDelete.kind === 'group'
+              ? `删除群聊「${pendingDelete.title}」？该群的成员、消息与摘要都会删除。`
+              : `删除会话「${pendingDelete.title}」？该会话的运行实例与数据库记录都会被删除。`}
           </p>
           <div className="flex justify-end gap-2">
             <button
@@ -267,9 +296,9 @@ export function SessionList({
               type="button"
               data-testid="delete-confirm-button"
               onClick={() => {
-                const sessionId = pendingDelete.id;
+                const target = pendingDelete;
                 setPendingDeleteId(null);
-                onDelete(sessionId);
+                onDelete(target);
               }}
               className="rounded-card bg-danger px-2 py-1 font-semibold text-bg"
             >

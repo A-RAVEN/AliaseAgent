@@ -322,11 +322,23 @@ class FakeSidecar implements ISidecar {
     _createdByEnsure[sessionId] = created;
   }
 
+  /// 让**下一次** `ensureContext` 直接抛异常（change `group-chat-layout` R.14）。
+  ///
+  /// 用来验 `GroupService.ensureGroupContext` 把 sidecar 的 `StateError` 包成可归因的
+  /// `GroupException`（否则 RPC 层 `on GroupException` 接不住，会变成 -32603）。
+  /// 字符串会被包成 [StateError]（真实 bridge 的失败形态）；一次性，触发后清空。
+  Object? nextEnsureContextError;
+
   @override
   Future<bool> ensureContext(String sessionId, {String? defaultWorkspace}) async {
     ensureContextCalls.add(sessionId);
     ensureContextDefaultWorkspaces.add(defaultWorkspace);
     defaultWorkspaceByHandle[sessionId] = defaultWorkspace;
+    final injectedError = nextEnsureContextError;
+    if (injectedError != null) {
+      nextEnsureContextError = null;
+      throw injectedError is String ? StateError(injectedError) : injectedError;
+    }
     final created = _createdByEnsure[sessionId] ?? !_ensured.contains(sessionId);
     _ensured.add(sessionId);
     // 真实 sidecar 在**新建**上下文时把 defaultWorkspace 记进上下文；getWorkspace$nl    // 之后读回的就是它（组服务靠这条路径让成员继承组工作区）。桩这里照做。
@@ -476,6 +488,10 @@ class FakeSidecar implements ISidecar {
   /// `get_workspace` 桩（add-spawn-subagent-tool 1.2）：按句柄记录每次查询，并返回
   /// 该句柄自己的工作区。没有为某句柄设值时返回空串 —— 与真实的新建上下文一致，
   /// 不用应用主目录顶替。
+  ///
+  /// **未注册句柄**（从未 `ensureContext`、且没有被 [stubWorkspace] 显式登记）返回
+  /// `unknown_context` 失败 —— 对齐真实 DLL（change `group-chat-layout` R.14：核心重启
+  /// 后 sidecar 内存上下文全丢，旧假实现对未知句柄返 `success('')` 会让修前的红靶假绿）。
   final List<String> getWorkspaceCalls = [];
   final Map<String, String> workspaceByHandle = {};
 
@@ -484,6 +500,22 @@ class FakeSidecar implements ISidecar {
 
   void stubWorkspace(String handle, String workspace) {
     workspaceByHandle[handle] = workspace;
+    // 显式登记过的句柄算"上下文已知"：允许返回空串（R.14 的空工作区防御红靶需要
+    // `get_workspace` ok + workspace='' 这个状态，而不是 unknown_context）。
+    _ensured.add(handle);
+  }
+
+  /// 模拟 **sidecar DLL 进程重启**（change `group-chat-layout` R.14）。
+  ///
+  /// 真实 sidecar 的上下文表在内存里，核心重启后全部丢失；这里清掉"已注册"与
+  /// "句柄→工作区"两张表，使重启后未重注册的存量群句柄按真实行为返回
+  /// `unknown_context`。`ensureContext*` / `setWorkspaceCalls` 等观察日志**不清**，
+  /// 用例要看重启前后的调用序列。
+  void simulateSidecarRestart() {
+    _ensured.clear();
+    workspaceByHandle.clear();
+    _createdByEnsure.clear();
+    defaultWorkspaceByHandle.clear();
   }
 
   @override
@@ -492,6 +524,12 @@ class FakeSidecar implements ISidecar {
     final code = workspaceFailureCode;
     if (code != null) {
       return WorkspaceQueryResult.failure(code, 'fake: $code ($handle)');
+    }
+    if (!_ensured.contains(handle)) {
+      return WorkspaceQueryResult.failure(
+        'unknown_context',
+        'fake: unknown context: $handle（未注册 / sidecar 重启后丢失）',
+      );
     }
     return WorkspaceQueryResult.success(workspaceByHandle[handle] ?? '');
   }

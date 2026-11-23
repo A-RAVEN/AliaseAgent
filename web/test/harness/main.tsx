@@ -18,6 +18,8 @@ import { applyAgentEvent, type AgentEventLike } from '../../src/chat/events';
 import type { RawMessage } from '../../src/chat/model';
 import { emptyChatView, type ChatView } from '../../src/chat/render';
 import { ChatScreen } from '../../src/components/ChatScreen';
+import { ChatShell } from '../../src/components/ChatShell';
+import { SessionList } from '../../src/components/SessionList';
 import { ProvidersPage } from '../../src/components/ProvidersPage';
 import { TemplatesPage } from '../../src/components/TemplatesPage';
 import { Wizard } from '../../src/components/Wizard';
@@ -79,6 +81,8 @@ interface HarnessScenario {
   earlierDelayMs?: number;
   error?: string | null;
   notice?: string | null;
+  /** ChatScreen 的「有技能未生效」提示行（change `group-chat-layout` 1.1）。 */
+  skillFailures?: string[];
   snapshot?: SnapshotEventData | null;
   /** 会话侧栏（change `web-management-ui` 1.3）：可选模板名。 */
   templates?: string[];
@@ -368,11 +372,13 @@ function Harness({ scenario }: { scenario: HarnessScenario }) {
     );
   }, []);
 
-  const onDelete = useCallback((sessionId: string) => {
-    callsRef.current.push(`session.delete:${sessionId}`);
+  const onDelete = useCallback((session: Session) => {
+    callsRef.current.push(
+      `${session.kind === 'group' ? 'group.delete' : 'session.delete'}:${session.id}`,
+    );
     setSessions((previous) => {
-      const remaining = previous.filter((session) => session.id !== sessionId);
-      setCurrentSessionId((current) => (current === sessionId ? remaining[0]?.id ?? null : current));
+      const remaining = previous.filter((entry) => entry.id !== session.id);
+      setCurrentSessionId((current) => (current === session.id ? remaining[0]?.id ?? null : current));
       return remaining;
     });
   }, []);
@@ -438,49 +444,59 @@ function Harness({ scenario }: { scenario: HarnessScenario }) {
   }, [view.messages.length, sessions, switchFailure]);
 
   const status: ConnectionStatus = 'open';
+  const currentSession = sessions.find((session) => session.id === currentSessionId) ?? null;
   return (
-    <ChatScreen
-      status={status}
-      sessions={sessions}
-      currentSessionId={currentSessionId}
-      onSelectSession={setCurrentSessionId}
-      onCreateSession={onCreate}
-      onRenameSession={onRename}
-      onDeleteSession={onDelete}
-      templates={scenario.templates ?? []}
-      currentAgentType={sessions.find((session) => session.id === currentSessionId)?.agentType ?? null}
-      onSwitchTemplate={onSwitchTemplate}
-      switchFailure={switchFailure}
-      view={view}
-      hasEarlier={hasEarlier}
-      loadingEarlier={loadingEarlier}
-      onLoadEarlier={loadEarlier}
-      error={error}
-      notice={notice}
-      skillFailures={[]}
-      snapshot={scenario.snapshot ?? null}
-      metering={null}
-      attachments={attachmentDataUrls}
-      imagesSupported={scenario.imagesSupported ?? null}
-      onSend={(text, images = []) => {
-        callsRef.current.push(`agent.send:${text}:${images.length}`);
-        const paths = images.map((image) => ({
-          path: `pending/${image.name}`,
-          dataUrl: image.dataUrl,
-        }));
-        setAttachmentDataUrls((previous) => {
-          const next = { ...previous };
-          for (const item of paths) next[item.path] = item.dataUrl;
-          return next;
-        });
-        window.__harness?.pushMessage({
-          id: `sent-${Date.now()}`,
-          role: 'user',
-          content: text,
-          attachments: paths.map((item) => item.path),
-        });
-      }}
-    />
+    <ChatShell
+      sidebar={
+        <SessionList
+          sessions={sessions}
+          currentSessionId={currentSessionId}
+          onSelect={setCurrentSessionId}
+          onCreate={onCreate}
+          onRename={onRename}
+          onDelete={onDelete}
+          templates={scenario.templates ?? []}
+          currentAgentType={currentSession?.agentType ?? null}
+          onSwitchTemplate={onSwitchTemplate}
+          switchFailure={switchFailure}
+        />
+      }
+    >
+      <ChatScreen
+        status={status}
+        sessionTitle={currentSession?.title ?? null}
+        sessionSelected={currentSession !== null}
+        view={view}
+        hasEarlier={hasEarlier}
+        loadingEarlier={loadingEarlier}
+        onLoadEarlier={loadEarlier}
+        error={error}
+        notice={notice}
+        skillFailures={scenario.skillFailures ?? []}
+        snapshot={scenario.snapshot ?? null}
+        metering={null}
+        attachments={attachmentDataUrls}
+        imagesSupported={scenario.imagesSupported ?? null}
+        onSend={(text, images = []) => {
+          callsRef.current.push(`agent.send:${text}:${images.length}`);
+          const paths = images.map((image) => ({
+            path: `pending/${image.name}`,
+            dataUrl: image.dataUrl,
+          }));
+          setAttachmentDataUrls((previous) => {
+            const next = { ...previous };
+            for (const item of paths) next[item.path] = item.dataUrl;
+            return next;
+          });
+          window.__harness?.pushMessage({
+            id: `sent-${Date.now()}`,
+            role: 'user',
+            content: text,
+            attachments: paths.map((item) => item.path),
+          });
+        }}
+      />
+    </ChatShell>
   );
 }
 

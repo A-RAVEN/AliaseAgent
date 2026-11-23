@@ -1,8 +1,9 @@
-// 群视图（change `agent-group-chat` 任务 8.3~8.7 / design D11）。
+// 群视图（change `agent-group-chat` 任务 8.3~8.7；change `group-chat-layout` 2.1~2.5 布局重构）。
 //
-// 真实应用里的组屏幕：公开时间线 + 每成员私有分栏（含「已移除」栏）+ 每成员真实
-// 上下文（复用 `RealContextView`）+ 每成员占用环（复用 `ContextRing`，分母是各自
-// 实例窗口）+ 操作面（加成员 / 编辑覆盖层 / 选发言人并发送）。
+// 真实应用里的组屏幕：**两行头部 + `[群聊 | 成员视图]` 双标签**。
+//   - 群聊标签：公开时间线 + 发送区（中）+ 成员名单（右；< xl 时是抽屉）；
+//   - 成员视图：成员选择器 + 该成员私有过程行 + 真实上下文 + 占用环（分母是该成员自己的窗口）。
+// 底部「成员私有分栏」已删除（design D3/D4/D5）。
 //
 // 组件是**纯展示 + 动作**：数据由 App 注入（它在真实 WS 上拉 group.list /
 // message.query / group.view），动作直接走 `group.*` RPC 再让 App 重拉。
@@ -15,17 +16,24 @@ import type {
   GroupSendResult,
   GroupSummary,
   InstanceOverrides,
-  SnapshotEventData,
 } from '../protocol';
-import type { GroupLane, GroupTimelineItem } from './model';
+import type { GroupLane, GroupTimelineItem, MemberSnapshotState } from './model';
 import {
   chainIsRunning,
   kDefaultMaxReactionRounds,
   kMaxMaxReactionRounds,
   kMinMaxReactionRounds,
   parseMaxRoundsInput,
+  ringDenominator,
   validateSpeaker,
 } from './model';
+import {
+  initialGroupPanelState,
+  selectGroupMember,
+  switchGroupTab,
+  resolveSelectedMemberId,
+  type GroupPanelState,
+} from './panel';
 import { ContextRing } from '../components/ContextRing';
 import { RealContextView } from '../components/RealContextView';
 
@@ -35,7 +43,7 @@ export interface GroupViewProps {
   members: GroupMemberSummary[];
   timeline: GroupTimelineItem[];
   lanes: GroupLane[];
-  snapshots: Record<string, SnapshotEventData | null>;
+  snapshots: Record<string, MemberSnapshotState>;
   templates: string[];
   thinkingEfforts: string[];
   toolNames: string[];
@@ -58,7 +66,10 @@ export interface GroupViewProps {
   /** 当前错误横幅文本（App 的 `error`）；组模式下没有 ChatScreen 承载它。 */
   error?: string | null;
   onLoadEarlier: () => void;
-  onReload: () => Promise<void> | void;
+  /** 重拉组数据（`loadGroup` 的返回值 = 成功/失败，供 R.8 的 tick bump 判断）。 */
+  onReload: () => Promise<boolean> | void;
+  /** 只重拉一个成员的快照（成员视图的「重试」，不重载整条时间线）。 */
+  onReloadMemberSnapshot: (memberId: string) => void;
   onError: (message: string) => void;
 }
 
@@ -80,6 +91,7 @@ export function GroupView({
   error,
   onLoadEarlier,
   onReload,
+  onReloadMemberSnapshot,
   onError,
 }: GroupViewProps) {
   const [newName, setNewName] = useState('');
@@ -90,7 +102,6 @@ export function GroupView({
   const [subset, setSubset] = useState<Record<string, string[]>>({});
   const [append, setAppend] = useState<Record<string, string>>({});
   const [effort, setEffort] = useState<Record<string, string>>({});
-  const [realContextFor, setRealContextFor] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   // `group.send` 的**同步阶段**状态（design D10）：收到 `started` 即解除，不等链结束。
   const [sending, setSending] = useState(false);
@@ -99,13 +110,36 @@ export function GroupView({
   const [forcedNotice, setForcedNotice] = useState<string | null>(null);
   // 达每组轮数上限的提示（`stopReason = round_cap`；design D10 / D13）。
   const [roundCapNotice, setRoundCapNotice] = useState<string | null>(null);
+  // R.15：链 `failed` 的真因（`group.chain.error`）。独立于加载/视图错误横幅，一过性：
+  // 下次发送即清（不做常驻告警，也不复用 group-view-error / group-loading-error）。
+  const [chainError, setChainError] = useState<string | null>(null);
   const [togglingReactions, setTogglingReactions] = useState(false);
   // 「反应轮数上限」输入框的草稿：`''` = 留空（保存时发 `maxRounds: null`）。
   const [roundCapDraft, setRoundCapDraft] = useState(
     group.maxRounds === null ? '' : String(group.maxRounds),
   );
   const [savingRoundCap, setSavingRoundCap] = useState(false);
-  const lastCompletedTick = useRef(0);
+  // R.8：一次性提示游标的**挂载基线**是挂载时的 tick，不是 0。否则换群重挂后
+  // 旧的 `chainCompletedTick`（全局单调）会立刻越过 0，把上一次链的提示重放一遍。
+  const lastCompletedTick = useRef(chainCompletedTick);
+  // 双标签与成员选择（change `group-chat-layout` D3/D4）：切换只改本地状态。
+  const [panelState, setPanelState] = useState<GroupPanelState>(initialGroupPanelState);
+  // 窄屏（< xl）成员名单抽屉的开关（D5）。
+  const [membersOpen, setMembersOpen] = useState(false);
+  const membersPanelRef = useRef<HTMLElement | null>(null);
+  const membersToggleRef = useRef<HTMLButtonElement | null>(null);
+  // 成员视图激活时链终态提示的未读点（D3）。
+  const [chatUnread, setChatUnread] = useState(false);
+  const tabRef = useRef(panelState.tab);
+  tabRef.current = panelState.tab;
+  // 时间线滚动位置的存档：未激活面板用 display:none 隐藏（design D3），而浏览器
+  // 在盒子被销毁时会把 scrollTop 归零 —— 切回群聊时按存档恢复（见下方 effect）。
+  const timelineRef = useRef<HTMLElement | null>(null);
+  const timelineScrollRef = useRef(0);
+  // R.9：成员视图与成员名单的滚动存档（时间线之外的两个滚动容器）。
+  const memberViewRef = useRef<HTMLDivElement | null>(null);
+  const memberViewScrollRef = useRef(0);
+  const membersScrollRef = useRef(0);
 
   const activeMembers = members.filter((member) => member.removedAt === null);
   const chainRunning = chainIsRunning({
@@ -121,6 +155,16 @@ export function GroupView({
     setRoundCapDraft(group.maxRounds === null ? '' : String(group.maxRounds));
   }, [group.maxRounds]);
 
+  // 成员 id 从成员表消失时回退到默认成员（软删成员仍在表里 ⇒ 保持选中，D4）。
+  useEffect(() => {
+    setPanelState((previous) => {
+      if (previous.memberId === null) return previous;
+      const resolved = resolveSelectedMemberId(members, previous.memberId);
+      if (resolved === previous.memberId) return previous;
+      return { ...previous, memberId: resolved };
+    });
+  }, [members]);
+
   // 链结束事件到达：按终态/步骤给一次性提示（刷新后不再显示）。
   useEffect(() => {
     if (chainCompletedTick <= lastCompletedTick.current) return;
@@ -129,17 +173,31 @@ export function GroupView({
     const rejected = steps.filter(
       (step) => step.status === 'forced_pass' || step.status === 'forced_empty',
     );
-    setForcedNotice(
+    const nextForcedNotice =
       rejected.length > 0
         ? '被点名的成员没有回应（返回 pass=true / 空 message）'
-        : null,
-    );
-    setRoundCapNotice(
+        : null;
+    const nextRoundCapNotice =
       chain?.stopReason === 'round_cap'
         ? '已达轮数上限（反应已停止；可继续点名，或调大该组的反应轮数上限）'
-        : null,
-    );
+        : null;
+    setForcedNotice(nextForcedNotice);
+    setRoundCapNotice(nextRoundCapNotice);
+    // 提示产生时用户正在成员视图：群聊标签置未读点，避免提示在隐藏面板里静默丢失。
+    if (tabRef.current === 'members' && (nextForcedNotice !== null || nextRoundCapNotice !== null)) {
+      setChatUnread(true);
+    }
   }, [chainCompletedTick, chain]);
+
+  // R.15：链失败真因跟随当前 `group.chain` —— 只有 failed 且有 error 时显示；
+  // completed / cancelled / running / idle 一律清掉（旧错不许残留）。
+  useEffect(() => {
+    if (chain?.status === 'failed' && chain.error) {
+      setChainError(chain.error);
+      return;
+    }
+    setChainError(null);
+  }, [chain]);
 
   const toggleReactions = async (next: boolean) => {
     setTogglingReactions(true);
@@ -283,6 +341,8 @@ export function GroupView({
     setSending(true);
     setForcedNotice(null);
     setRoundCapNotice(null);
+    // R.15：失败真因是一过性的，下次发送即清（若这次链也失败，会拿到新的 error）。
+    setChainError(null);
     try {
       const params: Record<string, unknown> = {
         groupId: group.id,
@@ -303,79 +363,414 @@ export function GroupView({
     }
   };
 
+  /** 关抽屉并把焦点还给触发按钮（背景 / 关闭按钮 / Escape 三条路径共用）。 */
+  const closeMembersDrawer = () => {
+    // R.9：关抽屉前存成员名单的滚动位置（再打开时恢复）。
+    membersScrollRef.current = membersPanelRef.current?.scrollTop ?? 0;
+    setMembersOpen(false);
+    membersToggleRef.current?.focus();
+  };
+
+  // R.5：断点监听 —— Tailwind v4 的 xl 是 80rem；跨到 xl 时收起抽屉（否则打开态
+  // 会留下关不掉的 absolute 浮层）。监听器必须在卸载时移除（换群重挂 / StrictMode）。
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return undefined;
+    const query = window.matchMedia('(min-width: 80rem)');
+    const onChange = () => {
+      // 只在跨到 xl 时收抽屉；缩回窄屏时保持关闭（不自行重开）。
+      if (query.matches) setMembersOpen(false);
+    };
+    query.addEventListener('change', onChange);
+    return () => query.removeEventListener('change', onChange);
+  }, []);
+
+  // R.5：抽屉打开时的对话框语义：焦点进入抽屉、Escape 关闭并回到触发按钮。
+  useEffect(() => {
+    if (!membersOpen) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      closeMembersDrawer();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    membersPanelRef.current?.focus();
+    return () => document.removeEventListener('keydown', onKeyDown);
+    // `closeMembersDrawer` 每帧重建，但它只读写 ref / setter；跟随 membersOpen 订阅即可。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [membersOpen]);
+
+  const tab = panelState.tab;
+  const selectedMemberId = panelState.memberId;
+  const selectedMember =
+    members.find((member) => member.id === selectedMemberId) ?? null;
+  const selectedLane =
+    selectedMemberId === null
+      ? null
+      : lanes.find((lane) => lane.memberId === selectedMemberId) ?? null;
+  const memberIds = new Set(members.map((member) => member.id));
+  const unknownLanes = lanes.filter((lane) => !memberIds.has(lane.memberId));
+  const snapshotState =
+    selectedMemberId === null ? undefined : snapshots[selectedMemberId];
+
+  // 头部反应指示：追加正在流式的成员名；成员间隙用 `runningMemberId` 回退。
+  // 这样 < xl 抽屉关着也能看到「谁在反应」（design D3）。
+  const streamingNames = streamingMembers
+    .map((memberId) => members.find((member) => member.id === memberId)?.name ?? memberId)
+    .filter((name) => name.length > 0);
+  const fallbackName =
+    streamingNames.length === 0 && group.runningMemberId !== null
+      ? members.find((member) => member.id === group.runningMemberId)?.name ?? null
+      : null;
+  const reactingNames =
+    streamingNames.length > 0 ? streamingNames : fallbackName !== null ? [fallbackName] : [];
+  const reactionText =
+    reactingNames.length > 0
+      ? `反应链进行中…（正在反应：${reactingNames.join('、')}）`
+      : '反应链进行中…（可取消）';
+
+  const switchTab = (nextTab: 'chat' | 'members') => {
+    if (panelState.tab === 'chat' && nextTab === 'members') {
+      timelineScrollRef.current = timelineRef.current?.scrollTop ?? 0;
+      // 离开群聊标签会隐藏成员名单（< xl 抽屉 / xl 静态列都在面板内）：先存一份。
+      membersScrollRef.current = membersPanelRef.current?.scrollTop ?? 0;
+    }
+    if (panelState.tab === 'members' && nextTab === 'chat') {
+      memberViewScrollRef.current = memberViewRef.current?.scrollTop ?? 0;
+    }
+    setPanelState((previous) => switchGroupTab(previous, nextTab, members));
+    // R.3：切标签一律收起窄屏抽屉 —— 否则切回群聊时它自行重开，且背景/按钮状态说谎。
+    setMembersOpen(false);
+    if (nextTab === 'chat') setChatUnread(false);
+  };
+
+  // 切回群聊后恢复时间线滚动位置（display:none 期间 scrollTop 会被重置）。
+  useEffect(() => {
+    if (tab !== 'chat') return;
+    if (timelineRef.current && timelineRef.current.scrollTop !== timelineScrollRef.current) {
+      timelineRef.current.scrollTop = timelineScrollRef.current;
+    }
+  }, [tab]);
+
+  // R.9：成员视图 / 成员名单的滚动恢复必须在容器**可见后**写回（同一 tick 写入会被
+  // display:none 忽略或清掉）。
+  useEffect(() => {
+    if (tab !== 'members') return;
+    const view = memberViewRef.current;
+    if (view !== null && view.scrollTop !== memberViewScrollRef.current) {
+      view.scrollTop = memberViewScrollRef.current;
+    }
+  }, [tab]);
+
+  useEffect(() => {
+    if (tab !== 'chat') return;
+    const panel = membersPanelRef.current;
+    if (panel !== null && panel.scrollTop !== membersScrollRef.current) {
+      panel.scrollTop = membersScrollRef.current;
+    }
+  }, [tab]);
+
+  useEffect(() => {
+    if (!membersOpen) return;
+    const panel = membersPanelRef.current;
+    if (panel !== null) panel.scrollTop = membersScrollRef.current;
+  }, [membersOpen]);
+
   return (
-    <div className="flex h-full min-h-0 flex-col bg-bg text-fg" data-testid="group-view">
-      <header className="flex items-center justify-between gap-3 border-b border-line px-4 py-3">
-        <div className="min-w-0">
-          <h1 className="truncate text-xl font-semibold">组视图 · {group.title}</h1>
-          <p className="text-xs text-muted">成员共享一份原文；每个成员只看得到自己的私有过程。</p>
-        </div>
-        <div className="flex shrink-0 items-center gap-3">
-          {/* 自发反应开关（change `group-reactive-mode` D10）：链运行中禁用。 */}
-          <label className="flex items-center gap-1 text-xs text-muted">
-            <input
-              type="checkbox"
-              data-testid="reactions-toggle"
-              checked={group.reactionsEnabled}
-              disabled={chainRunning || togglingReactions}
-              onChange={(event) => void toggleReactions(event.target.checked)}
-            />
-            自发反应（默认开）
-          </label>
-          {/* 反应轮数上限（change `group-reactive-mode` R.4 / D13）：null = 默认占位；
-              留空保存 ⇒ maxRounds: null（恢复默认）；链运行中禁用。 */}
-          <label className="flex items-center gap-1 text-xs text-muted">
-            反应轮数上限
-            <input
-              type="number"
-              min={kMinMaxReactionRounds}
-              max={kMaxMaxReactionRounds}
-              data-testid="group-round-cap"
-              value={roundCapDraft}
-              placeholder={`默认 ${kDefaultMaxReactionRounds}`}
-              disabled={chainRunning || savingRoundCap}
-              onChange={(event) => setRoundCapDraft(event.target.value)}
-              onBlur={() => void saveRoundCap()}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') event.currentTarget.blur();
-              }}
-              className="h-7 w-16 rounded-card border border-line bg-surface px-1 text-xs"
-            />
-          </label>
-          {chainRunning && (
-            <span className="text-xs text-accent" data-testid="reaction-active">
-              反应链进行中…（可取消）
+    <div
+      className="relative flex h-full min-h-0 flex-col bg-bg text-fg"
+      data-testid="group-view"
+      data-active-tab={tab}
+    >
+      <header className="relative z-30 border-b border-line px-4 py-3">
+        {/* 第一行：身份与全局动作（窄屏可换行，不为宽屏再写一套） */}
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="min-w-0">
+            <h1 className="truncate text-xl font-semibold">组视图 · {group.title}</h1>
+            <p className="text-xs text-muted">
+              成员共享一份原文；每个成员只看得到自己的私有过程。
+            </p>
+          </div>
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            {chainRunning && (
+              <span className="text-xs text-accent" data-testid="reaction-active">
+                {reactionText}
+              </span>
+            )}
+            <button
+              type="button"
+              data-testid="group-cancel"
+              disabled={!cancelEnabled}
+              onClick={() => void cancelChain()}
+              className="min-h-6 rounded-card border border-danger/40 px-2 py-1 text-xs text-danger/80 hover:text-danger disabled:opacity-40"
+            >
+              取消反应链
+            </button>
+            <span className="text-xs text-muted" data-testid="group-kind">
+              kind={group.kind}
             </span>
-          )}
-          <button
-            type="button"
-            data-testid="group-cancel"
-            disabled={!cancelEnabled}
-            onClick={() => void cancelChain()}
-            className="min-h-6 rounded-card border border-danger/40 px-2 py-1 text-xs text-danger/80 hover:text-danger disabled:opacity-40"
-          >
-            取消反应链
-          </button>
-          <span className="text-xs text-muted" data-testid="group-kind">
-            kind={group.kind}
-          </span>
+            {/* R.7：「成员」按钮只在群聊标签渲染/可用（成员视图里抽屉没有意义，
+                `aria-expanded` 也只会说谎）。 */}
+            {tab === 'chat' && (
+              <button
+                type="button"
+                ref={membersToggleRef}
+                data-testid="group-members-toggle"
+                aria-expanded={membersOpen}
+                aria-controls="group-members"
+                onClick={() => setMembersOpen((previous) => !previous)}
+                className="min-h-6 rounded-card border border-line px-2 py-1 text-xs text-muted hover:text-fg xl:hidden"
+              >
+                成员
+              </button>
+            )}
+          </div>
+        </div>
+        {/* 第二行：标签 + 组设置 */}
+        <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+          <div role="tablist" aria-label="群聊视图" className="flex items-center gap-1">
+            <button
+              type="button"
+              role="tab"
+              id="group-tab-chat"
+              aria-controls="group-chat-panel"
+              aria-selected={tab === 'chat'}
+              data-testid="group-tab-chat"
+              data-unread={chatUnread ? 'true' : undefined}
+              onClick={() => switchTab('chat')}
+              className={
+                tab === 'chat'
+                  ? 'flex min-h-6 items-center gap-1 rounded-card border border-accent bg-surface-2 px-2 py-1 text-xs text-fg'
+                  : 'flex min-h-6 items-center gap-1 rounded-card border border-line px-2 py-1 text-xs text-muted hover:text-fg'
+              }
+            >
+              群聊
+              {chatUnread && (
+                <span
+                  data-testid="group-tab-unread"
+                  className="text-accent"
+                  aria-label="有新提示"
+                >
+                  ●
+                </span>
+              )}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              id="group-tab-members"
+              aria-controls="member-view"
+              aria-selected={tab === 'members'}
+              data-testid="group-tab-members"
+              onClick={() => switchTab('members')}
+              className={
+                tab === 'members'
+                  ? 'min-h-6 rounded-card border border-accent bg-surface-2 px-2 py-1 text-xs text-fg'
+                  : 'min-h-6 rounded-card border border-line px-2 py-1 text-xs text-muted hover:text-fg'
+              }
+            >
+              成员视图
+            </button>
+          </div>
+          <div className="flex min-w-0 flex-wrap items-center gap-3">
+            {/* 自发反应开关（change `group-reactive-mode` D10）：链运行中禁用。 */}
+            <label className="flex items-center gap-1 text-xs text-muted">
+              <input
+                type="checkbox"
+                data-testid="reactions-toggle"
+                checked={group.reactionsEnabled}
+                disabled={chainRunning || togglingReactions}
+                onChange={(event) => void toggleReactions(event.target.checked)}
+              />
+              自发反应（默认开）
+            </label>
+            {/* 反应轮数上限（change `group-reactive-mode` R.4 / D13）：null = 默认占位；
+                留空保存 ⇒ maxRounds: null（恢复默认）；链运行中禁用。 */}
+            <label className="flex items-center gap-1 text-xs text-muted">
+              反应轮数上限
+              <input
+                type="number"
+                min={kMinMaxReactionRounds}
+                max={kMaxMaxReactionRounds}
+                data-testid="group-round-cap"
+                value={roundCapDraft}
+                placeholder={`默认 ${kDefaultMaxReactionRounds}`}
+                disabled={chainRunning || savingRoundCap}
+                onChange={(event) => setRoundCapDraft(event.target.value)}
+                onBlur={() => void saveRoundCap()}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') event.currentTarget.blur();
+                }}
+                className="h-7 w-16 rounded-card border border-line bg-surface px-1 text-xs"
+              />
+            </label>
+          </div>
         </div>
       </header>
 
       {error !== null && error !== undefined && (
         <div
-          data-testid="group-error"
+          data-testid="group-view-error"
           className="border-b border-danger/40 bg-danger/10 px-4 py-2 text-sm text-danger"
         >
           {error}
         </div>
       )}
 
-      <div className="flex min-h-0 flex-1">
-        {/* 成员与覆盖层 */}
-        <aside className="w-72 shrink-0 overflow-y-auto border-r border-line bg-surface px-3 py-3">
-          <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted">成员</h2>
-          <ul className="space-y-2" data-testid="group-members">
+      {/* R.15：链失败真因（独立 testid，不复用加载/视图错误；一过性，下次发送清）。 */}
+      {chainError !== null && (
+        <div
+          data-testid="group-chain-error"
+          role="alert"
+          className="border-b border-danger/40 bg-danger/10 px-4 py-2 text-sm text-danger"
+        >
+          反应链失败：{chainError}
+        </div>
+      )}
+
+      {/* 群聊标签：公开时间线 + 发送区（中） + 成员名单（右，< xl 抽屉）。
+          这一层必须是 `relative`：抽屉背景的包含块在此（R.3），只覆盖时间线/发送区，
+          不得以 group-view 根为包含块盖住头部标签。 */}
+      <div
+        id="group-chat-panel"
+        role="tabpanel"
+        aria-labelledby="group-tab-chat"
+        data-testid="group-chat-panel"
+        aria-hidden={tab !== 'chat' ? 'true' : undefined}
+        className={tab === 'chat' ? 'relative flex min-h-0 flex-1' : 'relative hidden'}
+      >
+        {/* R.6：主地标由 `ChatShell` 提供，这里用 section（时间线列不写 main）。 */}
+        <section className="flex min-w-0 flex-1 flex-col">
+          <section
+            ref={timelineRef}
+            className="min-h-0 flex-1 overflow-y-auto px-4 py-3"
+            data-testid="group-timeline"
+          >
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <h2 className="text-xs font-semibold uppercase tracking-wide text-muted">
+                公开时间线
+              </h2>
+              {hasEarlier && (
+                <button
+                  type="button"
+                  data-testid="group-load-earlier"
+                  disabled={loadingEarlier}
+                  onClick={onLoadEarlier}
+                  className="min-h-6 rounded-card border border-line px-2 py-1 text-xs text-muted hover:text-fg disabled:opacity-40"
+                >
+                  {loadingEarlier ? '正在加载更早的消息…' : '加载更早的消息'}
+                </button>
+              )}
+            </div>
+            {timeline.length === 0 && (
+              <p className="text-sm text-muted" data-testid="timeline-empty">
+                还没有公开消息：选一个发言人开始。
+              </p>
+            )}
+            <ul className="space-y-2">
+              {timeline.map((item, index) => (
+                <li
+                  key={`${item.seq ?? index}-${index}`}
+                  data-testid="timeline-item"
+                  data-seq={item.seq ?? ''}
+                  className="rounded-card border border-line bg-surface px-3 py-2"
+                >
+                  <div className="text-xs text-muted" data-testid="timeline-author">
+                    {item.authorName === null ? '用户' : item.authorName}
+                  </div>
+                  <div className="whitespace-pre-wrap text-sm">{item.content}</div>
+                </li>
+              ))}
+            </ul>
+          </section>
+
+          <div className="border-t border-line px-4 py-2">
+            {forcedNotice !== null && (
+              <p className="mb-1 text-xs text-warn" data-testid="forced-notice">
+                {forcedNotice}
+              </p>
+            )}
+            {roundCapNotice !== null && (
+              <p className="mb-1 text-xs text-warn" data-testid="round-cap-notice">
+                {roundCapNotice}
+              </p>
+            )}
+            <div className="flex items-center gap-2">
+              <label className="flex items-center gap-1 text-xs text-muted">
+                发言人
+                <select
+                  data-testid="speaker-select"
+                  value={speaker}
+                  onChange={(event) => setSpeaker(event.target.value)}
+                  className="h-7 rounded-card border border-line bg-surface px-1 text-xs"
+                >
+                  <option value="">
+                    {group.reactionsEnabled ? '（不点名，仅触发反应）' : '（未选择）'}
+                  </option>
+                  {activeMembers.map((member) => (
+                    <option key={member.id} value={member.id}>
+                      {member.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <textarea
+                data-testid="group-input"
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                placeholder={
+                  group.reactionsEnabled
+                    ? '说点什么：所有公开消息都会触发成员反应（可留空仅点名）'
+                    : '给点名成员的一句话（可留空：不带文本的点名不写空用户行）'
+                }
+                className="h-10 min-w-0 flex-1 resize-none rounded-card border border-line bg-surface px-2 py-1 text-sm"
+              />
+              <button
+                type="button"
+                data-testid="group-send"
+                disabled={sending}
+                onClick={() => void send()}
+                className="rounded-card bg-accent px-3 py-2 text-sm font-semibold text-bg disabled:opacity-40"
+              >
+                {sending ? '发送中…' : '发送'}
+              </button>
+            </div>
+          </div>
+        </section>
+
+        {/* 成员名单（右置；< xl 时同一份 DOM 变成右侧抽屉） */}
+        {membersOpen && (
+          <div
+            data-testid="group-members-backdrop"
+            aria-hidden="true"
+            onClick={closeMembersDrawer}
+            className="absolute inset-0 z-10 bg-bg/60 xl:hidden"
+          />
+        )}
+        <aside
+          ref={membersPanelRef}
+          id="group-members"
+          data-testid="group-members"
+          role={membersOpen ? 'dialog' : undefined}
+          aria-modal={membersOpen ? 'true' : undefined}
+          aria-label={membersOpen ? '成员名单' : undefined}
+          tabIndex={membersOpen ? -1 : undefined}
+          className={
+            membersOpen
+              ? 'absolute inset-y-0 right-0 z-20 flex w-72 flex-col overflow-y-auto border-l border-line bg-surface px-3 py-3 xl:static xl:flex'
+              : 'hidden w-72 shrink-0 flex-col overflow-y-auto border-l border-line bg-surface px-3 py-3 xl:static xl:flex'
+          }
+        >
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <h2 className="text-xs font-semibold uppercase tracking-wide text-muted">成员</h2>
+            <button
+              type="button"
+              data-testid="group-members-close"
+              onClick={closeMembersDrawer}
+              className="min-h-6 rounded-card border border-line px-2 py-1 text-xs text-muted hover:text-fg xl:hidden"
+            >
+              关闭
+            </button>
+          </div>
+          <ul className="space-y-2" data-testid="group-members-list">
             {members.map((member) => (
               <li key={member.id} className="rounded-card border border-line bg-bg/40 p-2">
                 <div className="flex items-center justify-between gap-2">
@@ -387,7 +782,16 @@ export function GroupView({
                       </span>
                     )}
                   </span>
-                  <span className="shrink-0 text-xs text-muted">{member.template}</span>
+                  {streamingMembers.includes(member.id) ? (
+                    <span
+                      className="shrink-0 text-xs text-accent"
+                      data-testid={`member-streaming-${member.id}`}
+                    >
+                      正在反应…
+                    </span>
+                  ) : (
+                    <span className="shrink-0 text-xs text-muted">{member.template}</span>
+                  )}
                 </div>
                 {member.effective && (
                   <p className="mt-1 text-xs text-muted" data-testid={`effective-${member.id}`}>
@@ -522,193 +926,147 @@ export function GroupView({
             </button>
           </div>
         </aside>
+      </div>
 
-        {/* 公开时间线 */}
-        <main className="flex min-w-0 flex-1 flex-col">
-          <section className="min-h-0 flex-1 overflow-y-auto px-4 py-3" data-testid="group-timeline">
-            <div className="mb-2 flex items-center justify-between gap-2">
-              <h2 className="text-xs font-semibold uppercase tracking-wide text-muted">
-                公开时间线
+      {/* 成员视图标签：选择器 + 私有过程 + 真实上下文 + 占用环（单列滚动）。 */}
+      <div
+        ref={memberViewRef}
+        id="member-view"
+        role="tabpanel"
+        aria-labelledby="group-tab-members"
+        data-testid="member-view"
+        aria-hidden={tab !== 'members' ? 'true' : undefined}
+        className={tab === 'members' ? 'min-h-0 flex-1 overflow-y-auto px-4 py-3' : 'hidden'}
+      >
+        <div role="group" aria-label="选择成员" className="flex flex-wrap gap-2">
+          {members.length === 0 && (
+            <p className="text-sm text-muted" data-testid="member-view-empty">
+              群里还没有成员：先在「群聊」标签右侧的成员名单里加入成员。
+            </p>
+          )}
+          {members.map((member) => (
+            <button
+              key={member.id}
+              type="button"
+              data-testid={`member-select-${member.id}`}
+              aria-pressed={selectedMemberId === member.id}
+              onClick={() =>
+                setPanelState((previous) => selectGroupMember(previous, member.id, members))
+              }
+              className={
+                selectedMemberId === member.id
+                  ? 'flex min-h-6 items-center gap-1 rounded-card border border-accent bg-surface-2 px-2 py-1 text-xs text-fg'
+                  : 'flex min-h-6 items-center gap-1 rounded-card border border-line px-2 py-1 text-xs text-muted hover:text-fg'
+              }
+            >
+              {member.name}
+              {member.removedAt !== null && (
+                <span className="text-warn">（已移除）</span>
+              )}
+              {streamingMembers.includes(member.id) && (
+                <span className="text-accent">正在反应…</span>
+              )}
+            </button>
+          ))}
+        </div>
+
+        {unknownLanes.length > 0 && (
+          <div
+            data-testid="member-unknown-authors"
+            className="mt-3 rounded-card border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-warn"
+          >
+            未知作者私有行（不在成员表里，只读）：
+            {unknownLanes
+              .map((lane) => `${lane.name}（${lane.messages.length} 行）`)
+              .join('、')}
+          </div>
+        )}
+
+        {selectedMember && (
+          <>
+            <section data-testid="member-context-section" className="mt-4">
+              <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted">
+                真实上下文与占用
               </h2>
+              {snapshotState === undefined || snapshotState.status === 'loading' ? (
+                <p className="text-sm text-muted" data-testid="member-snapshot-loading">
+                  正在加载该成员的上下文…
+                </p>
+              ) : snapshotState.status === 'error' ? (
+                <div className="rounded-card border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
+                  <p data-testid="member-snapshot-error">读取失败：{snapshotState.error}</p>
+                  <button
+                    type="button"
+                    data-testid="member-snapshot-retry"
+                    onClick={() => onReloadMemberSnapshot(selectedMember.id)}
+                    className="mt-2 min-h-6 rounded-card border border-danger/40 px-2 py-1 text-xs text-danger hover:text-fg"
+                  >
+                    重试
+                  </button>
+                </div>
+              ) : snapshotState.status === 'empty' ? (
+                <p className="text-sm text-muted" data-testid="member-no-snapshot">
+                  本次运行内没发过言（重启后为空是既定语义）。
+                </p>
+              ) : (
+                <div className="rounded-card border border-line bg-surface px-3 py-2">
+                  <p className="text-xs text-muted" data-testid="member-window">
+                    窗口 {ringDenominator(snapshotState.snapshot)} tokens
+                  </p>
+                  {snapshotState.snapshot.breakdown ? (
+                    <div className="mt-2">
+                      <ContextRing breakdown={snapshotState.snapshot.breakdown} />
+                    </div>
+                  ) : (
+                    <p className="mt-2 text-xs text-warn" data-testid="member-no-breakdown">
+                      没有占用拆分数据：不渲染环（不静默当成 0）。
+                    </p>
+                  )}
+                  <RealContextView snapshot={snapshotState.snapshot} />
+                </div>
+              )}
+            </section>
+
+            <section data-testid="member-private-section" className="mt-4">
+              <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted">
+                私有过程（仅该成员可见）
+              </h2>
+              <ul data-testid="member-private-rows" className="space-y-1">
+                {(selectedLane?.messages ?? []).map((message, index) => (
+                  <li
+                    key={`${message.id}-${index}`}
+                    data-testid="member-private-row"
+                    data-seq={message.seq ?? ''}
+                    // R.13：作者必须取 `message.author`（不能写 lane.memberId，否则恒真自证）。
+                    data-author={message.author ?? ''}
+                    className="rounded-card border border-line/60 bg-surface px-3 py-2 text-xs text-muted"
+                  >
+                    {message.content.trim().length > 0
+                      ? message.content
+                      : '（私有过程：思考 / 工具调用）'}
+                  </li>
+                ))}
+              </ul>
+              {(selectedLane?.messages.length ?? 0) === 0 && (
+                <p className="text-sm text-muted" data-testid="member-private-empty">
+                  本次已加载页里没有私有行
+                </p>
+              )}
               {hasEarlier && (
                 <button
                   type="button"
-                  data-testid="group-load-earlier"
+                  data-testid="member-load-earlier"
                   disabled={loadingEarlier}
                   onClick={onLoadEarlier}
-                  className="min-h-6 rounded-card border border-line px-2 py-1 text-xs text-muted hover:text-fg disabled:opacity-40"
+                  className="mt-2 min-h-6 rounded-card border border-line px-2 py-1 text-xs text-muted hover:text-fg disabled:opacity-40"
                 >
                   {loadingEarlier ? '正在加载更早的消息…' : '加载更早的消息'}
                 </button>
               )}
-            </div>
-            {timeline.length === 0 && (
-              <p className="text-sm text-muted" data-testid="timeline-empty">
-                还没有公开消息：选一个发言人开始。
-              </p>
-            )}
-            <ul className="space-y-2">
-              {timeline.map((item, index) => (
-                <li
-                  key={`${item.seq ?? index}-${index}`}
-                  data-testid="timeline-item"
-                  data-seq={item.seq ?? ''}
-                  className="rounded-card border border-line bg-surface px-3 py-2"
-                >
-                  <div className="text-xs text-muted" data-testid="timeline-author">
-                    {item.authorName === null ? '用户' : item.authorName}
-                  </div>
-                  <div className="whitespace-pre-wrap text-sm">{item.content}</div>
-                </li>
-              ))}
-            </ul>
-          </section>
-
-          <div className="border-t border-line px-4 py-2">
-            {forcedNotice !== null && (
-              <p className="mb-1 text-xs text-warn" data-testid="forced-notice">
-                {forcedNotice}
-              </p>
-            )}
-            {roundCapNotice !== null && (
-              <p className="mb-1 text-xs text-warn" data-testid="round-cap-notice">
-                {roundCapNotice}
-              </p>
-            )}
-            <div className="flex items-center gap-2">
-              <label className="flex items-center gap-1 text-xs text-muted">
-                发言人
-                <select
-                  data-testid="speaker-select"
-                  value={speaker}
-                  onChange={(event) => setSpeaker(event.target.value)}
-                  className="h-7 rounded-card border border-line bg-surface px-1 text-xs"
-                >
-                  <option value="">
-                    {group.reactionsEnabled ? '（不点名，仅触发反应）' : '（未选择）'}
-                  </option>
-                  {activeMembers.map((member) => (
-                    <option key={member.id} value={member.id}>
-                      {member.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <textarea
-                data-testid="group-input"
-                value={draft}
-                onChange={(event) => setDraft(event.target.value)}
-                placeholder={
-                  group.reactionsEnabled
-                    ? '说点什么：所有公开消息都会触发成员反应（可留空仅点名）'
-                    : '给点名成员的一句话（可留空：不带文本的点名不写空用户行）'
-                }
-                className="h-10 min-w-0 flex-1 resize-none rounded-card border border-line bg-surface px-2 py-1 text-sm"
-              />
-              <button
-                type="button"
-                data-testid="group-send"
-                disabled={sending}
-                onClick={() => void send()}
-                className="rounded-card bg-accent px-3 py-2 text-sm font-semibold text-bg disabled:opacity-40"
-              >
-                {sending ? '发送中…' : '发送'}
-              </button>
-            </div>
-          </div>
-        </main>
+            </section>
+          </>
+        )}
       </div>
-
-      {/* 成员私有分栏 */}
-      <section className="max-h-72 shrink-0 overflow-y-auto border-t border-line bg-surface px-4 py-2">
-        <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted">
-          成员私有分栏（仅该成员可见）
-        </h2>
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
-          {lanes.map((lane) => {
-            const snapshot = snapshots[lane.memberId] ?? null;
-            return (
-              <article
-                key={lane.memberId}
-                data-testid={`lane-${lane.memberId}`}
-                className="rounded-card border border-line bg-bg/40 p-2"
-              >
-                <header className="flex items-center justify-between gap-2">
-                  <span className="truncate text-sm">
-                    {lane.name}
-                    {lane.removed && <span className="ml-1 text-warn">（已移除）</span>}
-                  </span>
-                  {streamingMembers.includes(lane.memberId) ? (
-                    <span className="shrink-0 text-xs text-accent" data-testid={`lane-reacting-${lane.memberId}`}>
-                      正在反应…
-                    </span>
-                  ) : (
-                    <span className="shrink-0 text-xs text-muted">仅该成员可见</span>
-                  )}
-                </header>
-                <ul className="mt-1 space-y-1">
-                  {lane.messages.map((message, index) => (
-                    <li
-                      key={`${message.id}-${index}`}
-                      data-testid="lane-item"
-                      data-seq={message.seq ?? ''}
-                      className="rounded-card border border-line/60 px-2 py-1 text-xs text-muted"
-                    >
-                      {message.content.trim().length > 0
-                        ? message.content
-                        : '（私有过程：思考 / 工具调用）'}
-                    </li>
-                  ))}
-                  {lane.messages.length === 0 && (
-                    <li className="text-xs text-muted">（本次已加载页里没有私有行）</li>
-                  )}
-                </ul>
-                <div className="mt-2 flex items-center gap-2">
-                  <button
-                    type="button"
-                    data-testid={`lane-context-${lane.memberId}`}
-                    onClick={() =>
-                      setRealContextFor((previous) =>
-                        previous === lane.memberId ? null : lane.memberId,
-                      )
-                    }
-                    className="min-h-6 rounded-card border border-line px-2 py-1 text-xs text-muted hover:text-fg"
-                  >
-                    真实上下文
-                  </button>
-                  {snapshot ? (
-                    <span className="text-xs text-muted" data-testid={`lane-window-${lane.memberId}`}>
-                      窗口 {snapshot.windowTokens}
-                    </span>
-                  ) : (
-                    <span className="text-xs text-muted" data-testid={`lane-nosnapshot-${lane.memberId}`}>
-                      本次运行内没发过言
-                    </span>
-                  )}
-                </div>
-                {snapshot?.breakdown ? (
-                  <div className="mt-2" data-testid={`lane-ring-${lane.memberId}`}>
-                    <ContextRing breakdown={snapshot.breakdown} />
-                  </div>
-                ) : (
-                  <p className="mt-1 text-xs text-warn" data-testid={`lane-noring-${lane.memberId}`}>
-                    没有快照或没有占用拆分：环不渲染（不静默当成 0）。
-                  </p>
-                )}
-                {realContextFor === lane.memberId && snapshot && (
-                  <RealContextView snapshot={snapshot} />
-                )}
-                {realContextFor === lane.memberId && !snapshot && (
-                  <p className="mt-1 text-xs text-muted" data-testid={`lane-nocontext-${lane.memberId}`}>
-                    还没有真实发出的上下文可看（重启后为空是既定语义）。
-                  </p>
-                )}
-              </article>
-            );
-          })}
-        </div>
-      </section>
     </div>
   );
 }
-

@@ -89,4 +89,29 @@ void main() {
       expect(text, contains(anchor), reason: '管理文档缺少内容锚点 "$anchor"');
     }
   });
+
+  test('布局锚点：列表常驻 / 只覆盖主区 / 点会话关闭 / 管理入口在单聊顶栏（change `group-chat-layout`）', () {
+    final text = doc.readAsStringSync();
+    for (final anchor in const [
+      '会话列表',
+      '只覆盖主区',
+      '点会话',
+      '管理入口在单聊顶栏',
+      '群聊模板由各成员决定',
+    ]) {
+      _obs('布局锚点', anchor);
+      expect(text, contains(anchor), reason: '管理文档缺少布局锚点 "$anchor"');
+    }
+  });
+
+  test('返工锚点：删除当前会话会关闭管理页（change `group-chat-layout` 3.5）', () {
+    final text = doc.readAsStringSync();
+    for (final anchor in const [
+      '删除当前会话会关闭管理页',
+      '失败不关',
+    ]) {
+      _obs('返工锚点', anchor);
+      expect(text, contains(anchor), reason: '管理文档缺少返工锚点 "$anchor"');
+    }
+  });
 }
