@@ -52,6 +52,120 @@ void main() {
     return (harness: harness, groupId: groupId, memberId: member.id, agent: agent);
   }
 
+  test('R.12 成员身份锚：每个成员的系统提示词含自己的名字、不含别人的身份', () async {
+    final harness = await GroupHarness.create(reactionsEnabled: true);
+    final a = await harness.addMember('甲');
+    final b = await harness.addMember('乙');
+    final c = await harness.addMember('丙');
+    final agents = <String, Agent>{
+      '甲': await harness.groups.ensureMemberAgent(a),
+      '乙': await harness.groups.ensureMemberAgent(b),
+      '丙': await harness.groups.ensureMemberAgent(c),
+    };
+    for (final entry in agents.entries) {
+      final prompt = entry.value.config.systemPrompt;
+      // ignore: avoid_print
+      print('[OBS] ${entry.key} 系统提示词含身份锚？'
+          '${prompt.contains(kGroupMemberIdentityPrompt(entry.key))}');
+      expect(prompt, contains(kGroupMemberIdentityPrompt(entry.key)),
+          reason: '${entry.key} 的系统提示词必须含自己的身份锚');
+      for (final other in agents.keys.where((name) => name != entry.key)) {
+        expect(prompt, isNot(contains(kGroupMemberIdentityPrompt(other))),
+            reason: '${entry.key} 的系统提示词不得把 $other 的身份句当成自己');
+      }
+    }
+    await harness.dispose();
+  });
+
+  test('R.12 群成员名单每轮现读 + 第一人称身份', () async {
+    final harness = await GroupHarness.create(reactionsEnabled: true);
+    final a = await harness.addMember('甲');
+    await harness.addMember('乙');
+    final agent = await harness.groups.ensureMemberAgent(a);
+    harness.queuePass();
+    await agent.send('', writeUserMessage: false, reaction: true);
+    final firstPrompt = harness.support.sidecar.lastSystemPrompt!;
+    // ignore: avoid_print
+    print('[OBS] 首轮名单片段：${firstPrompt.contains('本群成员：甲、乙。你是「甲」。')}');
+    expect(firstPrompt, contains('本群成员：甲、乙。你是「甲」。'));
+    expect(firstPrompt, contains('你就是「甲」本人'));
+    expect(firstPrompt, contains('不要称自己为「甲」'));
+    expect(firstPrompt, isNot(contains('你是「乙」')));
+    // 模板名不作为身份字段进入模型请求：请求参数里没有模板名/agentType 键。
+    final request = harness.support.sidecar.sendRequests.last;
+    expect(request.toString(), isNot(contains('agentType')),
+        reason: '模板名只进 ContextSnapshot（UI），不得作为身份进模型请求');
+
+    // 加成员后**下一轮**名单立即更新（不缓存）。
+    await harness.addMember('丙');
+    harness.queuePass();
+    await agent.send('', writeUserMessage: false, reaction: true);
+    final secondPrompt = harness.support.sidecar.lastSystemPrompt!;
+    // ignore: avoid_print
+    print('[OBS] 加丙后名单片段：${secondPrompt.contains('本群成员：甲、乙、丙。你是「甲」。')}');
+    expect(secondPrompt, contains('本群成员：甲、乙、丙。你是「甲」。'));
+    await harness.dispose();
+  });
+
+  test('R.12 裸名点名：甲乙先等待对象出现，丙讲后甲乙再评真笑话', () async {
+    final harness =
+        await GroupHarness.create(reactionsEnabled: true, maxRounds: 2);
+    final a = await harness.addMember('甲');
+    final b = await harness.addMember('乙');
+    final c = await harness.addMember('丙');
+    // 第一轮：甲/乙看到「丙讲笑话」但对象还没出现 ⇒ PASS 等待；丙讲笑话。
+    // 第二轮：对象已出现 ⇒ 甲/乙评价**丙实际讲的那段**（不复述、不编造）。
+    harness.queuePass();
+    harness.queuePass();
+    harness.queueReact(pass: false, message: '我来讲个笑话：从前有座山，山里有座庙。');
+    harness.queueReact(
+        pass: false, message: '我评丙这段：从前有座山，山里有座庙——垫得短，包袱还没落。');
+    harness.queueReact(
+        pass: false, message: '我也评这段：从前有座山、山里有座庙——庙里那个包袱如果翻出来，会比前两句更响。');
+    await harness.groups.send(
+        groupId: harness.group.id,
+        memberId: null,
+        text: '丙讲个笑话，甲和乙评价一下。');
+    final chain = await harness.waitForChain();
+    final rows =
+        await harness.support.messageRepo.queryBySession(harness.group.id);
+    final publicAssistant = rows
+        .where((row) => row.visibility == 'public' && row.role == 'assistant')
+        .toList();
+    // ignore: avoid_print
+    print('[OBS] steps=${chain.steps.map((s) => '${s.memberId}/${s.status}').toList()} '
+        '首个公开成员行 author=${publicAssistant.isEmpty ? null : publicAssistant.first.author}');
+    expect(chain.status, 'completed');
+    // 第一轮（trigger = 用户消息 seq）里：甲乙 passed（对象未出现），丙 replied。
+    final userRow = rows.firstWhere((row) => row.role == 'user');
+    final firstRound =
+        chain.steps.where((step) => step.triggerSeq == userRow.seq).toList();
+    final aStep = firstRound.firstWhere((step) => step.memberId == a.id);
+    final bStep = firstRound.firstWhere((step) => step.memberId == b.id);
+    final cStep = firstRound.firstWhere((step) => step.memberId == c.id);
+    expect(aStep.status, 'passed', reason: '对象未出现：甲应先 PASS 等待，不编造评价');
+    expect(bStep.status, 'passed', reason: '对象未出现：乙应先 PASS 等待，不编造评价');
+    expect(cStep.status, 'replied', reason: '点名的是丙，丙应回应');
+    expect(cStep.publicSeq, isNotNull);
+    expect(publicAssistant.first.author, c.id,
+        reason: '讲笑话的公开行 author 必须是丙（不是甲乙抢讲）');
+    expect(publicAssistant.first.content, contains('从前有座山'));
+    // 第二轮（trigger = 丙的公开 seq）里：甲乙都评价了**真实出现过**的同一段。
+    final secondRound = chain.steps
+        .where((step) => step.triggerSeq == cStep.publicSeq)
+        .toList();
+    expect(secondRound.length, 2);
+    for (final step in secondRound) {
+      expect(step.status, 'replied');
+      expect('${step.finalText}', contains('从前有座山'));
+    }
+    final allPublicText = publicAssistant.map((row) => row.content).join('\n');
+    expect(allPublicText, isNot(contains('joke_scores')),
+        reason: '不得引用不存在的假文件');
+    expect(allPublicText, isNot(contains('不存在的文件')));
+    await harness.dispose();
+  });
+
   test('pass=true 吞掉元话术、不写公开行；私有工具行仍在', () async {
     final env = await setUpMember();
     // 一轮工具轮（私有思考 + 工具调用）→ 终态调用 group_react {pass:true}。
@@ -151,6 +265,27 @@ void main() {
     expect(publicRows.length, 1);
     expect(publicRows.single.content, '结论：改用 lib/b.dart');
     expect(result.publicMessage!.content, '结论：改用 lib/b.dart');
+    expect(publicRows.single.content, isNot(startsWith('甲')),
+        reason: '产品不自动加成员名/归属前缀（署名由 author 字段承担）');
+    await env.harness.dispose();
+  });
+
+  test('R.12 第一人称 message 原样落库：不加「甲：」前缀，也不改写口吻', () async {
+    final env = await setUpMember();
+    env.harness.queueReact(pass: false, message: '我认为这个笑话的包袱落在最后一句。');
+    final result = await env.agent
+        .send('', writeUserMessage: false, reaction: true);
+    final rows =
+        await env.harness.support.messageRepo.queryBySession(env.groupId);
+    final publicRow = rows.firstWhere((row) =>
+        row.author == env.memberId && row.visibility == 'public');
+    // ignore: avoid_print
+    print('[OBS] 公开行 content=「${publicRow.content}」author=${publicRow.author}');
+    expect(publicRow.content, '我认为这个笑话的包袱落在最后一句。');
+    expect(publicRow.content, startsWith('我'));
+    expect(publicRow.content, isNot(startsWith('甲')));
+    expect(publicRow.content, isNot(contains('甲：')));
+    expect(result.publicMessage!.content, startsWith('我'));
     await env.harness.dispose();
   });
 

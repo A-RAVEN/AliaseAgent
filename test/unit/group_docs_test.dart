@@ -154,6 +154,12 @@ void main() {
       'pass=false',
       '群聊礼仪',
       '纠正重试',
+      '自己的名字',
+      '裸名点名',
+      '本群成员',
+      '替其它成员发言',
+      '第一人称',
+      '不编造',
       'missing_group_react',
       'invalid_group_react',
     ]) {

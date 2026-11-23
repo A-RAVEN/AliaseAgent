@@ -291,14 +291,17 @@ class AgentFactory {
   ///   ② 上下文工作区 = **组上下文已保存的工作区**（`group.create` 建立，成员继承，
   ///      不给成员单独的私有工作区）；
   ///   ③ 历史 = 该成员的**投影视图**（增量装配），不走全量 `restore()`。
-  /// 系统提示词追加组角色说明（`kGroupMemberRolePrompt`，复用 `systemPromptSuffix`
-  /// seam 的同一做法：只改实例配置副本，不改模板）。
+  /// 系统提示词追加组角色说明 + **成员自我身份锚**（`kGroupMemberRolePrompt` /
+  /// `kGroupMemberIdentityPrompt(member.name)`，复用 `systemPromptSuffix` seam 的同一
+  /// 做法：只改实例配置副本，不改模板）。身份锚必须用成员自己的显示名参数化——
+  /// 否则「丙讲个笑话」这类裸名点名会因成员不知道自己叫什么而错位（R.12）。
   Future<Agent> createMember({
     required Session group,
     required GroupMember member,
     required String workspace,
     required GroupViewLoader viewLoader,
     Future<Map<String, String>> Function()? displayNamesResolver,
+    Future<List<String>> Function()? groupRosterProvider,
     Future<AgentInstanceOverrides?> Function()? overridesLookup,
     AgentCallbacks callbacks = const AgentCallbacks(),
   }) async {
@@ -308,8 +311,10 @@ class AgentFactory {
     final template = candidate.template;
     var resolved = candidate.resolved;
     resolved = resolved.copyWith(
-      systemPrompt:
-          '${resolved.systemPrompt}\n\n$kGroupMemberRolePrompt'.trim(),
+      systemPrompt: '${resolved.systemPrompt}\n\n'
+              '${kGroupMemberIdentityPrompt(member.name)}\n\n'
+              '$kGroupMemberRolePrompt'
+          .trim(),
     );
 
     final guardForAgent = guard ?? _guardFrom(template);
@@ -327,6 +332,7 @@ class AgentFactory {
       handle: context.handle,
       member: context,
       viewLoader: viewLoader,
+      groupRosterProvider: groupRosterProvider,
       overrides: overrides,
       overridesLookup: overridesLookup,
       agentTypeName: template.name,

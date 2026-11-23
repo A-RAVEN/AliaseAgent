@@ -567,6 +567,15 @@ class GroupService {
       workspace: workspace.workspace ?? '',
       viewLoader: loaderFor(group.id),
       displayNamesResolver: () => displayNamesOf(group.id),
+      // 群成员名单**每轮现读**（change `group-member-identity`）：成员增减下一轮
+      // 系统提示词即更新；已移除成员不进名单（历史归属仍由 displayNamesOf 保留）。
+      groupRosterProvider: () async {
+        final members = await memberRepo.listByGroup(group.id);
+        return [
+          for (final item in members)
+            if (!item.isRemoved) item.name,
+        ];
+      },
       // 每轮现读成员行的覆盖层：思考强度改档位不必重建实例即生效。
       overridesLookup: () async => (await memberRepo.get(member.id))?.overrides,
       callbacks: callbacksForMember(member),

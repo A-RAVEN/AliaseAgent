@@ -273,6 +273,12 @@ class Agent {
   /// 成员视图的增量装配器（单会话为 null ⇒ 走原来的全量 `restore()`）。
   final GroupViewLoader? viewLoader;
 
+  /// **每轮现读**的群成员名单提供者（成员实例专用；change `group-member-identity`）。
+  ///
+  /// 返回当前未移除成员的显示名（加入顺序）。每次 `_callModel` 装配系统提示词时调用，
+  /// 所以成员增减下一轮就生效，不做实例级缓存。单会话为 null。
+  final Future<List<String>> Function()? groupRosterProvider;
+
   /// 实例级覆盖层（单会话来自 `sessions.overrides_json`，成员来自成员行）。
   ///
   /// 工具子集与提示词追加已在创建时叠进 [config]（创建/恢复时生效）；[overrides]
@@ -366,6 +372,7 @@ class Agent {
     String? handle,
     this.member,
     this.viewLoader,
+    this.groupRosterProvider,
     this.overrides,
     this.overridesLookup,
     required this.agentTypeName,
@@ -732,6 +739,16 @@ class Agent {
     }
   }
 
+  /// 当前群成员名单（每轮现读；单会话或没有 provider 时返回 null）。
+  Future<String?> _groupRosterSection() async {
+    final provider = groupRosterProvider;
+    final self = member;
+    if (provider == null || self == null) return null;
+    final names = await provider();
+    if (names.isEmpty) return null;
+    return '本群成员：${names.join('、')}。你是「${self.displayName}」。';
+  }
+
   /// 反应轮的结构化收尾（R.10 / design D5）：读 `group_react` 的 `pass` / `message`，
   /// 决定是否写公开行。**绝不回退到 `[PASS]` 文本匹配**，也不为 `group_react` 写 tool 行。
   Future<AgentRunResult> _finishStructuredReaction({
@@ -1028,8 +1045,17 @@ class Agent {
       // 技能 = **只有创建简则**（不再整段消失，也不留空悬的标题/清单行）。技能段的
       // token 由下面这整段估算覆盖，因此自动计入 `fixedOverheadTokens`。
       final skillSection = SkillCatalogService.instance.promptSection;
+      // 群成员名单**每轮现读**（change `group-member-identity`）：不缓存，成员增减
+      // 下一轮系统提示词就更新；已移除成员不进名单（历史归属仍保留）。
+      final rosterSection = await _groupRosterSection();
       final systemPromptBuffer = StringBuffer()
-        ..write(config.systemPrompt)
+        ..write(config.systemPrompt);
+      if (rosterSection != null) {
+        systemPromptBuffer
+          ..write('\n\n')
+          ..write(rosterSection);
+      }
+      systemPromptBuffer
         ..write('\n')
         ..write(guard.inject());
       if (skillSection.isNotEmpty) {

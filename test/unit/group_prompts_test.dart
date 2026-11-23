@@ -30,6 +30,19 @@ void main() {
     // ⑤ 共享工作区是协调通道
     expect(prompt, contains('共享工作区'));
     expect(prompt, contains('协调通道'));
+    // ⑥ 公开回复只代表自己，不冒充其它成员（R.12 第三条纪律）
+    expect(prompt, contains('只代表你自己'));
+    expect(prompt, contains('不要替其它成员发言'));
+    expect(prompt, contains('编造他们的观点'));
+    expect(prompt, contains('不要抢答点名其它成员的问题'));
+    expect(prompt, contains('实际说过'));
+    expect(prompt, contains('模拟多个成员的对话'));
+    // ⑦ 第一人称发言，禁自我署名（系统自动署名）
+    expect(prompt, contains('第一人称'));
+    expect(prompt, contains('不要在正文开头写自己的名字'));
+    expect(prompt, contains('归属标签'));
+    expect(prompt, contains('系统自动署名'));
+    expect(prompt, contains('不要凭空编造'));
 
     // 与先例同源：子 Agent 角色说明里的"自包含最终结论 + 结论与文件路径写清楚"
     // 被泛化到成员的每一次公开回复。
@@ -56,6 +69,37 @@ void main() {
   // ---------------------------------------------------------------------------
   // 自发反应的两段提示词（change `group-reactive-mode` R.9 / design D6）
   // ---------------------------------------------------------------------------
+
+  test('kGroupMemberIdentityPrompt：把成员自己的显示名注入系统提示词', () {
+    final a = kGroupMemberIdentityPrompt('甲');
+    final b = kGroupMemberIdentityPrompt('乙');
+    // ignore: avoid_print
+    print('[OBS] 甲身份句=$a');
+    // ignore: avoid_print
+    print('[OBS] 乙身份句=$b');
+    expect(a, contains('你就是「甲」本人'));
+    expect(a, contains('别人用「甲」称呼你'));
+    expect(a, contains('跟你说话'));
+    expect(a, contains('跟别人说话'));
+    expect(a, contains('你自己发言时直接以第一人称「我」'));
+    expect(a, contains('不要称自己为「甲」'));
+    expect(a, contains('系统会自动把你的发言标为「甲」'));
+    expect(a, contains('模板'));
+    expect(a, contains('不代表你在本群的身份'));
+    expect(a, isNot(contains('唯一称呼')),
+        reason: '旧的外部标签视角必须删掉，不能保留「唯一称呼」');
+    expect(a, isNot(equals(b)), reason: '不同成员的身份句必须不同');
+    expect(a, isNot(contains('「乙」')), reason: '甲的身份句不能把乙写成自己');
+  });
+
+  test('kGroupReactionPrompt：名点识别纪律（点名别人沉默 / 点名自己回应）', () {
+    const prompt = kGroupReactionPrompt;
+    expect(prompt, contains('点名'));
+    expect(prompt, contains('其他成员'));
+    expect(prompt, contains('别人名字'));
+    expect(prompt, contains('点名的是**你**'));
+    expect(prompt, contains('应当回应'));
+  });
 
   test('kGroupReactionPrompt：默认沉默框架 + few-shot + 相关性门槛 + group_react', () {
     const prompt = kGroupReactionPrompt;
@@ -99,6 +143,24 @@ void main() {
     expect(prompt, contains('文件指针'));
     expect(prompt, contains('有依据的同意'));
     expect(prompt, contains('有依据的反对'));
+    // ⑦ 不替其它成员发言，但允许引用/回应实际说过的话（精确界定）
+    expect(prompt, contains('只代表你自己'));
+    expect(prompt, contains('不要替其它成员发言'));
+    expect(prompt, contains('编造他们的观点'));
+    expect(prompt, contains('不要抢答点名'));
+    expect(prompt, contains('实际说过'));
+    expect(prompt, contains('不要模拟多个成员的对话'));
+    // ⑧ 第一人称、禁自我署名
+    expect(prompt, contains('第一人称'));
+    expect(prompt, contains('开头写'));
+    expect(prompt, contains('自己的名字'));
+    expect(prompt, contains('归属标签'));
+    expect(prompt, contains('系统自动署名'));
+    // ⑨ 对象未出现先等待，不编造
+    expect(prompt, contains('尚未出现'));
+    expect(prompt, contains('等待它出现'));
+    expect(prompt, contains('不要凭空编造'));
+    expect(prompt, contains('不要假装读了不存在的文件'));
   });
 
   test('kGroupMustRespondPrompt：必应 + 指示 group_react pass=false，且无沉默授权', () {
@@ -121,6 +183,15 @@ void main() {
     expect(prompt, isNot(contains('pass: true')));
     expect(prompt, isNot(contains('没有话说')));
     expect(prompt, isNot(contains('没有贡献')));
+    // ④ 第一人称、禁自我署名（必应轮同样适用）
+    expect(prompt, contains('第一人称'));
+    expect(prompt, contains('开头写'));
+    expect(prompt, contains('自己的名字'));
+    expect(prompt, contains('系统自动署名'));
+    // ⑤ 对象没出现：如实说还没看到，不编造
+    expect(prompt, contains('还没看到'));
+    expect(prompt, contains('不要编造对象'));
+    expect(prompt, contains('不存在的文件'));
   });
 
   test('两段提示词分工：不互相替换，也都不与成员角色说明互换', () {
@@ -137,6 +208,6 @@ void main() {
     expect(kGroupMustRespondPrompt, isNot(contains('pass=true')));
     // 成员角色说明仍只有角色与自包含，不含反应/必应纪律。
     expect(kGroupMemberRolePrompt, isNot(contains('group_react')));
-    expect(kGroupMemberRolePrompt, isNot(contains('点名')));
+    expect(kGroupMemberRolePrompt, isNot(contains('用户点名了你')));
   });
 }

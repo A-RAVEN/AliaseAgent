@@ -9,9 +9,9 @@
 // stopReason 与 steps 一律**轮询 `group.chain`** 读，不再从 send 回包里取。
 //
 // 场景（design D12 的 live 部分 / R.6）：
-//   ① 建组（**默认自发反应开启**）+ 按顺序加甲乙丙；第一段用户消息「甲讲笑话，乙丙评价」
-//      （不带 `@`，验自发）：链终态 `stopReason` 在封闭枚举内、`rounds <= 该组上限`、
-//      末轮全 `passed`/`empty`（`all_passed`）或 `round_cap`；全程无 `turn.failed`；
+//   ① 建组（**默认自发反应开启**）+ 按顺序加甲乙丙；第一段用户消息「丙讲笑话，甲乙评价」
+//      （裸名点名、不带 `@`，验身份锚 + 名点识别）：第一个成员公开发言的 `author` 必须是丙；
+//      链终态 `stopReason ∈ {all_passed, round_cap}`、`rounds <= 上限`、无 `turn.failed`；
 //      R.9 起**允许成员结构化沉默**，只打印沉默率，不强制每人 replied；
 //   ② 第二段用户消息「@乙 具体说说哪里好笑」（不选 speaker，验定向）：乙的 step 满足
 //      `source == mention && status == replied && publicSeq != null`，且没有 `forced_*`；
@@ -595,10 +595,124 @@ void runGroupReactionLiveSuite() {
             stallLimit: stallLimit);
       }
 
-      // ---- 第一段：甲讲笑话，乙丙评价（不带 @，验自发） ----
-      final firstChain = await sendAndWait('甲讲一个笑话，乙和丙分别评价一下这个笑话。');
+      // ---- 第一段：丙讲笑话，甲乙评价（裸名点名，验身份锚 + 名点识别） ----
+      final firstChain =
+          await sendAndWait('丙讲一个笑话，甲和乙分别评价一下这个笑话。');
       _dumpChain('第一段', firstChain);
       final firstSteps = (firstChain['steps'] as List).cast<Map<String, dynamic>>();
+      final firstChainText = jsonEncode(firstChain);
+      if (firstChainText.contains('402') || firstChainText.contains('余额不足')) {
+        _obs('余额不足', '第一段链出现 402/余额不足：跳过后续断言，不伪绿');
+        markTestSkipped('模型余额不足（402）：live 未验证，不伪造通过');
+        return;
+      }
+      // R.12：裸名点名「丙」必须由丙把笑话讲出来。用**丙自己的公开发言行**判作者：
+      // 丙的 step 必须是 replied、publicSeq 非空，且时间线里确实有 author=丙 的公开行。
+      // 注意：甲/乙在此之前说一句「请丙先贴正文」属于提示词允许的「实质性补充」，
+      // 不算抢讲；判据是**讲笑话的公开行 author=丙**，不是「全场第一条必须是丙」。
+      final firstPage = ((await ws.request('message.query', {
+        'sessionId': groupId,
+        'pageSize': 500,
+      }))['result'] as Map)['messages'] as List;
+      final firstPublicAssistant = [
+        for (final row in firstPage)
+          if ((row as Map)['visibility'] == 'public' && row['role'] == 'assistant')
+            row as Map<String, dynamic>,
+      ]..sort((a, b) => ((a['seq'] as num?) ?? 0)
+          .compareTo((b['seq'] as num?) ?? 0));
+      expect(firstPublicAssistant, isNotEmpty,
+          reason: '第一段必须至少产生一条成员公开发言（丙没有回应？）');
+      _obs('第一段公开行 author',
+          firstPublicAssistant.map((row) => row['author']).toList());
+      // R.12 对象未出现先等待：第一轮（trigger = 用户消息 seq）甲/乙必须 passed，
+      // 丙才能 replied；甲乙不得在对象未出现时编造评价。
+      final userSeq = ((firstPage.firstWhere(
+        (row) => (row as Map)['role'] == 'user',
+        orElse: () => <String, dynamic>{},
+      ) as Map)['seq'] as num?)
+          ?.toInt();
+      expect(userSeq, isNotNull, reason: '第一段必须有用户消息作为首触发');
+      final firstRound =
+          firstSteps.where((step) => step['triggerSeq'] == userSeq).toList();
+      _obs('第一轮步骤',
+          firstRound.map((s) => '${s['memberId']}/${s['status']}').toList());
+      final firstRoundByMember = <String, Map<String, dynamic>>{
+        for (final step in firstRound)
+          '${step['memberId']}': step,
+      };
+      for (final name in ['甲', '乙']) {
+        final step = firstRoundByMember[memberIds[name]];
+        expect(step, isNotNull, reason: '$name 必须有第一轮步骤');
+        expect(step!['status'], 'passed',
+            reason: '$name 在对象（丙的笑话）未出现时必须 PASS 等待，不能编造评价');
+      }
+      final cFirst = firstRoundByMember[memberIds['丙']];
+      expect(cFirst, isNotNull);
+      expect(cFirst!['status'], 'replied',
+          reason: '丙必须在第一轮讲出笑话');
+      final laterEvaluations = firstSteps
+          .where((step) =>
+              step['triggerSeq'] != userSeq &&
+              (step['memberId'] == memberIds['甲'] ||
+                  step['memberId'] == memberIds['乙']) &&
+              step['status'] == 'replied')
+          .toList();
+      _obs('对象出现后甲乙评价步骤',
+          laterEvaluations.map((s) => '${s['memberId']}/${s['status']}').toList());
+      expect(laterEvaluations, isNotEmpty,
+          reason: '丙的笑话出现后，甲乙应在后续轮评价它');
+      final firstAllPublicText =
+          firstPublicAssistant.map((row) => '${row['content']}').join('\n');
+      expect(firstAllPublicText, isNot(contains('joke_scores')),
+          reason: '不得引用不存在的假文件 joke_scores');
+      final cPublic = firstPublicAssistant
+          .where((row) => row['author'] == memberIds['丙'])
+          .toList();
+      expect(cPublic, isNotEmpty,
+          reason: '丙必须公开讲出笑话（R.12：点名丙不能由别人代讲）');
+      final firstPublicText = '${cPublic.first['content']}'.trim();
+      expect(firstPublicText, isNotEmpty);
+      // R.12 第一人称/禁自我署名：正文不能以「丙：」「丙（作者本人）：」「作为丙」开头，
+      // 也不能自报「丙（作者本人）」；应使用第一人称「我」，署名由系统 author 承担。
+      final selfLabel = RegExp(r'^\s*(丙\s*[:：（(]|作为丙)');
+      _obs('丙正文首行', firstPublicText.split('\n').first);
+      expect(firstPublicText, isNot(contains('丙（作者本人）')),
+          reason: '正文不得给自己贴「丙（作者本人）」署名');
+      expect(selfLabel.hasMatch(firstPublicText), isFalse,
+          reason: '正文不得以「丙：」「丙（…）」「作为丙」开头（系统自动署名）');
+      expect(firstPublicText, contains('我'),
+          reason: '正文应使用第一人称「我」');
+      _obs('丙正文是否第一人称开头', firstPublicText.startsWith('我'));
+      // 丙的 step 必须与这条公开行对得上（不是只在别处说了句话）。
+      final cStep = (firstChain['steps'] as List)
+          .cast<Map<String, dynamic>>()
+          .firstWhere((step) => step['memberId'] == memberIds['丙'],
+              orElse: () => <String, dynamic>{});
+      // ignore: avoid_print
+      print('[OBS] 丙讲笑话 author=${cPublic.first['author']} '
+          'step.status=${cStep['status']} publicSeq=${cStep['publicSeq']}');
+      expect(cStep['status'], 'replied');
+      expect(cStep['publicSeq'], cPublic.first['seq'],
+          reason: '丙的 replied step 必须指向这条讲笑话的公开行');
+      // ignore: avoid_print
+      print('[OBS] 丙讲的公开内容：「$firstPublicText」');
+      // R.12：每个成员最近一次真实请求的系统提示词必须含**当前群成员名单**与自己的
+      // 唯一称呼（名单每轮现读，不是创建时缓存）。
+      for (final name in ['甲', '乙', '丙']) {
+        final view = (await ws.request('group.view', {
+          'groupId': groupId,
+          'memberId': memberIds[name],
+        }))['result'] as Map;
+        final snapshot = view['snapshot'] as Map?;
+        // ContextSnapshot.toJson 的键是 `system`（不是 systemPrompt）。
+        final prompt = '${snapshot?['system'] ?? ''}';
+        _obs('$name 名单/身份片段',
+            prompt.contains('本群成员：甲、乙、丙。你是「$name」。'));
+        expect(prompt, contains('本群成员：甲、乙、丙。'),
+            reason: '$name 的系统提示词必须含当前群成员名单');
+        expect(prompt, contains('你是「$name」'),
+            reason: '$name 的系统提示词必须含自己的唯一称呼');
+      }
       // R.9：默认沉默框架下**允许**成员 pass=true（不再要求每人都发言）；
       // 只要求每个成员至少被规划到一步，且一旦 replied 就必须是实质内容。
       for (final name in ['甲', '乙', '丙']) {
@@ -722,7 +836,7 @@ void runGroupReactionLiveSuite() {
           script,
           '--coreUrl=${core.url.toString().replaceAll(RegExp(r'/$'), '')}',
           '--shotPath=$shotPath',
-          '--prompt=甲再讲一个短笑话，乙和丙各评价一句。',
+          '--prompt=丙再讲一个短笑话，甲和乙各评价一句。',
           '--mentionPrompt=@乙 具体说说哪里好笑。',
         ],
         workingDirectory: p.join(Directory.current.path, 'web'),
