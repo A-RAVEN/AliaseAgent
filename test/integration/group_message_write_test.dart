@@ -26,9 +26,10 @@ void main() {
       stubResult: '{"ok":true,"content":"A 的内容 A-RESULT"}',
     );
     harness.queueFinal('甲的公开结论：lib/a.dart 已看过', thinking: '最终轮的私有思考');
-    final outcome = await harness.groups
+    await harness.groups
         .send(groupId: harness.group.id, memberId: member.id, text: '甲看一下 lib/a.dart');
-    expect(outcome.status, 'completed');
+    // 异步发送：等链终态再断言写库形状（R.7）。
+    expect((await harness.waitForChain()).status, 'completed');
 
     final rows =
         await harness.support.messageRepo.queryBySession(harness.group.id);
@@ -117,6 +118,7 @@ void main() {
     harness.queueSimpleReply('回复');
     await harness.groups
         .send(groupId: harness.group.id, memberId: member.id, text: '用户说的');
+    await harness.waitForChain();
     final rows =
         await harness.support.messageRepo.queryBySession(harness.group.id);
     final users = rows.where((r) => r.role == 'user').toList();

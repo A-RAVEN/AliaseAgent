@@ -1,9 +1,9 @@
-// 调度 v1：用户点名 + 组级单运行门 + 两个前置门（change `agent-group-chat` 任务 5.4 /
-// design D5 / spec「成员发言调度：用户点名」）。
+// 调度 v1：用户点名 + 吸收式执行器 + 两个前置门（change `agent-group-chat` 任务 5.4 /
+// design D5 / spec「成员发言调度：用户点名」；R.8 返工 busy 语义）。
 //
 // 六条用例：
 //   ① 点名谁就只有谁发言；
-//   ② 甲运行中点名乙 ⇒ 可归因 busy（**组级**门：不是只查乙的忙闲）；
+//   ② 甲运行中点名乙 ⇒ **照常接受**（R.8：永不 busy），请求排队、不交错写；
 //   ③ 未点名 ⇒ 可归因拒绝；
 //   ④ 不带文本且视图为空 ⇒ 可归因错误（绝不发 messages: []）；
 //   ⑤ 不带文本且最后可见项是本人 assistant ⇒ 可归因错误（不退化成 prefill）；
@@ -21,8 +21,10 @@ void main() {
     final b = await harness.addMember('乙');
     harness.queueSimpleReply('甲说过：已改完 lib/a.dart');
 
-    final outcome = await harness.groups
+    await harness.groups
         .send(groupId: harness.group.id, memberId: a.id, text: '甲先说');
+    // 异步发送：等链终态再断言消息行（R.7）。
+    final chain = await harness.waitForChain();
     final rows = await harness.support.messageRepo
         .queryBySession(harness.group.id);
     final byAuthor = <String?, int>{};
@@ -30,9 +32,9 @@ void main() {
       byAuthor[row.author] = (byAuthor[row.author] ?? 0) + 1;
     }
     // ignore: avoid_print
-    print('[OBS] status=${outcome.status} 行数=${rows.length} 作者分布=$byAuthor');
+    print('[OBS] status=${chain.status} 行数=${rows.length} 作者分布=$byAuthor');
 
-    expect(outcome.status, 'completed');
+    expect(chain.status, 'completed');
     expect(rows.where((r) => r.author == b.id), isEmpty,
         reason: '乙不产生任何消息行');
     expect(rows.any((r) => r.author == a.id && !r.isPrivate), isTrue,
@@ -40,11 +42,12 @@ void main() {
     await harness.dispose();
   });
 
-  test('② 甲运行中点名乙 ⇒ 可归因 busy（组级单运行门）', () async {
+  test('② 甲运行中点名乙 ⇒ 发送照常接受（R.8：用户发送永不拒绝），乙排队执行', () async {
     final harness = await GroupHarness.create();
     final a = await harness.addMember('甲');
     final b = await harness.addMember('乙');
     harness.queueSimpleReply('甲的回复');
+    harness.queueSimpleReply('乙的回复');
     harness.support.sidecar.gateNextSend();
 
     final futureA = harness.groups
@@ -57,21 +60,29 @@ void main() {
         .send(groupId: harness.group.id, memberId: b.id, text: '乙插一句');
     // ignore: avoid_print
     print('[OBS] 乙的结果 status=${outcomeB.status} error=${outcomeB.error}');
-    expect(outcomeB.isBusy, isTrue,
-        reason: '组内已有成员在跑时，点名任何成员都必须 busy');
-    expect('${outcomeB.error}', contains('已有成员在运行'));
-
+    expect(outcomeB.status, 'started',
+        reason: 'R.8：链/成员运行中再发也接受，永不返回 busy');
     final rowsDuring = await harness.support.messageRepo
         .queryBySession(harness.group.id);
     // ignore: avoid_print
-    print('[OBS] busy 期间原文行数=${rowsDuring.length} '
-        '含乙=${rowsDuring.any((r) => r.author == b.id)}');
+    print('[OBS] 链运行中原文行数=${rowsDuring.length} '
+        '含乙用户消息=${rowsDuring.any((r) => r.role == 'user' && r.content == '乙插一句')}');
+    expect(
+        rowsDuring.any((r) => r.role == 'user' && r.content == '乙插一句'), isTrue,
+        reason: '排队请求的用户消息先落库（内容不丢）');
     expect(rowsDuring.any((r) => r.author == b.id), isFalse,
-        reason: 'busy 的那次发送没有产生任何消息（不排队、不静默）');
+        reason: '乙还没轮到：不会与甲交错写公开行');
 
     harness.support.sidecar.releaseGate();
-    final outcomeA = await futureA;
-    expect(outcomeA.status, 'completed');
+    final startedA = await futureA;
+    expect(startedA.status, 'started');
+    final chain = await harness.waitForChain();
+    expect(chain.status, 'completed');
+    // 乙的定向轮在甲之后执行（steps 里两步都在）。
+    // ignore: avoid_print
+    print('[OBS] steps=${chain.steps.map((s) => '${s.source}/${s.status}').toList()}');
+    expect(chain.steps.where((s) => s.memberId == b.id), isNotEmpty,
+        reason: '排队中的点名请求按序执行');
     await harness.dispose();
   });
 
@@ -125,6 +136,7 @@ void main() {
     harness.queueSimpleReply('甲的第一句');
     await harness.groups
         .send(groupId: harness.group.id, memberId: a.id, text: '甲先发言');
+    await harness.waitForChain();
 
     final sendsBefore = harness.support.sidecar.sendHandles.length;
     Object? error;
@@ -159,17 +171,18 @@ void main() {
         .length;
 
     harness.queueSimpleReply('甲看过 lib/a.dart 了');
-    final outcome = await harness.groups
+    await harness.groups
         .send(groupId: harness.group.id, memberId: a.id);
+    final chain = await harness.waitForChain();
     final rows = await harness.support.messageRepo
         .queryBySession(harness.group.id);
     final usersAfter = rows.where((r) => r.role == 'user').length;
     // ignore: avoid_print
-    print('[OBS] status=${outcome.status} 用户行 before=$usersBefore '
+    print('[OBS] status=${chain.status} 用户行 before=$usersBefore '
         'after=$usersAfter 空内容用户行='
         '${rows.where((r) => r.role == 'user' && r.content.trim().isEmpty).length}');
 
-    expect(outcome.status, 'completed');
+    expect(chain.status, 'completed');
     expect(usersAfter, usersBefore, reason: '不带文本时不写空用户行');
     expect(rows.any((r) => r.role == 'user' && r.content.trim().isEmpty), isFalse);
     await harness.dispose();

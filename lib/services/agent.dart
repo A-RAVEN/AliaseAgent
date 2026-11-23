@@ -23,6 +23,7 @@ import 'context_snapshot.dart';
 import 'database_service.dart';
 import 'group_member_context.dart';
 import 'group_prompts.dart';
+import 'group_reaction.dart';
 import 'group_view_loader.dart';
 import 'logging.dart';
 import 'message_repository.dart';
@@ -147,22 +148,34 @@ class AgentMeteringSnapshot {
 }
 
 /// [Agent.send] 的不可变结构化结果：四类状态 + 最终文本 + 错误 + 计量快照。
+///
+/// change `group-reactive-mode` 任务 2.1 / design D5 增两个字段；R.10 起
+/// [reactionPassed] 来自**结构化** `group_react.pass`，不再看正文：
+///   - [publicMessage]：本轮**写入的公开消息**（`pass=true` / 空 message / 失败 /
+///     取消时为 null）。组服务据此推进触发 `seq`，不需要额外查询"最新公开行"；
+///   - [reactionPassed]：本轮 `group_react.pass == true`（结构化沉默）。
 class AgentRunResult {
   const AgentRunResult._({
     required this.status,
     required this.metering,
     this.finalText,
     this.error,
+    this.publicMessage,
+    this.reactionPassed = false,
   });
 
   /// 整轮自然结束；[finalText] 只来自没有工具调用的最终模型轮。
   const AgentRunResult.completed({
     required String finalText,
     required AgentMeteringSnapshot metering,
+    Message? publicMessage,
+    bool reactionPassed = false,
   }) : this._(
           status: AgentRunStatus.completed,
           metering: metering,
           finalText: finalText,
+          publicMessage: publicMessage,
+          reactionPassed: reactionPassed,
         );
 
   /// 失败并带可归因错误文本。
@@ -189,6 +202,17 @@ class AgentRunResult {
   final AgentMeteringSnapshot metering;
   final String? finalText;
   final String? error;
+
+  /// 本轮写入的公开消息（反应轮 PASS / 空输出 / 失败 / 取消时为 null）。
+  ///
+  /// 只描述**这一轮**：普通轮里它也是本轮的最终公开 assistant 行，不含用户消息。
+  final Message? publicMessage;
+
+  /// 本轮是否命中**结构化**沉默（`reaction` 轮的 `group_react.pass == true`）。
+  ///
+  /// 普通轮（含关闭态纯 speaker）恒为 false：它们不注入 `group_react`、不做这套判定，
+  /// `[PASS]` 在这些轮里只是普通正文。
+  final bool reactionPassed;
 
   bool get isCompleted => status == AgentRunStatus.completed;
   bool get isFailed => status == AgentRunStatus.failed;
@@ -605,9 +629,22 @@ class Agent {
   /// 子 Agent 运行器据此区分成功、失败、取消与实例正忙。
   /// [writeUserMessage] 为 false 时**不写**用户消息行（群聊里"不带文本的点名"用：
   /// 那不写空用户行，直接基于现有原文发言）。
+  ///
+  /// [reaction] / [mustRespond]：**反应轮标志**（change `group-reactive-mode` D5）。
+  ///   - `reaction: true` 只用于 ① 开启态 speaker 的强制轮；② 两态下 `@mention` 的
+  ///     强制轮；③ 开启态的自愿反应轮。**关闭态纯 speaker（无 @）不置该标志**，
+  ///     走普通轮（逐字不变：不追加提示词、不做 PASS 判定）；
+  ///   - `mustRespond` 蕴含 `reaction`：追加 [kGroupMustRespondPrompt]（必应），
+  ///     否则追加 [kGroupReactionPrompt]（授权沉默）；
+  ///   - 命中哨兵（`trim` 后恰为 `[PASS]`）或 `trim` 为空时**不写公开行**，
+  ///     私有工具行照常落库；[AgentRunResult.publicMessage] / `reactionPassed`
+  ///     把这件事带回调用方（组服务据此记 `passed` / `forced_pass` / `empty` /
+  ///     `forced_empty`）。
   Future<AgentRunResult> send(String text,
       {List<String> attachments = const [],
-      bool writeUserMessage = true}) async {
+      bool writeUserMessage = true,
+      bool reaction = false,
+      bool mustRespond = false}) async {
     if (_disposed) throw AgentDisposedException(sessionId);
     if (_retiring) throw AgentRetiredException(sessionId, agentTypeName);
     if (_streaming) {
@@ -627,7 +664,9 @@ class Agent {
     final round = _sendMessageRound(
         text: text,
         attachments: attachments,
-        writeUserMessage: writeUserMessage);
+        writeUserMessage: writeUserMessage,
+        reaction: reaction,
+        mustRespond: mustRespond);
     _registerRound(round);
     return await round;
   }
@@ -636,6 +675,8 @@ class Agent {
     required String text,
     required List<String> attachments,
     bool writeUserMessage = true,
+    bool reaction = false,
+    bool mustRespond = false,
   }) async {
     final epoch = ++_requestEpoch;
     if (writeUserMessage) {
@@ -673,7 +714,12 @@ class Agent {
         ? List<Message>.from(_history)
         : await _memberViewForRound();
     try {
-      return await _callModel(messages: snapshotMessages, epoch: epoch);
+      return await _callModel(
+        messages: snapshotMessages,
+        epoch: epoch,
+        reaction: reaction,
+        mustRespond: mustRespond,
+      );
     } catch (e, st) {
       // 未预期异常（例如写库失败）不许把流式标记永远留在 true，也不许当成空成功；
       // 这里不额外写一条错误消息（界面路径原本也不写，避免同一错误重复写库）。
@@ -684,6 +730,70 @@ class Agent {
         metering: _meteringSnapshot(),
       );
     }
+  }
+
+  /// 反应轮的结构化收尾（R.10 / design D5）：读 `group_react` 的 `pass` / `message`，
+  /// 决定是否写公开行。**绝不回退到 `[PASS]` 文本匹配**，也不为 `group_react` 写 tool 行。
+  Future<AgentRunResult> _finishStructuredReaction({
+    required List<Map<String, dynamic>> reactCalls,
+    required int epoch,
+    required int inputTokens,
+    required int outputTokens,
+    required String? thinkingJsonStr,
+    required List<Map<String, dynamic>> allTurnToolCalls,
+  }) async {
+    final decision = parseGroupReactDecision(reactCalls);
+    if (decision.isFailed) {
+      if (!_isActive(epoch)) {
+        _endStreaming();
+        return _cancelledRun();
+      }
+      // 缺调用 / 参数非法：不写公开行、不写公开 Error 行；步骤由上层记 failed。
+      _endStreaming();
+      return AgentRunResult.failed(
+        error: decision.error ?? kInvalidGroupReactError,
+        metering: _meteringSnapshot(),
+      );
+    }
+    // `pass=true` 时 message 被忽略（连「我这回合不发言」这类元话术一起吞掉），
+    // 只用它作为 finalText 供调用方观察；时间线看不到。
+    final message = decision.message ?? '';
+    final blank = decision.isSpeak && message.trim().isEmpty;
+    Message? publicMessage;
+    if (decision.isSpeak && !blank) {
+      final toolCallsJson = allTurnToolCalls.isNotEmpty
+          ? jsonEncode(allTurnToolCalls)
+          : null;
+      final isGroupMember = member != null;
+      final assistantMsg = await messageRepo.insert(
+        sessionId: sessionId,
+        role: 'assistant',
+        content: message,
+        toolCallsJson: isGroupMember ? null : toolCallsJson,
+        thinkingJson: isGroupMember ? null : thinkingJsonStr,
+        tokenCount: inputTokens,
+        outputTokenCount: outputTokens,
+        author: member?.memberId,
+        visibility: Message.visibilityPublic,
+      );
+      await sessionRepo.touch(sessionId);
+      if (isGroupMember) {
+        await assembleMemberView();
+      } else {
+        _history.add(assistantMsg);
+      }
+      callbacks.onAssistantMessage?.call(assistantMsg, true);
+      publicMessage = assistantMsg;
+    }
+    if (!_isActive(epoch)) return _cancelledRun();
+    _endStreaming();
+    _maybeScheduleBackgroundFold();
+    return AgentRunResult.completed(
+      finalText: message,
+      metering: _meteringSnapshot(),
+      publicMessage: publicMessage,
+      reactionPassed: decision.isPass,
+    );
   }
 
   bool _isActive(int epoch) => !_disposed && _cancelledEpoch < epoch;
@@ -761,6 +871,8 @@ class Agent {
   Future<AgentRunResult> _callModel({
     required List<Message> messages,
     required int epoch,
+    bool reaction = false,
+    bool mustRespond = false,
   }) async {
     final baseUrl = _provider.baseUrl.isNotEmpty
         ? _provider.baseUrl
@@ -783,7 +895,17 @@ class Agent {
 
     // 实际发送的工具定义 = 本实例生效配置 ∩ 工具目录；未知名字在这里显式失败（
     // 创建路径已经校验过一次，这里保持同一判据，避免绕过目录）。
-    final toolsJson = jsonEncode(toolDefinitions);
+    //
+    // 反应轮额外注入**终态控制工具** `group_react`（change `group-reactive-mode`
+    // R.10 / design D5）：它不进工具目录、不写 tool 行，模型循环拦截它并结束本轮。
+    // 普通轮（单会话 / 关闭态纯 speaker / 非反应轮）的工具清单逐字不变。
+    final effectiveToolDefinitions = reaction
+        ? <Map<String, dynamic>>[
+            ...toolDefinitions,
+            kGroupReactToolDefinition,
+          ]
+        : toolDefinitions;
+    final toolsJson = jsonEncode(effectiveToolDefinitions);
 
     final maxContextTokens = config.maxContextTokens;
     final List<Map<String, dynamic>> apiMessages;
@@ -851,6 +973,37 @@ class Agent {
     final allTurnToolCalls = <Map<String, dynamic>>[];
     final projectionMessageCount = apiMessages.length;
 
+    /// R.11：结构化调用不合规时，把模型这一轮的内容与纠正要求追加进请求上下文，
+    /// **类似工具执行失败后的错误反馈**，然后重新请求（不写库、不产生公开行）。
+    var reactRetries = 0;
+    void appendGroupReactCorrection({
+      required String error,
+      required String turnText,
+      required List<Map<String, dynamic>> calls,
+    }) {
+      final blocks = <Map<String, dynamic>>[];
+      if (turnText.trim().isNotEmpty) {
+        blocks.add({'type': 'text', 'text': turnText});
+      }
+      for (final call in calls) {
+        blocks.add({
+          'type': call['type'] ?? 'tool_use',
+          'id': call['id'] ?? 'group_react_retry_$reactRetries',
+          'name': kGroupReactToolName,
+          'input': call['input'] ?? <String, dynamic>{},
+        });
+      }
+      if (blocks.isEmpty) {
+        blocks.add({'type': 'text', 'text': '（本轮没有调用任何工具）'});
+      }
+      apiMessages
+        ..add({'role': 'assistant', 'content': blocks})
+        ..add({
+          'role': 'user',
+          'content': groupReactCorrectionPrompt(error),
+        });
+    }
+
     var turn = 0;
     while (true) {
       if (!_isActive(epoch)) return _cancelledRun();
@@ -858,6 +1011,8 @@ class Agent {
 
       var turnText = '';
       final turnToolCalls = <Map<String, dynamic>>[];
+      // R.10：本轮的 `group_react` 终态调用（被拦截，不进工具执行器、不写 tool 行）。
+      final reactCalls = <Map<String, dynamic>>[];
       final turnThinkingBlocks = <Map<String, dynamic>>[];
       var doneCode = 0;
       String? doneError;
@@ -888,6 +1043,17 @@ class Agent {
         ..write('\nCurrent date: ')
         ..write(DateTime.now().toIso8601String().substring(0, 10))
         ..write('. For precise time-sensitive queries, use the get_current_time tool.');
+      // 反应轮的纪律**追加在系统提示词末尾**（change `group-reactive-mode` D6）：
+      // - 必应轮（开启态 speaker / 两态 @mention）⇒ `kGroupMustRespondPrompt`；
+      // - 自愿反应轮（开启态）⇒ `kGroupReactionPrompt`（强烈授权沉默）。
+      // 两段都**不是**替换 `kGroupMemberRolePrompt`（那一段在实例创建时已叠进
+      // `config.systemPrompt`），所以反应轮同时看得到角色说明与当轮纪律。
+      // 普通轮（单会话 / 关闭态纯 speaker）不追加任何一段，行为逐字不变。
+      if (reaction) {
+        systemPromptBuffer
+          ..write('\n\n')
+          ..write(mustRespond ? kGroupMustRespondPrompt : kGroupReactionPrompt);
+      }
       final systemPrompt = systemPromptBuffer.toString();
 
       // 快照与拆分在同一次赋值里落定：两者描述同一份请求。
@@ -948,6 +1114,12 @@ class Agent {
           try {
             final tc = jsonDecode(json) as Map<String, dynamic>;
             tc['id'] ??= 'tool_${turn}_${turnToolCalls.length}';
+            // `group_react` 是**终态控制工具**（R.10）：拦截它、不交给工具执行器、
+            // 不写 tool 行、不产生工具活动卡片。本轮结束时按结构化 pass 收尾。
+            if (reaction && tc['name'] == kGroupReactToolName) {
+              reactCalls.add(tc);
+              return;
+            }
             turnToolCalls.add(tc);
             metering.toolCalls++;
             callbacks.onMeteringChanged?.call();
@@ -1017,10 +1189,70 @@ class Agent {
       metering.outputTokens += lastOutputTokens;
       callbacks.onMeteringChanged?.call();
 
+      // **结构化终态**（change `group-reactive-mode` R.10 / design D5）：反应轮里
+      // 模型调用 `group_react` 就是这一轮的终点——不论正文写了什么、也不论同轮是否
+      // 还有普通工具调用，一律按 `pass` / `message` 收尾，并且：
+      //   - 不执行 group_react、不为它写 tool 行、不发工具活动卡片；
+      //   - `pass=true` ⇒ 不写公开行（message 里的元话术一起吞掉）；
+      //   - `pass=false` ⇒ 公开行只写 message；
+      //   - 参数非法 / 多次调用 ⇒ 先**纠正重试**（R.11），超限才 failed 且不写公开行
+      //     （不回退文本匹配）。
+      if (reactCalls.isNotEmpty) {
+        final decision = parseGroupReactDecision(reactCalls);
+        if (decision.isFailed && reactRetries < kMaxGroupReactRetries) {
+          reactRetries++;
+          debugPrint('[AliasAgent] group_react 不合规（${decision.error}）：'
+              '第 $reactRetries/$kMaxGroupReactRetries 次纠正重试');
+          appendGroupReactCorrection(
+            error: decision.error ?? kInvalidGroupReactError,
+            turnText: turnText,
+            calls: reactCalls,
+          );
+          continue;
+        }
+        return _finishStructuredReaction(
+          reactCalls: reactCalls,
+          epoch: epoch,
+          inputTokens: lastInputTokens,
+          outputTokens: lastOutputTokens,
+          thinkingJsonStr: thinkingJsonStr,
+          allTurnToolCalls: allTurnToolCalls,
+        );
+      }
+
       // 没有工具调用 ⇒ 最终回复，落库并结束这一轮。只有这一条分支能产生成功
       // 结果的文本；中间工具轮的文本绝不作为最终结论。
       if (turnToolCalls.isEmpty) {
-        if (turnText.isNotEmpty) {
+        // 反应轮却没有调用 `group_react`：R.11 先像工具失败那样回一条纠正消息并重试；
+        // 超过上限才记可归因失败（不写公开行、不回退到 `[PASS]` 文本匹配）。
+        // 这一步不是"空输出"——那是 pass=false + 空 message。
+        if (reaction) {
+          if (reactRetries < kMaxGroupReactRetries) {
+            reactRetries++;
+            debugPrint('[AliasAgent] 反应轮缺 group_react：'
+                '第 $reactRetries/$kMaxGroupReactRetries 次纠正重试');
+            appendGroupReactCorrection(
+              error: kMissingGroupReactError,
+              turnText: turnText,
+              calls: const [],
+            );
+            continue;
+          }
+          if (!_isActive(epoch)) {
+            _endStreaming();
+            return _cancelledRun();
+          }
+          _endStreaming();
+          return AgentRunResult.failed(
+            error: kMissingGroupReactError,
+            metering: _meteringSnapshot(),
+          );
+        }
+        // 普通轮（单会话 / 关闭态纯 speaker / 非反应轮）保持既有 `isNotEmpty` 判定
+        // **逐字不变**：`[PASS]` 是普通正文，纯空白照旧按旧行为处理。
+        final writePublic = turnText.isNotEmpty;
+        Message? publicMessage;
+        if (writePublic) {
           final toolCallsJson = allTurnToolCalls.isNotEmpty
               ? jsonEncode(allTurnToolCalls)
               : null;
@@ -1046,6 +1278,7 @@ class Agent {
             _history.add(assistantMsg);
           }
           callbacks.onAssistantMessage?.call(assistantMsg, true);
+          publicMessage = assistantMsg;
         }
         if (!_isActive(epoch)) return _cancelledRun();
         _endStreaming();
@@ -1053,6 +1286,7 @@ class Agent {
         return AgentRunResult.completed(
           finalText: turnText,
           metering: _meteringSnapshot(),
+          publicMessage: publicMessage,
         );
       }
 

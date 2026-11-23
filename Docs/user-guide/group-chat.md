@@ -1,7 +1,7 @@
 # 群聊（组会话与成员）
 
-> 适用版本：`agent-group-chat`。群聊的界面**只在 web 端**（`dart run bin/alias_agent_core.dart`
-> 之后用浏览器打开回环地址）；Flutter 桌面端只显示占位。
+> 适用版本：`agent-group-chat` + `group-reactive-mode`（自发反应）。群聊的界面**只在 web 端**
+> （`dart run bin/alias_agent_core.dart` 之后用浏览器打开回环地址）；Flutter 桌面端只显示占位。
 
 ## 组是什么
 
@@ -38,7 +38,8 @@
 - **每成员真实上下文**：点分栏里的「真实上下文」，显示该成员**本轮实际发出**的
   「system」 / 「messages」 / 「tools」 原始 JSON（可滚、可复制）。
 - **每成员占用环**：按该成员自己的窗口与占用拆分绘制；分母是**该成员自己**的窗口。
-- **操作面**：加成员、编辑成员的覆盖层、选一个发言人并发送。
+- **操作面**：加成员、编辑成员的覆盖层、选一个发言人（**可不选**）并发送、开关「自发反应」、
+  取消正在跑的反应链。
 
 ## 怎么操作
 
@@ -76,59 +77,197 @@
 界面上的「生效工具：… · 思考：…」就是这次解析出来的**生效配置**，可用来核对覆盖层真的
 生效了（不是只改了界面）。
 
-### 点名发言
+### 自发反应（默认开）
 
-一次只能点名**一个**成员（组视图底部的「发言人」下拉）。发一条用户消息可以一起带上，
-也可以留空直接点名。
+组视图右上角有一个「**自发反应**」开关（`data-testid="reactions-toggle"`）。它存在
+`sessions` 表的 `reactions_enabled` 列里（JSON 字段 `reactionsEnabled`）——**不是**
+`config.json` 键，所以配置文档里找不到它。
 
-- **组级单运行门**：同一个组同一时刻至多一个成员在运行。某个成员在跑时，点名任何成员
-  都会返回可归因的 busy（不排队、不改写到别人）。
-- 不带文本时不写空的用户消息行；这时有两个前置门会拒绝请求并说明原因：
+**默认值有两副面孔，这是刻意的**：
+
+- **新建的组默认开启**（点名不该是默认体验：用户说「甲讲笑话，乙评价」时，乙应该自己接话）；
+- **从旧版本（schema v9）升级上来的既有组默认关闭**：升级不改旧体验，你可以在组视图里自己
+  打开开关。
+
+开启后，**每一条公开消息都会成为反应刺激**：
+
+- 用户消息启动一轮；
+- 同一轮里**后跑的成员**能在自己的视图里看到**先跑成员**刚发出的公开回复（串行可见），
+  所以每条成员公开回复都被反应了 —— 但链的下一轮触发只取**该轮最后一条公开消息**的 `seq`，
+  不会把轮内每条回复再各自排一轮；
+- 成员的运行顺序是**加入顺序**（`created_at`）；本次用户文本里 `@显示名` 点名的成员排在
+  第一个反应轮的最前面、且**必应**；
+- **发送是异步的，而且永远接受**：点「发送」后消息先落库、链在后台跑，界面**立刻**回到
+  可发送状态（不再一直显示「发送中」）。链运行中也能继续发：新消息照常写入，由每组一个
+  内部执行器**吸收/排队**（同一时刻只有一条链在写原文，公开行不会交错）。链的进度、结束
+  原因与每一步都从 `group.chain` 读，链进入终态时还会收到一条 `group.chain.completed`
+  事件（本版本唯一新增的事件类型）。
+- **每组上限**（反应轮数上限，默认 8，范围 1..50，界面可改）：只计**反应轮**，而且是
+  **每条用户触发一份预算**——用户新发一条消息会把 `rounds` 重置为 0；agent 自己的公开
+  回复不重置。正常聊天靠两条收敛防线自然停：① 一轮里没有任何新公开消息（全员沉默）⇒
+  下一轮没有可反应成员 ⇒ 链自然停（`all_passed`）；② `last-reacted-seq`：成员只对
+  `seq` 更新的公开消息反应，不对同一条反复接话。上限是防失控的保险：没有新用户消息、
+  队列也空、预算耗尽时链以 `stopReason = round_cap` **优雅停止**（不是报错），后续点名 /
+  定向发送照常可用。
+  - 上限是**组设置**（`sessions.max_reaction_rounds` 列，JSON 字段 `maxRounds`），
+    **不是** `config.json` 键；留空 = 用产品默认 8。
+  - **定向轮不计数、不被拦截**：显式 `speaker` 的强制轮与安静态的 `@mention` 强制轮是
+    用户点名，不是反应轮。
+
+成员怎么沉默（**结构化 PASS**）：每个自愿反应轮与强制轮都会拿到一个 **`group_react`
+终态工具**（`input_schema {pass: boolean, message: string}`），模型必须在本轮**恰好调用
+一次**；正文不进入公开时间线，`message` 是**唯一**会公开的内容：
+
+- `pass=true` ⇒ 沉默：不写公开行，时间线里看不到；`message` 写什么都被忽略（连「我这回合
+  不发言」这类元话术也一起吞掉）。`pass=true` 不是失败，是群聊礼仪。
+- `pass=false` ⇒ 公开发言：公开行**只写 `message`**（正文里的解释、`[PASS]` 之类都不会进
+  时间线）。
+- `pass=false` + 空 `message` ⇒ 不写公开行（自愿轮记 `empty`，被点名轮记 `forced_empty`）。
+- **没有调用 `group_react` / 参数非法 / 同一轮多次调用** ⇒ 产品**先纠正重试**：像工具
+  执行失败那样回一条纠正消息，要求模型重新调用（最多 2 次，按成员轮计）；重试合规就
+  正常收尾。**超限仍不合规**才该步骤记 `failed`（错误码 `missing_group_react` /
+  `invalid_group_react`），**不写公开行，也不回退到 `[PASS]` 文本匹配**；纠正过程与
+  期间正文（含元话术）都不进时间线。
+
+**普通轮不受影响**：单会话、关闭态纯 speaker（没开自发反应）等非反应轮**不注入**
+`group_react`、不做 PASS 判定；在那些轮里 `[PASS]` 只是普通正文，照常进时间线。
+
+**提示词怎么要求沉默**：开启态的自愿反应轮按「**默认沉默**」写——沉默是常态、发言是
+例外；大多数轮应当返回 `pass=true`，只有一条非说不可、别人没说过的实质新信息才
+`pass=false`。`pass=true` 不是失败，是群聊礼仪。提示词列了 4 个该沉默的样板（别人已
+说过 / 纯表态无新依据 / 对话已收尾 / 与你的角色无关）与相关性门槛。**这是经验性的**：
+模型仍可能话多，`round_cap` 是可靠兜底；"全 round_cap、零 all_passed"只说明该模型
+偏话多，不是故障。
+
+**被点名却仍不回应**（`pass=true`、或空 `message`）记 `forced_pass` / `forced_empty`：
+产物里**不写公开行**、**不发 `turn.failed`**（它不是整轮失败）。它们只在 `group.chain`
+的 `steps` 里可观察，web 在收到 `group.chain.completed` 事件后提示「被点名的成员没有
+回应」。**这个提示不持久**：刷新页面后历史里没有它（没有对应的公开行）。
+
+**取消**：链运行中顶部的「取消反应链」可用（核心说该组 `busy`，或 `group.chain` 为
+`running`，或本页看到某成员正在流式 —— 三者任一成立）。它发 `agent.cancel {sessionId: 组 id}`，
+停整条链并**清空排队**（已写入的用户消息保留，可重发）：
+
+- 不带 `memberId`：停链 + 取消当前成员，回包 `cancelled: true` + `reactionChainStopped: true`；
+- 带 `memberId` 且该成员**正在跑**：取消它并停链，`cancelled: true`；
+- 带 `memberId` 且该成员在链里**排队未轮到**：停整条链，但 `cancelled: false`
+  （它确实没在运行，不谎报）+ `reactionChainStopped: true`；
+- 带 `memberId` 但该成员既不在链里也没在运行：可归因「当前没有在运行」，链继续跑。
+
+`group.list` 的每个组项带 `busy`（布尔）与 `runningMemberId`（当前运行成员，成员间隙为
+「null」）。**它们只是状态指示，不是发送拒绝条件**：`busy=true` 时照样可以 `group.send`，
+新请求会入队/被吸收。**断线重连后**本地发送状态会丢，但重新拉 `group.list` /
+`group.chain` 就能恢复「链在跑」的显示并让取消按钮可用。
+
+### 发言人（可选）与点名
+
+组视图底部的「发言人」下拉：**开启自发反应时第一项是「（不点名，仅触发反应）」**，默认就选它
+—— 只输入一条消息点「发送」，成员就会自己对这条消息反应。**发送是异步的**：点完「发送」
+界面立刻回到可发送状态（链在后台跑），被点名成员的定向轮也在后台执行。选了某个成员则是**定向**：
+
+| 开关 | 有没有 speaker | 有没有 `@显示名` | 行为 |
+| --- | --- | --- | --- |
+| 开 | 有 | 任意 | 该成员跑一轮**强制轮**（必应）；它产生公开回复 ⇒ 链从这条回复起；它 `pass=true`/空 `message` ⇒ 链从**用户消息**起（`@` 仍必应） |
+| 开 | 无 | 任意 | 写用户消息一次 ⇒ 以它的 `seq` 起链（`@` 命中的成员在首轮强制） |
+| 开 | 无 | 无 | 没有文本 ⇒ 可归因错误 `no_trigger`（不写任何行） |
+| 关 | 有 | 无 | **旧普通轮逐字不变**：不注入 `group_react`、不做 PASS 判定，`[PASS]` 就是普通正文 |
+| 关 | 有 | 有 | speaker 普通轮 + 按点名顺序的 mention 强制轮（两者都跑） |
+| 关 | 无 | 有 | 组服务写用户消息一次 + 按点名顺序的 mention 强制轮（不起链） |
+| 关 | 无 | 无 | 可归因错误 `no_speaker`（不写任何行） |
+
+- **`@显示名` 只在用户消息里解析**：成员自己的公开回复里写 `@` 只是正文。匹配规则：取最长的
+  成员名、名字后面必须是结尾 / 空白 / 标点；未命中的 `@…` 原样留在正文里（不报错、不删字）。
+- **内部串行执行器**：同一个组同一时刻至多一个成员在写公开行（**整条反应链**也算一个
+  运行单位），但这是内部调度细节——**发送永不因它在跑被拒绝**：新消息写入、请求入队，
+  执行器在轮边界吸收它（更新触发、重置该用户触发的预算）。
+- 不带文本、只点名一个成员时的两个前置门仍然有效（**关闭态纯点名**与**开启态强制轮**都适用）：
   - 该成员视图**为空**（什么可见项都没有）⇒ 拒绝，**不会发空 messages**；
   - 该成员视图最后一条可见项是**它自己的回复** ⇒ 拒绝（继续会退化成续写 / prefill）。
 - 公开回复应当自包含（结论 + 文件指针）：其他成员看不到你的工具过程，只能按你写的路径去读。
+
+**改名**：组的标题还是默认值（`新组` 或 `New Chat`）时，第一条用户消息会自动把它改成消息
+前 30 个字符；**你已经命名过的组不会被改**。
 
 ## 出错时会看到什么
 
 - **组会话没有自己的模板**：对组会话调用「切换模板」会被拒绝（每个成员的模板来自成员行）。
 - **单 Agent 入口拒绝组会话**：`agent.send` 作用在组会话上会被拒绝并指明改用 `group.send`
-  （带 「speaker」）。这是防止组原文绕过投影被当成单会话历史喂给模型。
+  （`speaker` 可选）。这是防止组原文绕过投影被当成单会话历史喂给模型。
 - **空视图 / prefill**：见上一节，两种都返回可归因错误（指明成员与原因）。
 - **不存在的组或成员**：返回带对象 id 与原因的 JSON-RPC 错误。
-- **组内没有成员在运行**时点「取消」：返回「该组当前没有成员在运行」（真话）；带 `memberId`
-  且该成员不在运行时会指名它。
+- **没有发言者也没有 `@`**（关闭态）：返回 `no_speaker`；**没有文本也没有发言者**（开启态）：
+  返回 `no_trigger`。两者都不写任何消息。
+- **被点名成员不回应**：`group.chain` 的 `steps` 里会出现 `forced_pass` / `forced_empty`，
+  界面在收到链结束事件后提示「被点名的成员没有回应」。刷新后该提示消失（它没有公开行，
+  不是持久化告警），也不会发 `turn.failed` 事件。
+- **达到每组轮数上限**：链以 `completed` + `stopReason = round_cap` 停止（不是报错），
+  界面提示「已达轮数上限」；后续点名 / 定向发送照常可用，也可以把该组的上限调大。
+- **组内没有成员在运行**时点「取消反应链」：返回「该组当前没有成员在运行」（真话）；带
+  `memberId` 且该成员不在运行时会指名它。
+- **链运行中改组设置**：`group.update` 返回可归因 busy（不排队），设置值不变。
 
 ## RPC 一览（无头核心）
 
 | 方法 | 参数 | 说明 |
 | --- | --- | --- |
-| `group.create` | `title?` / `workspace?` | 建组并建立组上下文（缺省工作区用产品既有口径） |
-| `group.list` | — | 全部组 + 每组成员清单（id / 显示名 / 模板 / `removedAt` / 「overrides」 / 「effective」） |
-| `group.delete` | `groupId` | 删组：成员 / 消息 / 摘要随外键级联删除（先取消并销毁成员实例） |
+| `group.create` | `title?` / `workspace?` / `reactionsEnabled?` / `maxRounds?` | 建组并建立组上下文（缺省工作区用产品既有口径）；`reactionsEnabled` 省略 = 新建组**开启**自发反应；`maxRounds` 省略 / 显式 null = 产品默认（8），范围 1..50，越界 `-32602` |
+| `group.update` | `groupId` / `reactionsEnabled?` / `maxRounds?` | 改组的运行设置（至少给一个字段）；`maxRounds` 显式「null」 = 恢复默认（与**字段缺席**不同：缺席 = 不改）；缺字段 / 类型不对 / 越界 ⇒ `-32602`；链运行中 ⇒ 可归因 busy |
+| `group.chain` | `groupId` | 当前 / 最近一条链的只读状态：`groupId` / `sessionId` / `status` / `triggerSeq` / `rounds` / `stopReason` / `steps`。`status ∈ {idle, running, completed, cancelled, failed}`；`stopReason ∈ {all_passed, round_cap, cancelled, failed, no_members}`（运行中为 null）；核心重启后为 `idle` |
+| `group.list` | — | 全部组 + 每组成员清单（id / 显示名 / 模板 / `removedAt` / 「overrides」 / 「effective」）；组项另带 `reactionsEnabled`、`maxRounds`、`busy`（布尔）与 `runningMemberId` |
+| `group.delete` | `groupId` | 删组：成员 / 消息 / 摘要随外键级联删除（先停反应链、再取消并销毁成员实例） |
 | `group.member.add` | `groupId` / 「name」 / `templateName` / `overrides?` | 加成员（重名或空名可归因拒绝） |
-| `group.member.remove` | `groupId` / `memberId` | **软删**成员（行与历史保留，同名重建是新 id） |
-| `group.member.update` | `groupId` / `memberId` / `name?` / `templateName?` / `overrides?` / `clearOverrides?` | 原地改成员（id 不变）并重建实例 |
-| `group.send` | `groupId` / 「speaker」 / `text?` | 点名一个成员发言一轮（组级单运行门；busy 是结构化结果） |
-| `group.view` | `groupId` / `memberId` | 该成员**本次运行内**最近一次真实发出的上下文快照；没发过 ⇒ 「null」 |
+| `group.member.remove` | `groupId` / `memberId` | **软删**成员（行与历史保留，同名重建是新 id）；先停反应链 |
+| `group.member.update` | `groupId` / `memberId` / `name?` / `templateName?` / `overrides?` / `clearOverrides?` | 原地改成员（id 不变）并重建实例；先停反应链 |
+| `group.send` | `groupId` / `speaker?` / `text?` | **异步且永不 busy**：`speaker` 可选（省略 = 开启态纯触发 / 关闭态按 `@mention` 定向）；写完用户消息（若有文本）与标题后**立刻**回 `{status: started, triggerSeq}`；链运行中再发也接受（入队/被吸收），**不会**回 `busy`。结果**不带** `steps` / `rounds` / `finalText` / `memberId` |
+| `group.view` | `groupId` / `memberId` | 该成员**本次运行内**最近一次真实发出的上下文快照（**反应轮也算**）；没发过 ⇒ 「null」 |
+
+`group.chain` 的 `steps` 每条是一个可观察的步骤（**不是第二套消息存储**）：
+
+- `source ∈ { speaker, mention, reaction }`；
+- `status ∈ { replied, passed, forced_pass, forced_empty, empty, failed, cancelled }`；
+- 另有 `memberId` / `triggerSeq` / `publicSeq` / `finalText` / `error`。
+
+链进入终态时，客户端还会收到一条 `group.chain.completed` 事件（`agent.event`，payload
+带 `groupId` / `sessionId` / `status` / `stopReason` / `rounds` / `triggerSeq`；**steps 不进
+事件**，需要时查 `group.chain`）。
 
 相关的既有方法：
 
 | 方法 | 群聊上的行为 |
 | --- | --- |
-| `session.list` | 每项带 「kind」（「single」 / 「group」）与 「overrides」（会话级覆盖层，可空） |
+| `session.list` | 每项带 「kind」（「single」 / 「group」）、`reactionsEnabled`、`maxRounds`（整数或 null）与 「overrides」（会话级覆盖层，可空） |
 | `message.query` | 每条消息带 `author`（稳定成员 id，用户消息为 「null」）与 `visibility`（`public` / `private-to-author`）；分页语义不变 |
-| `agent.event` | 组事件在 `sessionId` 之外带 `groupId` 与 `memberId`；事件类型不新造 |
-| `agent.cancel` | 组会话按组路由：组内没有成员在运行时返回「该组当前没有成员在运行」；有成员在运行时取消它并返回 `memberId`；带 `memberId` 时只取消该成员，不在运行则指名 |
+| `agent.event` | 成员运行产生的组事件在 `sessionId` 之外带 `groupId` 与 `memberId`；**组服务自己写入的用户消息只带 `groupId`**（没有成员可归，不伪造 memberId）；链进入终态时发 `group.chain.completed`（本 change 唯一新增的事件类型）；`forced_pass` / `forced_empty` **不走** `turn.failed` |
+| `agent.cancel` | 组会话按组路由：链运行中停整条链并**清空排队**，回包带 `reactionChainStopped`；带 `memberId` 取消排队成员 ⇒ `cancelled: false` + `reactionChainStopped: true`（不谎报 cancelled）；没有链时「该组当前没有成员在运行」 |
+
+**`reactions_enabled` 与 `max_reaction_rounds` 不是 `config.json` 键**：它们是 `sessions`
+表的列（组级持久属性），`configuration.md` 里没有它们，也不该有。
 
 ## 已知限制
 
 - **看不到他人私有过程**：成员之间只看得到彼此的公开回复；思考与工具过程只属于作者自己。
 - **成员看不到彼此的工具证据**：协作靠共享工作区里的文件 + 公开回复里的文件指针。
-- **只支持点名**：没有轮转、主持人、自由抢话、并行发言；一次点名一个成员。
+- **关闭自发反应后仍只支持点名**：关闭态没有轮转、主持人、自由抢话；一次点名一个成员。
+- **无并行**：反应链里的成员是**串行**跑的（并行反应留到以后）；链越长越慢。
+- **每组上限（默认 8，范围 1..50，界面可改）**：反应轮数上限只计反应轮，达上限以
+  `stopReason = round_cap` 优雅停（不是报错）；定向轮不计数、不被拦截。它是组设置
+  （`sessions.max_reaction_rounds`），**不是** `config.json` 键。链没有别的深度上限配置项。
+- **链状态只在内存**：`group.chain` 是「本次运行内」的当前 / 最近一条链，核心重启后为
+  `idle`；重启后看不到旧链的 `steps`（消息与公开行不受影响）。
+- **无 token 预算治理**：N 个成员 × 多轮 × 每次生成都会烧 token，本期没有预算护栏；
+  上限只管轮数，不管每轮 token。
+- **沉默率是经验性的**：提示词按「默认沉默 + 4 个 pass=true 样板」写，但是否真的沉默取决于
+  模型；`group_react {pass:true}` 是模型主动选择，产品**不保证**大多数轮一定沉默。
+  `round_cap` 仍是可靠兜底（达到上限就优雅停），"全 `round_cap`、零 `all_passed`"只说明
+  该模型偏话多，不是故障。
+- **`forced_pass` 提示不持久**：被点名成员不回应的提示只在这次发送后显示；刷新页面就没了
+  （它没有对应的公开行）。
 - **重启后真实上下文视图为空**：`group.view` 只给**本次运行内**真实发出过的快照，重启后是空
   （界面显示占位）。这是既定语义，不会用历史拼一份"没发过的上下文"。
 - **已移除成员只读**：已移除成员仍有分栏与历史行（只读），但不能再被点名发言；同名重建是
   新身份，看不到旧成员的私有行。
+- **旧组升级后默认关闭**：从旧版本升级上来的组是安静态（点名体验不变），要在组视图里自己
+  打开「自发反应」。
 - **Flutter 只有占位**：组会话在 Flutter 会话列表里可见，点开显示「请在 web 组视图打开」，
   不加载整份原文、也不进入单 Agent 对话界面。
 - **公开回复不带附件**：组成员的最终公开行只存正文（「tool_calls」 与 「thinking_json」 均为
@@ -139,3 +278,17 @@
 界面文案：「请在 web 组视图打开」
 
 界面文案：「组会话没有自己的模板」
+
+界面文案（web）：「（不点名，仅触发反应）」
+
+界面文案（web）：「反应链进行中…（可取消）」
+
+界面文案（web）：「取消反应链」
+
+界面文案（web）：「被点名的成员没有回应（返回 pass=true / 空 message）」
+
+界面文案（web）：「正在反应…」
+
+界面文案（web）：「已达轮数上限（反应已停止；可继续点名，或调大该组的反应轮数上限）」
+
+界面文案（web）：「反应轮数上限」

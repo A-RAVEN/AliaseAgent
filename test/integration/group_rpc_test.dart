@@ -137,7 +137,10 @@ void main() {
       'text': '甲说一句',
     });
     _obs('group.send', send['result']);
-    expect((send['result'] as Map)['status'], 'completed');
+    // 异步契约（R.3）：send 只回 started；终态从 group.chain 读（R.7 先等终态）。
+    expect((send['result'] as Map)['status'], 'started');
+    final chain = await harness.waitForChain(seeded.groupId);
+    expect(chain['status'], 'completed');
 
     final page = await harness.ws.request('message.query', {
       'sessionId': seeded.groupId,
@@ -161,6 +164,32 @@ void main() {
     expect(reply['thinking'], isNull);
   });
 
+  test('0.3 夹具口径：不传 reactionsEnabled 时 group.list 读回 false', () async {
+    // **夹具口径，不是产品默认**（change `group-reactive-mode` 任务 0.3）：
+    // `GroupCoreHarness.createGroup` 缺省传 `reactionsEnabled: false`，因为既有群聊
+    // 用例依赖旧点名语义。产品的新建组默认是 `true`（见 0.2 的持久化用例）。
+    final created = await harness.createGroup(title: '夹具口径组');
+    final returned = (created['result'] as Map)['group'] as Map;
+    final list = await harness.ws.request('group.list');
+    final groups = (list['result'] as Map)['groups'] as List;
+    final listed = groups.singleWhere((g) => g['id'] == returned['id']);
+    _obs('夹具建组返回 reactionsEnabled', returned['reactionsEnabled']);
+    _obs('group.list reactionsEnabled', listed['reactionsEnabled']);
+    expect(returned['reactionsEnabled'], isFalse);
+    expect(listed['reactionsEnabled'], isFalse,
+        reason: 'RPC 夹具不传开关时必须读回 false（否则既有群聊用例会多出反应轮）');
+
+    // 显式传 true 的建组必须回读 true —— 说明开关真的透传，不是恒 false。
+    final enabled = await harness.createGroup(
+        title: '开启组', reactionsEnabled: true);
+    final enabledMap = (enabled['result'] as Map)['group'] as Map;
+    final list2 = await harness.ws.request('group.list');
+    final listed2 = ((list2['result'] as Map)['groups'] as List)
+        .singleWhere((g) => g['id'] == enabledMap['id']);
+    _obs('显式开启的回读', listed2['reactionsEnabled']);
+    expect(listed2['reactionsEnabled'], isTrue);
+  });
+
   test('7.3 agent.event 带 groupId + memberId，sessionId 保留', () async {
     final seeded = await seedTwoMembers();
     for (final speaker in [seeded.a, seeded.b]) {
@@ -171,6 +200,8 @@ void main() {
         'speaker': speaker,
         'text': '说一句',
       });
+      // 异步发送：每次都要等它那条链收尾，再让下一个成员发（组级单运行门）。
+      await harness.waitForChain(seeded.groupId);
     }
     final groupEvents = harness.ws.events
         .where((e) => e['groupId'] == seeded.groupId)
@@ -178,11 +209,35 @@ void main() {
     _obs('组事件数', groupEvents.length);
     _obs('事件身份', groupEvents.map((e) => '${e['type']}/${e['memberId']}').toList());
     expect(groupEvents, isNotEmpty);
+    // **按事件类型断言 memberId**（change `group-reactive-mode` 任务 0.3 / 4.2）：
+    // 成员运行产生的事件必须有 memberId；组服务自己写入的用户消息没有成员可归，
+    // 允许 memberId 为空（spec「用户消息事件带 groupId 但不伪造 memberId」）。
+    // 这里用关闭态组（夹具缺省），用户消息由 Agent 那一轮写，memberId 非空；
+    // 断言仍按类型分流，使开启态（组服务写用户消息）不会误红。
+    const memberRunTypes = {
+      'assistant.message',
+      'assistant.chunk',
+      'tool.call',
+      'tool.result',
+      'agent.streaming',
+      'turn.completed',
+      'context.snapshot',
+      'agent.metering',
+      'thinking.delta',
+      'thinking.block',
+      'session.title',
+    };
     for (final event in groupEvents) {
       expect(event['sessionId'], seeded.groupId, reason: 'sessionId 保留');
       expect(event['groupId'], seeded.groupId);
-      expect(event['memberId'], isNotNull);
+      if (memberRunTypes.contains(event['type'])) {
+        expect(event['memberId'], isNotNull,
+            reason: '成员运行事件（${event['type']}）必须带 memberId');
+      }
     }
+    final userMessages = groupEvents.where((e) => e['type'] == 'user.message');
+    _obs('user.message 的 memberId',
+        userMessages.map((e) => e['memberId']).toList());
     // 两个成员各自的回合事件带各自的 memberId。
     final memberIds = groupEvents.map((e) => e['memberId']).toSet();
     expect(memberIds, containsAll([seeded.a, seeded.b]));
@@ -201,6 +256,7 @@ void main() {
       'speaker': seeded.a,
       'text': '甲说一句',
     });
+    await harness.waitForChain(seeded.groupId);
     final view = await harness.ws.request('group.view', {
       'groupId': seeded.groupId,
       'memberId': seeded.a,
@@ -209,6 +265,13 @@ void main() {
     _obs('group.view snapshot keys', snapshot?.keys.toList());
     expect(snapshot, isNotNull);
     expect(snapshot!['windowTokens'], 100000, reason: '窗口是成员自己实例的窗口');
+    // **反应轮也算真实发出**（change `group-reactive-mode` / web-core-shim「反应轮也
+    // 更新成员视图快照」）：`_lastSnapshots` 在每一次成员轮结束后更新，与本轮是点名轮
+    // 还是反应轮无关。这里断言快照里的系统提示词是**成员真实发出的那一份**（含成员
+    // 角色说明），从而不会把「本次运行内没发过言」误报给链跑过的成员。
+    expect('${snapshot['system']}',
+        contains('你是一个群聊组的成员'),
+        reason: '快照必须是成员真实发出的系统提示词（含成员角色说明）');
     final messages = snapshot['messages'] as List;
     expect(messages, isNotEmpty);
     // 与该轮实际发出的投影一致：至少含用户那句。
@@ -275,6 +338,7 @@ void main() {
     expect((cancelled['result'] as Map)['memberId'], seeded.a);
     harness.sidecar.releaseGate();
     await sendFuture;
+    await harness.waitForChain(seeded.groupId);
   });
 
   test('7.8 分页回归：尾锚 / beforeSeq / head+afterSeq 三种取页', () async {

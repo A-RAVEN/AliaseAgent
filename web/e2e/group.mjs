@@ -89,6 +89,8 @@ const sessions = [
     updatedAt: 1,
     kind: 'single',
     overrides: null,
+    reactionsEnabled: true,
+    maxRounds: null,
   },
 ];
 const groups = new Map();
@@ -119,6 +121,10 @@ function newGroup(title) {
     updatedAt: Date.now(),
     kind: 'group',
     overrides: null,
+    // 新建组默认开启自发反应（change `group-reactive-mode` D1）：假核心照产品口径来。
+    reactionsEnabled: true,
+    // 反应轮数上限（R.4 / D13）：null = 用产品默认；界面以默认值占位。
+    maxRounds: null,
   };
   sessions.push(session);
   groups.set(id, {
@@ -127,8 +133,214 @@ function newGroup(title) {
     messages: [],
     snapshots: {},
     seq: 0,
+    busy: false,
+    runningMemberId: null,
+    aborted: false,
+    // R.8：吸收式执行器近似——用户请求排队、串行处理，**永不**因链在跑拒绝。
+    pending: [],
+    pumping: false,
+    // 链状态（R.4 / D9）：idle = 本进程内还没有链；send 立刻回 started、链在后台跑。
+    chain: idleChain(),
   });
   return session;
+}
+
+function idleChain() {
+  return {
+    status: 'idle',
+    triggerSeq: null,
+    rounds: 0,
+    stopReason: null,
+    steps: [],
+  };
+}
+
+function chainOfGroup(group) {
+  return group.chain ?? idleChain();
+}
+
+/**
+ * 链进入终态：写 status/stopReason、清 busy、**只广播一次** `group.chain.completed`
+ * （唯一新增的事件类型；payload 不带 steps，change `group-reactive-mode` R.2 / D7）。
+ */
+function finishChain(group, { status, stopReason }) {
+  const chain = group.chain;
+  if (!chain || chain.status !== 'running') return;
+  chain.status = status;
+  chain.stopReason = stopReason;
+  group.busy = false;
+  group.runningMemberId = null;
+  broadcast({
+    sessionId: group.session.id,
+    groupId: group.session.id,
+    type: 'group.chain.completed',
+    data: {
+      status: chain.status,
+      stopReason: chain.stopReason,
+      rounds: chain.rounds,
+      triggerSeq: chain.triggerSeq,
+    },
+  });
+}
+
+/**
+ * R.8：假核心的**吸收式执行器**近似。
+ *
+ * 用户请求排队、串行处理（同一时刻至多一条链写原文）；`group.send` 永不 busy。
+ * 每条请求自己重建链状态（新用户触发重置 rounds / steps），处理完广播
+ * `group.chain.completed`。真实核心的"轮边界吸收"语义见 design D3；e2e 只验界面契约。
+ */
+async function pumpGroup(group) {
+  if (group.pumping) return;
+  group.pumping = true;
+  try {
+    while (group.pending.length > 0) {
+      const request = group.pending.shift();
+      await runFakeChain(group, request);
+    }
+  } catch (error) {
+    group.busy = false;
+    group.runningMemberId = null;
+    if (group.chain && group.chain.status === 'running') {
+      finishChain(group, { status: 'failed', stopReason: 'failed' });
+    }
+    console.log(`  [假核心] group.send 后台失败：${error}`);
+  } finally {
+    group.pumping = false;
+  }
+}
+
+/** 跑一条请求对应的假链（每个成员一步；`#pass` 步为结构化沉默）。 */
+async function runFakeChain(group, request) {
+  const { userMessage, text, responders, speaker } = request;
+  group.busy = true;
+  group.aborted = false;
+  group.runningMemberId = null;
+  group.chain = {
+    status: 'running',
+    triggerSeq: userMessage.seq,
+    rounds: 0,
+    stopReason: null,
+    steps: [],
+  };
+  // `#forced-pass` / `#pass` 是**假核心专用**提示：分别模拟"被点名却返回 pass=true"
+  // 与"自愿轮返回 pass=true"（都不写公开行）；用来验 web 的提示与 steps 状态。
+  const forcedPassHint = text.includes('#forced-pass');
+  const passHint = text.includes('#pass');
+  const maxRounds = group.session.maxRounds;
+  let index = 0;
+  try {
+    for (const member of responders) {
+      if (group.aborted) break;
+      if (maxRounds !== null && group.chain.rounds >= maxRounds) {
+        finishChain(group, { status: 'completed', stopReason: 'round_cap' });
+        return;
+      }
+      // 每一步之间可被 e2e gate 挂住：这样测试能看到"逐条冒出"的中间态，
+      // 并在链仍在跑时断言"发送态已解除 / 还能再发"（R.4 / R.8）。
+      if (index === 1 && sendGateEnabled) {
+        await new Promise((resolve) => {
+          sendGate = resolve;
+        });
+      }
+      if (group.aborted) break;
+      index += 1;
+      group.chain.rounds += 1;
+      group.runningMemberId = member.id;
+      broadcast({
+        sessionId: group.session.id,
+        groupId: group.session.id,
+        memberId: member.id,
+        type: 'agent.streaming',
+        data: { streaming: true },
+      });
+      const source = speaker && member.id === speaker.id ? 'speaker' : 'reaction';
+      if (passHint || (forcedPassHint && index === 2)) {
+        group.chain.steps.push({
+          memberId: member.id,
+          source,
+          status: forcedPassHint && index === 2 ? 'forced_pass' : 'passed',
+          triggerSeq: userMessage.seq,
+          publicSeq: null,
+          finalText: '',
+          error: null,
+        });
+        broadcast({
+          sessionId: group.session.id,
+          groupId: group.session.id,
+          memberId: member.id,
+          type: 'agent.streaming',
+          data: { streaming: false },
+        });
+        continue;
+      }
+      const privateMessage = pushMessage(group, {
+        role: 'assistant',
+        content: '',
+        author: member.id,
+        visibility: 'private-to-author',
+      });
+      const publicMessage = pushMessage(group, {
+        role: 'assistant',
+        content: `${member.name}的公开结论：已改完 lib/a.dart`,
+        author: member.id,
+      });
+      group.snapshots[member.id] = {
+        sessionId: group.session.id,
+        model: 'fake-model',
+        thinkingMode: 'disabled',
+        thinkingEffort: '',
+        capturedAt: new Date().toISOString(),
+        windowTokens: member.window,
+        agentType: 'general',
+        breakdown: breakdown(member.window, 1200, 300, 100),
+        messages: [{ role: 'user', content: text }],
+        system: '你是测试模板。',
+        tools: '[]',
+        skillFailures: [],
+        skillFailureNotice: null,
+      };
+      broadcast({
+        sessionId: group.session.id,
+        groupId: group.session.id,
+        memberId: member.id,
+        type: 'assistant.message',
+        data: publicMessage,
+      });
+      broadcast({
+        sessionId: group.session.id,
+        groupId: group.session.id,
+        memberId: member.id,
+        type: 'assistant.message',
+        data: privateMessage,
+      });
+      broadcast({
+        sessionId: group.session.id,
+        groupId: group.session.id,
+        memberId: member.id,
+        type: 'agent.streaming',
+        data: { streaming: false },
+      });
+      group.chain.steps.push({
+        memberId: member.id,
+        source,
+        status: 'replied',
+        triggerSeq: userMessage.seq,
+        publicSeq: publicMessage.seq,
+        finalText: publicMessage.content,
+        error: null,
+      });
+    }
+  } finally {
+    group.busy = false;
+    group.runningMemberId = null;
+    if (group.chain && group.chain.status === 'running') {
+      finishChain(group, {
+        status: group.aborted ? 'cancelled' : 'completed',
+        stopReason: group.aborted ? 'cancelled' : 'all_passed',
+      });
+    }
+  }
 }
 
 function pushMessage(group, { role, content, author = null, visibility = 'public' }) {
@@ -170,8 +382,23 @@ function describeGroup(group) {
         maxContextTokens: member.window,
       },
     })),
+    // 只读忙碌状态（change `group-reactive-mode` D7）：断线重连后的 web 靠它恢复
+    // "链在跑"并启用取消按钮。
+    busy: group.busy === true,
+    runningMemberId: group.runningMemberId ?? null,
   };
 }
+
+/**
+ * 假核心的「按成员分步」闸门（只用于 e2e 观察**逐步展开**，不是产品接口）。
+ *
+ * `GET /__gate_next_send` 让下一次 `group.send` 在**第一个成员之后**暂停；
+ * `GET /__release_send` 放行。这样测试能在同一条链中途断言"时间线只出现了第一位
+ * 成员的公开回复、还没有第二位"。
+ */
+let sendGate = null;
+let sendGateEnabled = false;
+
 
 function broadcast(event) {
   eventLog.push(event);
@@ -180,10 +407,21 @@ function broadcast(event) {
 }
 
 function reply(socket, id, result) {
+  // 页面在链中途刷新/关闭时 socket 已关：静默跳过（假核心不该因此崩溃）。
+  if (socket.readyState !== 1) return;
   socket.send(JSON.stringify({ jsonrpc: '2.0', id, result }));
 }
 
+/** 记录**响应**（payload 判据的一部分：`group.send` 的 steps 在响应里，不在 params 里）。 */
+const responseLog = [];
+
+function replyLogged(socket, id, method, result) {
+  responseLog.push({ method, result });
+  reply(socket, id, result);
+}
+
 function fail(socket, id, message) {
+  if (socket.readyState !== 1) return;
   socket.send(
     JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32602, message } }),
   );
@@ -222,6 +460,7 @@ function handleRpc(socket, request) {
       updatedAt: Date.now(),
       kind: 'single',
       overrides: null,
+      reactionsEnabled: true,
     };
     sessions.unshift(session);
     return reply(socket, id, { session });
@@ -310,78 +549,112 @@ function handleRpc(socket, request) {
       snapshot: group.snapshots[params.memberId] ?? null,
     });
   }
+  if (method === 'group.update') {
+    const group = groups.get(params.groupId);
+    if (!group) return fail(socket, id, `组 ${params.groupId} 不存在`);
+    const hasReactions = Object.prototype.hasOwnProperty.call(params, 'reactionsEnabled');
+    const hasMaxRounds = Object.prototype.hasOwnProperty.call(params, 'maxRounds');
+    if (!hasReactions && !hasMaxRounds) {
+      return fail(socket, id, 'group.update 至少要给一个字段（reactionsEnabled / maxRounds）');
+    }
+    if (hasReactions && typeof params.reactionsEnabled !== 'boolean') {
+      return fail(socket, id, 'reactionsEnabled 必须是布尔');
+    }
+    if (hasMaxRounds && params.maxRounds !== null) {
+      const value = params.maxRounds;
+      if (!Number.isInteger(value) || value < 1 || value > 50) {
+        return fail(socket, id, `maxRounds 必须是 1..50 的整数或 null，实测 ${value}`);
+      }
+    }
+    if (group.busy) return fail(socket, id, '组正在运行反应链：不能改设置');
+    if (hasReactions) group.session.reactionsEnabled = params.reactionsEnabled;
+    if (hasMaxRounds) group.session.maxRounds = params.maxRounds;
+    return replyLogged(socket, id, method, { group: group.session });
+  }
+  if (method === 'group.chain') {
+    const group = groups.get(params.groupId);
+    if (!group) return fail(socket, id, `组 ${params.groupId} 不存在`);
+    return replyLogged(socket, id, method, {
+      groupId: group.session.id,
+      sessionId: group.session.id,
+      ...chainOfGroup(group),
+    });
+  }
   if (method === 'group.send') {
     const group = groups.get(params.groupId);
     if (!group) return fail(socket, id, `组 ${params.groupId} 不存在`);
-    const speaker = group.members.find(
-      (member) => member.id === params.speaker && member.removedAt === null,
-    );
-    if (!speaker || params.speaker === undefined) {
-      return fail(socket, id, '群发送必须指定恰好一个发言者');
+    const text = params.text ?? '';
+    const active = group.members.filter((member) => member.removedAt === null);
+    const speaker =
+      params.speaker === undefined || params.speaker === null
+        ? null
+        : active.find((member) => member.id === params.speaker) ?? null;
+    if (params.speaker !== undefined && params.speaker !== null && speaker === null) {
+      return fail(socket, id, `发言者 ${params.speaker} 不存在或已移除`);
     }
+    if (!speaker && !group.session.reactionsEnabled) {
+      return fail(socket, id, 'no_speaker：关闭自发反应时必须点名一个成员');
+    }
+    if (!speaker && text.trim().length === 0) {
+      return fail(socket, id, 'no_trigger：没有可触发的公开消息');
+    }
+    /** 假核心按"点名者优先，其余按加入顺序"排步骤（真实核心同口径，见 design D3）。 */
+    const responders = [];
+    if (speaker) responders.push(speaker);
+    if (group.session.reactionsEnabled) {
+      for (const member of active) {
+        if (speaker && member.id === speaker.id) continue;
+        responders.push(member);
+      }
+    }
+    // 用户消息由**组服务**写：事件不带 memberId（spec「不伪造 memberId」）。
     const userMessage = pushMessage(group, {
       role: 'user',
-      content: params.text ?? '',
+      content: text,
       author: null,
     });
-    const privateMessage = pushMessage(group, {
-      role: 'assistant',
-      content: '',
-      author: speaker.id,
-      visibility: 'private-to-author',
-    });
-    const publicMessage = pushMessage(group, {
-      role: 'assistant',
-      content: `${speaker.name}的公开结论：已改完 lib/a.dart`,
-      author: speaker.id,
-    });
-    group.snapshots[speaker.id] = {
-      sessionId: group.session.id,
-      model: 'fake-model',
-      thinkingMode: 'disabled',
-      thinkingEffort: '',
-      capturedAt: new Date().toISOString(),
-      windowTokens: speaker.window,
-      agentType: 'general',
-      breakdown: breakdown(speaker.window, 1200, 300, 100),
-      messages: [{ role: 'user', content: params.text ?? '' }],
-      system: '你是测试模板。',
-      tools: '[]',
-      skillFailures: [],
-      skillFailureNotice: null,
-    };
     broadcast({
       sessionId: group.session.id,
       groupId: group.session.id,
-      memberId: speaker.id,
       type: 'user.message',
       data: userMessage,
     });
-    broadcast({
-      sessionId: group.session.id,
-      groupId: group.session.id,
-      memberId: speaker.id,
-      type: 'assistant.message',
-      data: publicMessage,
-    });
-    broadcast({
-      sessionId: group.session.id,
-      groupId: group.session.id,
-      memberId: speaker.id,
-      type: 'assistant.message',
-      data: privateMessage,
-    });
-    reply(socket, id, {
+    // **立刻回 started**（R.8：永不 busy；链运行中再发也接受、入队排队）。
+    replyLogged(socket, id, method, {
       groupId: group.session.id,
       sessionId: group.session.id,
-      status: 'completed',
-      memberId: speaker.id,
-      finalText: publicMessage.content,
-      error: null,
+      status: 'started',
+      triggerSeq: userMessage.seq,
     });
+    group.pending.push({ userMessage, text, responders, speaker });
+    void pumpGroup(group);
     return;
   }
-  if (method === 'agent.cancel') return reply(socket, id, { cancelled: false });
+  if (method === 'agent.cancel') {
+    const group = groups.get(params.sessionId);
+    if (group && (group.busy || group.pending.length > 0)) {
+      const cancelledMemberId = group.runningMemberId;
+      group.aborted = true;
+      // R.8：取消停当前链并**清空排队**（已写入的用户消息保留）。
+      group.pending.length = 0;
+      if (sendGate) {
+        sendGate();
+        sendGate = null;
+      }
+      finishChain(group, { status: 'cancelled', stopReason: 'cancelled' });
+      group.busy = false;
+      group.runningMemberId = null;
+      return replyLogged(socket, id, method, {
+        sessionId: group.session.id,
+        groupId: group.session.id,
+        cancelled: true,
+        reactionChainStopped: true,
+        memberId: cancelledMemberId,
+        reason: '已取消正在运行的成员，整条反应链已停止',
+      });
+    }
+    return replyLogged(socket, id, method, { cancelled: false });
+  }
   return fail(socket, id, `fake core 未实现 ${method}`);
 }
 
@@ -425,8 +698,50 @@ function startServer() {
       response.end(JSON.stringify({ id: seeded.id, title: seeded.title }));
       return;
     }
-    const relative = requestPath === '/' ? 'index.html' : requestPath.replace(/^\/+/, '');
-    const target = path.join(DIST, relative);
+    // 自发反应的 e2e 夹具（假核心专用）：建一个**开启自发反应**、含三个成员的组。
+    // 标题可由 `?title=` 指定，避免多个 '新组' 在会话列表里无法区分。
+    if (requestPath === '/__seed_reaction_group') {
+      const title =
+        new URL(request.url ?? '/', 'http://127.0.0.1').searchParams.get('title') ??
+        '反应组';
+      const seeded = newGroup(title);
+      const group = groups.get(seeded.id);
+      for (const name of ['甲', '乙', '丙']) {
+        group.members.push({
+          id: `mem-rx-${seeded.id}-${name}`,
+          name,
+          template: 'general',
+          removedAt: null,
+          overrides: null,
+          window: windows[group.members.length % windows.length],
+        });
+      }
+      const index = sessions.findIndex((session) => session.id === seeded.id);
+      if (index >= 0) {
+        const [entry] = sessions.splice(index, 1);
+        sessions.unshift(entry);
+      }
+      response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      response.end(JSON.stringify({ id: seeded.id, title: seeded.title }));
+      return;
+    }
+    // e2e 观察「按成员分步展开」的闸门（只存在于假核心，不是产品接口）。
+    if (requestPath === '/__gate_next_send') {      sendGateEnabled = true;
+      response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      response.end(JSON.stringify({ gated: true }));
+      return;
+    }
+    if (requestPath === '/__release_send') {
+      sendGateEnabled = false;
+      if (sendGate) {
+        sendGate();
+        sendGate = null;
+      }
+      response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      response.end(JSON.stringify({ released: true }));
+      return;
+    }
+    const relative = requestPath === '/' ? 'index.html' : requestPath.replace(/^\/+/, '');    const target = path.join(DIST, relative);
     if (!target.startsWith(DIST)) {
       response.writeHead(403).end('forbidden');
       return;
@@ -684,6 +999,22 @@ await run('8.4 操作面：加两个成员、编辑覆盖层（生效可核）�
     assert(memberIds.length >= 2, `应有至少两个成员，实测 ${memberIds.length}`);
     [memberA, memberB] = memberIds;
 
+    // 本用例验的是**关闭态纯点名**（旧语义）：先把自发反应关掉，这样只有被点名的
+    // 成员跑一轮、乙保持"本次运行内没发过言"（8.6 的占位断言依赖它）。
+    // 开关本身的行为由 9.1 单独验。
+    const toggleChecked = await page.$eval(
+      '[data-testid="reactions-toggle"]',
+      (element) => element.checked,
+    );
+    if (toggleChecked) {
+      await clickByTestId(page, 'reactions-toggle');
+      await page.waitForFunction(
+        () =>
+          document.querySelector('[data-testid="reactions-toggle"]')?.checked === false,
+        { timeout: 15000 },
+      );
+    }
+
     // 编辑甲的覆盖层：只留 read_file + 追加提示词 + high。
     await clickByTestId(page, `member-edit-${memberA}`);
     await page.waitForSelector(`[data-testid="override-editor-${memberA}"]`, { timeout: 15000 });
@@ -774,9 +1105,13 @@ await run('8.5 事件按 payload 归位：memberId 进分栏、公开回复进�
     obs('时间线是否泄漏私有行', timelineText.includes('私有过程'));
     assert(laneText.includes('私有过程'), '私有行必须落到该成员分栏');
     assert(!timelineText.includes('私有过程'), '私有行不得进公开时间线');
-    // DOM 选中值只作辅助：再次核对 payload 里 speaker 与事件 memberId 一致。
+    // DOM 选中值只作辅助：speaker 那个成员的运行事件必须真的带同一个 memberId
+    // （链里可能还有别的成员，所以按 memberId 找，不是"最后一条事件"）。
     const sendRpc = rpcLog.filter((entry) => entry.method === 'group.send').at(-1);
-    assert(sendRpc?.params?.speaker === messageEvents.at(-1)?.memberId, 'speaker 与事件 memberId 必须一致');
+    assert(
+      messageEvents.some((event) => event.memberId === sendRpc?.params?.speaker),
+      'speaker 的成员运行事件必须带同一个 memberId',
+    );
   } finally {
     await page.close();
   }
@@ -916,9 +1251,537 @@ await run('8.7 布局：1280 宽与窄屏不重叠/不溢出（几何断言）',
   }
 });
 
-// GROUP_SHOT=<path>：测试跑完后把真实组视图截一张图（视觉验收用）。
-if (process.env.GROUP_SHOT) {
+// ---------------------------------------------------------------------------
+// 自发反应（change `group-reactive-mode` 任务 5.2 / design D10）
+// ---------------------------------------------------------------------------
+
+async function seedReactionGroup(title) {
+  const seeded = await fetch(
+    `${staticServer.url}__seed_reaction_group?title=${encodeURIComponent(title)}`,
+  ).then((response) => response.json());
+  obs(`反应组夹具 ${title}`, seeded);
+  return seeded;
+}
+
+async function toggleChecked(page) {
+  return page.$eval('[data-testid="reactions-toggle"]', (element) => element.checked);
+}
+
+async function waitForToggle(page, expected) {
+  await page.waitForFunction(
+    (want) =>
+      document.querySelector('[data-testid="reactions-toggle"]')?.checked === want,
+    { timeout: 15000 },
+    expected,
+  );
+}
+
+async function timelineHas(page, text) {
+  return page.evaluate((label) => {
+    const timeline = document.querySelector('[data-testid="group-timeline"]');
+    return timeline?.textContent?.includes(label) === true;
+  }, text);
+}
+
+await run('9.1 自发反应开关：新建组默认开启；点开关发出 group.update', async () => {
+  await seedReactionGroup('反应组开关');
   const page = await openPage();
+  try {
+    await openExistingGroup(page, '反应组开关');
+    const initial = await toggleChecked(page);
+    obs('打开组时的开关初始值', initial);
+    assert(initial === true, '新建组默认必须开启自发反应（开关 checked）');
+
+    await clickByTestId(page, 'reactions-toggle');
+    await waitForToggle(page, false);
+    const updateOff = rpcLog.filter((entry) => entry.method === 'group.update').at(-1);
+    obs('group.update 实际 params（关闭）', updateOff?.params);
+    assert(updateOff !== undefined, '点开关必须发出 group.update');
+    assert(
+      updateOff.params.reactionsEnabled === false,
+      `group.update 必须带 reactionsEnabled=false，实测 ${JSON.stringify(updateOff.params)}`,
+    );
+    assert(updateOff.params.groupId, 'group.update 必须带 groupId');
+
+    await clickByTestId(page, 'reactions-toggle');
+    await waitForToggle(page, true);
+    const updateOn = rpcLog.filter((entry) => entry.method === 'group.update').at(-1);
+    obs('group.update 实际 params（开启）', updateOn?.params);
+    assert(updateOn.params.reactionsEnabled === true, '再次点击必须改回 true');
+  } finally {
+    await page.close();
+  }
+});
+
+await run('9.2 开启态不选发言人发送：speaker 缺省 + 成员分步出现（不是只看最终行数）', async () => {
+  await seedReactionGroup('反应组分步');
+  await fetch(`${staticServer.url}__gate_next_send`);
+  const page = await openPage();
+  try {
+    await openExistingGroup(page, '反应组分步');
+    assert((await toggleChecked(page)) === true, '该组必须是开启态');
+    const speakerValue = await page.$eval(
+      '[data-testid="speaker-select"]',
+      (element) => element.value,
+    );
+    obs('发言人下拉的初始值', speakerValue);
+    assert(speakerValue === '', '开启态默认必须是不点名（空发言人）');
+    const firstOption = await page.$eval(
+      '[data-testid="speaker-select"] option',
+      (element) => element.textContent,
+    );
+    obs('发言人第一项文案', firstOption);
+    assert(
+      firstOption.includes('不点名'),
+      `开启态第一项应是「（不点名，仅触发反应）」，实测 ${firstOption}`,
+    );
+
+    await page.type('[data-testid="group-input"]', '讲个笑话，大家评价');
+    await clickByTestId(page, 'group-send');
+
+    // **第一步先出现**：时间线先只有甲的公开回复。
+    await page.waitForFunction(
+      () =>
+        [...document.querySelectorAll('[data-testid="timeline-item"]')].some((node) =>
+          node.textContent?.includes('甲的公开结论'),
+        ),
+      { timeout: 15000 },
+    );
+    const hasBWhileGated = await timelineHas(page, '乙的公开结论');
+    obs('闸门挂住时是否已出现乙的公开回复', hasBWhileGated);
+    assert(!hasBWhileGated, '闸门挂住时不应已出现第二位成员的公开回复（必须逐步展开）');
+    // 无错误横幅：省略 speaker 是合法路径。
+    const errBanner = await page.$('[data-testid="group-error"]');
+    obs('是否有错误横幅', errBanner !== null);
+    assert(errBanner === null, '省略 speaker 发送不应出现错误横幅');
+
+    await fetch(`${staticServer.url}__release_send`);
+    await page.waitForFunction(
+      () =>
+        [...document.querySelectorAll('[data-testid="timeline-item"]')].some((node) =>
+          node.textContent?.includes('乙的公开结论'),
+        ) &&
+        [...document.querySelectorAll('[data-testid="timeline-item"]')].some((node) =>
+          node.textContent?.includes('丙的公开结论'),
+        ),
+      { timeout: 15000 },
+    );
+
+    const sendRpc = rpcLog.filter((entry) => entry.method === 'group.send').at(-1);
+    obs('group.send 实际 params（省略 speaker）', sendRpc?.params);
+    assert(sendRpc?.params, '必须真的发出 group.send');
+    assert(
+      !('speaker' in sendRpc.params) || !sendRpc.params.speaker,
+      `开启态不选发言人时 params.speaker 必须缺省，实测 ${JSON.stringify(sendRpc.params.speaker)}`,
+    );
+    // 异步契约（R.4）：send 的响应只有 started（不含 steps）；链跑完后
+    // 界面靠 group.chain 拿到 steps。
+    const sendResponse = responseLog.filter((entry) => entry.method === 'group.send').at(-1);
+    obs('group.send 响应', sendResponse?.result);
+    assert(
+      sendResponse?.result?.status === 'started',
+      `group.send 必须立刻回 started，实测 ${JSON.stringify(sendResponse?.result)}`,
+    );
+    assert(
+      !('steps' in (sendResponse?.result ?? {})),
+      'group.send 响应不得带 steps（链进度从 group.chain 读）',
+    );
+    // 链结束：活动指示消失（App 收到 group.chain.completed 后重拉，status 变终态）。
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="reaction-active"]') === null,
+      { timeout: 15000 },
+    );
+    const chainResponse = responseLog.filter((entry) => entry.method === 'group.chain').at(-1);
+    obs('group.chain 终态', chainResponse?.result);
+    assert(
+      chainResponse?.result?.status === 'completed',
+      `group.chain 终态应为 completed，实测 ${JSON.stringify(chainResponse?.result?.status)}`,
+    );
+    const chainSteps = chainResponse?.result?.steps ?? [];
+    obs('group.chain steps', chainSteps);
+    assert(chainSteps.length >= 3, 'group.chain 必须带三位成员各一步');
+    assert(
+      chainSteps.every((step) => step.status === 'replied'),
+      '本例三位成员都应 replied',
+    );
+    const anyFailureEvent = eventLog.filter((event) => event.type === 'turn.failed');
+    assert(anyFailureEvent.length === 0, '正常反应链不应产生 turn.failed');
+  } finally {
+    await page.close();
+  }
+});
+
+await run('9.3 forced_pass：只提示本次结果、不写公开行、不发 turn.failed', async () => {
+  await seedReactionGroup('反应组拒绝');
+  const page = await openPage();
+  try {
+    await openExistingGroup(page, '反应组拒绝');
+    assert((await toggleChecked(page)) === true, '该组必须是开启态');
+    await page.type('[data-testid="group-input"]', '#forced-pass 我想听评价');
+    await clickByTestId(page, 'group-send');
+    await page.waitForSelector('[data-testid="forced-notice"]', { timeout: 15000 });
+    const notice = await page.$eval(
+      '[data-testid="forced-notice"]',
+      (element) => element.textContent,
+    );
+    obs('被点名者没回应的提示文案', notice);
+    assert(notice.includes('没有回应'), `提示必须说明被点名成员没有回应，实测 ${notice}`);
+
+    const chainResponse = responseLog.filter((entry) => entry.method === 'group.chain').at(-1);
+    const steps = chainResponse?.result?.steps ?? [];
+    obs('group.chain steps（含 forced_pass）', steps);
+    assert(
+      steps.some((step) => step.status === 'forced_pass'),
+      'group.chain 的 steps 里必须有 forced_pass（提示来自本次链状态，不是持久化告警）',
+    );
+    const hasSecondMemberPublic = await timelineHas(page, '乙的公开结论');
+    obs('被拒绝成员是否有公开行', hasSecondMemberPublic);
+    assert(!hasSecondMemberPublic, 'forced_pass 的成员不得写公开行');
+    const failedEvents = eventLog.filter(
+      (event) => event.type === 'turn.failed' && event.groupId === sendRpcGroupId(),
+    );
+    obs('turn.failed 事件', failedEvents.length);
+    assert(failedEvents.length === 0, 'forced_pass 不是整轮失败：不许发 turn.failed');
+  } finally {
+    await page.close();
+  }
+});
+
+function sendRpcGroupId() {
+  return rpcLog.filter((entry) => entry.method === 'group.send').at(-1)?.params?.groupId;
+}
+
+await run('9.4 取消：链中按钮可用并发出 agent.cancel；重连（刷新）后 busy 仍可取消', async () => {
+  await seedReactionGroup('反应组取消');
+  await fetch(`${staticServer.url}__gate_next_send`);
+  const page = await openPage();
+  try {
+    await openExistingGroup(page, '反应组取消');
+    await page.type('[data-testid="group-input"]', '这条会停在第一位成员');
+    await clickByTestId(page, 'group-send');
+    await page.waitForFunction(
+      () =>
+        [...document.querySelectorAll('[data-testid="timeline-item"]')].some((node) =>
+          node.textContent?.includes('甲的公开结论'),
+        ),
+      { timeout: 15000 },
+    );
+    const cancelDuring = await page.$eval(
+      '[data-testid="group-cancel"]',
+      (element) => element.disabled,
+    );
+    obs('链中取消按钮是否可用', !cancelDuring);
+    assert(cancelDuring === false, '链进行中取消按钮必须可用');
+
+    // 模拟"断线重连后本地 sending 丢失"：刷新页面。本地状态清空，但核心仍 busy。
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await openExistingGroup(page, '反应组取消');
+    await page.waitForFunction(
+      () => {
+        const cancel = document.querySelector('[data-testid="group-cancel"]');
+        return cancel !== null && cancel.disabled === false;
+      },
+      { timeout: 15000 },
+    );
+    const activeAfterReload = await page.$('[data-testid="reaction-active"]');
+    obs('刷新后是否显示反应链进行中', activeAfterReload !== null);
+    assert(activeAfterReload !== null, '重连后必须靠 group.busy 恢复「链在跑」的显示');
+
+    await clickByTestId(page, 'group-cancel');
+    // 取消成功后 `agent.cancel` 回包带 reactionChainStopped，界面重拉后 busy 变 false
+    // ⇒「反应链进行中」指示消失（这也是"取消真的到达核心"的界面证据）。
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="reaction-active"]') === null,
+      { timeout: 15000 },
+    );
+    const cancelRpc = rpcLog.filter((entry) => entry.method === 'agent.cancel').at(-1);
+    obs('agent.cancel 实际 params', cancelRpc?.params);
+    assert(cancelRpc !== undefined, '点取消必须发出 agent.cancel');
+    assert(cancelRpc.params.sessionId, 'agent.cancel 必须带组会话 id');
+    const cancelResponse = responseLog
+      .filter((entry) => entry.method === 'agent.cancel')
+      .at(-1);
+    obs('agent.cancel 响应', cancelResponse?.result);
+    assert(
+      cancelResponse?.result?.reactionChainStopped === true,
+      '取消回包必须带 reactionChainStopped=true',
+    );
+    await fetch(`${staticServer.url}__release_send`);
+  } finally {
+    await page.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 异步发送 + 每组轮数上限（change `group-reactive-mode` R.4 / design D10、D13）
+// ---------------------------------------------------------------------------
+
+async function waitForRpcCount(method, count, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (rpcLog.filter((entry) => entry.method === method).length < count) {
+    if (Date.now() > deadline) {
+      throw new Error(`等待 ${method} 第 ${count} 次调用超时（实际 ${rpcLog.filter((e) => e.method === method).length}）`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+/** 在「反应轮数上限」输入框里填值并失焦保存（`''` = 清空 ⇒ maxRounds: null）。 */
+async function setRoundCap(page, value) {
+  await page.click('[data-testid="group-round-cap"]', { clickCount: 3 });
+  if (value === '') {
+    await page.keyboard.press('Backspace');
+  } else {
+    await page.type('[data-testid="group-round-cap"]', value);
+  }
+  await page.$eval('[data-testid="group-round-cap"]', (element) => element.blur());
+}
+
+await run('9.5 反应轮数上限：填 6 发 maxRounds=6，留空发 maxRounds=null（payload 判据）', async () => {
+  await seedReactionGroup('反应组上限');
+  const page = await openPage();
+  try {
+    await openExistingGroup(page, '反应组上限');
+    const initial = await page.$eval('[data-testid="group-round-cap"]', (element) => ({
+      value: element.value,
+      placeholder: element.placeholder,
+    }));
+    obs('上限输入框初值', initial);
+    assert(initial.value === '', 'maxRounds=null 时输入框必须留空（以默认值占位）');
+    assert(
+      initial.placeholder.includes('默认 8'),
+      `占位文案应是「默认 8」，实测 ${initial.placeholder}`,
+    );
+
+    const beforeSet = rpcLog.filter((entry) => entry.method === 'group.update').length;
+    await setRoundCap(page, '6');
+    await waitForRpcCount('group.update', beforeSet + 1);
+    const setRpc = rpcLog.filter((entry) => entry.method === 'group.update').at(-1);
+    obs('group.update 实际 params（设 6）', setRpc?.params);
+    assert(setRpc?.params?.groupId, 'group.update 必须带 groupId');
+    assert(
+      setRpc?.params?.maxRounds === 6,
+      `payload 的 maxRounds 必须是 6，实测 ${JSON.stringify(setRpc?.params)}`,
+    );
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="group-round-cap"]')?.value === '6',
+      { timeout: 15000 },
+    );
+
+    const beforeClear = rpcLog.filter((entry) => entry.method === 'group.update').length;
+    await setRoundCap(page, '');
+    await waitForRpcCount('group.update', beforeClear + 1);
+    const clearRpc = rpcLog.filter((entry) => entry.method === 'group.update').at(-1);
+    obs('group.update 实际 params（留空）', clearRpc?.params);
+    assert(
+      clearRpc?.params !== undefined &&
+        Object.prototype.hasOwnProperty.call(clearRpc.params, 'maxRounds') &&
+        clearRpc.params.maxRounds === null,
+      `留空必须发 maxRounds: null（恢复默认），实测 ${JSON.stringify(clearRpc?.params)}`,
+    );
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="group-round-cap"]')?.value === '',
+      { timeout: 15000 },
+    );
+  } finally {
+    await page.close();
+  }
+});
+
+await run('9.6 异步发送：started 后发送态立即解除，链活动由 chain/事件驱动', async () => {
+  await seedReactionGroup('反应组异步');
+  await fetch(`${staticServer.url}__gate_next_send`);
+  const page = await openPage();
+  try {
+    await openExistingGroup(page, '反应组异步');
+    await page.type('[data-testid="group-input"]', '这条会停在第二位成员之前');
+    await clickByTestId(page, 'group-send');
+    // 第一位成员的公开回复出现：链仍在跑（第二位被 gate 挂住）。
+    await page.waitForFunction(
+      () =>
+        [...document.querySelectorAll('[data-testid="timeline-item"]')].some((node) =>
+          node.textContent?.includes('甲的公开结论'),
+        ),
+      { timeout: 15000 },
+    );
+    const sendState = await page.$eval('[data-testid="group-send"]', (element) => ({
+      disabled: element.disabled,
+      text: element.textContent,
+    }));
+    obs('链中发送按钮', sendState);
+    assert(sendState.disabled === false, 'started 之后发送态必须立即解除（不等链结束）');
+    assert(
+      sendState.text.includes('发送') && !sendState.text.includes('发送中'),
+      `按钮文案必须回到「发送」，实测 ${sendState.text}`,
+    );
+    const activeDuring = await page.$('[data-testid="reaction-active"]');
+    assert(activeDuring !== null, '链仍在跑时必须显示活动指示（started 响应驱动）');
+    const sendResponse = responseLog.filter((entry) => entry.method === 'group.send').at(-1);
+    obs('group.send 响应', sendResponse?.result);
+    assert(sendResponse?.result?.status === 'started', 'group.send 必须回 started');
+    assert(
+      !('steps' in (sendResponse?.result ?? {})),
+      'group.send 响应不得带 steps',
+    );
+
+    await fetch(`${staticServer.url}__release_send`);
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="reaction-active"]') === null,
+      { timeout: 15000 },
+    );
+    const chainResponse = responseLog.filter((entry) => entry.method === 'group.chain').at(-1);
+    obs('group.chain 终态', chainResponse?.result);
+    assert(
+      chainResponse?.result?.status === 'completed',
+      `链终态应为 completed，实测 ${JSON.stringify(chainResponse?.result?.status)}`,
+    );
+  } finally {
+    await page.close();
+  }
+});
+
+await run('9.7 达轮数上限：round_cap 可归因提示 + 上限外的成员不写公开行', async () => {
+  await seedReactionGroup('反应组上限停');
+  const page = await openPage();
+  try {
+    await openExistingGroup(page, '反应组上限停');
+    const beforeSet = rpcLog.filter((entry) => entry.method === 'group.update').length;
+    await setRoundCap(page, '1');
+    await waitForRpcCount('group.update', beforeSet + 1);
+    await page.type('[data-testid="group-input"]', '只跑一轮');
+    await clickByTestId(page, 'group-send');
+    await page.waitForSelector('[data-testid="round-cap-notice"]', { timeout: 15000 });
+    const notice = await page.$eval(
+      '[data-testid="round-cap-notice"]',
+      (element) => element.textContent,
+    );
+    obs('round_cap 提示文案', notice);
+    assert(notice.includes('已达轮数上限'), `提示必须说明达上限，实测 ${notice}`);
+    const chainResponse = responseLog.filter((entry) => entry.method === 'group.chain').at(-1);
+    obs('round_cap 链终态', chainResponse?.result);
+    assert(
+      chainResponse?.result?.status === 'completed',
+      '达上限是优雅停（completed），不是失败',
+    );
+    assert(
+      chainResponse?.result?.stopReason === 'round_cap',
+      `stopReason 必须是 round_cap，实测 ${JSON.stringify(chainResponse?.result?.stopReason)}`,
+    );
+    assert(
+      (chainResponse?.result?.steps ?? []).length === 1,
+      '上限 1 轮 ⇒ 只跑了一位成员',
+    );
+    const timelineText = await page.$eval(
+      '[data-testid="group-timeline"]',
+      (element) => element.textContent,
+    );
+    assert(timelineText.includes('甲的公开结论'), '上限内的成员必须有公开行');
+    assert(!timelineText.includes('乙的公开结论'), '上限外的成员不得写公开行');
+  } finally {
+    await page.close();
+  }
+});
+
+await run('9.8 R.8 链中还能再发：group.send 永不 busy，第二条消息被接受/排队', async () => {
+  await seedReactionGroup('反应组连发');
+  await fetch(`${staticServer.url}__gate_next_send`);
+  const page = await openPage();
+  try {
+    await openExistingGroup(page, '反应组连发');
+    const beforeSends = responseLog.filter((entry) => entry.method === 'group.send').length;
+    await page.type('[data-testid="group-input"]', '第一条（会停在 gate）');
+    await clickByTestId(page, 'group-send');
+    // 第一位成员流式出现 = 链在跑（第二位被 gate 挂住）。
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="reaction-active"]') !== null,
+      { timeout: 15000 },
+    );
+    // 等 `started` 回包后的 setSending(false) 落地，再断言按钮可用。
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="group-send"]')?.disabled === false,
+      { timeout: 15000 },
+    );
+    const sendState = await page.$eval('[data-testid="group-send"]', (element) => ({
+      disabled: element.disabled,
+    }));
+    assert(sendState.disabled === false, '链运行中发送按钮必须可用（R.8）');
+    await page.type('[data-testid="group-input"]', '第二条（链中追加）');
+    await clickByTestId(page, 'group-send');
+    await waitForRpcCount('group.send', beforeSends + 2);
+    const sends = responseLog
+      .filter((entry) => entry.method === 'group.send')
+      .slice(beforeSends);
+    obs('两次 group.send 回包', sends.map((entry) => entry.result));
+    assert(sends.length >= 2, '链运行中第二次发送也必须真正发出');
+    for (const entry of sends) {
+      assert(
+        entry.result?.status === 'started',
+        `group.send 永不 busy，实测 ${JSON.stringify(entry.result)}`,
+      );
+      assert(entry.result?.status !== 'busy', '不得出现 busy 回包');
+    }
+    const chainBefore = responseLog.filter((entry) => entry.method === 'group.chain').length;
+    await fetch(`${staticServer.url}__release_send`);
+    // 两条请求各一条链（两条 group.chain.completed）；等 App 重拉两次再断言终态，
+    // 避免恰好落在"链 1 结束、链 2 还没开始"的空隙。
+    await waitForRpcCount('group.chain', chainBefore + 2);
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="reaction-active"]') === null,
+      { timeout: 20000 },
+    );
+    const chainResponse = responseLog.filter((entry) => entry.method === 'group.chain').at(-1);
+    obs('连发后的链终态', chainResponse?.result);
+    assert(
+      chainResponse?.result?.status === 'completed',
+      `连发后链应优雅结束，实测 ${JSON.stringify(chainResponse?.result?.status)}`,
+    );
+  } finally {
+    // 即使断言失败也放掉 gate：否则后续用例会被一条永远挂着的链拖死。
+    await fetch(`${staticServer.url}__release_send`).catch(() => {});
+    await page.close();
+  }
+});
+
+await run('9.9 R.10 结构化沉默：passed 步骤不写公开行、链 all_passed', async () => {
+  await seedReactionGroup('反应组结构化沉默');
+  const page = await openPage();
+  try {
+    await openExistingGroup(page, '反应组结构化沉默');
+    const before = responseLog.filter((entry) => entry.method === 'group.send').length;
+    await page.type('[data-testid="group-input"]', '随便聊聊 #pass');
+    await clickByTestId(page, 'group-send');
+    await waitForRpcCount('group.send', before + 1);
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="reaction-active"]') === null,
+      { timeout: 15000 },
+    );
+    const chainResponse = responseLog.filter((entry) => entry.method === 'group.chain').at(-1);
+    obs('结构化沉默链终态', chainResponse?.result);
+    const steps = chainResponse?.result?.steps ?? [];
+    assert(steps.length > 0, '链必须有 steps');
+    assert(
+      steps.every((step) => step.status === 'passed'),
+      `#pass 的步骤必须全部是 passed，实测 ${JSON.stringify(steps.map((s) => s.status))}`,
+    );
+    assert(
+      chainResponse?.result?.stopReason === 'all_passed',
+      `结构化沉默应收敛为 all_passed，实测 ${JSON.stringify(chainResponse?.result?.stopReason)}`,
+    );
+    const timelineText = await page.$eval(
+      '[data-testid="group-timeline"]',
+      (element) => element.textContent,
+    );
+    assert(
+      !timelineText.includes('的公开结论'),
+      'passed 步骤不得写任何成员公开行（结构化沉默不占时间线）',
+    );
+  } finally {
+    await page.close();
+  }
+});
+
+// GROUP_SHOT=<path>：测试跑完后把真实组视图截一张图（视觉验收用）。
+if (process.env.GROUP_SHOT) {  const page = await openPage();
   try {
     await page.waitForSelector('[data-testid="session-list"]', { timeout: 15000 });
     await page.evaluate(() => {

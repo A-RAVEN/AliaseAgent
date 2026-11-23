@@ -159,14 +159,14 @@ web 客户端本身是独立子项目，回退到最少形态就是恢复 `web/s
 | 方法 | 参数 | 返回 |
 |---|---|---|
 | `core.ping` | 无 | `{ok, service, protocolVersion, pid}` |
-| `session.list` | 无 | `{sessions: [{id,title,agentType,parentSessionId,createdAt,updatedAt,kind,overrides}]}`（只含顶层会话，按最近更新倒序）；「kind」 为 「single」 / 「group」，客户端据此分流到聊天屏或组视图 |
+| `session.list` | 无 | `{sessions: [{id,title,agentType,parentSessionId,createdAt,updatedAt,kind,overrides,reactionsEnabled}]}`（只含顶层会话，按最近更新倒序）；「kind」 为 「single」 / 「group」，客户端据此分流到聊天屏或组视图；`reactionsEnabled` 组与单会话都写（客户端只对组使用） |
 | `session.create` | `{title?, agentType?}` | `{session}`；`agentType` 必须是已存在的模板 |
 | `session.delete` | `{sessionId}` | `{sessionId, deleted}`；删除进行中的切换被拒（阶段 deleting） |
 | `session.rename` | `{sessionId, title}` | `{session}`；不存在的会话 → 可归因 `-32602` |
 | `session.switchTemplate` | `{sessionId, templateName}` | `{sessionId, agentType, templateName}`；失败消息含阶段与候选名 |
 | `message.query` | `{sessionId, pageSize, anchor?, cursor?, before?}` | `{sessionId,pageSize,messages,nextCursor,prevCursor}`。`pageSize` **请求方必填且为正整数**，缺参/非法返回 `-32602`；核心不提供默认页大小，也不发明上限。`anchor`：`tail`（缺省，取**最新一页**）或 `head`（从最旧开始）；`cursor` = 上一页的 `nextCursor`（前向，seq 升序）；`before` = 上一页的 `prevCursor`（反向，取更早一页）；`cursor` 与 `before` 不能同时出现。`prevCursor` 是本页首条 seq（没有更早页时为 null）。 |
 | `agent.send` | `{sessionId, text, attachments?}` | `{sessionId,status,finalText,error,metering}`；复用 `Agent.send` / `AgentFactory.ensure`。 |
-| `agent.cancel` | `{sessionId, memberId?}` | `{sessionId,cancelled,reason?,memberId?,groupId?}`。单会话按实例表；**组会话按组路由**：组内没有成员在运行时说明「该组当前没有成员在运行」（不是"查不到实例"），有成员在运行时取消它并返回 `memberId`；带 `memberId` 时只取消该成员，不在运行则指名（**不静默成功**）。 |
+| `agent.cancel` | `{sessionId, memberId?}` | `{sessionId,cancelled,reason?,memberId?,groupId?,reactionChainStopped?}`。单会话按实例表；**组会话按组路由**：链运行中停整条反应链并回 `reactionChainStopped: true`（带当前成员）；带 `memberId` 且该成员**在链里排队未轮到** ⇒ 停链但 `cancelled:false`（不谎报）；带 `memberId` 且该成员既不在链里也没在运行 ⇒ 「当前没有在运行」，链继续；组内没有成员在运行时说明「该组当前没有成员在运行」（不是"查不到实例"）。 |
 | `config.get` | 无 | `{missing, configPath, providers, agentTypes, tools}`；**api_key 不回显**（只给 hasApiKey） |
 | `config.save` | `{providers}` | `{config}`；整份 provider 表（没提交的现存 provider = 删除），支持 `rename_from` 改名级联与向导写目录 |
 | `provider.probe` | `{providerName}` | 探测报告（新增/更新/移除/丢弃 + `discovered_at`），成功写回目录 |
@@ -176,14 +176,25 @@ web 客户端本身是独立子项目，回退到最少形态就是恢复 `web/s
 | `template.delete` | `{templateName}` | `{templateName, deleted}`；general 不可删、被会话引用拒删（名单在错误里） |
 | `attachment.upload` | `{filename, base64}` | `{path, bytes, format, mediaType, width, height}`；单张上限与文件头魔数校验见管理屏文档 |
 | `attachment.read` | `{path}` | `{path, bytes, base64, mediaType}`；只读附件目录内文件 |
-| `group.create` | `{title?, workspace?}` | `{group}`；建组并建立组上下文（「workspace」 缺省 = 产品既有缺省工作区） |
-| `group.list` | 无 | `{groups:[{...session, members:[{id,name,template,removedAt,overrides,effective}]}]}`；含已移除成员 |
-| `group.delete` | `{groupId}` | `{groupId, deleted:true}`；先取消并销毁成员实例，成员/消息/摘要随外键级联删除 |
+| `group.create` | `{title?, workspace?, reactionsEnabled?, maxRounds?}` | `{group}`；建组并建立组上下文（「workspace」 缺省 = 产品既有缺省工作区）；`reactionsEnabled` 省略 = 新建组**开启**自发反应（取布尔 true），显式 false 落 0；`maxRounds` 省略 / 显式 null = 产品默认 8，范围 1..50，越界 / 非整数 ⇒ `-32602` |
+| `group.update` | `{groupId, reactionsEnabled?, maxRounds?}` | `{group}`；改组的运行设置（**至少给一个字段**）。`reactionsEnabled` 必须布尔；`maxRounds` 必须是 1..50 的整数或**显式 null**（恢复默认；字段缺席 = 不改）。缺字段 / 类型不对 / 越界 ⇒ `-32602`（指明字段）；组不存在 ⇒ 带 `groupId` 的可归因错误；反应链运行中 ⇒ 可归因 busy（不排队、值不变） |
+| `group.chain` | `{groupId}` | `{groupId, sessionId, status, triggerSeq, rounds, stopReason, steps}`；当前 / 最近一条链的只读状态。`status ∈ {idle, running, completed, cancelled, failed}`（`idle` = 本进程内还没有链，核心重启后回到它）；`stopReason ∈ {all_passed, round_cap, cancelled, failed, no_members}`（运行中为 null）；`rounds` 只计反应轮；`steps` 是 0..N 条观察数据（**不是第二份消息存储**） |
+| `group.list` | 无 | `{groups:[{...session, reactionsEnabled, maxRounds, busy, runningMemberId, members:[{id,name,template,removedAt,overrides,effective}]}]}`；含已移除成员；`maxRounds` 是整数或 null；`busy` 是布尔、`runningMemberId` 是当前运行成员或 null（成员间隙为 null），供断线重连后恢复「链在跑」 |
+| `group.delete` | `{groupId}` | `{groupId, deleted:true}`；先停反应链、再取消并销毁成员实例，成员/消息/摘要随外键级联删除 |
 | `group.member.add` | `{groupId, name, templateName, overrides?}` | `{groupId, member}`；重名/空名/未知模板/非法覆盖层都可归因拒绝 |
-| `group.member.remove` | `{groupId, memberId}` | `{groupId, memberId, removed:true}`；软删（行与历史保留，同名重建是新 id） |
-| `group.member.update` | `{groupId, memberId, name?, templateName?, overrides?, clearOverrides?}` | `{groupId, member}`；原地改（id 不变）并重建实例 |
-| `group.send` | `{groupId, speaker, text?}` | `{groupId, sessionId, status, memberId, finalText, error}`；「speaker」 必须是一个成员 id（缺 = `-32602`）；组级单运行门，busy 是结构化结果；不带 `text` 时有两个前置门（空视图 / 本人 assistant 结尾） |
-| `group.view` | `{groupId, memberId}` | `{groupId, memberId, snapshot\|null}`；只给该成员**本次运行内**最近一次真实发出的快照（重启后为空） |
+| `group.member.remove` | `{groupId, memberId}` | `{groupId, memberId, removed:true}`；先停反应链，再软删（行与历史保留，同名重建是新 id） |
+| `group.member.update` | `{groupId, memberId, name?, templateName?, overrides?, clearOverrides?}` | `{groupId, member}`；先停反应链，原地改（id 不变）并重建实例 |
+| `group.send` | `{groupId, speaker?, text?}` | **异步且永不 busy**：`{groupId, sessionId, status, triggerSeq}`。`speaker` **可选**（出现时必须是非空字符串，类型/空串不对 ⇒ `-32602`）：省略 = 开启态纯触发反应链 / 关闭态按用户文本里的 `@mention` 定向。完成同步前置校验与用户消息写入后**立刻**回 `status: started`（`triggerSeq` = 用户消息 seq；`speaker`-only 时为 null）；执行器运行中再发也**照常接受**（入队/被吸收），不会回 `busy`，也不会改写到别人。结果**不带** `steps` / `rounds` / `finalText` / `memberId` —— 链进度查 `group.chain`，终态看 `group.chain.completed` |
+| `group.view` | `{groupId, memberId}` | `{groupId, memberId, snapshot\|null}`；只给该成员**本次运行内**最近一次真实发出的快照（**反应轮也算真实发出**；重启后为空） |
+
+`group.chain` 的 `steps` 每条：`source ∈ {speaker, mention, reaction}`、
+`status ∈ {replied, passed, forced_pass, forced_empty, empty, failed, cancelled}`，另有
+`memberId`/`triggerSeq`/`publicSeq`/`finalText`/`error` —— 它是观察/测试用的结果描述，
+**不是第二份消息存储**。状态由**结构化 PASS** 派生：反应轮注入 `group_react
+{pass:boolean, message:string}` 终态工具，`pass=true` → `passed`（被点名 → `forced_pass`），
+`pass=false` 且 `message` 非空 → `replied`，`pass=false` 且空 `message` → `empty`
+（被点名 → `forced_empty`），缺调用 / 参数非法 → `failed`（`missing_group_react` /
+`invalid_group_react`，不回退 `[PASS]` 文本匹配）。
 
 > 管理类方法的参数 / 返回细节、以及各管理屏怎么操作，见
 > [web 管理屏](web-management.md) 的「管理 RPC 表」。
@@ -207,6 +218,17 @@ web 客户端本身是独立子项目，回退到最少形态就是恢复 `web/s
   判"整轮还在生成"要用 `agent.streaming`，不要用 `turn.completed`。
 - `context.snapshot`（含窗口、占用拆分 breakdown、**逐条技能失败明细** `skillFailures`）
 - `compaction.status`、`session.title`、`agent.metering`
+
+**组成员身份（change `group-reactive-mode`）**：
+
+- **成员运行**产生的事件在 `sessionId` 之外带 `groupId` 与 `memberId`（流式/工具/消息事件都带）；
+- **组服务自己写入**的用户消息也发 `user.message`，但只带 `sessionId` + `groupId`，
+  **不带 `memberId`**（这条消息没有成员作者，不伪造身份）；标题变化同理由组服务发 `session.title`；
+- **唯一新增的事件类型是 `group.chain.completed`**：一条链进入任意终态时发一次，payload 为
+  `{status, stopReason, rounds, triggerSeq}`（外层带 `groupId` / `sessionId`）；`steps` **不塞
+  进事件**，需要时查 `group.chain`。其余反应链事件仍复用既有类型；
+- `forced_pass` / `forced_empty` **不用 `turn.failed`** 表达（它们不是整轮失败），只在
+  `group.chain` 的 `steps` 里可观察。
 
 ## 测试
 

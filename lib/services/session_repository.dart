@@ -33,12 +33,22 @@ class SessionRepository {
   /// [kind]：`single`（缺省，变更前的行为）或 `group`（组会话，单 Agent 入口一律
   /// 拒绝/路由，见 `agent-group-chat` D16）。[overridesJson]：会话级覆盖层文本
   /// （单会话用；成员覆盖层在成员行里）。
+  ///
+  /// [reactionsEnabled]：组的**自发反应开关**（change `group-reactive-mode` D1 / D8）。
+  /// 省略 = `true`（**新建组默认开启**；传 `false` 才是安静态）。单会话行也写该值，
+  /// 但它不改变单 Agent 的任何行为。
+  ///
+  /// [maxRounds]：组的**反应轮数上限**（change `group-reactive-mode` R.1 / D13）。
+  /// 省略 / `null` = 用产品默认 [kDefaultMaxReactionRounds]（列写 NULL）。范围校验在
+  /// `group.create` / `group.update` 的入口做（`-32602`），仓储只负责如实写入。
   Future<Session> create({
     String? title,
     String? agentType,
     String? parentSessionId,
     String kind = Session.kindSingle,
     String? overridesJson,
+    bool reactionsEnabled = true,
+    int? maxRounds,
   }) async {
     final db = await DatabaseService.database;
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -51,6 +61,8 @@ class SessionRepository {
       updatedAt: now,
       kind: kind,
       overridesJson: overridesJson,
+      reactionsEnabled: reactionsEnabled,
+      maxRounds: maxRounds,
     );
     await db.insert('sessions', session.toRow());
     return session;
@@ -95,11 +107,20 @@ class SessionRepository {
         where: 'id = ?', whereArgs: [id]);
   }
 
-  /// Updates the session title from the first user message if it's still the
-  /// default "New Chat". Returns true if the title was updated.
+  /// Updates the session title from the first user message if it's still a
+  /// **默认标题**. Returns true if the title was updated.
+  ///
+  /// 缺省判据**按 kind 泛化**（change `group-reactive-mode` D2 / 任务 3.4）：
+  /// 组会话的缺省标题是 `新组`（`GroupService.createGroup` 写的），单会话仍是
+  /// `New Chat`。两边都同时认这两个串 —— 否则组的标题永远停在「新组」。
+  /// 标题**不是**缺省值 = 用户已经命名过，不覆盖。
   Future<bool> updateTitleIfDefault(String id, String text) async {
     final session = await get(id);
-    if (session == null || session.title != 'New Chat') return false;
+    if (session == null) return false;
+    final defaults = session.isGroup
+        ? const {'新组', 'New Chat'}
+        : const {'New Chat'};
+    if (!defaults.contains(session.title)) return false;
     final title = text.length > 30 ? '${text.substring(0, 30)}...' : text;
     await updateTitle(id, title);
     return true;
@@ -119,6 +140,29 @@ class SessionRepository {
   Future<void> updateOverrides(String id, String? json) async {
     final db = await DatabaseService.database;
     await db.update('sessions', {'overrides_json': json},
+        where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// 原地更新组的**自发反应开关**（`sessions.reactions_enabled`，change
+  /// `group-reactive-mode` D1 / D8 第 6 条；`group.update` 的唯一写入口）。
+  ///
+  /// 只做这一件事：不碰标题、模板、覆盖层，也不改 `updated_at`（它是组的持久属性，
+  /// 不是"会话最近活动"）。是否允许在链运行中改由组服务判定（它拿得到链状态）。
+  Future<void> updateReactionsEnabled(String id, bool enabled) async {
+    final db = await DatabaseService.database;
+    await db.update('sessions', {'reactions_enabled': enabled ? 1 : 0},
+        where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// 原地更新组的**反应轮数上限**（`sessions.max_reaction_rounds`，change
+  /// `group-reactive-mode` R.1 / D13；`group.update` 的写入口）。
+  ///
+  /// [maxRounds] 为 `null` = **恢复默认**（列写 NULL，链下次用
+  /// [kDefaultMaxReactionRounds]）。与 `updateReactionsEnabled` 同口径：只写这一列，
+  /// 不碰标题/模板/覆盖层/`updated_at`；范围与链运行中的判定在组服务 / RPC 层做。
+  Future<void> updateMaxRounds(String id, int? maxRounds) async {
+    final db = await DatabaseService.database;
+    await db.update('sessions', {'max_reaction_rounds': maxRounds},
         where: 'id = ?', whereArgs: [id]);
   }
 

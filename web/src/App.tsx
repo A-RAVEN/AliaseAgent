@@ -29,6 +29,7 @@ import {
   type ConnectionStatus,
   type Session,
   type GroupListResult,
+  type GroupChainResult,
   type GroupSummary,
   type GroupViewResult,
   type Message,
@@ -80,6 +81,15 @@ export default function App() {
   const [groupSnapshots, setGroupSnapshots] = useState<Record<string, SnapshotEventData | null>>({});
   const [groupToolNames, setGroupToolNames] = useState<string[]>([]);
   const [groupEfforts, setGroupEfforts] = useState<string[]>([]);
+  // 正在流式的成员 id（change `group-reactive-mode` D10）：`agent.streaming` 事件按
+  // `memberId` 记，驱动分栏的「正在反应…」与取消按钮的可用性。断线重连后它清空，
+  // 但 `group.list` 的 `busy` / `runningMemberId` 仍能恢复「链在跑」的判断。
+  const [groupStreamingMembers, setGroupStreamingMembers] = useState<string[]>([]);
+  // 当前 / 最近一条链（change `group-reactive-mode` R.4）：`group.chain` 重拉 + 事件驱动。
+  // 它让「发送态」在 `started` 后立即解除，同时仍能显示「链在跑」并启用取消。
+  const [groupChain, setGroupChain] = useState<GroupChainResult | null>(null);
+  // `group.chain.completed` 事件计数：只在事件到达时给一次性提示（刷新不显示）。
+  const [groupChainCompletedTick, setGroupChainCompletedTick] = useState(0);
   const currentSessionIdRef = useRef<string | null>(null);
   const requestedAttachments = useRef<Set<string>>(new Set());
 
@@ -215,6 +225,8 @@ export default function App() {
   const loadGroup = useCallback(
     async (sessionId: string) => {
       try {
+        // 成功拉到组数据 ⇒ 清掉上一次的错误横幅（组模式下它就是唯一错误出口）。
+        setError(null);
         const list = await client.request<GroupListResult>('group.list');
         const summary = list.groups.find((entry) => entry.id === sessionId) ?? null;
         setGroupSummary(summary);
@@ -240,6 +252,17 @@ export default function App() {
           }
         }
         setGroupSnapshots(snapshots);
+        // 链状态（R.4 / D10）：重连后本地 `sending` 已丢，靠 `group.chain` 恢复
+        // 「链在跑」与取消按钮；核心重启后它是 `idle`（既定语义）。
+        try {
+          setGroupChain(
+            await client.request<GroupChainResult>('group.chain', {
+              groupId: sessionId,
+            }),
+          );
+        } catch {
+          setGroupChain(null);
+        }
       } catch (groupError: unknown) {
         setError(`加载组视图失败：${errorText(groupError)}`);
       }
@@ -305,10 +328,37 @@ export default function App() {
     // 组事件按 payload（groupId/memberId）归位：消息类事件到达时重拉组数据，
     // 不依赖 DOM 选中的分栏（design D11 的 payload 判据）。
     if (event.groupId && event.groupId === currentSessionIdRef.current) {
+      if (event.type === 'agent.streaming') {
+        // 流式指示按 `memberId` 归位（change `group-reactive-mode` D10）：
+        // 它不是"消息事件"，不需要重拉数据，但决定"谁正在反应"。
+        const memberId = event.memberId;
+        if (memberId) {
+          const streaming = (event.data ?? {}).streaming === true;
+          setGroupStreamingMembers((previous) => {
+            const next = new Set(previous);
+            if (streaming) next.add(memberId);
+            else next.delete(memberId);
+            return [...next];
+          });
+        }
+        return;
+      }
+      if (event.type === 'group.chain.completed') {
+        // 链进入终态：重拉组数据 + `group.chain`（steps 在后者里），并让组视图给
+        // 一次性提示（`round_cap` / `forced_pass`）。refresh 之后再 bump tick，
+        // 保证提示读到的 `chain` 是本次终态（change `group-reactive-mode` R.4）。
+        const groupId = event.groupId;
+        void (async () => {
+          await loadGroup(groupId);
+          setGroupChainCompletedTick((tick) => tick + 1);
+        })();
+        return;
+      }
       if (
         event.type === 'user.message' ||
         event.type === 'assistant.message' ||
-        event.type === 'turn.completed'
+        event.type === 'turn.completed' ||
+        event.type === 'session.title'
       ) {
         void loadGroup(event.groupId);
       }
@@ -371,6 +421,14 @@ export default function App() {
       const sessionsResult = await client.request<{ sessions: Session[] }>('session.list');
       setSessions(sessionsResult.sessions);
       if (!sessionId) return;
+      // 组会话：重拉组数据恢复 `busy` / `runningMemberId`（本地 `sending` 与
+      // `streamingMembers` 在断线时都丢了，取消按钮靠核心的只读状态恢复可用）。
+      const current = sessionsResult.sessions.find((session) => session.id === sessionId);
+      if (current?.kind === 'group') {
+        setGroupStreamingMembers([]);
+        await loadGroup(sessionId);
+        return;
+      }
       const page = await loadInitialPage(
         (method, params) => client.request(method, params),
         sessionId,
@@ -383,7 +441,7 @@ export default function App() {
     } catch (refreshError: unknown) {
       setError(errorText(refreshError));
     }
-  }, [client]);
+  }, [client, loadGroup]);
 
   useEffect(() => {
     const offStatus = client.onStatus(setStatus);
@@ -418,6 +476,10 @@ export default function App() {
     setSkillFailures([]);
     setMetering(null);
     setError(null);
+    setGroupStreamingMembers([]);
+    // 链状态由 loadGroup 重拉重置；`groupChainCompletedTick` 是**单调计数**，不在这里
+    // 归零（归零会让组视图的"上次已提示"游标卡住，事件再也不会触发一次性提示）。
+    setGroupChain(null);
     try {
       const selected = sessions.find((session) => session.id === sessionId);
       if (selected?.kind === 'group') {
@@ -585,6 +647,10 @@ export default function App() {
           templates={templates}
           thinkingEfforts={groupEfforts}
           toolNames={groupToolNames}
+          streamingMembers={groupStreamingMembers}
+          chain={groupChain}
+          chainCompletedTick={groupChainCompletedTick}
+          error={error}
           onReload={() => loadGroup(groupSummary.id)}
           onError={(message) => setError(message)}
         />

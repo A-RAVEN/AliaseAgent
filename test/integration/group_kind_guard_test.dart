@@ -125,6 +125,8 @@ void main() {
       'speaker': memberId,
       'text': '甲说一句',
     });
+    // 异步发送（change `group-reactive-mode` R.7）：等链终态再读成员请求。
+    await harness.waitForChain(groupId);
     final memberRequest = harness.sidecar.lastMessagesJson ?? '';
     expect(memberRequest, contains('PRIVATE-ONLY-MARK'),
         reason: '反证：甲自己的请求里私有证据仍在');

@@ -239,3 +239,25 @@ Vite 环境变量（`VITE_BOTTOM_THRESHOLD_PX`、`VITE_RECONNECT_BASE_MS`、
 - 编辑成员覆盖层（`group.member.update`）会**重建实例**，使新的工具清单与提示词在下一轮
   立即生效；模型与上下文窗口保持模板级冻结，覆盖层不能改它们。
 - 单 agent 会话与群成员走**同一条**解析路径。
+
+## 组的运行设置（不是 config.json 键）
+
+群聊（组会话）有两个**按组**保存的运行设置。它们存在 `sessions` 表的两列里，**不是**
+`config.json` 键 —— 配置文件的任何段里都不该出现这两个名字：
+
+| 设置 | 存储列 | JSON 字段 | 取值 | 默认 |
+| --- | --- | --- | --- | --- |
+| 自发反应开关 | `reactions_enabled` | `reactionsEnabled` | 布尔（1 = 开，0 = 关） | 新建组**开**；从 v9 升级上来的旧组**关**（保留旧点名体验，可在组视图打开） |
+| 反应轮数上限 | `max_reaction_rounds` | `maxRounds` | 整数 1..50，或 NULL | NULL = 产品默认 **8** |
+
+- 上限是**每组**设置，只计反应轮，而且是**每条用户触发一份预算**：用户新发一条消息把
+  `rounds` 重置为 0，agent 自己的公开回复不重置；被点名（`speaker` / `@提及`）的定向轮
+  不计数、不被拦截。预算耗尽且没有排队的用户请求时链以 `stopReason = round_cap` 优雅停止
+  （不是报错）。
+- 界面在 web 组视图右上角：开关 + 「反应轮数上限」数字输入框（为 NULL 时留空并以「默认 8」
+  占位；留空保存 = 恢复默认）。
+- 改这两个设置走 `group.update`（`reactionsEnabled` / `maxRounds`；`maxRounds` 显式「null」
+  = 恢复默认，字段缺席 = 不改）；反应链运行中返回可归因 busy，不排队。
+- 它们的**默认值与范围是代码常量**（`kDefaultMaxReactionRounds = 8`、
+  `kMinMaxReactionRounds = 1`、`kMaxMaxReactionRounds = 50`），不是配置项；想改默认值只能
+  改代码并重新构建，不要指望在 `config.json` 里加键。

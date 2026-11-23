@@ -231,6 +231,26 @@ class _Ws {
   }
 }
 
+/// 轮询 `group.chain` 到终态（异步发送契约；change `group-reactive-mode` R.6 / R.7）。
+///
+/// [limit] 是**测试侧**上界（各调用点的推导公式在注释里）；它是保护，不是产品上限。
+Future<Map<String, dynamic>> _waitChain(
+    _Ws ws, String groupId, Duration limit) async {
+  final deadline = DateTime.now().add(limit);
+  while (true) {
+    final response = await ws.request('group.chain', {'groupId': groupId});
+    final error = response['error'];
+    if (error != null) throw StateError('group.chain 失败：$error');
+    final chain = Map<String, dynamic>.from(response['result'] as Map);
+    if (chain['status'] != 'running') return chain;
+    if (DateTime.now().isAfter(deadline)) {
+      throw TimeoutException(
+          '组 "$groupId" 的链没有在 $limit 内进入终态（当前 $chain）', limit);
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+  }
+}
+
 void main() {
   test('真实模型下的组：甲的私有标记不进乙的视图/快照/摘要输入；相邻 user 轮不报错',
       () async {
@@ -261,6 +281,8 @@ void main() {
     final recorded = _RecordingSidecar(SidecarBridge.instance);
     HeadlessCore? core;
     _Ws? ws;
+    // 清理用：**异步链未结束不得销毁侧车/删临时目录**（R.7），finally 里要等它。
+    String? chainGroupId;
     try {
       core = await HeadlessCoreRunner.start(
         configPath: configPath,
@@ -279,8 +301,14 @@ void main() {
       final created = await ws.request('group.create', {
         'title': 'live 组',
         'workspace': workspace,
+        // **本用例刻意建关闭态组**（change `group-reactive-mode` 任务 0.3）：
+        // 它验的是「点名一个成员 → 只有他跑」的旧语义（私有证据、相邻 user 轮、
+        // 文件指针），自发反应会让额外成员在真模型下接话、烧钱且让断言面变得
+        // 不可归因。自发反应的真模型验收在 `group_reaction_live_test.dart`。
+        'reactionsEnabled': false,
       });
       final groupId = (created['result'] as Map)['group']['id'] as String;
+      chainGroupId = groupId;
       final groupWorkspace = recorded.getWorkspace(groupId);
       _obs('组工作区', groupWorkspace.workspace);
       expect(p.normalize(groupWorkspace.workspace ?? ''), p.normalize(workspace));
@@ -310,7 +338,11 @@ void main() {
             '然后用一句自包含的公开结论回复，带上文件路径。',
       });
       _obs('甲的结果', sendA['result']);
-      expect((sendA['result'] as Map)['status'], 'completed');
+      // 异步契约（change group-reactive-mode R.7）：send 只回 started，链终态查 group.chain。
+      expect((sendA['result'] as Map)['status'], 'started');
+      final chainA = await _waitChain(ws, groupId, const Duration(minutes: 5));
+      _obs('甲的链终态', { 'status': chainA['status'], 'stopReason': chainA['stopReason'] });
+      expect(chainA['status'], isNot('failed'));
 
       // 打印实际工具调用（从后续请求的 tool_use 回放里读）与两次请求差异。
       final aRequests = recorded.requests
@@ -336,7 +368,10 @@ void main() {
         'text': '请复述一下甲说了什么，并确认 note-a.txt 是否存在。',
       });
       _obs('乙的结果', sendB['result']);
-      expect((sendB['result'] as Map)['status'], 'completed');
+      expect((sendB['result'] as Map)['status'], 'started');
+      final chainB = await _waitChain(ws, groupId, const Duration(minutes: 5));
+      _obs('乙的链终态', { 'status': chainB['status'], 'stopReason': chainB['stopReason'] });
+      expect(chainB['status'], isNot('failed'));
 
       final bRequests = recorded.requests
           .where((r) => r.handle == '$groupId::$bId')
@@ -443,14 +478,45 @@ void main() {
           .toList();
       _obs('turn.failed 事件', failures);
       expect(failures, isEmpty, reason: '相邻 user 轮不得导致接口报错');
-      // 组事件带身份。
+      // 组事件带身份。**按事件类型断言**（change `group-reactive-mode` 任务 0.3 / R.2）：
+      // 成员运行事件必须带 memberId；组服务自己写入的用户消息（异步契约下**所有**发送
+      // 都由组服务写）没有成员可归，允许为空 —— 判据按类型分流。
+      const memberRunTypes = {
+        'assistant.message',
+        'assistant.chunk',
+        'tool.call',
+        'tool.result',
+        'agent.streaming',
+        'turn.completed',
+        'context.snapshot',
+        'agent.metering',
+        'thinking.delta',
+        'thinking.block',
+        'session.title',
+      };
       final groupEvents = ws.events.where((event) => event['groupId'] == groupId);
       expect(groupEvents, isNotEmpty);
       for (final event in groupEvents.take(5)) {
         _obs('事件身份', '${event['type']}/${event['memberId']}');
-        expect(event['memberId'], isNotNull);
+      }
+      for (final event in groupEvents) {
+        if (!memberRunTypes.contains(event['type'])) continue;
+        expect(event['memberId'], isNotNull,
+            reason: '成员运行事件（${event['type']}）必须带 memberId，payload='
+                '${event['data']}');
       }
     } finally {
+      // R.7：**异步链未结束不得销毁侧车 / 删临时目录**。这里先尝试等链进入终态；
+      // 1 分钟是"没有实测单轮耗时可用时"的清理保护（不是产品上限），超时也继续清理
+      // （不掩盖原来的失败）。
+      if (ws != null && chainGroupId != null) {
+        try {
+          await _waitChain(ws, chainGroupId, const Duration(minutes: 1));
+        } catch (waitError) {
+          // ignore: avoid_print
+          print('[OBS] 清理前等链终态失败（已继续清理）：$waitError');
+        }
+      }
       await ws?.close();
       await core?.stop();
       try {

@@ -669,6 +669,38 @@ void main() {
       _obs('turn.failed payload', failed);
       expect('${failed['error']}', contains('provider exploded'));
     });
+
+    // ---------------------------------------------------------------------
+    // 群聊：group.update（change `group-reactive-mode` 任务 4.2）
+    // ---------------------------------------------------------------------
+
+    test('group.update 已注册：改开关回读、缺字段 -32602', () async {
+      // 注册表与清单一致（漏注册在核心启动时就抛 StateError，这里再核一次）。
+      expect(harness.core.rpcMethods, kCoreRpcMethodNames);
+      expect(harness.core.rpcMethods, contains('group.update'));
+      // 异步链的查询方法（change `group-reactive-mode` R.3）：清单与实现一致。
+      expect(kCoreRpcMethodNames, contains('group.chain'));
+      expect(harness.core.rpcMethods, contains('group.chain'));
+
+      final created = await harness.ws.request('group.create', {
+        'title': 'web 组',
+        'reactionsEnabled': true,
+      });
+      final groupId = (created['result'] as Map)['group']['id'] as String;
+      final updated = await harness.ws.request('group.update', {
+        'groupId': groupId,
+        'reactionsEnabled': false,
+      });
+      _obs('group.update 响应', updated);
+      expect(((updated['result'] as Map)['group'] as Map)['reactionsEnabled'],
+          isFalse);
+
+      final missing = await harness.ws.request('group.update', {
+        'groupId': groupId,
+      });
+      _obs('缺字段错误', missing['error']);
+      expect((missing['error'] as Map)['code'], -32602);
+    });
   });
 
   group('会话与消息分页（任务 3.1 / 3.2）', () {

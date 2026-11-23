@@ -8,7 +8,7 @@ class FakeSessionRepository implements SessionRepository {
   FakeSessionRepository(this.sessions);
 
   @override
-  Future<Session> create({String? title, String? agentType, String? parentSessionId, String kind = Session.kindSingle, String? overridesJson}) async {
+  Future<Session> create({String? title, String? agentType, String? parentSessionId, String kind = Session.kindSingle, String? overridesJson, bool reactionsEnabled = true, int? maxRounds}) async {
     final s = Session(
       id: 'new-${sessions.length}',
       title: title ?? 'New Chat',
@@ -18,6 +18,8 @@ class FakeSessionRepository implements SessionRepository {
       updatedAt: DateTime.now().millisecondsSinceEpoch,
       kind: kind,
       overridesJson: overridesJson,
+      reactionsEnabled: reactionsEnabled,
+      maxRounds: maxRounds,
     );
     sessions.insert(0, s);
     return s;
@@ -46,6 +48,8 @@ class FakeSessionRepository implements SessionRepository {
       updatedAt: old.updatedAt,
       kind: old.kind,
       overridesJson: json,
+      reactionsEnabled: old.reactionsEnabled,
+      maxRounds: old.maxRounds,
     );
   }
 
@@ -72,10 +76,30 @@ class FakeSessionRepository implements SessionRepository {
   @override
   Future<bool> updateTitleIfDefault(String id, String text) async {
     final s = await get(id);
-    if (s == null || s.title != 'New Chat') return false;
+    if (s == null) return false;
+    // 缺省判据按 kind 泛化（与真仓库同口径）：组认「新组」与「New Chat」，单会话认后者。
+    final defaults = s.isGroup ? const {'新组', 'New Chat'} : const {'New Chat'};
+    if (!defaults.contains(s.title)) return false;
     final title = text.length > 30 ? '${text.substring(0, 30)}...' : text;
     await updateTitle(id, title);
     return true;
+  }
+
+  @override
+  Future<void> updateReactionsEnabled(String id, bool enabled) async {
+    final i = sessions.indexWhere((s) => s.id == id);
+    if (i < 0) return;
+    sessions[i] = sessions[i].copyWith(reactionsEnabled: enabled);
+  }
+
+  @override
+  Future<void> updateMaxRounds(String id, int? maxRounds) async {
+    final i = sessions.indexWhere((s) => s.id == id);
+    if (i < 0) return;
+    // 显式 null = 恢复默认（`clearMaxRounds`；命名参数上 null 与"不传"不可区分）。
+    sessions[i] = maxRounds == null
+        ? sessions[i].copyWith(clearMaxRounds: true)
+        : sessions[i].copyWith(maxRounds: maxRounds);
   }
 
   @override

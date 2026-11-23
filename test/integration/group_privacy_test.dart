@@ -57,9 +57,10 @@ void main() {
     // ③ B 触发一次折叠：摘要请求输入（folded + 参考块）不含标记。
     // 先给 B 一个真实请求（B 的回合会先折叠）。
     harness.queueFinal('乙的公开结论');
-    final outcomeB = await harness.groups
+    await harness.groups
         .send(groupId: harness.group.id, memberId: b.id, text: '乙总结一下');
-    expect(outcomeB.status, 'completed');
+    // 异步发送：等链终态再断言折叠/快照（R.7）。
+    expect((await harness.waitForChain()).status, 'completed');
     final foldedB = harness.support.summary.lastFolded ?? const [];
     final foldedText = foldedB
         .map((m) => '${m.content}|${m.thinkingJson ?? ''}|${m.toolCallsJson ?? ''}')
@@ -92,9 +93,9 @@ void main() {
 
     // ④ 反证：A 自己的请求里标记仍在（近期私有行按 replay 出现在 A 的视图）。
     harness.queueFinal('甲的公开结论');
-    final outcomeA = await harness.groups
+    await harness.groups
         .send(groupId: harness.group.id, memberId: a.id, text: '甲也说一句');
-    expect(outcomeA.status, 'completed');
+    expect((await harness.waitForChain()).status, 'completed');
     final aRequest = harness.support.sidecar.lastMessagesJson ?? '';
     final aRaw = await harness.support.messageRepo.queryBySession(harness.group.id);
     final aView = GroupViewProjection.project(

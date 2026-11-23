@@ -19,9 +19,10 @@ void main() {
 
     // 甲先发言 → 触发甲的视图折叠。
     harness.queueFinal('甲的公开结论：lib/a.dart');
-    final outcomeA = await harness.groups
+    await harness.groups
         .send(groupId: harness.group.id, memberId: a.id, text: '甲总结一下');
-    expect(outcomeA.status, 'completed');
+    // 异步发送：等链终态再断言折叠产物（R.7）。
+    expect((await harness.waitForChain()).status, 'completed');
     final aNodes = await harness.summaryNodeRepo
         .queryBySession(harness.group.id, memberId: a.id);
     // ignore: avoid_print
@@ -30,9 +31,9 @@ void main() {
 
     // 乙接着发言 → 乙的视图自己折叠；不得取到甲的摘要作参考块。
     harness.queueFinal('乙的公开结论：lib/b.dart');
-    final outcomeB = await harness.groups
+    await harness.groups
         .send(groupId: harness.group.id, memberId: b.id, text: '乙总结一下');
-    expect(outcomeB.status, 'completed');
+    expect((await harness.waitForChain()).status, 'completed');
     final bNodes = await harness.summaryNodeRepo
         .queryBySession(harness.group.id, memberId: b.id);
     final allNodes = await harness.summaryNodeRepo

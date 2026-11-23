@@ -1,5 +1,22 @@
 import '../models/instance_overrides.dart';
 
+/// 组的**反应轮数上限**产品默认值（change `group-reactive-mode` R.1 / design D13）。
+///
+/// 依据（design D13）：典型 3 人群聊的 2–3 个来回约 4–6 个反应轮，再加 2 轮评价/回应
+/// 余量；不取 3（用户示例 3 层会把正常讨论截断），不取几十（默认就失去保险意义）。
+/// 它是**代码常量**，不是 `config.json` 键；`sessions.max_reaction_rounds` 为 NULL 时用它。
+const int kDefaultMaxReactionRounds = 8;
+
+/// 上限的合法下界（design D13：范围 1..50；0 / 负数被拒绝，不静默截断）。
+const int kMinMaxReactionRounds = 1;
+
+/// 上限的合法上界（design D13）。
+const int kMaxMaxReactionRounds = 50;
+
+/// 上限是不是一个可接受的显式值（组设置的唯一判据；`null` = 用默认，也合法）。
+bool isValidMaxReactionRounds(int? value) =>
+    value == null || (value >= kMinMaxReactionRounds && value <= kMaxMaxReactionRounds);
+
 class Session {
   /// 单 Agent 会话（缺省；变更前的所有会话都是它）。
   static const String kindSingle = 'single';
@@ -30,6 +47,26 @@ class Session {
   final int createdAt;
   final int updatedAt;
 
+  /// 组的**自发反应开关**（`sessions.reactions_enabled`，change
+  /// `group-reactive-mode` D1 / D8）。它是组的持久属性，不是 `config.json` 键。
+  ///
+  /// 三处口径（design D8 第 5 条）：
+  ///   - 构造函数缺省 `true`（**新建组默认开启**；点名不该是默认体验）；
+  ///   - `toRow` 写成 1/0；
+  ///   - `fromRow` 在**列缺失或为 null** 时按 `false` 解释（未迁移的旧库 / 手工夹具
+  ///     = 旧点名行为），列存在时按值解释。
+  ///
+  /// 单会话行也带这一列，但它不影响单 Agent 的任何行为（`group_reactive` 只读组行）。
+  final bool reactionsEnabled;
+
+  /// 组的**反应轮数上限**（`sessions.max_reaction_rounds`，可空；change
+  /// `group-reactive-mode` R.1 / design D13）。
+  ///
+  /// `null` = 用产品默认 [kDefaultMaxReactionRounds]（组设置，**不是** `config.json` 键）。
+  /// 范围 [kMinMaxReactionRounds]..[kMaxMaxReactionRounds]：越界由 `group.update` 拒绝
+  /// （`-32602`），不静默截断。单会话行也带该列，但值不影响单 Agent 行为。
+  final int? maxRounds;
+
   const Session({
     required this.id,
     required this.title,
@@ -39,6 +76,8 @@ class Session {
     required this.updatedAt,
     this.kind = kindSingle,
     this.overridesJson,
+    this.reactionsEnabled = true,
+    this.maxRounds,
   }) : assert(
           kind == kindSingle || kind == kindGroup,
           'kind 只能是 single 或 group：收到 "$kind"',
@@ -52,6 +91,13 @@ class Session {
 
   factory Session.fromRow(Map<String, dynamic> row) {
     final rawKind = row['kind'] as String?;
+    // `containsKey == false`（旧库缺列）与显式 null 都按 false 解释：那是「旧点名
+    // 行为」，不是新默认 true（design D8 第 5 条）。
+    final rawReactions = row['reactions_enabled'];
+    final reactionsEnabled = rawReactions is int && rawReactions != 0;
+    // 上限：缺列 / null 都读成 null（= 用产品默认，design D13）。
+    final rawMaxRounds = row['max_reaction_rounds'];
+    final maxRounds = rawMaxRounds is int ? rawMaxRounds : null;
     return Session(
       id: row['id'] as String,
       title: row['title'] as String,
@@ -61,6 +107,8 @@ class Session {
       updatedAt: row['updated_at'] as int,
       kind: kKindValues.contains(rawKind) ? rawKind! : kindSingle,
       overridesJson: row['overrides_json'] as String?,
+      reactionsEnabled: reactionsEnabled,
+      maxRounds: maxRounds,
     );
   }
 
@@ -73,6 +121,8 @@ class Session {
         'updated_at': updatedAt,
         'kind': kind,
         'overrides_json': overridesJson,
+        'reactions_enabled': reactionsEnabled ? 1 : 0,
+        'max_reaction_rounds': maxRounds,
       };
 
   Session copyWith({
@@ -81,6 +131,9 @@ class Session {
     int? updatedAt,
     String? overridesJson,
     bool clearOverrides = false,
+    bool? reactionsEnabled,
+    int? maxRounds,
+    bool clearMaxRounds = false,
   }) {
     return Session(
       id: id,
@@ -92,6 +145,10 @@ class Session {
       kind: kind,
       overridesJson:
           clearOverrides ? null : (overridesJson ?? this.overridesJson),
+      reactionsEnabled: reactionsEnabled ?? this.reactionsEnabled,
+      // `maxRounds: null` 与「不传」在命名参数上不可区分（同 `clearOverrides`
+      // 的先例）：要恢复默认显式传 `clearMaxRounds: true`。
+      maxRounds: clearMaxRounds ? null : (maxRounds ?? this.maxRounds),
     );
   }
 }

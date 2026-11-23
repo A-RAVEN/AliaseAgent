@@ -35,9 +35,10 @@ void main() {
 
     // 甲发言 ⇒ 甲的视图折叠。
     harness.queueFinal('甲的公开结论');
-    final outcomeA = await harness.groups
+    await harness.groups
         .send(groupId: harness.group.id, memberId: a.id, text: '甲先说');
-    expect(outcomeA.status, 'completed');
+    // 异步发送：等链终态再断言折叠产物（R.7）。
+    expect((await harness.waitForChain()).status, 'completed');
 
     // ① 折叠输入是视图：不含乙的私有标记，也不含乙的原文私有行对象。
     final foldedA = harness.support.summary.lastFolded ?? const [];
@@ -67,9 +68,9 @@ void main() {
 
     // ③ 乙发言 ⇒ 乙也折叠出自己的一条摘要。
     harness.queueFinal('乙的公开结论');
-    final outcomeB = await harness.groups
+    await harness.groups
         .send(groupId: harness.group.id, memberId: b.id, text: '乙再说');
-    expect(outcomeB.status, 'completed');
+    expect((await harness.waitForChain()).status, 'completed');
     final bNodes = await harness.summaryNodeRepo
         .queryBySession(harness.group.id, memberId: b.id);
     final allNodes = await harness.summaryNodeRepo

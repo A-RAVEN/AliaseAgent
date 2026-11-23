@@ -6,16 +6,26 @@
 //
 // 组件是**纯展示 + 动作**：数据由 App 注入（它在真实 WS 上拉 group.list /
 // message.query / group.view），动作直接走 `group.*` RPC 再让 App 重拉。
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import type {
   CoreClient,
+  GroupChainResult,
   GroupMemberSummary,
+  GroupSendResult,
   GroupSummary,
   InstanceOverrides,
   SnapshotEventData,
 } from '../protocol';
 import type { GroupLane, GroupTimelineItem } from './model';
+import {
+  chainIsRunning,
+  kDefaultMaxReactionRounds,
+  kMaxMaxReactionRounds,
+  kMinMaxReactionRounds,
+  parseMaxRoundsInput,
+  validateSpeaker,
+} from './model';
 import { ContextRing } from '../components/ContextRing';
 import { RealContextView } from '../components/RealContextView';
 
@@ -29,9 +39,24 @@ export interface GroupViewProps {
   templates: string[];
   thinkingEfforts: string[];
   toolNames: string[];
+  /**
+   * 正在流式的成员 id（App 从 `agent.streaming` 事件按 `memberId` 累出来的，
+   * change `group-reactive-mode` D10）。链断线重连后它是空的，但 `group.busy` /
+   * `chain.status` 仍在 ⇒ 取消按钮照样可用。
+   */
+  streamingMembers: string[];
+  /** 当前 / 最近一条链的只读状态（`group.chain`；断线重连后由 App 重拉）。 */
+  chain: GroupChainResult | null;
+  /**
+   * `group.chain.completed` 事件计数。界面只在**事件**到达时提示一次
+   * `round_cap` / `forced_pass`（刷新后不再显示，因为历史里没有这些提示）。
+   */
+  chainCompletedTick: number;
   /** 还有更早的消息（= 上一页的 prevCursor 非空）。 */
   hasEarlier: boolean;
   loadingEarlier: boolean;
+  /** 当前错误横幅文本（App 的 `error`）；组模式下没有 ChatScreen 承载它。 */
+  error?: string | null;
   onLoadEarlier: () => void;
   onReload: () => Promise<void> | void;
   onError: (message: string) => void;
@@ -47,8 +72,12 @@ export function GroupView({
   templates,
   thinkingEfforts,
   toolNames,
+  streamingMembers,
+  chain,
+  chainCompletedTick,
   hasEarlier,
   loadingEarlier,
+  error,
   onLoadEarlier,
   onReload,
   onError,
@@ -63,8 +92,102 @@ export function GroupView({
   const [effort, setEffort] = useState<Record<string, string>>({});
   const [realContextFor, setRealContextFor] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // `group.send` 的**同步阶段**状态（design D10）：收到 `started` 即解除，不等链结束。
+  const [sending, setSending] = useState(false);
+  // `forced_pass` / `forced_empty` 的可归因提示：只在**本次链结束事件**后存在，
+  // 刷新后不再显示（没有对应公开行，design D7）。也不走 turn.failed。
+  const [forcedNotice, setForcedNotice] = useState<string | null>(null);
+  // 达每组轮数上限的提示（`stopReason = round_cap`；design D10 / D13）。
+  const [roundCapNotice, setRoundCapNotice] = useState<string | null>(null);
+  const [togglingReactions, setTogglingReactions] = useState(false);
+  // 「反应轮数上限」输入框的草稿：`''` = 留空（保存时发 `maxRounds: null`）。
+  const [roundCapDraft, setRoundCapDraft] = useState(
+    group.maxRounds === null ? '' : String(group.maxRounds),
+  );
+  const [savingRoundCap, setSavingRoundCap] = useState(false);
+  const lastCompletedTick = useRef(0);
 
   const activeMembers = members.filter((member) => member.removedAt === null);
+  const chainRunning = chainIsRunning({
+    busy: group.busy,
+    chainStatus: chain?.status ?? null,
+    streamingMembers: streamingMembers.length,
+    sending,
+  });
+  const cancelEnabled = chainRunning;
+
+  // 上限值随重拉更新（`group.update` 成功后 App 会重拉 group.list）。
+  useEffect(() => {
+    setRoundCapDraft(group.maxRounds === null ? '' : String(group.maxRounds));
+  }, [group.maxRounds]);
+
+  // 链结束事件到达：按终态/步骤给一次性提示（刷新后不再显示）。
+  useEffect(() => {
+    if (chainCompletedTick <= lastCompletedTick.current) return;
+    lastCompletedTick.current = chainCompletedTick;
+    const steps = chain?.steps ?? [];
+    const rejected = steps.filter(
+      (step) => step.status === 'forced_pass' || step.status === 'forced_empty',
+    );
+    setForcedNotice(
+      rejected.length > 0
+        ? '被点名的成员没有回应（返回 pass=true / 空 message）'
+        : null,
+    );
+    setRoundCapNotice(
+      chain?.stopReason === 'round_cap'
+        ? '已达轮数上限（反应已停止；可继续点名，或调大该组的反应轮数上限）'
+        : null,
+    );
+  }, [chainCompletedTick, chain]);
+
+  const toggleReactions = async (next: boolean) => {
+    setTogglingReactions(true);
+    try {
+      await client.request('group.update', {
+        groupId: group.id,
+        reactionsEnabled: next,
+      });
+      await onReload();
+    } catch (error) {
+      onError(`切换自发反应失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setTogglingReactions(false);
+    }
+  };
+
+  // 保存上限：留空 ⇒ `maxRounds: null`（恢复默认）；1..50 ⇒ 整数。越界不静默改正。
+  const saveRoundCap = async () => {
+    if (savingRoundCap) return;
+    const parsed = parseMaxRoundsInput(roundCapDraft);
+    if ('error' in parsed) {
+      onError(parsed.error);
+      return;
+    }
+    setSavingRoundCap(true);
+    try {
+      await client.request('group.update', {
+        groupId: group.id,
+        maxRounds: parsed.value,
+      });
+      await onReload();
+    } catch (error) {
+      onError(
+        `保存反应轮数上限失败：${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      setSavingRoundCap(false);
+    }
+  };
+
+  const cancelChain = async () => {
+    try {
+      await client.request('agent.cancel', { sessionId: group.id });
+      await onReload();
+    } catch (error) {
+      onError(`取消失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
 
   const addMember = async () => {
     const name = newName.trim();
@@ -143,23 +266,40 @@ export function GroupView({
   };
 
   const send = async () => {
-    if (!speaker) {
-      onError('请先选择发言人（群发送必须点名一个成员）');
+    // 本地校验按开关分流（design D10）：开启态发言人可选（空 + 有文本 = 纯触发）；
+    // 关闭态含 `@` 允许空发言人（有效性由核心裁决，前端不复制 mention 解析规则）。
+    const error = validateSpeaker({
+      speaker: speaker.length > 0 ? speaker : null,
+      text: draft,
+      viewMessages: [],
+      reactionsEnabled: group.reactionsEnabled,
+    });
+    // 选了发言人且不带文本时的两个退化前置门由核心裁决（本地没有该成员视图，
+    // 不能凭空调 viewMessages 之外的判断）；这里只拦截"必填项缺失"。
+    if (error && (error.code === 'no_speaker' || error.code === 'no_trigger')) {
+      onError(error.message);
       return;
     }
-    setBusy(true);
+    setSending(true);
+    setForcedNotice(null);
+    setRoundCapNotice(null);
     try {
-      await client.request('group.send', {
+      const params: Record<string, unknown> = {
         groupId: group.id,
-        speaker,
         text: draft,
-      });
+      };
+      if (speaker.length > 0) params.speaker = speaker;
+      await client.request<GroupSendResult>('group.send', params);
+      // R.8：`group.send` **永不返回 busy**（链运行中也照常接受，新消息由执行器
+      // 吸收/排队）；这里不再有「发送未开始」分支。
+      // **`started` 即解除发送态**（design D10 / R.4）：链在后台跑，发送态不等链结束。
+      // 链活动/取消由 `chain.status` + `group.busy` + 流式成员 + 事件驱动。
       setDraft('');
       await onReload();
-    } catch (error) {
-      onError(`发送失败：${error instanceof Error ? error.message : String(error)}`);
+    } catch (sendError) {
+      onError(`发送失败：${sendError instanceof Error ? sendError.message : String(sendError)}`);
     } finally {
-      setBusy(false);
+      setSending(false);
     }
   };
 
@@ -170,10 +310,66 @@ export function GroupView({
           <h1 className="truncate text-xl font-semibold">组视图 · {group.title}</h1>
           <p className="text-xs text-muted">成员共享一份原文；每个成员只看得到自己的私有过程。</p>
         </div>
-        <span className="text-xs text-muted" data-testid="group-kind">
-          kind={group.kind}
-        </span>
+        <div className="flex shrink-0 items-center gap-3">
+          {/* 自发反应开关（change `group-reactive-mode` D10）：链运行中禁用。 */}
+          <label className="flex items-center gap-1 text-xs text-muted">
+            <input
+              type="checkbox"
+              data-testid="reactions-toggle"
+              checked={group.reactionsEnabled}
+              disabled={chainRunning || togglingReactions}
+              onChange={(event) => void toggleReactions(event.target.checked)}
+            />
+            自发反应（默认开）
+          </label>
+          {/* 反应轮数上限（change `group-reactive-mode` R.4 / D13）：null = 默认占位；
+              留空保存 ⇒ maxRounds: null（恢复默认）；链运行中禁用。 */}
+          <label className="flex items-center gap-1 text-xs text-muted">
+            反应轮数上限
+            <input
+              type="number"
+              min={kMinMaxReactionRounds}
+              max={kMaxMaxReactionRounds}
+              data-testid="group-round-cap"
+              value={roundCapDraft}
+              placeholder={`默认 ${kDefaultMaxReactionRounds}`}
+              disabled={chainRunning || savingRoundCap}
+              onChange={(event) => setRoundCapDraft(event.target.value)}
+              onBlur={() => void saveRoundCap()}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') event.currentTarget.blur();
+              }}
+              className="h-7 w-16 rounded-card border border-line bg-surface px-1 text-xs"
+            />
+          </label>
+          {chainRunning && (
+            <span className="text-xs text-accent" data-testid="reaction-active">
+              反应链进行中…（可取消）
+            </span>
+          )}
+          <button
+            type="button"
+            data-testid="group-cancel"
+            disabled={!cancelEnabled}
+            onClick={() => void cancelChain()}
+            className="min-h-6 rounded-card border border-danger/40 px-2 py-1 text-xs text-danger/80 hover:text-danger disabled:opacity-40"
+          >
+            取消反应链
+          </button>
+          <span className="text-xs text-muted" data-testid="group-kind">
+            kind={group.kind}
+          </span>
+        </div>
       </header>
+
+      {error !== null && error !== undefined && (
+        <div
+          data-testid="group-error"
+          className="border-b border-danger/40 bg-danger/10 px-4 py-2 text-sm text-danger"
+        >
+          {error}
+        </div>
+      )}
 
       <div className="flex min-h-0 flex-1">
         {/* 成员与覆盖层 */}
@@ -369,6 +565,16 @@ export function GroupView({
           </section>
 
           <div className="border-t border-line px-4 py-2">
+            {forcedNotice !== null && (
+              <p className="mb-1 text-xs text-warn" data-testid="forced-notice">
+                {forcedNotice}
+              </p>
+            )}
+            {roundCapNotice !== null && (
+              <p className="mb-1 text-xs text-warn" data-testid="round-cap-notice">
+                {roundCapNotice}
+              </p>
+            )}
             <div className="flex items-center gap-2">
               <label className="flex items-center gap-1 text-xs text-muted">
                 发言人
@@ -378,7 +584,9 @@ export function GroupView({
                   onChange={(event) => setSpeaker(event.target.value)}
                   className="h-7 rounded-card border border-line bg-surface px-1 text-xs"
                 >
-                  <option value="">（未选择）</option>
+                  <option value="">
+                    {group.reactionsEnabled ? '（不点名，仅触发反应）' : '（未选择）'}
+                  </option>
                   {activeMembers.map((member) => (
                     <option key={member.id} value={member.id}>
                       {member.name}
@@ -390,17 +598,21 @@ export function GroupView({
                 data-testid="group-input"
                 value={draft}
                 onChange={(event) => setDraft(event.target.value)}
-                placeholder="给点名成员的一句话（可留空：不带文本的点名不写空用户行）"
+                placeholder={
+                  group.reactionsEnabled
+                    ? '说点什么：所有公开消息都会触发成员反应（可留空仅点名）'
+                    : '给点名成员的一句话（可留空：不带文本的点名不写空用户行）'
+                }
                 className="h-10 min-w-0 flex-1 resize-none rounded-card border border-line bg-surface px-2 py-1 text-sm"
               />
               <button
                 type="button"
                 data-testid="group-send"
-                disabled={busy}
+                disabled={sending}
                 onClick={() => void send()}
                 className="rounded-card bg-accent px-3 py-2 text-sm font-semibold text-bg disabled:opacity-40"
               >
-                点名发送
+                {sending ? '发送中…' : '发送'}
               </button>
             </div>
           </div>
@@ -426,7 +638,13 @@ export function GroupView({
                     {lane.name}
                     {lane.removed && <span className="ml-1 text-warn">（已移除）</span>}
                   </span>
-                  <span className="shrink-0 text-xs text-muted">仅该成员可见</span>
+                  {streamingMembers.includes(lane.memberId) ? (
+                    <span className="shrink-0 text-xs text-accent" data-testid={`lane-reacting-${lane.memberId}`}>
+                      正在反应…
+                    </span>
+                  ) : (
+                    <span className="shrink-0 text-xs text-muted">仅该成员可见</span>
+                  )}
                 </header>
                 <ul className="mt-1 space-y-1">
                   {lane.messages.map((message, index) => (

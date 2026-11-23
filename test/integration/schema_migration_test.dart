@@ -1,4 +1,4 @@
-﻿import 'dart:io';
+import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -163,9 +163,10 @@ void main() {
         final freshCols = await freshDb.rawQuery('PRAGMA table_info(messages)');
         expect(freshCols.any((c) => c['name'] == 'attachments'), isTrue,
             reason: 'CREATE TABLE 里也要带 attachments（v7 全新建库）');
-        // 当前建库版本已随 agent-group-chat 升到 9；这里验的是「全新建库
-        // 也带 attachments」，版本号取当前 schema 版本。
-        expect(await freshDb.getVersion(), 9);
+        // 当前建库版本已随 group-reactive-mode 升到 11（v9 是 agent-group-chat，
+        // v10 加 sessions.reactions_enabled、v11 补 sessions.max_reaction_rounds）；
+        // 这里验的是「全新建库也带 attachments」，版本号取当前 schema 版本。
+        expect(await freshDb.getVersion(), 11);
       } finally {
         await DatabaseService.close();
         if (freshDir.existsSync()) {
@@ -264,7 +265,8 @@ void main() {
           '${sessionCols.map((c) => c['name']).join(',')}');
       expect(sessionCols.any((c) => c['name'] == 'parent_session_id'), isTrue,
           reason: 'v7→v8 必须给 sessions 加上 parent_session_id');
-      expect(await db.getVersion(), 9);
+      // v10/v11（group-reactive-mode）再往上加两版：本用例只验 v8 的列在升级产物里。
+      expect(await db.getVersion(), 11);
 
       final sessions = await db.query('sessions');
       // ignore: avoid_print
@@ -312,7 +314,8 @@ void main() {
         final cols = await db.rawQuery('PRAGMA table_info(sessions)');
         expect(cols.any((c) => c['name'] == 'parent_session_id'), isTrue,
             reason: 'CREATE TABLE 里也要带 parent_session_id（v8 全新建库）');
-        expect(await db.getVersion(), 9);
+        // 当前 schema 版本（v11 = group-reactive-mode 的 sessions.max_reaction_rounds）。
+        expect(await db.getVersion(), 11);
 
         final repo = SessionRepository();
         final parent = await repo.create(title: '父会话');
@@ -381,6 +384,478 @@ void main() {
   });
 
   _v9MigrationTests();
+  _v10MigrationTests();
+}
+
+// -----------------------------------------------------------------------------
+// v9 → v10（change `group-reactive-mode` 任务 0.1 / design D8）
+// -----------------------------------------------------------------------------
+
+/// 按 v9 的建表语句造一个旧库：**一条 group 会话 + 一条 single 会话**、两条消息、
+/// 一条摘要、一条成员，索引与生产 v9 逐项对齐（结构指纹要比的就是这些）。
+Future<void> _createV9Database(Directory dir) async {
+  final dbPath = p.join(dir.path, 'aliasagent.db');
+  final db9 = await openDatabase(dbPath, version: 9, onCreate: (db, v) async {
+    await db.execute('''CREATE TABLE sessions (
+      id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT 'New Chat',
+      agent_type TEXT NOT NULL DEFAULT 'general',
+      parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      tree_version INTEGER NOT NULL DEFAULT 0,
+      dirty_since_seq INTEGER NOT NULL DEFAULT 0,
+      kind TEXT NOT NULL DEFAULT 'single',
+      overrides_json TEXT)''');
+    await db.execute('''CREATE TABLE messages (
+      id TEXT PRIMARY KEY, seq INTEGER,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+      content TEXT NOT NULL, tool_calls TEXT, thinking_json TEXT,
+      token_count INTEGER, output_token_count INTEGER,
+      attachments TEXT, created_at INTEGER NOT NULL,
+      author TEXT, visibility TEXT NOT NULL DEFAULT 'public')''');
+    await db.execute('CREATE INDEX idx_messages_session ON messages(session_id)');
+    await db.execute('CREATE INDEX idx_messages_seq ON messages(session_id, seq)');
+    await db.execute('CREATE INDEX idx_sessions_updated ON sessions(updated_at DESC)');
+    await db.execute('''CREATE TABLE summary_nodes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      member_id TEXT,
+      level INTEGER NOT NULL, start_seq INTEGER NOT NULL, end_seq INTEGER NOT NULL,
+      node_type TEXT NOT NULL, parent_id INTEGER, summary_json TEXT,
+      token_cost INTEGER, summary_prompt_version INTEGER, model TEXT,
+      covered_min_seq INTEGER NOT NULL, covered_max_seq INTEGER NOT NULL)''');
+    await db.execute('CREATE INDEX idx_summary_nodes_session ON summary_nodes(session_id)');
+    await db.execute('CREATE INDEX idx_summary_nodes_span ON summary_nodes(session_id, member_id, level, start_seq, end_seq)');
+    await db.execute('CREATE INDEX idx_summary_nodes_leaf_owner ON summary_nodes(session_id, member_id, covered_min_seq, covered_max_seq)');
+    await db.execute('''CREATE TABLE group_members (
+      id TEXT PRIMARY KEY,
+      group_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      name TEXT NOT NULL, template_name TEXT NOT NULL, overrides_json TEXT,
+      removed_at INTEGER, created_at INTEGER NOT NULL)''');
+    await db.execute('CREATE INDEX idx_group_members_group ON group_members(group_session_id)');
+    await db.execute(
+        'CREATE UNIQUE INDEX idx_group_members_active_name '
+        'ON group_members(group_session_id, name) WHERE removed_at IS NULL');
+  });
+  await db9.insert('sessions', {
+    'id': 'old-group',
+    'title': '升级前的组',
+    'agent_type': 'reviewer',
+    'created_at': 11,
+    'updated_at': 22,
+    'tree_version': 3,
+    'dirty_since_seq': 5,
+    'kind': 'group',
+    'overrides_json': null,
+  });
+  await db9.insert('sessions', {
+    'id': 'old-single',
+    'title': '升级前的单会话',
+    'agent_type': 'reviewer',
+    'created_at': 33,
+    'updated_at': 44,
+    'tree_version': 1,
+    'dirty_since_seq': 0,
+    'kind': 'single',
+    'overrides_json': '{"toolsSubset":["read_file"]}',
+  });
+  await db9.insert('messages', {
+    'id': 'old-group-msg',
+    'seq': 1,
+    'session_id': 'old-group',
+    'role': 'user',
+    'content': '组里的老消息',
+    'attachments': '[{"path":"old.png"}]',
+    'token_count': 7,
+    'output_token_count': 3,
+    'created_at': 11,
+    'author': null,
+    'visibility': 'public',
+  });
+  await db9.insert('messages', {
+    'id': 'old-single-msg',
+    'seq': 2,
+    'session_id': 'old-single',
+    'role': 'assistant',
+    'content': '单会话的老消息',
+    'created_at': 33,
+    'author': null,
+    'visibility': 'public',
+  });
+  await db9.insert('summary_nodes', {
+    'session_id': 'old-group',
+    'member_id': 'old-member',
+    'level': 1,
+    'start_seq': 1,
+    'end_seq': 1,
+    'node_type': 'leaf',
+    'summary_json': '{"summary":"旧摘要"}',
+    'token_cost': 9,
+    'covered_min_seq': 1,
+    'covered_max_seq': 1,
+  });
+  await db9.insert('group_members', {
+    'id': 'old-member',
+    'group_session_id': 'old-group',
+    'name': '老成员',
+    'template_name': 'general',
+    'created_at': 11,
+  });
+  await db9.close();
+}
+
+/// 按 **v10（同步实现升上来的真实库）** 的建表语句造一个库：sessions 有
+/// `reactions_enabled`，但**没有** `max_reaction_rounds`（同步实现当时把版本号升到
+/// 10 却只加了开关列；异步返工把上限列塞进 `oldV <= 9`，而真实库已是 v10 ⇒ 永远不补）。
+///
+/// 这是 change `group-reactive-mode` R.1 的回归靶：修复前用它打开会停在 v10、缺列；
+/// 修复后 `oldV <= 10` 分支补列并升到 v11。
+Future<void> _createV10Database(Directory dir) async {
+  final dbPath = p.join(dir.path, 'aliasagent.db');
+  final db10 = await openDatabase(dbPath, version: 10, onCreate: (db, v) async {
+    await db.execute('''CREATE TABLE sessions (
+      id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT 'New Chat',
+      agent_type TEXT NOT NULL DEFAULT 'general',
+      parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      tree_version INTEGER NOT NULL DEFAULT 0,
+      dirty_since_seq INTEGER NOT NULL DEFAULT 0,
+      kind TEXT NOT NULL DEFAULT 'single',
+      overrides_json TEXT,
+      reactions_enabled INTEGER NOT NULL DEFAULT 1)''');
+    await db.execute('''CREATE TABLE messages (
+      id TEXT PRIMARY KEY, seq INTEGER,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+      content TEXT NOT NULL, tool_calls TEXT, thinking_json TEXT,
+      token_count INTEGER, output_token_count INTEGER,
+      attachments TEXT, created_at INTEGER NOT NULL,
+      author TEXT, visibility TEXT NOT NULL DEFAULT 'public')''');
+    await db.execute('CREATE INDEX idx_messages_session ON messages(session_id)');
+    await db.execute('CREATE INDEX idx_messages_seq ON messages(session_id, seq)');
+    await db.execute('CREATE INDEX idx_sessions_updated ON sessions(updated_at DESC)');
+    await db.execute('''CREATE TABLE summary_nodes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      member_id TEXT,
+      level INTEGER NOT NULL, start_seq INTEGER NOT NULL, end_seq INTEGER NOT NULL,
+      node_type TEXT NOT NULL, parent_id INTEGER, summary_json TEXT,
+      token_cost INTEGER, summary_prompt_version INTEGER, model TEXT,
+      covered_min_seq INTEGER NOT NULL, covered_max_seq INTEGER NOT NULL)''');
+    await db.execute('CREATE INDEX idx_summary_nodes_session ON summary_nodes(session_id)');
+    await db.execute('CREATE INDEX idx_summary_nodes_span ON summary_nodes(session_id, member_id, level, start_seq, end_seq)');
+    await db.execute('CREATE INDEX idx_summary_nodes_leaf_owner ON summary_nodes(session_id, member_id, covered_min_seq, covered_max_seq)');
+    await db.execute('''CREATE TABLE group_members (
+      id TEXT PRIMARY KEY,
+      group_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      name TEXT NOT NULL, template_name TEXT NOT NULL, overrides_json TEXT,
+      removed_at INTEGER, created_at INTEGER NOT NULL)''');
+    await db.execute('CREATE INDEX idx_group_members_group ON group_members(group_session_id)');
+    await db.execute(
+        'CREATE UNIQUE INDEX idx_group_members_active_name '
+        'ON group_members(group_session_id, name) WHERE removed_at IS NULL');
+  });
+  // 同步实现的迁移把**既有组行**回填成 0、单会话行保持 1；这里照真实产物造。
+  await db10.insert('sessions', {
+    'id': 'sync-group',
+    'title': '同步实现升上来的组',
+    'agent_type': 'reviewer',
+    'created_at': 11,
+    'updated_at': 22,
+    'kind': 'group',
+    'reactions_enabled': 0,
+  });
+  await db10.insert('sessions', {
+    'id': 'sync-single',
+    'title': '同步实现升上来的单会话',
+    'agent_type': 'general',
+    'created_at': 33,
+    'updated_at': 44,
+    'kind': 'single',
+    'reactions_enabled': 1,
+  });
+  await db10.insert('messages', {
+    'id': 'sync-msg',
+    'seq': 1,
+    'session_id': 'sync-group',
+    'role': 'user',
+    'content': '升级前的消息',
+    'created_at': 11,
+    'author': null,
+    'visibility': 'public',
+  });
+  await db10.insert('summary_nodes', {
+    'session_id': 'sync-group',
+    'member_id': 'sync-member',
+    'level': 1,
+    'start_seq': 1,
+    'end_seq': 1,
+    'node_type': 'leaf',
+    'summary_json': '{"summary":"同步实现的摘要"}',
+    'token_cost': 5,
+    'covered_min_seq': 1,
+    'covered_max_seq': 1,
+  });
+  await db10.insert('group_members', {
+    'id': 'sync-member',
+    'group_session_id': 'sync-group',
+    'name': '老成员',
+    'template_name': 'general',
+    'created_at': 11,
+  });
+  await db10.close();
+}
+
+void _v10MigrationTests() {
+  group('Database schema migration v9 -> v11 / v10 -> v11', () {
+    late Directory tempDir;
+
+    setUp(() {
+      tempDir = Directory.systemTemp.createTempSync('mig_v11_test_');
+    });
+
+    tearDown(() async {
+      await DatabaseService.close();
+      if (tempDir.existsSync()) {
+        try {
+          tempDir.deleteSync(recursive: true);
+        } catch (_) {}
+      }
+    });
+
+    // -------------------------------------------------------------------------
+    // 版本撞车回归靶（同步实现把真实库升到 v10、只加了 reactions_enabled；异步返工
+    // 把 max_reaction_rounds 塞进 oldV <= 9 ⇒ 真实库永远补不上列）。修复：版本升到
+    // 11，`oldV <= 10` 单独补列。
+    // -------------------------------------------------------------------------
+    test('v10 库（同步实现升上来的真实库）升级到 v11：补 max_reaction_rounds、旧组开关保留、行数不变',
+        () async {
+      await _createV10Database(tempDir);
+      // 前置事实：这个库真的**缺** max_reaction_rounds（否则本用例在测别的东西）。
+      final probe = await openDatabase(p.join(tempDir.path, 'aliasagent.db'));
+      final beforeCols = await probe.rawQuery('PRAGMA table_info(sessions)');
+      await probe.close();
+      final beforeNames = beforeCols.map((row) => row['name']).toSet();
+      // ignore: avoid_print
+      print('  [OBS] v10 升级前 sessions 列 => $beforeNames');
+      expect(beforeNames, contains('reactions_enabled'));
+      expect(beforeNames, isNot(contains('max_reaction_rounds')),
+          reason: '夹具必须是同步实现的真实形状：有开关列、没有上限列');
+
+      await DatabaseService.openAt(tempDir.path);
+      final db = await DatabaseService.database;
+      final version = await db.getVersion();
+      final cols = await db.rawQuery('PRAGMA table_info(sessions)');
+      final names = cols.map((row) => row['name']).toList();
+      final sessions = await db.query('sessions', orderBy: 'id');
+      final messages = await db.query('messages');
+      final summaries = await db.query('summary_nodes');
+      final members = await db.query('group_members');
+      // ignore: avoid_print
+      print('  [OBS] v10 -> v11 version=$version '
+          'sessions=${sessions.length} messages=${messages.length} '
+          'summaries=${summaries.length} members=${members.length}');
+      // ignore: avoid_print
+      print('  [OBS] v10 -> v11 sessions => '
+          '${sessions.map((r) => '${r['id']}: reactions=${r['reactions_enabled']} '
+              'max_rounds=${r['max_reaction_rounds']}').join(' | ')}');
+
+      // ① 缺的列必须补上（红靶：修复前这里没有 max_reaction_rounds）。
+      expect(names, contains('max_reaction_rounds'),
+          reason: 'v10 库升级到 v11 必须补上 max_reaction_rounds 列');
+      final added = cols.firstWhere((row) => row['name'] == 'max_reaction_rounds');
+      expect(added['type'], 'INTEGER');
+      expect(added['notnull'], 0, reason: '可空：NULL = 用产品默认');
+      expect(added['dflt_value'], isNull);
+
+      // ② 版本号必须到 11。
+      expect(version, 11, reason: 'schema 版本必须是 11（v10→v11 补列）');
+
+      // ③ 迁移不删行、不改既有值：旧组仍是安静态（同步实现的回填结果保留）。
+      expect(sessions.length, 2, reason: '迁移不删行');
+      expect(messages.length, 1, reason: '迁移不删行');
+      expect(summaries.length, 1, reason: '迁移不删行');
+      expect(members.length, 1, reason: '迁移不删行');
+      final groupRow = sessions.firstWhere((r) => r['id'] == 'sync-group');
+      final singleRow = sessions.firstWhere((r) => r['id'] == 'sync-single');
+      expect(groupRow['reactions_enabled'], 0,
+          reason: '旧组的关闭状态是同步实现的产物，升级不许改回 1');
+      expect(singleRow['reactions_enabled'], 1);
+      expect(groupRow['max_reaction_rounds'], isNull,
+          reason: '补列后旧行上限为 NULL（用产品默认 8）');
+      expect(singleRow['max_reaction_rounds'], isNull);
+      // 既有数据原样。
+      expect(summaries.first['member_id'], 'sync-member');
+      expect(members.first['name'], '老成员');
+      expect(messages.first['content'], '升级前的消息');
+
+      // ④ 升级产物与全新建库的结构一致（两份都已是 v11）。
+      final upgraded = await _structureFingerprint(db);
+      await DatabaseService.close();
+      final freshDir = Directory.systemTemp.createTempSync('mig_v11_fresh_');
+      try {
+        await DatabaseService.openAt(freshDir.path);
+        final fresh =
+            await _structureFingerprint(await DatabaseService.database);
+        for (final table in upgraded.keys) {
+          expect(upgraded[table], equals(fresh[table]),
+              reason: '表 $table 的列/索引在「v10 升级产物」与「全新建库」之间不一致');
+        }
+      } finally {
+        await DatabaseService.close();
+        if (freshDir.existsSync()) {
+          try {
+            freshDir.deleteSync(recursive: true);
+          } catch (_) {}
+        }
+      }
+    });
+
+    test('v9 库无损升级：行数不变、旧组回填 0、旧单会话保持 1、结构指纹一致', () async {
+      await _createV9Database(tempDir);
+      await DatabaseService.openAt(tempDir.path);
+      final db = await DatabaseService.database;
+
+      final version = await db.getVersion();
+      final sessions = await db.query('sessions', orderBy: 'id');
+      final messages = await db.query('messages');
+      final summaries = await db.query('summary_nodes');
+      final members = await db.query('group_members');
+      // ignore: avoid_print
+      print('  [OBS] v10 version=$version sessions=${sessions.length} '
+          'messages=${messages.length} summaries=${summaries.length} '
+          'members=${members.length}');
+      // ignore: avoid_print
+      print('  [OBS] v10 sessions => '
+          '${sessions.map((r) => '${r['id']}: kind=${r['kind']} '
+              'reactions=${r['reactions_enabled']} '
+              'max_rounds=${r['max_reaction_rounds']} '
+              'overrides=${r['overrides_json']}').join(' | ')}');
+      // ignore: avoid_print
+      print('  [OBS] v10 messages => '
+          '${messages.map((r) => '${r['id']}: ${r['content']}').join(' | ')}');
+
+      expect(version, 11, reason: 'schema 版本必须是 11（v9→v10 两列 + v10→v11 补上限列）');
+      expect(sessions.length, 2, reason: '迁移不删行');
+      expect(messages.length, 2, reason: '迁移不删行');
+      expect(summaries.length, 1, reason: '迁移不删行');
+      expect(members.length, 1, reason: '迁移不删行');
+
+      final groupRow = sessions.firstWhere((r) => r['id'] == 'old-group');
+      final singleRow = sessions.firstWhere((r) => r['id'] == 'old-single');
+
+      // 迁移的核心语义：**既有组行回填 false**，既有单会话行保持列默认 1。
+      expect(groupRow['reactions_enabled'], 0,
+          reason: '旧组升级后必须是安静态（保留旧点名体验）');
+      expect(singleRow['reactions_enabled'], 1,
+          reason: '旧单会话行保持列默认 1（无行为意义，但必须可断言）');
+      // v10 的**第二列**（change `group-reactive-mode` R.1 / design D13）：
+      // 迁移只加可空列、不回填 ⇒ 旧行上限为 NULL（= 用产品默认 8）。
+      expect(groupRow['max_reaction_rounds'], isNull,
+          reason: '旧组上限保持 NULL（用产品默认 8）');
+      expect(singleRow['max_reaction_rounds'], isNull);
+
+      // 模型读出同一口径：旧组 false、旧单会话 true、两者 maxRounds 都为 null
+      // （fromRow 各一次）。
+      expect(Session.fromRow(groupRow).reactionsEnabled, isFalse);
+      expect(Session.fromRow(singleRow).reactionsEnabled, isTrue);
+      expect(Session.fromRow(groupRow).maxRounds, isNull);
+      expect(Session.fromRow(singleRow).maxRounds, isNull);
+
+      // 旧单会话的 kind / overrides 等字段不变。
+      expect(singleRow['kind'], 'single');
+      expect(singleRow['overrides_json'], '{"toolsSubset":["read_file"]}');
+      expect(singleRow['agent_type'], 'reviewer');
+      expect(singleRow['tree_version'], 1);
+      expect(groupRow['kind'], 'group');
+      expect(groupRow['agent_type'], 'reviewer');
+      expect(groupRow['tree_version'], 3);
+      expect(groupRow['dirty_since_seq'], 5);
+
+      // 旧消息 / 摘要 / 成员原样。
+      expect(
+          messages
+              .firstWhere((r) => r['id'] == 'old-group-msg')['attachments'],
+          '[{"path":"old.png"}]');
+      expect(summaries.first['member_id'], 'old-member');
+      expect(members.first['name'], '老成员');
+
+      // 结构指纹：升级产物 == 全新建库（逐表逐列逐索引）。
+      final upgraded = await _structureFingerprint(db);
+      await DatabaseService.close();
+      final freshDir = Directory.systemTemp.createTempSync('mig_v10_fresh_');
+      try {
+        await DatabaseService.openAt(freshDir.path);
+        final fresh =
+            await _structureFingerprint(await DatabaseService.database);
+        // ignore: avoid_print
+        print('  [OBS] 升级产物 sessions 列 => '
+            '${((upgraded['sessions'] as Map)['columns'] as Map).keys.join(",")}');
+        // ignore: avoid_print
+        print('  [OBS] 全新建库 sessions 列 => '
+            '${((fresh['sessions'] as Map)['columns'] as Map).keys.join(",")}');
+        for (final table in upgraded.keys) {
+          expect(upgraded[table], equals(fresh[table]),
+              reason: '表 $table 的列/索引在「v9 升级产物」与「全新建库」之间不一致');
+        }
+      } finally {
+        await DatabaseService.close();
+        if (freshDir.existsSync()) {
+          try {
+            freshDir.deleteSync(recursive: true);
+          } catch (_) {}
+        }
+      }
+    });
+
+    test('新建 v11 库直接含两个组设置列且新组读出 true / null', () async {
+      final freshDir = Directory.systemTemp.createTempSync('mig_v10_new_');
+      try {
+        await DatabaseService.openAt(freshDir.path);
+        final db = await DatabaseService.database;
+        final cols = await db.rawQuery('PRAGMA table_info(sessions)');
+        final column = cols.firstWhere((c) => c['name'] == 'reactions_enabled');
+        // ignore: avoid_print
+        print('  [OBS] sessions.reactions_enabled => type=${column['type']} '
+            'notnull=${column['notnull']} default=${column['dflt_value']}');
+        expect(column['type'], 'INTEGER');
+        expect(column['notnull'], 1);
+        expect(column['dflt_value'], '1');
+
+        // v10 的第二列：可空的轮数上限（change `group-reactive-mode` R.1）。
+        final maxRoundsColumn =
+            cols.firstWhere((c) => c['name'] == 'max_reaction_rounds');
+        // ignore: avoid_print
+        print('  [OBS] sessions.max_reaction_rounds => '
+            'type=${maxRoundsColumn['type']} '
+            'notnull=${maxRoundsColumn['notnull']} '
+            'default=${maxRoundsColumn['dflt_value']}');
+        expect(maxRoundsColumn['type'], 'INTEGER');
+        expect(maxRoundsColumn['notnull'], 0, reason: '可空：NULL = 用产品默认');
+        expect(maxRoundsColumn['dflt_value'], isNull);
+
+        final repo = SessionRepository();
+        final group = await repo.create(title: '新组', kind: Session.kindGroup);
+        expect(group.reactionsEnabled, isTrue, reason: '新建组默认开启');
+        expect(group.maxRounds, isNull, reason: '新建组上限为空 = 用产品默认');
+        final reread = await repo.get(group.id);
+        expect(reread!.reactionsEnabled, isTrue);
+        expect(reread.maxRounds, isNull);
+        final row = (await db.query('sessions',
+                where: 'id = ?', whereArgs: [group.id]))
+            .first;
+        expect(row['reactions_enabled'], 1);
+        expect(row['max_reaction_rounds'], isNull);
+      } finally {
+        await DatabaseService.close();
+        if (freshDir.existsSync()) {
+          try {
+            freshDir.deleteSync(recursive: true);
+          } catch (_) {}
+        }
+      }
+    });
+  });
 }
 
 // -----------------------------------------------------------------------------
@@ -534,7 +1009,9 @@ void _v9MigrationTests() {
       // ignore: avoid_print
       print('  [OBS] 旧摘要 => member_id=${summaries.first['member_id']}');
 
-      expect(version, 9);
+      // v10/v11（group-reactive-mode）：v9 库再往上升，终点是 11；本用例验的是
+      // v9 的列（kind / overrides_json / author / visibility / member_id）都还在。
+      expect(version, 11);
       expect(sessions.length, 1, reason: '迁移不删行');
       expect(messages.length, 1, reason: '迁移不删行');
       expect(summaries.length, 1, reason: '迁移不删行');

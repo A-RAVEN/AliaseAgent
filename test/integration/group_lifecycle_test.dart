@@ -36,6 +36,7 @@ void main() {
     harness.queueSimpleReply('甲的公开发言');
     await harness.groups
         .send(groupId: harness.group.id, memberId: a.id, text: '甲先说');
+    await harness.waitForChain();
     await harness.groups.removeMember(harness.group.id, a.id);
 
     final rows = await harness.support.messageRepo
@@ -69,6 +70,7 @@ void main() {
     harness.queueFinal('旧甲的公开结论：lib/old-a.dart');
     await harness.groups
         .send(groupId: harness.group.id, memberId: oldA.id, text: '旧甲做点事');
+    await harness.waitForChain();
 
     final oldPrivateRows = (await harness.support.messageRepo
             .queryBySession(harness.group.id))
@@ -85,6 +87,7 @@ void main() {
     harness.queueSimpleReply('新甲的公开结论');
     await harness.groups
         .send(groupId: harness.group.id, memberId: newA.id, text: '新甲说一句');
+    await harness.waitForChain();
     final sent = harness.support.sidecar.lastMessagesJson ?? '';
     // ignore: avoid_print
     print('[OBS] 新甲请求含旧私有标记=${sent.contains('OLD-A-MARK-77')}');
@@ -115,9 +118,11 @@ void main() {
     harness.queueSimpleReply('甲的发言');
     await harness.groups
         .send(groupId: harness.group.id, memberId: a.id, text: '甲先说');
+    await harness.waitForChain();
     harness.queueSimpleReply('乙的发言');
     await harness.groups
         .send(groupId: harness.group.id, memberId: b.id, text: '乙再说');
+    await harness.waitForChain();
 
     // 直接写一条摘要行（模拟压缩产物），证明删除时也级联清掉。
     await harness.support.summaryNodeRepo.materialize(
@@ -182,6 +187,135 @@ void main() {
     print('[OBS] 重名错误=$error');
     expect(error, isA<GroupMemberNameConflictException>());
     expect('$error', contains('甲'));
+    await harness.dispose();
+  });
+
+  // ---------------------------------------------------------------------------
+  // 自发反应开关的持久化（change `group-reactive-mode` 任务 0.2）
+  // ---------------------------------------------------------------------------
+
+  test('0.2 新建组默认开启（reactionsEnabled == true，库里 1）', () async {
+    final harness = await GroupHarness.create(createGroup: false);
+    final created = await harness.groups.createGroup(title: '新组');
+    final reread = await harness.support.sessionRepo.get(created.id);
+    final rows = await (await DatabaseService.database)
+        .query('sessions', where: 'id = ?', whereArgs: [created.id]);
+    // ignore: avoid_print
+    print('[OBS] 新建组 reactionsEnabled=${created.reactionsEnabled} '
+        '读回=${reread?.reactionsEnabled} 行=${rows.first['reactions_enabled']}');
+    expect(created.reactionsEnabled, isTrue);
+    expect(reread!.reactionsEnabled, isTrue);
+    expect(rows.first['reactions_enabled'], 1);
+    await harness.dispose();
+  });
+
+  test('0.2 create(reactionsEnabled: false) 落 0 且读回 false', () async {
+    final harness = await GroupHarness.create(createGroup: false);
+    final created = await harness.support.sessionRepo.create(
+      title: '安静组',
+      kind: 'group',
+      reactionsEnabled: false,
+    );
+    final reread = await harness.support.sessionRepo.get(created.id);
+    final rows = await (await DatabaseService.database)
+        .query('sessions', where: 'id = ?', whereArgs: [created.id]);
+    // ignore: avoid_print
+    print('[OBS] 显式关闭 reactionsEnabled=${created.reactionsEnabled} '
+        '读回=${reread?.reactionsEnabled} 行=${rows.first['reactions_enabled']}');
+    expect(created.reactionsEnabled, isFalse);
+    expect(reread!.reactionsEnabled, isFalse);
+    expect(rows.first['reactions_enabled'], 0);
+    await harness.dispose();
+  });
+
+  test('0.2 updateReactionsEnabled 持久化（关闭 → 重读仍 false；再打开 → true）', () async {
+    final harness = await GroupHarness.create(createGroup: false);
+    final created = await harness.groups.createGroup(title: '可切组');
+
+    await harness.support.sessionRepo
+        .updateReactionsEnabled(created.id, false);
+    final off = await harness.support.sessionRepo.get(created.id);
+    final offRow = (await (await DatabaseService.database)
+            .query('sessions', where: 'id = ?', whereArgs: [created.id]))
+        .first;
+    // ignore: avoid_print
+    print('[OBS] 关闭后 读回=${off?.reactionsEnabled} '
+        '行=${offRow['reactions_enabled']}');
+    expect(off!.reactionsEnabled, isFalse);
+    expect(offRow['reactions_enabled'], 0);
+
+    await harness.support.sessionRepo.updateReactionsEnabled(created.id, true);
+    final on = await harness.support.sessionRepo.get(created.id);
+    // ignore: avoid_print
+    print('[OBS] 再打开后 读回=${on?.reactionsEnabled}');
+    expect(on!.reactionsEnabled, isTrue);
+    await harness.dispose();
+  });
+
+  // ---------------------------------------------------------------------------
+  // 反应轮数上限的持久化（change `group-reactive-mode` 任务 R.1 / design D13）
+  // ---------------------------------------------------------------------------
+
+  test('R.1 新建组 maxRounds 为 null（库列 NULL = 用产品默认）', () async {
+    final harness = await GroupHarness.create(createGroup: false);
+    final created = await harness.groups.createGroup(title: '新组');
+    final reread = await harness.support.sessionRepo.get(created.id);
+    final row = (await (await DatabaseService.database)
+            .query('sessions', where: 'id = ?', whereArgs: [created.id]))
+        .first;
+    // ignore: avoid_print
+    print('[OBS] 新建组 maxRounds=${created.maxRounds} '
+        '读回=${reread?.maxRounds} 行=${row['max_reaction_rounds']}');
+    expect(created.maxRounds, isNull);
+    expect(reread!.maxRounds, isNull);
+    expect(row['max_reaction_rounds'], isNull);
+    await harness.dispose();
+  });
+
+  test('R.1 create(maxRounds: 6) 落 6 且读回 6', () async {
+    final harness = await GroupHarness.create(createGroup: false);
+    final created = await harness.support.sessionRepo.create(
+      title: '限轮数组',
+      kind: 'group',
+      maxRounds: 6,
+    );
+    final reread = await harness.support.sessionRepo.get(created.id);
+    final row = (await (await DatabaseService.database)
+            .query('sessions', where: 'id = ?', whereArgs: [created.id]))
+        .first;
+    // ignore: avoid_print
+    print('[OBS] create(maxRounds:6) 读回=${reread?.maxRounds} '
+        '行=${row['max_reaction_rounds']}');
+    expect(created.maxRounds, 6);
+    expect(reread!.maxRounds, 6);
+    expect(row['max_reaction_rounds'], 6);
+    await harness.dispose();
+  });
+
+  test('R.1 updateMaxRounds 持久化，显式 null 恢复默认（库列 NULL）', () async {
+    final harness = await GroupHarness.create(createGroup: false);
+    final created = await harness.groups.createGroup(title: '可改上限组');
+
+    await harness.support.sessionRepo.updateMaxRounds(created.id, 6);
+    var reread = await harness.support.sessionRepo.get(created.id);
+    var row = (await (await DatabaseService.database)
+            .query('sessions', where: 'id = ?', whereArgs: [created.id]))
+        .first;
+    // ignore: avoid_print
+    print('[OBS] 设 6 后 读回=${reread?.maxRounds} 行=${row['max_reaction_rounds']}');
+    expect(reread!.maxRounds, 6);
+    expect(row['max_reaction_rounds'], 6);
+
+    await harness.support.sessionRepo.updateMaxRounds(created.id, null);
+    reread = await harness.support.sessionRepo.get(created.id);
+    row = (await (await DatabaseService.database)
+            .query('sessions', where: 'id = ?', whereArgs: [created.id]))
+        .first;
+    // ignore: avoid_print
+    print('[OBS] 显式 null 后 读回=${reread?.maxRounds} '
+        '行=${row['max_reaction_rounds']}');
+    expect(reread!.maxRounds, isNull, reason: '显式 null = 恢复默认');
+    expect(row['max_reaction_rounds'], isNull);
     await harness.dispose();
   });
 }

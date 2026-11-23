@@ -19,6 +19,7 @@ void main() {
     harness.queueSimpleReply('重建前的回复');
     await harness.groups
         .send(groupId: harness.group.id, memberId: member.id, text: '第一次');
+    await harness.waitForChain();
     final toolsBefore = harness.support.sidecar.lastToolsJson ?? '';
     final promptBefore = harness.support.sidecar.lastSystemPrompt ?? '';
 
@@ -34,6 +35,7 @@ void main() {
     harness.queueSimpleReply('重建后的回复');
     await harness.groups
         .send(groupId: harness.group.id, memberId: member.id, text: '第二次');
+    await harness.waitForChain();
     final toolsAfter = harness.support.sidecar.lastToolsJson ?? '';
     final promptAfter = harness.support.sidecar.lastSystemPrompt ?? '';
 
@@ -60,6 +62,7 @@ void main() {
     harness.queueSimpleReply('第一条');
     await harness.groups
         .send(groupId: harness.group.id, memberId: member.id, text: '第一次');
+    await harness.waitForChain();
     final toolsBefore = harness.support.sidecar.lastToolsJson ?? '';
     final promptBefore = harness.support.sidecar.lastSystemPrompt ?? '';
     final effortBefore = harness.support.sidecar.lastThinkingEffort ?? '';
@@ -77,6 +80,7 @@ void main() {
     harness.queueSimpleReply('第二条');
     await harness.groups
         .send(groupId: harness.group.id, memberId: member.id, text: '第二次');
+    await harness.waitForChain();
     final toolsAfter = harness.support.sidecar.lastToolsJson ?? '';
     final promptAfter = harness.support.sidecar.lastSystemPrompt ?? '';
     final effortAfter = harness.support.sidecar.lastThinkingEffort ?? '';

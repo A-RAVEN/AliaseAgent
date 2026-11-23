@@ -125,6 +125,50 @@ const _otherCodeNames = <String, String>{
   'rename_from': 'lib/core/headless_core.dart',
   // 会话表里的模板引用列名（模板删除守卫讲的"悬空引用"就是它）。
   'agent_type': 'lib/models/session.dart',
+  // 自发反应的开关与反应链词汇（change `group-reactive-mode`）：用户文档讲开关、哨兵、
+  // 步骤状态与调度时用反引号写出这些名字。它们不是配置键（开关是 sessions 列）也不是
+  // 工具参数，但确实是代码里的名字 —— 逐条指到它出现的文件。
+  'reactions_enabled': 'lib/models/session.dart',
+  'reactionsEnabled': 'lib/models/session.dart',
+  // 每组的反应轮数上限（change `group-reactive-mode` R.5 / design D13）：文档讲
+  // 「默认 8、范围 1..50、留空恢复默认、不是 config.json 键」时写出这些名字。
+  'max_reaction_rounds': 'lib/models/session.dart',
+  // 链的封闭取值（kGroupChainStatuses / kGroupChainStopReasons 里就是这些词）。
+  'idle': 'lib/services/group_reaction.dart',
+  'running': 'lib/services/group_reaction.dart',
+  'completed': 'lib/services/group_reaction.dart',
+  'cancelled': 'lib/services/group_reaction.dart',
+  'failed': 'lib/services/group_reaction.dart',
+  'all_passed': 'lib/services/group_reaction.dart',
+  'round_cap': 'lib/services/group_reaction.dart',
+  'no_members': 'lib/services/group_reaction.dart',
+  // 表名与列名（文档说清「它是 sessions 表的列，不是 config.json 键」）。
+  'sessions': 'lib/services/database_service.dart',
+  'created_at': 'lib/models/message.dart',
+  'seq': 'lib/models/message.dart',
+  // 反应链 step 的封闭取值（`kReactionStepStatuses` 里就是这几个词）。
+  'empty': 'lib/services/group_reaction.dart',
+  'forced_pass': 'lib/services/group_reaction.dart',
+  'forced_empty': 'lib/services/group_reaction.dart',
+  // 可归因错误码与调度状态字段（GroupException.code / GroupSendOutcome.toJson）。
+  'no_speaker': 'lib/services/group_service.dart',
+  'no_trigger': 'lib/services/group_service.dart',
+  'started': 'lib/services/group_service.dart',
+  'busy': 'lib/services/group_service.dart',
+  'speaker': 'lib/core/headless_core.dart',
+  'steps': 'lib/services/group_service.dart',
+  'rounds': 'lib/services/group_service.dart',
+  'status': 'lib/services/group_service.dart',
+  'error': 'lib/services/group_service.dart',
+  // 结构化 PASS（change group-reactive-mode R.10）：终态工具名、可归因错误码与 steps
+  // 状态都由 group_reaction.dart / group_service.dart 产生；用户文档讲「怎么沉默」时
+  // 会用反引号写出它们。
+  'group_react': 'lib/services/group_reaction.dart',
+  'missing_group_react': 'lib/services/group_reaction.dart',
+  'invalid_group_react': 'lib/services/group_reaction.dart',
+  'message': 'lib/services/group_reaction.dart',
+  'passed': 'lib/services/group_service.dart',
+  'replied': 'lib/services/group_service.dart',
 };
 
 /// 文档里"允许出现的、既不是配置键也不是工具名、但确实是代码里存在的名字"清单。

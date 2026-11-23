@@ -11,6 +11,7 @@
     "build:harness": "vite build --config vite.harness.config.ts",
     "test:ui": "node e2e/layout.mjs",
     "test:all": "vitest run && npm run build:harness && node e2e/layout.mjs && npm run build && node e2e/group.mjs",
+    "e2e:reactions": "node e2e/group_reactions.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

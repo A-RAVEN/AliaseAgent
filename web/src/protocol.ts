@@ -32,6 +32,20 @@ export interface Session {
   kind: 'single' | 'group';
   /** 会话级覆盖层（没有覆盖时是 null）。 */
   overrides: InstanceOverrides | null;
+  /**
+   * 组的自发反应开关（change `group-reactive-mode` D1 / D9）。
+   *
+   * 组的**持久属性**（`sessions.reactions_enabled`，不是 config.json 键）：新建组默认
+   * true，v9→v10 迁移把既有组回填 false。单会话也写该字段，但客户端只对组使用。
+   */
+  reactionsEnabled: boolean;
+  /**
+   * 组的**反应轮数上限**（change `group-reactive-mode` R.4 / D13）。
+   *
+   * `sessions.max_reaction_rounds`（不是 config.json 键）；`null` = 用产品默认
+   * （`kDefaultMaxReactionRounds`），界面以默认值占位显示。单会话也写该字段。
+   */
+  maxRounds: number | null;
 }
 
 /**
@@ -438,6 +452,15 @@ export interface GroupMemberSummary {
 
 export interface GroupSummary extends Session {
   members: GroupMemberSummary[];
+  /**
+   * 组级单运行门当前是否被占用（change `group-reactive-mode` D7 / D9）。
+   *
+   * 断线重连后本地 `sending` 会丢，web 靠它（+ `runningMemberId`）恢复"链在跑"
+   * 的显示并启用取消按钮。
+   */
+  busy: boolean;
+  /** 当前正在运行的成员 id（链在成员间隙时为 null）。 */
+  runningMemberId: string | null;
 }
 
 /** `group.list` 的结果形状。 */
@@ -450,14 +473,64 @@ export interface GroupCreateResult {
   group: Session;
 }
 
-/** `group.send` 的结果形状（带 speaker；busy 是结构化结果，不是异常）。 */
+/** 反应链 step 的来源（封闭枚举，与核心 `kReactionStepSources` 一致）。 */
+export type GroupSendStepSource = 'speaker' | 'mention' | 'reaction';
+
+/** 反应链 step 的状态（封闭枚举，与核心 `kReactionStepStatuses` 一致）。 */
+export type GroupSendStepStatus =
+  | 'replied'
+  | 'passed'
+  | 'forced_pass'
+  | 'forced_empty'
+  | 'empty'
+  | 'failed'
+  | 'cancelled';
+
+/** 反应链的一步（`group.chain` 的 `steps` 项；只是观察，不是第二套消息存储）。 */
+export interface GroupSendStep {
+  memberId: string;
+  source: GroupSendStepSource;
+  status: GroupSendStepStatus;
+  /** 这一步回应的是哪条公开消息的 seq（安静态定向轮可为 null）。 */
+  triggerSeq: number | null;
+  /** 这一步产生的公开行 seq（`replied` 时非空）。 */
+  publicSeq: number | null;
+  finalText?: string | null;
+  error?: string | null;
+}
+
+/**
+ * `group.send` 的**同步回包**（change `group-reactive-mode` R.4/R.8 / D9）。
+ *
+ * 异步契约：`started` = 用户消息（若有）已写入、请求已入执行器队列并在后台跑。
+ * **`group.send` 永不返回 busy**：执行器在跑时新请求照常入队/被吸收。**不再携带**
+ * `steps` / `rounds` / `finalText` / `memberId` —— 链进度只从 `GroupChainResult` 与
+ * `group.chain.completed` 事件读。
+ */
 export interface GroupSendResult {
   groupId: string;
   sessionId: string;
+  /** 恒为 `started`（没有 busy 分支）。 */
+  status: 'started';
+  /** 带文本时 = 用户消息 seq；speaker-only 时为 null（由链状态更新）。 */
+  triggerSeq: number | null;
+}
+
+/**
+ * `group.chain` 的结果形状：当前 / 最近一条链的只读状态（change
+ * `group-reactive-mode` R.4 / D9）。核心重启后为 `idle`。
+ */
+export interface GroupChainResult {
+  groupId: string;
+  sessionId: string;
+  /** idle / running / completed / cancelled / failed。 */
   status: string;
-  memberId: string;
-  finalText?: string | null;
-  error?: string | null;
+  triggerSeq: number | null;
+  /** 只计反应轮。 */
+  rounds: number;
+  /** 运行中为 null；终态 ∈ {all_passed, round_cap, cancelled, failed, no_members}。 */
+  stopReason: string | null;
+  steps: GroupSendStep[];
 }
 
 /** `group.view` 的结果形状：本次运行内没发过言时 `snapshot` 为 null。 */
@@ -479,6 +552,8 @@ export interface GroupCancelResult {
 /** 群聊 RPC 方法名（与核心 `kCoreRpcMethodNames` 的群聊段一一对应）。 */
 export const GROUP_RPC_METHODS = [
   'group.create',
+  'group.update',
+  'group.chain',
   'group.list',
   'group.delete',
   'group.member.add',

@@ -87,25 +87,45 @@ export function splitGroupMessages(
 /** 发言人校验的结果：`null` = 可以发送；否则是可归因的拒绝文案。 */
 export type SpeakerError =
   | { code: 'no_speaker'; message: string }
+  | { code: 'no_trigger'; message: string }
   | { code: 'empty_view'; message: string }
   | { code: 'prefill'; message: string };
 
 /**
  * 发送前校验（与核心的前置门同一口径，界面先给出可归因提示）：
- *   - 没选发言人 ⇒ no_speaker；
- *   - 不带文本且视图为空 ⇒ empty_view（绝不发空 messages）；
- *   - 不带文本且最后一条可见项是本人 assistant ⇒ prefill。
+ *
+ * **开关开启**（`reactionsEnabled: true`，change `group-reactive-mode` D10）：
+ *   - 发言人**可选**：空 + 有文本 = 纯触发（放行）；空 + 空文本 ⇒ `no_trigger`；
+ *   - 选了发言人时的两个退化前置门照旧（不带文本 + 空视图 / 本人 assistant 结尾）。
+ *
+ * **开关关闭**：
+ *   - 空 speaker + 文本含 `@` ⇒ 放行（`@` 的有效性由**核心**裁决，前端不复制
+ *     mention 解析规则 —— 两份规则必然漂移）；
+ *   - 空 speaker + 文本不含 `@` ⇒ `no_speaker`（旧本地校验）。
+ *
+ * `reactionsEnabled` 缺省 `false`：既有调用方与既有用例保持旧口径。
  */
 export function validateSpeaker(args: {
   speaker: string | null;
   text: string;
   viewMessages: Message[];
+  reactionsEnabled?: boolean;
 }): SpeakerError | null {
   const speaker = args.speaker?.trim() ?? '';
+  const reactionsEnabled = args.reactionsEnabled ?? false;
+  const hasText = args.text.trim().length > 0;
   if (speaker.length === 0) {
+    if (reactionsEnabled) {
+      if (hasText) return null;
+      return {
+        code: 'no_trigger',
+        message: '开启自发反应时必须输入一条消息（没有文本就没有可触发的公开消息）',
+      };
+    }
+    if (hasText && args.text.includes('@')) return null;
     return { code: 'no_speaker', message: '请先选择一个发言人（群发送必须点名一个成员）' };
   }
-  if (args.text.trim().length > 0) return null;
+  if (hasText) return null;
   if (args.viewMessages.length === 0) {
     return {
       code: 'empty_view',
@@ -136,4 +156,69 @@ export function ringDenominator(snapshot: {
     return snapshot.breakdown.windowTokens;
   }
   return snapshot.windowTokens;
+}
+
+// ---------------------------------------------------------------------------
+// 每组反应轮数上限（change `group-reactive-mode` R.4 / design D13）
+// ---------------------------------------------------------------------------
+
+/**
+ * 产品默认上限。出处：design D13（`kDefaultMaxReactionRounds = 8`）——典型 3 人群聊
+ * 的 2–3 个来回约 4–6 个反应轮，再加 2 轮评价/回应余量。**不是** `config.json` 键。
+ */
+export const kDefaultMaxReactionRounds = 8;
+
+/** 上限的合法下界（design D13：范围 1..50；0 / 负数被拒绝，不静默截断）。 */
+export const kMinMaxReactionRounds = 1;
+
+/** 上限的合法上界（design D13）。 */
+export const kMaxMaxReactionRounds = 50;
+
+/** 「反应轮数上限」输入框的解析结果：值 / 恢复默认 / 可归因错误。 */
+export type MaxRoundsParse =
+  | { value: number | null }
+  | { error: string };
+
+/**
+ * 解析输入框原文：留空 ⇒ `{value: null}`（`group.update {maxRounds: null}` = 恢复默认）；
+ * 1..50 的整数 ⇒ `{value: N}`；其它（0 / 负数 / 越界 / 小数 / 非数字）⇒ 可归因错误。
+ *
+ * 越界**不静默改正**（design D10 / D13）：界面把核心的拒绝如实显示出来。
+ */
+export function parseMaxRoundsInput(raw: string): MaxRoundsParse {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return { value: null };
+  if (!/^\d+$/.test(trimmed)) {
+    return {
+      error: `反应轮数上限必须是 ${kMinMaxReactionRounds}..${kMaxMaxReactionRounds} 的整数，或留空恢复默认`,
+    };
+  }
+  const value = Number(trimmed);
+  if (value < kMinMaxReactionRounds || value > kMaxMaxReactionRounds) {
+    return {
+      error: `反应轮数上限必须在 ${kMinMaxReactionRounds}..${kMaxMaxReactionRounds} 之间（收到 ${value}）`,
+    };
+  }
+  return { value };
+}
+
+/**
+ * 链是否正在跑（界面据此禁用设置、显示活动指示、启用取消）。
+ *
+ * 三个来源任一成立即算在跑：核心的只读 `busy`、`group.chain` 的 `running`、本页
+ * 观察到的流式成员。断线重连后前两个仍在，所以取消按钮不依赖本地发送状态
+ * （design D10 / spec「断线重连后仍能取消」）。
+ */
+export function chainIsRunning(args: {
+  busy: boolean;
+  chainStatus: string | null;
+  streamingMembers: number;
+  sending?: boolean;
+}): boolean {
+  return (
+    args.busy ||
+    args.chainStatus === 'running' ||
+    args.streamingMembers > 0 ||
+    args.sending === true
+  );
 }

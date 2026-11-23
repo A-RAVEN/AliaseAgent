@@ -51,7 +51,7 @@ class _RecordingSessionRepo implements SessionRepository {
   final List<Session> sessions;
 
   @override
-  Future<Session> create({String? title, String? agentType, String? parentSessionId, String kind = Session.kindSingle, String? overridesJson}) async {
+  Future<Session> create({String? title, String? agentType, String? parentSessionId, String kind = Session.kindSingle, String? overridesJson, bool reactionsEnabled = true, int? maxRounds}) async {
     final s = Session(
       id: 'new-${sessions.length}',
       title: title ?? 'New Chat',
@@ -59,6 +59,8 @@ class _RecordingSessionRepo implements SessionRepository {
       parentSessionId: parentSessionId,
       createdAt: DateTime.now().millisecondsSinceEpoch,
       updatedAt: DateTime.now().millisecondsSinceEpoch,
+      reactionsEnabled: reactionsEnabled,
+      maxRounds: maxRounds,
     );
     sessions.insert(0, s);
     return s;
@@ -66,6 +68,27 @@ class _RecordingSessionRepo implements SessionRepository {
 
   @override
   Future<void> updateOverrides(String id, String? json) async {}
+
+  /// 自发反应开关（change `group-reactive-mode`）：本用例盯的是删除与写库的先后，
+  /// 不读开关；改到对应行并记一条台账，既不谎报成功也不引入新的观察点。
+  @override
+  Future<void> updateReactionsEnabled(String id, bool enabled) async {
+    final i = sessions.indexWhere((s) => s.id == id);
+    if (i < 0) return;
+    sessions[i] = sessions[i].copyWith(reactionsEnabled: enabled);
+    ledger.record('session-update-reactions');
+  }
+
+  /// 反应轮数上限（change `group-reactive-mode` R.1）：同上，记录台账即可。
+  @override
+  Future<void> updateMaxRounds(String id, int? maxRounds) async {
+    final i = sessions.indexWhere((s) => s.id == id);
+    if (i < 0) return;
+    sessions[i] = maxRounds == null
+        ? sessions[i].copyWith(clearMaxRounds: true)
+        : sessions[i].copyWith(maxRounds: maxRounds);
+    ledger.record('session-update-max-rounds');
+  }
 
   @override
   Future<Session?> get(String id) async {

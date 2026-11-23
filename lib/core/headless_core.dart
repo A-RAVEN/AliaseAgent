@@ -89,8 +89,11 @@ const List<String> kCoreRpcMethodNames = <String>[
   'template.delete',
   'attachment.upload',
   'attachment.read',
-  // 群聊（change `agent-group-chat` §7）：八个方法，实现与清单必须一致。
+  // 群聊（change `agent-group-chat` §7；change `group-reactive-mode` 加 `group.update`
+  // 与 `group.chain`）：十个方法，实现与清单必须一致。
   'group.create',
+  'group.update',
+  'group.chain',
   'group.list',
   'group.delete',
   'group.member.add',
@@ -453,6 +456,8 @@ class HeadlessCore {
       'attachment.upload': _handleAttachmentUpload,
       'attachment.read': _handleAttachmentRead,
       'group.create': _handleGroupCreate,
+      'group.update': _handleGroupUpdate,
+      'group.chain': _handleGroupChain,
       'group.list': _handleGroupList,
       'group.delete': _handleGroupDelete,
       'group.member.add': _handleGroupMemberAdd,
@@ -1313,12 +1318,84 @@ class HeadlessCore {
       throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
           'Invalid params: workspace 必须是字符串或省略');
     }
+    // 组的自发反应开关（change `group-reactive-mode` D9）：布尔，省略 = 新建组默认
+    // 开启（`true` 由 `GroupService.createGroup` 的缺省给出，不在 RPC 层写第二份）。
+    final rawReactions = params['reactionsEnabled'];
+    if (rawReactions != null && rawReactions is! bool) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: reactionsEnabled 必须是布尔或省略');
+    }
+    // 组的反应轮数上限（R.3 / D13）：整数 1..50 或省略 / null（= 产品默认）。
+    final rawMaxRounds = params['maxRounds'];
+    if (rawMaxRounds != null && rawMaxRounds is! int) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: maxRounds 必须是整数或省略（null = 用产品默认）');
+    }
+    final maxRounds = rawMaxRounds as int?;
+    if (!isValidMaxReactionRounds(maxRounds)) {
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: maxRounds 必须是 $kMinMaxReactionRounds..$kMaxMaxReactionRounds '
+              '的整数或省略（收到 $maxRounds）');
+    }
     try {
       final session = await groups.createGroup(
         title: rawTitle as String?,
         workspace: rawWorkspace as String?,
+        reactionsEnabled: rawReactions as bool?,
+        maxRounds: maxRounds,
       );
       return {'group': serializeSession(session)};
+    } on GroupException catch (e) {
+      throw _groupError(e);
+    }
+  }
+
+  /// `group.update`：改组的两个运行设置（自发反应开关 / 反应轮数上限）并返回更新后的
+  /// 会话（change `group-reactive-mode` D1 / R.3）。
+  ///
+  /// 至少给一个字段；`reactionsEnabled` 必须布尔；`maxRounds` 必须是 1..50 的整数或
+  /// **显式 null**（恢复默认；与字段缺席不同：缺席 = 不改）。类型不对 / 越界 /
+  /// 空对象 ⇒ `-32602`；组不存在 / 链运行中 busy ⇒ 可归因错误。
+  Future<Map<String, dynamic>> _handleGroupUpdate(
+      Map<String, dynamic> params) async {
+    final groupId = _requireString(params, 'groupId');
+    final hasReactions = params.containsKey('reactionsEnabled');
+    final rawReactions = params['reactionsEnabled'];
+    if (hasReactions && rawReactions is! bool) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: reactionsEnabled 必须是布尔');
+    }
+    final hasMaxRounds = params.containsKey('maxRounds');
+    final rawMaxRounds = params['maxRounds'];
+    if (hasMaxRounds && rawMaxRounds != null && rawMaxRounds is! int) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: maxRounds 必须是整数或显式 null（恢复默认）');
+    }
+    if (!hasReactions && !hasMaxRounds) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: group.update 至少要给一个字段（reactionsEnabled / maxRounds）');
+    }
+    try {
+      final session = await groups.updateGroupSettings(
+        groupId,
+        reactionsEnabled: rawReactions as bool?,
+        maxRounds: rawMaxRounds as int?,
+        setMaxRounds: hasMaxRounds,
+      );
+      return {'group': serializeSession(session)};
+    } on GroupException catch (e) {
+      throw _groupError(e);
+    }
+  }
+
+  /// `group.chain`：返回当前 / 最近一条链的只读状态（change `group-reactive-mode`
+  /// R.3 / D9）。核心重启后为 `idle`（本进程内语义）。
+  Future<Map<String, dynamic>> _handleGroupChain(
+      Map<String, dynamic> params) async {
+    final groupId = _requireString(params, 'groupId');
+    try {
+      await groups.requireGroup(groupId);
+      return groups.chainOf(groupId).toJson();
     } on GroupException catch (e) {
       throw _groupError(e);
     }
@@ -1332,6 +1409,10 @@ class HeadlessCore {
       out.add({
         ...serializeSession(entry.session),
         'members': await groups.describeMembers(entry.session.id),
+        // 只读忙碌状态（change `group-reactive-mode` D7 / D9）：断线重连后的 web 靠
+        // 它判断"链在跑/谁在跑"，从而启用取消按钮（不依赖本地 sending 状态）。
+        'busy': groups.isGroupBusy(entry.session.id),
+        'runningMemberId': groups.runningMemberIdOf(entry.session.id),
       });
     }
     return {'groups': out};
@@ -1464,10 +1545,19 @@ class HeadlessCore {
       Map<String, dynamic> params) async {
     await _ready;
     final groupId = _requireString(params, 'groupId');
+    // `speaker` **可选**（change `group-reactive-mode` D9）：出现时必须是非空字符串
+    // （类型/空串不对 ⇒ -32602）；省略 = 由组服务按 reactionsEnabled 与 @mention
+    // 决定响应者。模式相关的校验（no_speaker / no_trigger）交给组服务 ——
+    // 那是它的语义，RPC 层不复制；`group.send` 永不 busy。
     final rawSpeaker = params['speaker'];
-    if (rawSpeaker is! String || rawSpeaker.isEmpty) {
+    if (rawSpeaker != null && rawSpeaker is! String) {
       throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
-          'Invalid params: 群发送必须带 speaker（成员 id）—— 不指定发言者的发送被拒绝');
+          'Invalid params: speaker 必须是字符串或省略');
+    }
+    final speaker = rawSpeaker as String?;
+    if (speaker != null && speaker.trim().isEmpty) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: speaker 出现时必须是非空字符串（要"不点名"请省略该字段）');
     }
     final rawText = params['text'];
     if (rawText != null && rawText is! String) {
@@ -1477,14 +1567,13 @@ class HeadlessCore {
     try {
       final outcome = await groups.send(
         groupId: groupId,
-        memberId: rawSpeaker,
+        memberId: speaker,
         text: rawText as String?,
       );
-      if (outcome.status == 'failed') {
-        _sendEvent(groupId, 'turn.failed',
-            {'error': outcome.error ?? '(整轮失败但没有错误文本)'},
-            groupId: groupId, memberId: outcome.memberId);
-      }
+      // 异步契约（change `group-reactive-mode` R.3/R.8 / D9）：只返回
+      // `{groupId, sessionId, status: started, triggerSeq}`（永不 busy）；步骤、轮数、
+      // 终态从 `group.chain` 与 `group.chain.completed` 读。`turn.failed` 由组服务在
+      // 后台按**真实失败**的步骤发（`onTurnFailed`），这里不再看 outcome。
       return {
         'groupId': groupId,
         'sessionId': groupId,
@@ -1641,6 +1730,12 @@ Map<String, dynamic> serializeSession(Session session) => {
       'updatedAt': session.updatedAt,
       // 客户端据此分流：组会话 → 组视图，单会话 → 聊天屏（agent-group-chat D16）。
       'kind': session.kind,
+      // 组的自发反应开关（change `group-reactive-mode` D9）：组与单会话都写，客户端
+      // 只对组使用（单会话的值无行为意义）。
+      'reactionsEnabled': session.reactionsEnabled,
+      // 反应轮数上限（R.3 / D13）：整数或 null（null = 用产品默认 8，客户端以默认值
+      // 占位显示）。它是 `sessions` 列，不是 config.json 键。
+      'maxRounds': session.maxRounds,
       // 会话级覆盖层：可空字段如实写出（没有覆盖时是 null，不是 {}）。
       'overrides': session.overrides?.toJson(),
     };
@@ -1746,6 +1841,47 @@ Future<HeadlessCore> buildHeadlessCore({
     factory: factory,
     templates: templates,
     callbacksForMember: (member) => core.callbacksForMember(member),
+    // 组服务自己写入的用户消息**不带 memberId**（这条消息没有成员作者），标题变化
+    // 同理由组服务发 `session.title`（change `group-reactive-mode` D9）。
+    onUserMessage: (groupId, message) => core._sendEvent(
+      groupId,
+      'user.message',
+      serializeMessage(message),
+      groupId: groupId,
+    ),
+    onTitleChanged: (groupId, title) => core._sendEvent(
+      groupId,
+      'session.title',
+      {'title': title},
+      groupId: groupId,
+    ),
+    // 链进入终态 ⇒ 唯一新增的事件类型 `group.chain.completed`（payload 带
+    // groupId/sessionId/status/stopReason/rounds/triggerSeq；**steps 不进事件**，
+    // 需要时查 `group.chain`）。change `group-reactive-mode` R.2 / R.3 / D7。
+    onChainCompleted: (chain) => core._sendEvent(
+      chain.groupId,
+      'group.chain.completed',
+      {
+        'status': chain.status,
+        'stopReason': chain.stopReason,
+        'rounds': chain.rounds,
+        'triggerSeq': chain.triggerSeq,
+      },
+      groupId: chain.groupId,
+    ),
+    // `turn.failed` 只按**真实失败**步骤发（forced_pass / forced_empty 不是整轮失败，
+    // 只在链状态的 steps 里可观察）。
+    onTurnFailed: (groupId, step) => core._sendEvent(
+      groupId,
+      'turn.failed',
+      {
+        'error': step.error ?? '(整轮失败但没有错误文本)',
+        'source': step.source,
+        'status': step.status,
+      },
+      groupId: groupId,
+      memberId: step.memberId,
+    ),
   );
 
   core = HeadlessCore(

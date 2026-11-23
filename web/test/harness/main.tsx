@@ -148,6 +148,8 @@ function makeSessions(count: number): Session[] {
     updatedAt: index,
     kind: 'single' as const,
     overrides: null,
+    reactionsEnabled: true,
+    maxRounds: null,
   }));
 }
 
@@ -351,6 +353,8 @@ function Harness({ scenario }: { scenario: HarnessScenario }) {
       updatedAt: Date.now(),
       kind: 'single',
       overrides: null,
+      reactionsEnabled: true,
+      maxRounds: null,
     };
     setSessions((previous) => [created, ...previous]);
     setCurrentSessionId(created.id);

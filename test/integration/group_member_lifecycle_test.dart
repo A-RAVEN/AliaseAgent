@@ -45,9 +45,10 @@ void main() {
     expect(children, isEmpty, reason: '群成员不是一次性子运行');
 
     harness.queueFinal('甲的公开结论：lib/a.dart（工具过程不可见）', thinking: '甲的私有思考');
-    final outcome = await harness.groups
+    await harness.groups
         .send(groupId: harness.group.id, memberId: member.id, text: '甲说一下');
-    expect(outcome.status, 'completed');
+    // 异步发送：等链终态再断言实例与上下文（R.7）。
+    expect((await harness.waitForChain()).status, 'completed');
 
     final after = harness.agents.lookup(member.handle);
     // ignore: avoid_print
@@ -67,6 +68,7 @@ void main() {
     harness.queueSimpleReply('公开结论');
     await harness.groups
         .send(groupId: harness.group.id, memberId: member.id, text: '甲说');
+    await harness.waitForChain();
 
     final prompt = harness.support.sidecar.lastSystemPrompt ?? '';
     // ignore: avoid_print
@@ -91,6 +93,7 @@ void main() {
     harness.queueSimpleReply('甲的第一条公开结论');
     await harness.groups
         .send(groupId: harness.group.id, memberId: member.id, text: '甲先说');
+    await harness.waitForChain();
 
     final rowsBefore = await harness.support.messageRepo
         .queryBySession(harness.group.id);
@@ -134,6 +137,7 @@ void main() {
     harness.queueSimpleReply('甲二的第二条');
     await harness.groups
         .send(groupId: harness.group.id, memberId: updated.id, text: '再说一句');
+    await harness.waitForChain();
 
     final toolsJson = harness.support.sidecar.lastToolsJson ?? '';
     // ignore: avoid_print

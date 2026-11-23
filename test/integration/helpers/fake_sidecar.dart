@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io' show sleep;
 
 import 'package:alias_agent/services/sidecar_bridge.dart';
@@ -237,6 +238,17 @@ class FakeSidecar implements ISidecar {
     _events.add(_FakeEvent(type: 'tool_call', json: json));
   }
 
+  /// 排一个 `group_react` 终态调用（change `group-reactive-mode` R.10）：模拟模型
+  /// 通过结构化工具声明「本轮沉默 / 本轮发言」。它必须在 [queueDone] 之前排。
+  void queueGroupReact({required bool pass, String message = ''}) {
+    queueToolCall(jsonEncode({
+      'type': 'tool_use',
+      'id': 'group_react_${_events.length}',
+      'name': 'group_react',
+      'input': {'pass': pass, 'message': message},
+    }));
+  }
+
   void queueThinking(String json) {
     _events.add(_FakeEvent(type: 'thinking', json: json));
   }
@@ -289,6 +301,19 @@ class FakeSidecar implements ISidecar {
   final List<String> sendHandles = [];
   final List<String> cancelHandles = [];
   final List<String> toolHandles = [];
+
+  /// 每次 `sendMessage` 的全文记录（按句柄过滤即可看「某个成员这一轮实际收到什么」）。
+  final List<
+      ({
+        String handle,
+        String systemPrompt,
+        String messagesJson,
+        String toolsJson,
+      })> sendRequests = [];
+
+  /// 让**下一次** `sendMessage` 直接抛异常（change `group-reactive-mode` D7 的第二种
+  /// 失败形态：整轮 failed 但**不写**公开 `Error: …` 行 —— 未预期异常路径）。
+  Object? nextSendError;
   final Map<String, bool> _createdByEnsure = {};
   final Set<String> _ensured = {};
 
@@ -391,6 +416,21 @@ class FakeSidecar implements ISidecar {
     lastBaseUrl = baseUrl;
     lastModel = model;
     lastToolsJson = toolsJson;
+    // **per-handle 的请求记录**（change `group-reactive-mode` 任务 2.1 / 3.2）：
+    // `lastSystemPrompt` 只留最后一次，验不了"每个成员的请求各自看到了什么"；
+    // 反应链要断言「B 的视图含 A 的公开回复」「反应轮的系统提示词含对应常量」，
+    // 所以按句柄留全文（测试自己过滤，不在这里做语义）。
+    sendRequests.add((
+      handle: handle,
+      systemPrompt: systemPrompt,
+      messagesJson: messagesJson,
+      toolsJson: toolsJson,
+    ));
+    final injectedError = nextSendError;
+    if (injectedError != null) {
+      nextSendError = null;
+      throw injectedError is String ? Exception(injectedError) : injectedError;
+    }
 
     // Gate (11.4): suspend event delivery until the test releases it.
     // Per-send semantics (17.1): each sendMessage pops ITS OWN gate — the

@@ -18,6 +18,13 @@ import 'package:alias_agent/services/tool_catalog.dart';
 
 import 'fake_sidecar.dart';
 
+/// 链在**测试侧**的上界（不是产品上限；产品的每组上限是 `maxRounds` ≤ 50）。
+///
+/// 出处（change `group-reactive-mode` R.6 的推导公式）：假 sidecar 单轮预期 ≤ 1s ×
+/// 用例最大成员数 4 × `min(该组上限或默认 8, 3)` × 安全系数 2 = 24s。它的唯一作用是
+/// 让"链不收敛 / 忘了等终态"变成**红**而不是永久挂起。
+const Duration kTestChainTimeout = Duration(seconds: 24);
+
 const AgentTypeConfig kGroupTestTemplate = AgentTypeConfig(
   name: 'general',
   provider: 'p',
@@ -123,11 +130,23 @@ class GroupCoreHarness {
         core: core, ws: ws, root: root, sidecar: fake);
   }
 
-  /// 建组（可带 workspace）。
-  Future<Map<String, dynamic>> createGroup({String? title, String? workspace}) =>
+  /// 建组（可带 workspace / 自发反应开关）。
+  ///
+  /// **夹具口径，不是产品默认**（change `group-reactive-mode` 任务 0.3 / design D12
+  /// 的 Risks）：产品新建组默认 `reactionsEnabled = true`，但既有群聊 RPC 用例依赖
+  /// 「点名后只有一个人跑」的旧语义，所以这里**缺省 `false`**。要验自发反应的用例
+  /// 必须显式传 `true`。不传时 `group.list` 必须读回 `false`（7.1 之外的 0.3 用例验它）。
+  Future<Map<String, dynamic>> createGroup({
+    String? title,
+    String? workspace,
+    bool? reactionsEnabled = false,
+    Object? maxRounds,
+  }) =>
       ws.request('group.create', {
         'title': ?title,
         'workspace': ?workspace,
+        'reactionsEnabled': ?reactionsEnabled,
+        'maxRounds': ?maxRounds,
       });
 
   Future<Map<String, dynamic>> addMember(
@@ -143,7 +162,41 @@ class GroupCoreHarness {
         'overrides': ?overrides,
       });
 
+  /// `group.chain` 的结果体（没链时 `status = idle`）。
+  Future<Map<String, dynamic>> groupChain(String groupId) async {
+    final response = await ws.request('group.chain', {'groupId': groupId});
+    final error = response['error'];
+    if (error != null) {
+      throw StateError('group.chain 失败：$error');
+    }
+    return Map<String, dynamic>.from(response['result'] as Map);
+  }
+
+  /// 轮询 `group.chain` 到终态（异步发送的测试必须等终态再断言 / 清理；
+  /// change `group-reactive-mode` R.7）。上界出处见 `kTestChainTimeout` 的注释。
+  Future<Map<String, dynamic>> waitForChain(
+    String groupId, {
+    Duration limit = kTestChainTimeout,
+  }) async {
+    final deadline = DateTime.now().add(limit);
+    while (true) {
+      final chain = await groupChain(groupId);
+      if (chain['status'] != 'running') return chain;
+      if (DateTime.now().isAfter(deadline)) {
+        throw TimeoutException(
+            '等待组 "$groupId" 的链进入终态超时（$limit）：当前 $chain',
+            limit);
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 2));
+    }
+  }
+
   Future<void> stop() async {
+    // R.7 的硬约束：**异步链未结束不得销毁侧车 / 删临时目录**。先等所有在跑的链
+    // 进入终态（上界 `kTestChainTimeout`，让"忘了等终态"变成红而不是竞态）。
+    for (final groupId in core.groups.runningGroupIds) {
+      await core.groups.waitForChain(groupId).timeout(kTestChainTimeout);
+    }
     await ws.close();
     await core.stop();
     try {

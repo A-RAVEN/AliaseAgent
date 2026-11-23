@@ -9,7 +9,7 @@ import 'package:path/path.dart' as p;
 import 'config_service.dart';
 
 class DatabaseService {
-  static const _schemaVersion = 9;
+  static const _schemaVersion = 11;
   static Database? _db;
 
   /// Whether a database is currently open. Compaction-tree persistence
@@ -68,7 +68,9 @@ class DatabaseService {
         tree_version INTEGER NOT NULL DEFAULT 0,
         dirty_since_seq INTEGER NOT NULL DEFAULT 0,
         kind TEXT NOT NULL DEFAULT 'single',
-        overrides_json TEXT
+        overrides_json TEXT,
+        reactions_enabled INTEGER NOT NULL DEFAULT 1,
+        max_reaction_rounds INTEGER
       )
     ''');
     await db.execute('''
@@ -239,6 +241,32 @@ class DatabaseService {
         await db.execute(
             'CREATE INDEX IF NOT EXISTS idx_summary_nodes_leaf_owner ON summary_nodes(session_id, member_id, covered_min_seq, covered_max_seq)');
       }
+    }
+    if (oldV <= 9) {
+      // v9 → v10：组的**自发反应开关**（change `group-reactive-mode` D1 / D8）。
+      // 只加这一列 + 回填既有组行，不删行、不改既有列。
+      //
+      // 回填口径刻意是「新组默认开、旧组升级默认关」：升级用户的既有群聊保持原来的
+      // 点名体验（他们可以在组视图里自己打开），而新建组享受自发反应。
+      // 旧**单会话**行保持列默认 1（对单 Agent 行为无意义，但验收要能分别断言）。
+      //
+      // **不要在这里加 `max_reaction_rounds`**：它属于 v10 → v11（见下）。
+      // 上一轮同步实现已经把这个库升到 v10、只加了本列；版本号在同步→异步返工之间
+      // 撞车，若把上限列留在本分支，真实库（oldV=10）永远不会补列，导致
+      // `INSERT ... max_reaction_rounds` 报「table sessions has no column named …」。
+      await db.execute(
+          'ALTER TABLE sessions ADD COLUMN reactions_enabled INTEGER NOT NULL DEFAULT 1');
+      await db.execute(
+          "UPDATE sessions SET reactions_enabled = 0 WHERE kind = 'group'");
+    }
+    if (oldV <= 10) {
+      // v10 → v11：组的**反应轮数上限**（change `group-reactive-mode` R.1 / D13）。
+      //
+      // 两种库都走这里：① 从 v9 及更早升上来（上一个分支刚加了开关列）；
+      // ② **已经是 v10、但缺上限列**的库 —— 即上一轮同步实现升上来的真实用户库。
+      // 只加可空列，既有行保持 NULL（= 用产品默认 8），不回填。
+      await db.execute(
+          'ALTER TABLE sessions ADD COLUMN max_reaction_rounds INTEGER');
     }
     if (oldV < 1 || oldV > _schemaVersion) {
       await db.execute('DROP TABLE IF EXISTS messages');

@@ -9,7 +9,17 @@ import type { AddressInfo } from 'node:net';
 import { createServer } from 'node:net';
 import { once } from 'node:events';
 
-import { GROUP_RPC_METHODS, RpcClient, type ConnectionStatus } from './protocol';
+import {
+  GROUP_RPC_METHODS,
+  RpcClient,
+  type ConnectionStatus,
+  type GroupChainResult,
+  type GroupSendResult,
+  type GroupSendStepSource,
+  type GroupSendStepStatus,
+  type GroupSummary,
+  type Session,
+} from './protocol';
 import { readLayoutConfig } from './tokens';
 
 function obs(label: string, value: unknown): void {
@@ -206,9 +216,11 @@ describe('断线期间的请求', () => {
 // ---------------------------------------------------------------------------
 
 describe('群聊协议形状', () => {
-  it('八个群聊方法名在客户端清单里齐备（与核心 kCoreRpcMethodNames 同步）', () => {
+  it('十个群聊方法名在客户端清单里齐备（与核心 kCoreRpcMethodNames 同步）', () => {
     expect([...GROUP_RPC_METHODS]).toEqual([
       'group.create',
+      'group.update',
+      'group.chain',
       'group.list',
       'group.delete',
       'group.member.add',
@@ -217,6 +229,152 @@ describe('群聊协议形状', () => {
       'group.send',
       'group.view',
     ]);
+  });
+
+  // -------------------------------------------------------------------------
+  // 自发反应（change `group-reactive-mode` 任务 5.1）
+  // -------------------------------------------------------------------------
+
+  it('steps 的状态枚举是封闭的（含 forced_empty / empty / cancelled / failed）', () => {
+    // 类型层已经由 `GroupSendStep` 的联合类型固定；这里用可执行断言钉住取值，
+    // 防止有人把枚举放宽成 string 而测试仍绿。
+    const statuses: GroupSendStepStatus[] = [
+      'replied',
+      'passed',
+      'forced_pass',
+      'forced_empty',
+      'empty',
+      'failed',
+      'cancelled',
+    ];
+    const sources: GroupSendStepSource[] = ['speaker', 'mention', 'reaction'];
+    obs('steps statuses', statuses);
+    obs('steps sources', sources);
+    expect(statuses).toContain('forced_empty');
+    expect(statuses).toContain('forced_pass');
+    expect(statuses).toContain('empty');
+    expect(statuses).toContain('cancelled');
+    expect(statuses).toContain('failed');
+    expect(statuses.length).toBe(7);
+    expect(sources.length).toBe(3);
+  });
+
+  it('group.send 异步形状：只带 status/triggerSeq，不带 steps；链状态由 GroupChainResult 承载', () => {
+    // 异步契约（change `group-reactive-mode` R.4 / D9）：send 的回包只有
+    // groupId/sessionId/status/triggerSeq/error —— 链进度从 `group.chain` 读。
+    const send: GroupSendResult = {
+      groupId: 'g-1',
+      sessionId: 'g-1',
+      status: 'started',
+      triggerSeq: 1,
+    };
+    obs('group.send 异步回包', send);
+    expect(send.status).toBe('started');
+    expect(send.triggerSeq).toBe(1);
+    expect('steps' in send).toBe(false);
+    expect('rounds' in send).toBe(false);
+
+    const chain: GroupChainResult = {
+      groupId: 'g-1',
+      sessionId: 'g-1',
+      status: 'completed',
+      triggerSeq: 4,
+      rounds: 2,
+      stopReason: 'round_cap',
+      steps: [
+        {
+          memberId: 'member-a',
+          source: 'reaction',
+          status: 'replied',
+          triggerSeq: 1,
+          publicSeq: 2,
+          finalText: '甲的回复',
+          error: null,
+        },
+        {
+          memberId: 'member-b',
+          source: 'reaction',
+          status: 'passed',
+          triggerSeq: 1,
+          publicSeq: null,
+          finalText: '[PASS]',
+          error: null,
+        },
+      ],
+    };
+    obs('反应链状态', chain);
+    expect(chain.steps.length).toBe(2);
+    expect(chain.rounds).toBe(2);
+    expect(chain.stopReason).toBe('round_cap');
+    expect(chain.steps[0].publicSeq).toBe(2);
+  });
+
+  it('组会话可带 reactionsEnabled / maxRounds；group.list 项带 busy / runningMemberId', () => {
+    const session: Session = {
+      id: 'g-1',
+      title: '新组',
+      agentType: 'general',
+      parentSessionId: null,
+      createdAt: 1,
+      updatedAt: 2,
+      kind: 'group',
+      overrides: null,
+      reactionsEnabled: true,
+      maxRounds: null,
+    };
+    const summary: GroupSummary = {
+      ...session,
+      members: [],
+      busy: true,
+      runningMemberId: 'member-a',
+    };
+    obs('组会话', session);
+    obs('组项', summary);
+    expect(session.reactionsEnabled).toBe(true);
+    expect(session.maxRounds).toBeNull();
+    expect(summary.busy).toBe(true);
+    expect(summary.runningMemberId).toBe('member-a');
+  });
+
+  it('group.update 的实际 params 带 groupId 与 reactionsEnabled（payload 判据）', async () => {
+    const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+    const received: Array<Record<string, unknown>> = [];
+    server.on('connection', (socket) => {
+      socket.on('message', (raw) => {
+        const request = JSON.parse(raw.toString()) as {
+          id?: number;
+          method?: string;
+          params?: Record<string, unknown>;
+        };
+        if (request.method === 'group.update' && request.params) {
+          received.push(request.params);
+          socket.send(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: request.id,
+              result: {
+                group: {
+                  id: 'g-1',
+                  reactionsEnabled: request.params.reactionsEnabled,
+                },
+              },
+            }),
+          );
+        }
+      });
+    });
+    await once(server, 'listening');
+    const port = (server.address() as AddressInfo).port;
+    const client = new RpcClient();
+    await client.connect(`ws://127.0.0.1:${port}`);
+    await client.request('group.update', {
+      groupId: 'g-1',
+      reactionsEnabled: false,
+    });
+    obs('group.update 实际收到的 params', received);
+    expect(received).toEqual([{ groupId: 'g-1', reactionsEnabled: false }]);
+    client.close();
+    server.close();
   });
 
   it('group.send 的实际 params 带 speaker（payload 判据，不是 DOM 选中值）', async () => {
@@ -235,7 +393,12 @@ describe('群聊协议形状', () => {
             JSON.stringify({
               jsonrpc: '2.0',
               id: request.id,
-              result: { status: 'completed', memberId: request.params.speaker },
+              result: {
+                groupId: 'g-1',
+                sessionId: 'g-1',
+                status: 'started',
+                triggerSeq: 7,
+              },
             }),
           );
         }
@@ -245,15 +408,16 @@ describe('群聊协议形状', () => {
     const port = (server.address() as AddressInfo).port;
     const client = new RpcClient();
     await client.connect(`ws://127.0.0.1:${port}`);
-    const result = await client.request<{ status: string; memberId: string }>(
-      'group.send',
-      { groupId: 'g-1', speaker: 'member-a', text: '说一句' },
-    );
+    const result = await client.request<{
+      status: string;
+      triggerSeq: number;
+    }>('group.send', { groupId: 'g-1', speaker: 'member-a', text: '说一句' });
     obs('group.send 实际收到的 params', received);
     expect(received).toEqual([
       { groupId: 'g-1', speaker: 'member-a', text: '说一句' },
     ]);
-    expect(result.memberId).toBe('member-a');
+    expect(result.status).toBe('started');
+    expect(result.triggerSeq).toBe(7);
     client.close();
     server.close();
   });
