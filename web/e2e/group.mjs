@@ -107,6 +107,11 @@ function findEdge() {
 // ---------------------------------------------------------------------------
 
 const windows = [1_000_000, 200_000];
+// 头像夹具（change `chat-bubbles-avatars`）：假核心里"读得出来"的那张图与模板路径。
+const FAKE_AVATAR_PATH = 'uploaded/fake-agent-avatar.png';
+const FAKE_BROKEN_AVATAR_PATH = 'uploaded/fake-missing-avatar.png';
+const FAKE_AVATAR_DATA_URL =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/wD/2y6JAAAAAElFTkSuQmCC';
 let nextId = 1;
 const sessions = [
   {
@@ -526,16 +531,46 @@ function handleRpc(socket, request) {
       providers: {},
       agentTypes: { general: { input_modalities: ['text'] } },
       tools: ['read_file', 'list_dir', 'run_command'],
+      // 用户资料（change `chat-bubbles-avatars`）：没有上传头像，种子是常量缺省值。
+      profile: { avatarPath: null, userId: null, identitySeed: 'local-user' },
     });
   }
   if (method === 'template.list') {
     return reply(socket, id, {
-      templates: [{ name: 'general' }, { name: 'narrow' }],
+      templates: [
+        { name: 'general' },
+        { name: 'narrow' },
+        { name: 'avatar-tpl', avatar_path: FAKE_AVATAR_PATH },
+        { name: 'broken-avatar-tpl', avatar_path: FAKE_BROKEN_AVATAR_PATH },
+      ],
       tools: ['read_file', 'list_dir', 'run_command'],
       thinkingEfforts: ['low', 'medium', 'high', 'max'],
       defaultTools: ['read_file', 'list_dir', 'run_command'],
       providers: ['p'],
       effectiveNote: '只有推理强度从下一条消息起对运行中对话生效，其余字段对新会话生效。',
+    });
+  }
+  if (method === 'attachment.read') {
+    // 只认那张"存在的"假头像；其它路径回错（造"文件被删"的回落）。
+    if (params.path === FAKE_AVATAR_PATH) {
+      return reply(socket, id, {
+        path: FAKE_AVATAR_PATH,
+        bytes: 0,
+        base64: FAKE_AVATAR_DATA_URL.slice(FAKE_AVATAR_DATA_URL.indexOf(',') + 1),
+        mediaType: 'image/png',
+      });
+    }
+    return fail(socket, id, `图片已丢失：附件文件不存在（${params.path}）`);
+  }
+  if (method === 'attachment.upload') {
+    const path = `uploaded/${String(params.filename ?? 'avatar.png')}`;
+    return reply(socket, id, {
+      path,
+      bytes: 0,
+      format: 'png',
+      mediaType: 'image/png',
+      width: 1,
+      height: 1,
     });
   }
   if (method === 'session.list') {
@@ -664,6 +699,10 @@ function handleRpc(socket, request) {
     if (!member) return fail(socket, id, `成员 ${params.memberId} 不存在`);
     if (params.name) member.name = params.name;
     if (params.overrides) member.overrides = params.overrides;
+    // 齿轮面板里换模板（change `chat-bubbles-avatars` D5）：payload 带 templateName。
+    if (typeof params.templateName === 'string' && params.templateName.length > 0) {
+      member.template = params.templateName;
+    }
     return reply(socket, id, {
       groupId: params.groupId,
       member: describeGroup(group).members.find((entry) => entry.id === member.id),
@@ -911,6 +950,70 @@ function startServer() {
       }
       response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       response.end(JSON.stringify({ id: seeded.id, title: seeded.title }));
+      return;
+    }
+    // 群聊气泡 / 成员卡片 / 紧凑环的夹具（change `chat-bubbles-avatars` 5.3）。
+    // 成员模板覆盖：无上传图（甲/乙）、同模板同上传图（丙/丁）、模板头像读不到（辛）、
+    // 已移除（壬）、快照 ok（戊）、快照失败（庚）、快照还在加载（己，靠 flag 延迟）。
+    if (requestPath === '/__seed_bubble_group') {
+      const seeded = newGroup('气泡卡片组');
+      const group = groups.get(seeded.id);
+      const specs = [
+        { key: 'a', id: 'mem-bub-a', name: '甲', template: 'general' },
+        { key: 'b', id: 'mem-bub-b', name: '乙', template: 'narrow' },
+        { key: 'c', id: 'mem-bub-c', name: '丙', template: 'avatar-tpl' },
+        { key: 'd', id: 'mem-bub-d', name: '丁', template: 'avatar-tpl' },
+        { key: 'e', id: 'mem-bub-e', name: '戊', template: 'general' },
+        // 庚（失败）排在己（延迟）之前：错误态先到，延迟的己留出"加载中"窗口。
+        { key: 'g', id: 'mem-bub-g', name: '庚', template: 'general' },
+        { key: 'f', id: 'mem-bub-f', name: '己', template: 'general' },
+        { key: 'broken', id: 'mem-bub-broken', name: '辛', template: 'broken-avatar-tpl' },
+        { key: 'removed', id: 'mem-bub-removed', name: '壬', template: 'general', removed: true },
+      ];
+      const members = {};
+      for (const spec of specs) {
+        group.members.push({
+          id: spec.id,
+          name: spec.name,
+          template: spec.template,
+          removedAt: spec.removed === true ? Date.now() : null,
+          overrides: null,
+          window: windows[group.members.length % windows.length],
+        });
+        members[spec.key] = spec.id;
+      }
+      pushMessage(group, { role: 'user', content: '气泡夹具：用户先说一句' });
+      for (const spec of specs) {
+        if (spec.removed === true) continue;
+        if (spec.key === 'f' || spec.key === 'g') continue;
+        pushMessage(group, {
+          role: 'assistant',
+          content: `${spec.name}的公开结论（种子）`,
+          author: spec.id,
+        });
+      }
+      group.snapshots['mem-bub-e'] = {
+        sessionId: group.session.id,
+        model: 'fake-model',
+        thinkingMode: 'disabled',
+        thinkingEffort: '',
+        capturedAt: new Date().toISOString(),
+        windowTokens: windows[0],
+        agentType: 'general',
+        breakdown: breakdown(windows[0], 1200, 300, 100),
+        messages: [{ role: 'user', content: '气泡夹具上下文' }],
+        system: '你是测试模板。',
+        tools: '[]',
+        skillFailures: [],
+        skillFailureNotice: null,
+      };
+      const index = sessions.findIndex((session) => session.id === seeded.id);
+      if (index >= 0) {
+        const [entry] = sessions.splice(index, 1);
+        sessions.unshift(entry);
+      }
+      response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      response.end(JSON.stringify({ id: seeded.id, title: seeded.title, members }));
       return;
     }
     // 群加载的故障 / 延迟注入开关（change `group-chat-layout` 1.2；假核心夹具）。
@@ -5215,6 +5318,407 @@ await run('R.13 作者负控：member-private-row 的 data-author = message.auth
   } finally {
     await page.close();
   }
+});
+
+// ---------------------------------------------------------------------------
+// 5.3 群聊气泡、成员卡片与紧凑环（change `chat-bubbles-avatars` / design D4、D5、D6）
+//
+// 独立组 id + 结束时清场；连跑两遍确认夹具不串味。断言只读 data-bubble-side /
+// data-avatar-source / data-state / data-ring-state，量内层气泡**左缘**（不量右缘、
+// 不量"宽度 < 一半"）。
+// ---------------------------------------------------------------------------
+
+async function bubbleCaseOnce(pass) {
+  const seeded = await fetch(`${staticServer.url}__seed_bubble_group`).then((response) =>
+    response.json(),
+  );
+  obs(`气泡/卡片夹具（第 ${pass} 遍）`, { id: seeded.id, members: seeded.members });
+  const ids = seeded.members;
+  const groupId = seeded.id;
+  await setGroupFlags(
+    `reset=1&groupViewFailGroupId=${groupId}&groupViewFailMemberId=${ids.g}` +
+      `&groupViewDelayGroupId=${groupId}&groupViewDelayMemberId=${ids.f}&groupViewDelayMs=30000`,
+  );
+  const page = await openPage();
+  try {
+    await page.waitForSelector('[data-testid="group-view"]', { timeout: 15000 });
+    await page.waitForSelector('[data-testid="timeline-item"]', { timeout: 15000 });
+    // 等头像字节与快照陆续到达（假核心即时回，给两帧 + 一点余量）。
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+
+    // ---- ① / ② 气泡几何：用户靠右、成员靠左（只量内层气泡左缘）----
+    const timeline = await page.evaluate(() => {
+      const rect = (node) => {
+        const box = node.getBoundingClientRect();
+        return {
+          left: box.left,
+          right: box.right,
+          top: box.top,
+          bottom: box.bottom,
+          width: box.width,
+        };
+      };
+      return [...document.querySelectorAll('[data-testid="timeline-item"]')].map((item) => {
+        const bubble = item.querySelector('[data-testid="bubble"]');
+        const column = item.querySelector('[data-testid="bubble-column"]');
+        const avatar = item.querySelector('[data-avatar-source]');
+        const name = item.querySelector('[data-testid="bubble-name"]');
+        return {
+          side: bubble?.dataset.bubbleSide ?? null,
+          text: item.innerText,
+          row: rect(item),
+          bubble: bubble ? rect(bubble) : null,
+          column: column ? rect(column) : null,
+          avatar: avatar
+            ? {
+                ...rect(avatar),
+                source: avatar.dataset.avatarSource,
+                seed: avatar.dataset.seed,
+                src: avatar.getAttribute('src'),
+                tag: avatar.tagName,
+              }
+            : null,
+          name: name
+            ? { text: name.textContent ?? '', ...rect(name) }
+            : null,
+          bubbleCount: item.querySelectorAll('[data-testid="bubble"]').length,
+        };
+      });
+    });
+    obs('时间线行数', timeline.length);
+    const userRow = timeline.find((row) => row.side === 'user');
+    const memberA = timeline.find((row) => row.text.includes('甲的公开结论（种子）'));
+    const memberB = timeline.find((row) => row.text.includes('乙的公开结论（种子）'));
+    assert(userRow !== undefined, '时间线必须有用户行');
+    assert(memberA !== undefined && memberB !== undefined, '时间线必须有甲/乙的成员行');
+    assert(
+      userRow.bubbleCount === 1,
+      `整行容器里应恰好一个内层气泡（纯气泡），实测 ${userRow.bubbleCount}`,
+    );
+    assert(
+      userRow.bubble.left > userRow.row.left + userRow.row.width / 2,
+      `用户内层气泡左缘必须落在行右半区（气泡 ${userRow.bubble.left} / 行 ${userRow.row.left}+${userRow.row.width / 2}）`,
+    );
+    assert(
+      userRow.avatar !== null && userRow.avatar.left >= userRow.bubble.right - 0.5,
+      '用户头像必须在该行最右端（气泡右侧）',
+    );
+    assert(
+      Math.abs(memberA.bubble.left - memberA.column.left) <= 1,
+      `成员内层气泡左缘必须贴自己的列（≤1px）：气泡 ${memberA.bubble.left} / 列 ${memberA.column.left}`,
+    );
+    assert(
+      memberA.avatar !== null && memberA.avatar.right <= memberA.bubble.left + 0.5,
+      '成员头像必须在气泡左侧',
+    );
+    assert(
+      memberA.avatar.left - memberA.row.left <= 1,
+      `成员头像必须贴行左缘（≤1px）：头像 ${memberA.avatar.left} / 行 ${memberA.row.left}`,
+    );
+    assert(memberA.name !== null && memberA.name.text === '甲', '成员名字必须在气泡上方');
+    assert(
+      memberA.name.bottom <= memberA.bubble.top + 1,
+      `名字必须在气泡上方（名字底 ${memberA.name.bottom} / 气泡顶 ${memberA.bubble.top}）`,
+    );
+
+    // ---- ③ 两名成员（模板无上传图）的身份图案种子是各自 id、图案不同 ----
+    assert(
+      memberA.avatar.source === 'identicon' && memberB.avatar.source === 'identicon',
+      '无上传图的模板必须画身份图案',
+    );
+    assert(
+      memberA.avatar.seed === ids.a && memberB.avatar.seed === ids.b,
+      `头像种子必须是成员 id（甲 ${ids.a} / 乙 ${ids.b}），实测 ${memberA.avatar.seed} / ${memberB.avatar.seed}`,
+    );
+    const patterns = await page.evaluate(() => {
+      const patternOf = (needle) => {
+        const row = [...document.querySelectorAll('[data-testid="timeline-item"]')].find((node) =>
+          node.innerText.includes(needle),
+        );
+        const svg = row?.querySelector('svg[data-avatar-source]');
+        if (!svg) return null;
+        return [...svg.querySelectorAll('rect')]
+          .filter((node) => (node.getAttribute('class') ?? '').startsWith('fill-avatar-tint'))
+          .map((node) => `${node.getAttribute('x')},${node.getAttribute('y')}`)
+          .join('|');
+      };
+      return { a: patternOf('甲的公开结论（种子）'), b: patternOf('乙的公开结论（种子）') };
+    });
+    obs('甲/乙 身份图案格位', patterns);
+    assert(patterns.a !== null && patterns.b !== null && patterns.a !== patterns.b,
+      '两名成员的身份图案必须不同（成员 id 不同）');
+
+    // ---- ④ 同模板同上传图：两人头像 src 相同且都是 data URL；两条都能按名字归属 ----
+    const shared = await page.evaluate(() => {
+      const info = (needle) => {
+        const row = [...document.querySelectorAll('[data-testid="timeline-item"]')].find((node) =>
+          node.innerText.includes(needle),
+        );
+        const avatar = row?.querySelector('[data-avatar-source]');
+        const name = row?.querySelector('[data-testid="bubble-name"]');
+        return {
+          source: avatar?.dataset.avatarSource ?? null,
+          src: avatar?.getAttribute('src') ?? null,
+          name: name?.textContent ?? null,
+        };
+      };
+      return { c: info('丙的公开结论（种子）'), d: info('丁的公开结论（种子）') };
+    });
+    obs('丙/丁 同模板同上传图', shared);
+    assert(shared.c.source === 'upload' && shared.d.source === 'upload', '可读上传图必须显示为上传');
+    assert(
+      typeof shared.c.src === 'string' && shared.c.src.startsWith('data:'),
+      '上传头像的 src 必须是 data URL（不是绝对路径）',
+    );
+    assert(shared.c.src === shared.d.src, '同模板同上传图时两人头像相同（属预期）');
+    assert(shared.c.name === '丙' && shared.d.name === '丁', '同图时靠名字归属');
+
+    // ---- ⑤ 成员卡片：头像 / 状态点 / 紧凑环 / 齿轮 ----
+    const cards = await page.evaluate((idList) => {
+      const read = (id) => {
+        const avatar = document.querySelector(`[data-testid="member-avatar-${id}"]`);
+        const status = document.querySelector(`[data-testid="member-status-${id}"]`);
+        const ring = document.querySelector(`[data-testid="member-ring-${id}"]`);
+        const gear = document.querySelector(`[data-testid="member-edit-${id}"]`);
+        return {
+          avatar: avatar
+            ? { source: avatar.dataset.avatarSource, seed: avatar.dataset.seed }
+            : null,
+          status: status ? status.dataset.state ?? null : null,
+          ring: ring
+            ? {
+                state: ring.dataset.ringState ?? null,
+                circles: ring.querySelectorAll('circle').length,
+                slices: ring.querySelectorAll('[data-testid="ring-slice"]').length,
+              }
+            : null,
+          gear: gear !== null,
+          gearHeight: gear ? gear.getBoundingClientRect().height : 0,
+        };
+      };
+      const out = {};
+      for (const id of idList) out[id] = read(id);
+      return out;
+    }, [ids.a, ids.b, ids.removed]);
+    obs('成员卡片要素', cards);
+    for (const [label, id] of [['甲', ids.a], ['乙', ids.b], ['已移除的壬', ids.removed]]) {
+      const card = cards[id];
+      assert(card.avatar !== null, `${label} 卡片必须有头像（member-avatar-<id>）`);
+      assert(
+        card.status === 'idle' || card.status === 'running',
+        `${label} 的状态点必须有 data-state（running/idle），实测 ${card.status}`,
+      );
+      assert(card.ring !== null, `${label} 卡片必须有紧凑环（member-ring-<id>）`);
+      assert(card.gear, `${label} 卡片必须有齿轮（member-edit-<id>）`);
+      assert(card.gearHeight >= 24, `${label} 的齿轮命中高度必须 ≥24px，实测 ${card.gearHeight}`);
+    }
+
+    // ---- ⑥ 成员都没有快照时全页 context-ring 数量为 0（紧凑环不得叫 context-ring）----
+    const ringCount = await page.evaluate(() => ({
+      contextRing: document.querySelectorAll('[data-testid="context-ring"]').length,
+      memberRing: document.querySelectorAll('[data-testid^="member-ring-"]').length,
+    }));
+    obs('环的标识', ringCount);
+    assert(ringCount.contextRing === 0, `紧凑环不得复用 context-ring，实测 ${ringCount.contextRing}`);
+    assert(ringCount.memberRing >= 3, '成员卡片必须有紧凑环占位或环');
+
+    // ---- ⑧ / ⑬ 空态 / 失败 / 加载态：只给占位、不画三瓣 ----
+    await page.waitForFunction(
+      (id) => document.querySelector(`[data-testid="member-ring-${id}"]`)?.dataset.ringState === 'error',
+      { timeout: 15000 },
+      ids.g,
+    );
+    const ringStates = await page.evaluate((idMap) => {
+      const read = (id) => {
+        const node = document.querySelector(`[data-testid="member-ring-${id}"]`);
+        return node
+          ? { state: node.dataset.ringState ?? null, circles: node.querySelectorAll('circle').length }
+          : null;
+      };
+      return { empty: read(idMap.a), error: read(idMap.g), loading: read(idMap.f) };
+    }, ids);
+    obs('环状态占位', ringStates);
+    assert(ringStates.empty.state === 'empty', `没发过言的成员环状态应为 empty，实测 ${ringStates.empty.state}`);
+    assert(ringStates.error.state === 'error', `读取失败的成员环状态应为 error，实测 ${ringStates.error.state}`);
+    assert(ringStates.loading.state === 'loading', `仍在加载的成员环状态应为 loading，实测 ${ringStates.loading.state}`);
+    for (const [label, state] of Object.entries(ringStates)) {
+      assert(state.circles === 0, `${label} 态不得画三瓣（不得画空环冒充零占用）`);
+    }
+    // 加载 / 失败两个夹具的观察目的已达成：清掉延迟与失败注入，后续重拉走快路径
+    // （否则 30s 的 group.view 会把链结束后的重拉拖住）。
+    await setGroupFlags('reset=1');
+
+    // ---- ⑦ 悬停紧凑环：浮层给 tokens 详情（对话 / 窗口 / 三瓣；不要求百分比）----
+    await page.waitForFunction(
+      (id) => document.querySelector(`[data-testid="member-ring-${id}"]`)?.dataset.ringState === 'ok',
+      { timeout: 15000 },
+      ids.e,
+    );
+    await page.hover(`[data-testid="member-ring-${ids.e}"]`);
+    await page.waitForSelector(`[data-testid="member-ring-detail-${ids.e}"]`, { timeout: 8000 });
+    const detail = await page.$eval(
+      `[data-testid="member-ring-detail-${ids.e}"]`,
+      (node) => node.innerText,
+    );
+    obs('紧凑环悬停详情', detail);
+    for (const anchor of ['对话', '窗口', '1200', '300', '100']) {
+      assert(detail.includes(anchor), `紧凑环详情缺少「${anchor}」，实测「${detail}」`);
+    }
+
+    // ---- ⑨ 已移除成员：齿轮仍可开、面板只读（保存/移除不发 RPC）----
+    await clickByTestId(page, `member-edit-${ids.removed}`);
+    await page.waitForSelector(`[data-testid="override-editor-${ids.removed}"]`, {
+      timeout: 8000,
+    });
+    const removedPanel = await page.evaluate((id) => {
+      const panel = document.querySelector(`[data-testid="override-editor-${id}"]`);
+      const save = panel?.querySelector(`[data-testid="member-save-${id}"]`);
+      const remove = panel?.querySelector(`[data-testid="member-remove-${id}"]`);
+      const controls = [...(panel?.querySelectorAll('select,input,textarea') ?? [])];
+      return {
+        saveAria: save?.getAttribute('aria-disabled') ?? null,
+        removeAria: remove?.getAttribute('aria-disabled') ?? null,
+        allControlsDisabled: controls.length > 0 && controls.every((node) => node.disabled === true),
+        effective: panel?.querySelector(`[data-testid="effective-${id}"]`)?.textContent != null,
+      };
+    }, ids.removed);
+    obs('已移除成员的面板', removedPanel);
+    assert(removedPanel.saveAria === 'true', '已移除成员的保存必须标 aria-disabled="true"');
+    assert(removedPanel.removeAria === 'true', '已移除成员的移除必须标 aria-disabled="true"');
+    assert(removedPanel.allControlsDisabled, '已移除成员的模板/工具/提示词/强度控件必须禁用');
+    assert(removedPanel.effective, '面板里仍要能看到它移除前的生效结果');
+
+    const writesBefore = rpcLog.filter(
+      (entry) =>
+        (entry.method === 'group.member.update' || entry.method === 'group.member.remove') &&
+        entry.params?.memberId === ids.removed,
+    ).length;
+    await page.click(`[data-testid="member-save-${ids.removed}"]`).catch(() => {});
+    await page.click(`[data-testid="member-remove-${ids.removed}"]`).catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const writesAfter = rpcLog.filter(
+      (entry) =>
+        (entry.method === 'group.member.update' || entry.method === 'group.member.remove') &&
+        entry.params?.memberId === ids.removed,
+    ).length;
+    obs('已移除成员的写请求数（前 / 后）', { writesBefore, writesAfter });
+    assert(writesAfter === writesBefore, '已移除成员的保存/移除点击不得发起任何写请求');
+    await clickByTestId(page, `member-edit-${ids.removed}`);
+
+    // ---- ⑪ 卡面不再有生效工具长列表（只在面板里）----
+    const cardFace = await page.evaluate((id) => {
+      const name = document.querySelector(`[data-testid="member-name-${id}"]`);
+      const card = name?.closest('li');
+      return {
+        hasEffective: card?.querySelector(`[data-testid="effective-${id}"]`) !== null,
+        text: card?.innerText ?? '',
+      };
+    }, ids.a);
+    obs('甲的卡面文本', cardFace.text);
+    assert(!cardFace.hasEffective, '卡面不得再摊出生效结果节点（effective 只在面板里）');
+    assert(!cardFace.text.includes('生效工具：'), '卡面不得再显示「生效工具：」长列表');
+
+    // ---- ⑩ 面板里换模板并保存：payload 带 templateName、保存不收起、头像随模板变 ----
+    await clickByTestId(page, `member-edit-${ids.a}`);
+    await page.waitForSelector(`[data-testid="member-template-${ids.a}"]`, { timeout: 8000 });
+    await page.select(`[data-testid="member-template-${ids.a}"]`, 'avatar-tpl');
+    await clickByTestId(page, `member-save-${ids.a}`);
+    await waitFor(
+      () =>
+        rpcLog.some(
+          (entry) =>
+            entry.method === 'group.member.update' &&
+            entry.params?.memberId === ids.a &&
+            entry.params?.templateName === 'avatar-tpl',
+        ),
+      'group.member.update 的 payload 必须带 templateName',
+    );
+    assert(
+      (await page.$(`[data-testid="override-editor-${ids.a}"]`)) !== null,
+      '保存后不得自动收起面板',
+    );
+    await page.waitForFunction(
+      (id) =>
+        document.querySelector(`[data-testid="member-avatar-${id}"]`)?.dataset.avatarSource ===
+        'upload',
+      { timeout: 15000 },
+      ids.a,
+    );
+    const aBubbleAvatar = await page.evaluate((needle) => {
+      const row = [...document.querySelectorAll('[data-testid="timeline-item"]')].find((node) =>
+        node.innerText.includes(needle),
+      );
+      return row?.querySelector('[data-avatar-source]')?.dataset.avatarSource ?? null;
+    }, '甲的公开结论（种子）');
+    obs('换模板后甲的头像来源（卡片 / 气泡）', aBubbleAvatar);
+    assert(aBubbleAvatar === 'upload', '换到有头像的模板后气泡头像也必须跟着变');
+    await clickByTestId(page, `member-edit-${ids.a}`);
+
+    // ---- ⑭ 模板头像读不到：该成员头像回落身份图案 ----
+    const brokenAvatar = await page.evaluate((id) => {
+      const node = document.querySelector(`[data-testid="member-avatar-${id}"]`);
+      return node ? { source: node.dataset.avatarSource, seed: node.dataset.seed } : null;
+    }, ids.broken);
+    obs('模板头像读不到的成员头像', brokenAvatar);
+    assert(brokenAvatar !== null && brokenAvatar.source === 'identicon',
+      '模板头像读不到时必须回落身份图案');
+    assert(brokenAvatar.seed === ids.broken, '回落时种子仍是成员 id');
+
+    // ---- ⑫ 流式状态点：门挂住甲 ⇒ 甲 running / 乙 idle；放行后两者都 idle ----
+    await fetch(`${staticServer.url}__gate_member_stream`);
+    await page.type('[data-testid="group-input"]', '开始反应');
+    await clickByTestId(page, 'group-send');
+    await page.waitForFunction(
+      (id) => document.querySelector(`[data-testid="member-status-${id}"]`)?.dataset.state === 'running',
+      { timeout: 15000 },
+      ids.a,
+    );
+    const duringStream = await page.evaluate((idMap) => {
+      const read = (id) =>
+        document.querySelector(`[data-testid="member-status-${id}"]`)?.dataset.state ?? null;
+      return {
+        a: read(idMap.a),
+        b: read(idMap.b),
+        streamingTextExists: document.querySelector(`[data-testid="member-streaming-${idMap.a}"]`) !== null,
+        streamingText:
+          document.querySelector(`[data-testid="member-streaming-${idMap.a}"]`)?.textContent ?? '',
+      };
+    }, ids);
+    obs('流式中的状态点', duringStream);
+    assert(duringStream.a === 'running', '正在流式的成员状态点必须是 running');
+    assert(duringStream.b === 'idle', '没在流式的成员状态点必须是 idle（不猜）');
+    assert(duringStream.streamingText.includes('正在反应'), '运行中必须带可读的「正在反应…」文本');
+
+    await fetch(`${staticServer.url}__release_send`);
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="reaction-active"]') === null,
+      { timeout: 20000 },
+    );
+    await page.waitForFunction(
+      (idMap) => {
+        const read = (id) =>
+          document.querySelector(`[data-testid="member-status-${id}"]`)?.dataset.state ?? null;
+        return read(idMap.a) === 'idle' && read(idMap.b) === 'idle';
+      },
+      { timeout: 20000 },
+      ids,
+    );
+    obs('链结束后状态点', await page.evaluate((idMap) => {
+      const read = (id) =>
+        document.querySelector(`[data-testid="member-status-${id}"]`)?.dataset.state ?? null;
+      return { a: read(idMap.a), b: read(idMap.b) };
+    }, ids));
+  } finally {
+    await page.close();
+    await setGroupFlags('reset=1').catch(() => {});
+  }
+  // 清场：删掉本遍的组（下一次 pass 从干净会话列表开始）。
+  await fetch(`${staticServer.url}__delete_session?id=${groupId}`).catch(() => {});
+}
+
+await run('5.3 群聊气泡 / 成员卡片 / 紧凑环（连跑两遍不串味）', async () => {
+  await bubbleCaseOnce(1);
+  await bubbleCaseOnce(2);
 });
 
 console.log('\n[群视图 e2e] 摘要：' + JSON.stringify({ total: results.length, failures: failureCount }));

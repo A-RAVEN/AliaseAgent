@@ -23,6 +23,15 @@ export const palette = {
   danger: '#f87171',
 } as const;
 
+/**
+ * 身份图案的三档填色（change `chat-bubbles-avatars` design D1）。
+ *
+ * 第 0 档**就是** `palette.accent` 本身（不写换算值，保持单一事实源）；另两档是 accent
+ * 的 HSL（H=198.44° S=93.2% L=59.61°）色相 +90° / +180°、饱和度与亮度不变。
+ * 不用语义色（ok / warn / danger）：头像是身份，不该与状态点的红绿混淆。
+ */
+export const avatarTints = ['#38BDF8', '#D338F8', '#F87338'] as const;
+
 /** 五档字阶（design D3）：12/14/16 沿用既有档，20/25 从 16 按 1.25 延伸。 */
 export const typeScale = {
   xs: 12,
@@ -50,6 +59,17 @@ export const spacingScale = [4, 8, 12, 16, 24, 32, 48, 64] as const;
 export const radii = {
   card: 8,
   panel: 12,
+} as const;
+
+/**
+ * 头像尺寸（change `chat-bubbles-avatars` design D7）：取自 `spacingScale`，不新写数字。
+ *
+ * - 气泡内头像 24 = 正文字阶 `base` 的行高，与单行文本等高；
+ * - 成员卡片头像 / 紧凑环 32。
+ */
+export const avatarSizes = {
+  bubble: spacingScale[4],
+  member: spacingScale[5],
 } as const;
 
 /** 两级 elevation（design D5）。 */

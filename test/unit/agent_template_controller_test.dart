@@ -51,6 +51,8 @@ void main() {
             'command_timeout_ms': 15000,
             'command_max_timeout_ms': 45000,
             'standing_requirements': ['不许删除用户文件'],
+            // change `chat-bubbles-avatars`：general 带头像，用来验「新模板不继承头像」。
+            'avatar_path': r'C:\tmp\general-avatar.png',
           },
           'reviewer': {
             'provider': 'deepseek',
@@ -94,6 +96,7 @@ void main() {
     String prompt = '你是写作者',
     List<String> tools = const ['read_file', 'write_file'],
     String window = '640000',
+    String? avatar,
   }) =>
       AgentTemplateDraft(
         originalName: originalName,
@@ -104,6 +107,7 @@ void main() {
         systemPrompt: prompt,
         tools: tools,
         maxContextTokensText: window,
+        avatarPath: avatar,
       );
 
   Map<String, dynamic> reread() {
@@ -253,6 +257,67 @@ void main() {
     test('修改不存在的模板被拒绝', () {
       expectRejected(draft(originalName: 'ghost', name: 'ghost'),
           '模板名', '不存在');
+    });
+  });
+
+  group('模板头像三态（change `chat-bubbles-avatars` 2.5 / design D3）', () {
+    /// 修改 general（它本来带 `avatar_path`）用的草稿；头像三态由参数决定。
+    AgentTemplateDraft generalDraft({String? avatar}) => draft(
+          originalName: 'general',
+          name: 'general',
+          provider: 'anthropic',
+          model: 'claude-sonnet-4-6',
+          effort: 'high',
+          prompt: '你是助手',
+          tools: const ['read_file', 'write_file'],
+          window: '200000',
+          avatar: avatar,
+        );
+
+    test('avatarPath=null（省略）⇒ 修改既有模板沿用原头像，不清空', () {
+      controller.save(generalDraft());
+      final raw = reread();
+      final general = (raw['agent_types'] as Map)['general'] as Map;
+      // ignore: avoid_print
+      print('  [OBS] 省略头像保存后 general.avatar_path=${general['avatar_path']}');
+      expect(general['avatar_path'], r'C:\tmp\general-avatar.png',
+          reason: '省略 = 不改（MUST NOT 静默清空既有头像）');
+    });
+
+    test("avatarPath='' ⇒ 清除该键（写回里不再有 avatar_path）", () {
+      controller.save(generalDraft(avatar: ''));
+      final raw = reread();
+      final general = (raw['agent_types'] as Map)['general'] as Map;
+      // ignore: avoid_print
+      print('  [OBS] 清除头像后 general=$general');
+      expect(general.containsKey('avatar_path'), isFalse,
+          reason: '清除 = 写回里不再有该键（不是写空串）');
+      expect(registry.lookup('general')?.avatarPath, isNull);
+    });
+
+    test('avatarPath=非空字符串 ⇒ 设为该路径', () {
+      const next = r'C:\tmp\new-avatar.png';
+      controller.save(generalDraft(avatar: next));
+      final raw = reread();
+      final general = (raw['agent_types'] as Map)['general'] as Map;
+      // ignore: avoid_print
+      print('  [OBS] 设置头像后 general.avatar_path=${general['avatar_path']}');
+      expect(general['avatar_path'], next);
+      expect(registry.lookup('general')?.avatarPath, next);
+    });
+
+    test('新增模板省略头像 ⇒ 没有该键，且不继承 general 的头像', () {
+      final result = controller.save(draft());
+      final raw = reread();
+      final writer = (raw['agent_types'] as Map)['writer'] as Map;
+      // ignore: avoid_print
+      print('  [OBS] 新模板头像：配置 hasKey=${writer.containsKey('avatar_path')} '
+          '模型=${result.template.avatarPath} general=${registry.lookup('general')?.avatarPath}');
+      expect(writer.containsKey('avatar_path'), isFalse,
+          reason: '新模板省略头像 ⇒ 没有头像，不许沿用 general 的');
+      expect(result.template.avatarPath, isNull);
+      expect(registry.lookup('general')?.avatarPath, r'C:\tmp\general-avatar.png',
+          reason: 'general 自己的头像不受影响');
     });
   });
 

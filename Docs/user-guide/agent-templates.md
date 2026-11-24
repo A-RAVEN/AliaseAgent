@@ -95,6 +95,7 @@ Agent 模板是一份"用哪个模型、带哪些工具、上下文多大"的可
 | 工具集合 | 勾选允许模型调用的工具；选项来自当前真实可用的工具目录。勾上 `spawn_subagent` 后这个模板创建的 Agent 才能让子 Agent 干活（见 [子 Agent](agent-subagents.md)） |
 | 输入模态 | text / image 两项：模型能不能收文字与图片。网关目录里的 video 等取值只会记录，不会出现在这两个勾选项里 |
 | 上下文窗口 | **可留空**。留空 = 生效窗口取网关目录里该模型的 `context_window`；填一个正整数 = 目录缺失时的覆盖值。它决定占用环的整圈与压缩阈值（窗口 × 百分比）。目录与覆盖都拿不到时，创建实例会失败并点名模板 |
+| 头像 | **可选**。上传一张图片后，模板页、该模板的成员卡片与消息气泡都显示它；没有上传（或图片文件丢了）就显示由实体 id 生成的**身份图案**。配置键是 `avatar_path`（附件目录内图片的绝对路径）。上传走核心的附件接口（大小上限与文件头魔数判定都在核心），不在浏览器里另做一套校验；**新增模板不继承头像**（不会沿用 `general` 或别的模板的头像），清除头像后回到身份图案 |
 
 选中目录里的模型后，编辑器会用目录值预填窗口、输入模态与推理强度（详见 [Provider 与模型目录](provider-models.md) 的"在模板里选模型"）：窗口未知时留空并提示"目录未提供窗口，请手填（压缩阈值依赖它）"；目录档位不被执行层支持时会显示一行"目录档位 X 暂不被执行层支持，未列入"，不静默消失。预填只是默认值，改完保存以你填的为准；目录后续刷新**不会**回改已保存的模板。
 
@@ -109,7 +110,7 @@ Agent 模板是一份"用哪个模型、带哪些工具、上下文多大"的可
 
 提示按**编辑器打开那一刻**的目录快照算，产品里没有实时通道：关掉编辑器 → 到 `Providers` 页手动刷新目录 → 再开一次编辑器，提示才按新目录重算（新目录里有了它，警示就消失）。没有 Provider 时编辑器显示 `请先在 Providers 页添加供应商` 并禁用保存。
 
-这些字段最终都写进 `config.json`，对应的配置键是 `provider`、`model`、`thinking_effort`、`system_prompt`、`tools`、`max_context_tokens`。模板表本身的键是 `agent_types`。
+这些字段最终都写进 `config.json`，对应的配置键是 `provider`、`model`、`thinking_effort`、`system_prompt`、`tools`、`max_context_tokens`、`avatar_path`。模板表本身的键是 `agent_types`。
 
 ```json
 {
@@ -120,7 +121,8 @@ Agent 模板是一份"用哪个模型、带哪些工具、上下文多大"的可
       "system_prompt": "You are a helpful assistant.",
       "tools": ["read_file", "write_file"],
       "thinking_effort": "high",
-      "max_context_tokens": 200000
+      "max_context_tokens": 200000,
+      "avatar_path": "C:\\Users\\你\\.aliasagent\\attachments\\face.png"
     }
   }
 }

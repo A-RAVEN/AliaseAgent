@@ -8,6 +8,7 @@
 // 组件是**纯展示 + 动作**：数据由 App 注入（它在真实 WS 上拉 group.list /
 // message.query / group.view），动作直接走 `group.*` RPC 再让 App 重拉。
 import { useEffect, useRef, useState } from 'react';
+import { Settings } from 'lucide-react';
 
 import type {
   CoreClient,
@@ -27,6 +28,7 @@ import {
   ringDenominator,
   validateSpeaker,
 } from './model';
+import { memberPanelControls, memberRunState } from './cards';
 import {
   initialGroupPanelState,
   selectGroupMember,
@@ -34,8 +36,17 @@ import {
   resolveSelectedMemberId,
   type GroupPanelState,
 } from './panel';
-import { ContextRing } from '../components/ContextRing';
+import type { AvatarData } from '../components/Avatar';
+import { Avatar } from '../components/Avatar';
+import { ContextRing, MemberRing } from '../components/ContextRing';
+import { MessageBubble } from '../components/MessageBubble';
 import { RealContextView } from '../components/RealContextView';
+import { avatarSizes } from '../tokens';
+
+/** 没传成员头像时的兜底：身份图案（种子 = 成员 id，不阻断渲染）。 */
+function fallbackAvatar(seed: string): AvatarData {
+  return { dataUrl: null, source: 'identicon', seed };
+}
 
 export interface GroupViewProps {
   client: CoreClient;
@@ -71,6 +82,10 @@ export interface GroupViewProps {
   /** 只重拉一个成员的快照（成员视图的「重试」，不重载整条时间线）。 */
   onReloadMemberSnapshot: (memberId: string) => void;
   onError: (message: string) => void;
+  /** 成员头像（App 层按「成员 id + 所属模板的 avatar_path」+ 字节缓存算出，D2）。 */
+  memberAvatars?: Record<string, AvatarData>;
+  /** 用户头像（`profile.avatar_path`，没有则身份图案）。 */
+  userAvatar?: AvatarData;
 }
 
 export function GroupView({
@@ -93,6 +108,8 @@ export function GroupView({
   onReload,
   onReloadMemberSnapshot,
   onError,
+  memberAvatars = {},
+  userAvatar = fallbackAvatar(''),
 }: GroupViewProps) {
   const [newName, setNewName] = useState('');
   const [newTemplate, setNewTemplate] = useState(templates[0] ?? 'general');
@@ -102,6 +119,8 @@ export function GroupView({
   const [subset, setSubset] = useState<Record<string, string[]>>({});
   const [append, setAppend] = useState<Record<string, string>>({});
   const [effort, setEffort] = useState<Record<string, string>>({});
+  // 齿轮面板里的模板草稿（D5：改模板后保存必须把 templateName 发给核心）。
+  const [templateDraft, setTemplateDraft] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   // `group.send` 的**同步阶段**状态（design D10）：收到 `started` 即解除，不等链结束。
   const [sending, setSending] = useState(false);
@@ -283,9 +302,15 @@ export function GroupView({
       ...previous,
       [member.id]: member.overrides?.thinkingEffort ?? '',
     }));
+    setTemplateDraft((previous) => ({
+      ...previous,
+      [member.id]: member.template,
+    }));
   };
 
   const saveOverrides = async (member: GroupMemberSummary) => {
+    // 已移除成员的面板是只读的：保存不发任何写请求（D5）。
+    if (member.removedAt !== null) return;
     const overrides: InstanceOverrides = {
       toolsSubset: subset[member.id] ?? [],
       systemPromptAppend: append[member.id] ?? '',
@@ -297,9 +322,11 @@ export function GroupView({
       await client.request('group.member.update', {
         groupId: group.id,
         memberId: member.id,
+        // 面板里换模板也要真的提交（只改本地状态会让下拉成摆设，D5）。
+        templateName: templateDraft[member.id] ?? member.template,
         overrides,
       });
-      setEditing(null);
+      // **保存后不自动收起面板**：用户要能立刻看到新的生效工具与思考强度（既有 8.4 也依赖）。
       await onReload();
     } catch (error) {
       onError(`保存覆盖层失败：${error instanceof Error ? error.message : String(error)}`);
@@ -309,6 +336,8 @@ export function GroupView({
   };
 
   const removeMember = async (member: GroupMemberSummary) => {
+    // 已移除成员的面板只读：移除按钮标 aria-disabled 且点击不发请求（D5）。
+    if (member.removedAt !== null) return;
     setBusy(true);
     try {
       await client.request('group.member.remove', {
@@ -666,19 +695,31 @@ export function GroupView({
               </p>
             )}
             <ul className="space-y-2">
-              {timeline.map((item, index) => (
-                <li
-                  key={`${item.seq ?? index}-${index}`}
-                  data-testid="timeline-item"
-                  data-seq={item.seq ?? ''}
-                  className="rounded-card border border-line bg-surface px-3 py-2"
-                >
-                  <div className="text-xs text-muted" data-testid="timeline-author">
-                    {item.authorName === null ? '用户' : item.authorName}
-                  </div>
-                  <div className="whitespace-pre-wrap text-sm">{item.content}</div>
-                </li>
-              ))}
+              {timeline.map((item, index) => {
+                const author = item.author;
+                const isUser = author === null;
+                const avatar = isUser
+                  ? userAvatar
+                  : memberAvatars[author] ?? fallbackAvatar(author);
+                return (
+                  <li
+                    key={`${item.seq ?? index}-${index}`}
+                    data-testid="timeline-item"
+                    data-seq={item.seq ?? ''}
+                    data-bubble-side={isUser ? 'user' : 'member'}
+                  >
+                    <MessageBubble
+                      side={isUser ? 'user' : 'member'}
+                      avatar={avatar}
+                      avatarSize={avatarSizes.bubble}
+                      testId={isUser ? 'timeline-user-message' : 'timeline-member-message'}
+                      name={isUser ? null : item.authorName}
+                    >
+                      <div className="whitespace-pre-wrap text-sm">{item.content}</div>
+                    </MessageBubble>
+                  </li>
+                );
+              })}
             </ul>
           </section>
 
@@ -771,127 +812,200 @@ export function GroupView({
             </button>
           </div>
           <ul className="space-y-2" data-testid="group-members-list">
-            {members.map((member) => (
-              <li key={member.id} className="rounded-card border border-line bg-bg/40 p-2">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="min-w-0 truncate text-sm" data-testid={`member-name-${member.id}`}>
-                    {member.name}
-                    {member.removedAt !== null && (
-                      <span className="ml-1 text-warn" data-testid={`member-removed-${member.id}`}>
-                        （已移除）
-                      </span>
-                    )}
-                  </span>
-                  {streamingMembers.includes(member.id) ? (
-                    <span
-                      className="shrink-0 text-xs text-accent"
-                      data-testid={`member-streaming-${member.id}`}
-                    >
-                      正在反应…
-                    </span>
-                  ) : (
-                    <span className="shrink-0 text-xs text-muted">{member.template}</span>
-                  )}
-                </div>
-                {member.effective && (
-                  <p className="mt-1 text-xs text-muted" data-testid={`effective-${member.id}`}>
-                    生效工具：{(member.effective.tools ?? []).join('、') || '（无）'} · 思考：
-                    {member.effective.thinkingMode ?? 'disabled'}
-                    {member.effective.thinkingEffort ? `/${member.effective.thinkingEffort}` : ''}
-                  </p>
-                )}
-                <div className="mt-1 flex gap-2 text-xs">
-                  <button
-                    type="button"
-                    data-testid={`member-edit-${member.id}`}
-                    disabled={busy || member.removedAt !== null}
-                    onClick={() => beginEdit(member)}
-                    className="min-h-6 rounded-card border border-line px-2 py-1 text-muted hover:text-fg disabled:opacity-40"
-                  >
-                    覆盖层
-                  </button>
-                  <button
-                    type="button"
-                    data-testid={`member-remove-${member.id}`}
-                    disabled={busy || member.removedAt !== null}
-                    onClick={() => void removeMember(member)}
-                    className="min-h-6 rounded-card border border-danger/40 px-2 py-1 text-danger/80 hover:text-danger disabled:opacity-40"
-                  >
-                    移除
-                  </button>
-                </div>
-                {editing === member.id && (
-                  <div className="mt-2 space-y-1 text-xs" data-testid={`override-editor-${member.id}`}>
-                    <div className="font-semibold text-muted">工具子集（只能收紧）</div>
-                    {toolNames.map((tool) => (
-                      <label key={tool} className="flex items-center gap-1">
-                        <input
-                          type="checkbox"
-                          data-testid={`tool-${member.id}-${tool}`}
-                          checked={(subset[member.id] ?? []).includes(tool)}
-                          onChange={(event) => {
-                            const next = new Set(subset[member.id] ?? []);
-                            if (event.target.checked) next.add(tool);
-                            else next.delete(tool);
-                            setSubset((previous) => ({
-                              ...previous,
-                              [member.id]: [...next],
-                            }));
-                          }}
+            {members.map((member) => {
+              const runState = memberRunState({
+                memberId: member.id,
+                streamingMembers,
+                runningMemberId: group.runningMemberId,
+              });
+              const controls = memberPanelControls({ removed: member.removedAt !== null });
+              const avatar = memberAvatars[member.id] ?? fallbackAvatar(member.id);
+              return (
+                <li
+                  key={member.id}
+                  aria-label={`成员卡片：${member.name}`}
+                  className="rounded-card border border-line bg-bg/40 p-2"
+                >
+                  <div className="flex items-center gap-2">
+                    <Avatar
+                      {...avatar}
+                      size={avatarSizes.member}
+                      label={`${member.name}的头像`}
+                      testId={`member-avatar-${member.id}`}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex min-w-0 items-center gap-1">
+                        <span
+                          className="min-w-0 truncate text-sm"
+                          data-testid={`member-name-${member.id}`}
+                        >
+                          {member.name}
+                          {member.removedAt !== null && (
+                            <span
+                              className="ml-1 text-warn"
+                              data-testid={`member-removed-${member.id}`}
+                            >
+                              （已移除）
+                            </span>
+                          )}
+                        </span>
+                        {/* 状态点：running 绿点带脉冲 / idle 灰点；运行中不只靠颜色表达。 */}
+                        <span
+                          data-testid={`member-status-${member.id}`}
+                          data-state={runState}
+                          title={runState === 'running' ? '运行中' : '空闲'}
+                          aria-label={runState === 'running' ? '运行中' : '空闲'}
+                          className={
+                            runState === 'running'
+                              ? 'status-dot-running inline-block h-2 w-2 shrink-0 rounded-full bg-ok animate-pulse'
+                              : 'inline-block h-2 w-2 shrink-0 rounded-full bg-muted'
+                          }
                         />
-                        <span>{tool}</span>
-                      </label>
-                    ))}
-                    <label className="block">
-                      提示词追加
-                      <input
-                        type="text"
-                        data-testid={`append-${member.id}`}
-                        value={append[member.id] ?? ''}
-                        onChange={(event) =>
-                          setAppend((previous) => ({
-                            ...previous,
-                            [member.id]: event.target.value,
-                          }))
-                        }
-                        className="mt-1 h-7 w-full rounded-card border border-line bg-surface px-2 text-xs"
-                      />
-                    </label>
-                    <label className="block">
-                      思考强度
-                      <select
-                        data-testid={`effort-${member.id}`}
-                        value={effort[member.id] ?? ''}
-                        onChange={(event) =>
-                          setEffort((previous) => ({
-                            ...previous,
-                            [member.id]: event.target.value,
-                          }))
-                        }
-                        className="mt-1 h-7 w-full rounded-card border border-line bg-surface px-1 text-xs"
-                      >
-                        <option value="">（无覆盖）</option>
-                        <option value="">关闭思考（空串）</option>
-                        {thinkingEfforts.map((value) => (
-                          <option key={value} value={value}>
-                            {value}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
+                        {runState === 'running' && (
+                          <span className="sr-only" data-testid={`member-streaming-${member.id}`}>
+                            正在反应…
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <MemberRing memberId={member.id} snapshot={snapshots[member.id]} />
                     <button
                       type="button"
-                      data-testid={`member-save-${member.id}`}
-                      disabled={busy}
-                      onClick={() => void saveOverrides(member)}
-                      className="rounded-card border border-accent px-2 py-1 text-accent"
+                      data-testid={`member-edit-${member.id}`}
+                      aria-expanded={editing === member.id}
+                      aria-controls={`override-editor-${member.id}`}
+                      onClick={() => (editing === member.id ? setEditing(null) : beginEdit(member))}
+                      className="flex min-h-6 min-w-6 shrink-0 items-center justify-center rounded-card border border-line px-1 text-muted hover:text-fg"
+                      title="成员设置"
+                      aria-label={`${member.name}的成员设置`}
                     >
-                      保存（重建实例）
+                      <Settings size={16} aria-hidden="true" />
                     </button>
                   </div>
-                )}
-              </li>
-            ))}
+                  {editing === member.id && (
+                    <div
+                      id={`override-editor-${member.id}`}
+                      className="mt-2 space-y-1 text-xs"
+                      data-testid={`override-editor-${member.id}`}
+                    >
+                      <label className="block">
+                        模板
+                        <select
+                          data-testid={`member-template-${member.id}`}
+                          value={templateDraft[member.id] ?? member.template}
+                          disabled={busy || controls.controlsDisabled}
+                          onChange={(event) =>
+                            setTemplateDraft((previous) => ({
+                              ...previous,
+                              [member.id]: event.target.value,
+                            }))
+                          }
+                          className="mt-1 h-7 w-full rounded-card border border-line bg-surface px-1 text-xs"
+                        >
+                          {templates.map((template) => (
+                            <option key={template} value={template}>
+                              {template}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <div className="font-semibold text-muted">工具子集（只能收紧）</div>
+                      {toolNames.map((tool) => (
+                        <label key={tool} className="flex items-center gap-1">
+                          <input
+                            type="checkbox"
+                            data-testid={`tool-${member.id}-${tool}`}
+                            checked={(subset[member.id] ?? []).includes(tool)}
+                            disabled={busy || controls.controlsDisabled}
+                            onChange={(event) => {
+                              const next = new Set(subset[member.id] ?? []);
+                              if (event.target.checked) next.add(tool);
+                              else next.delete(tool);
+                              setSubset((previous) => ({
+                                ...previous,
+                                [member.id]: [...next],
+                              }));
+                            }}
+                          />
+                          <span>{tool}</span>
+                        </label>
+                      ))}
+                      <label className="block">
+                        提示词追加
+                        <input
+                          type="text"
+                          data-testid={`append-${member.id}`}
+                          value={append[member.id] ?? ''}
+                          disabled={busy || controls.controlsDisabled}
+                          onChange={(event) =>
+                            setAppend((previous) => ({
+                              ...previous,
+                              [member.id]: event.target.value,
+                            }))
+                          }
+                          className="mt-1 h-7 w-full rounded-card border border-line bg-surface px-2 text-xs"
+                        />
+                      </label>
+                      <label className="block">
+                        思考强度
+                        <select
+                          data-testid={`effort-${member.id}`}
+                          value={effort[member.id] ?? ''}
+                          disabled={busy || controls.controlsDisabled}
+                          onChange={(event) =>
+                            setEffort((previous) => ({
+                              ...previous,
+                              [member.id]: event.target.value,
+                            }))
+                          }
+                          className="mt-1 h-7 w-full rounded-card border border-line bg-surface px-1 text-xs"
+                        >
+                          <option value="">（无覆盖）</option>
+                          <option value="">关闭思考（空串）</option>
+                          {thinkingEfforts.map((value) => (
+                            <option key={value} value={value}>
+                              {value}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      {/* 生效结果只在面板里（卡面不再摊开长列表）。已移除成员也保留它。 */}
+                      <div className="font-semibold text-muted">生效结果</div>
+                      <p className="text-muted" data-testid={`effective-${member.id}`}>
+                        生效工具：
+                        {(member.effective?.tools ?? []).join('、') || '（无）'} · 思考：
+                        {member.effective?.thinkingMode ?? 'disabled'}
+                        {member.effective?.thinkingEffort
+                          ? `/${member.effective.thinkingEffort}`
+                          : ''}
+                      </p>
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          data-testid={`member-save-${member.id}`}
+                          disabled={busy || controls.saveDisabled}
+                          aria-disabled={controls.saveDisabled ? 'true' : undefined}
+                          onClick={() => void saveOverrides(member)}
+                          className="min-h-6 rounded-card border border-accent px-2 py-1 text-accent disabled:opacity-40"
+                        >
+                          保存（重建实例）
+                        </button>
+                        <button
+                          type="button"
+                          data-testid={`member-remove-${member.id}`}
+                          disabled={busy || controls.removeDisabled}
+                          aria-disabled={controls.removeDisabled ? 'true' : undefined}
+                          onClick={() => void removeMember(member)}
+                          className="min-h-6 rounded-card border border-danger/40 px-2 py-1 text-danger/80 hover:text-danger disabled:opacity-40"
+                        >
+                          移除
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </li>
+              );
+            })}
           </ul>
 
           <div className="mt-4 space-y-1 border-t border-line pt-3 text-xs">

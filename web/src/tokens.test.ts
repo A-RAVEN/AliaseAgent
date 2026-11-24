@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 import {
+  avatarTints,
   elevation,
   kDefaultBottomThresholdPx,
   kDefaultHeartbeatPeriodMs,
@@ -45,6 +46,9 @@ function guardedSourceFiles(): string[] {
     ...listFiles(path.join(SRC_DIR, 'components')),
     ...listFiles(path.join(SRC_DIR, 'group')),
     ...listFiles(path.join(SRC_DIR, 'layout')),
+    // change `chat-bubbles-avatars` 1.2：身份图案组件目录也必须被扫到，否则新目录里
+    // 写裸 hex / 任意 Tailwind 值时守卫形同虚设。
+    ...listFiles(path.join(SRC_DIR, 'avatars')),
     path.join(SRC_DIR, 'App.tsx'),
   ].filter((file) => fs.existsSync(file));
 }
@@ -80,11 +84,18 @@ describe('设计 tokens 与 CSS @theme 一致', () => {
       ['color-ok', palette.success],
       ['color-warn', palette.warning],
       ['color-danger', palette.danger],
+      // 身份图案三档（change `chat-bubbles-avatars` 1.2）：CSS 侧与代码侧逐项比对。
+      ['color-avatar-tint-0', avatarTints[0]],
+      ['color-avatar-tint-1', avatarTints[1]],
+      ['color-avatar-tint-2', avatarTints[2]],
     ];
     obs('CSS 里声明的调色板', pairs.map(([name]) => themeValue(name)));
     for (const [name, value] of pairs) {
       expect(themeValue(name), `index.css @theme 缺 --${name}`).toBe(value);
     }
+    // 第 0 档就是 accent 本身（不写换算值，保持单一事实源）。
+    expect(avatarTints[0].toLowerCase()).toBe(palette.accent);
+    expect(avatarTints).toHaveLength(3);
   });
 
   it('字阶与行高逐项一致', () => {

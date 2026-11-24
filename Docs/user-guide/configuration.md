@@ -100,7 +100,8 @@ Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单�
       "compaction_threshold_percent": 25,
       "compaction_wait_threshold_percent": 75,
       "standing_requirements": ["不要删我的文件"],
-      "input_modalities": ["text", "image"]
+      "input_modalities": ["text", "image"],
+      "avatar_path": "C:\\Users\\你\\.aliasagent\\attachments\\face.png"
     }
   },
   "search": {
@@ -123,6 +124,10 @@ Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单�
   },
   "tool": {
     "parallel_max": 0
+  },
+  "profile": {
+    "avatar_path": "C:\\Users\\你\\.aliasagent\\attachments\\me.png",
+    "user_id": "alice"
   }
 }
 ```
@@ -148,6 +153,10 @@ Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单�
 | `compaction_wait_threshold_percent` | 每个 agent | **等待**阈值百分比，1 到 100 的整数：这一轮要发出去的内容占模型总上下文超过这个比例时，才等压缩做完再发（见 [上下文压缩](context-compaction.md)） | 用 75 |
 | `standing_requirements` | 每个 agent | 你写死的目标，压缩时不许丢掉 | 空清单 |
 | `input_modalities` | 每个 agent | 这个模型能吃哪些输入：一个数组，取值只能是 text 和 image。**不写 image，贴进来的图片就不会发给模型**，界面上会提示"模型未声明图片输入，本次没有发送图片" | `["text"]`（只有文字） |
+| `avatar_path` | 每个 agent | 模板头像（可选）：附件目录内一张图片的**绝对路径**。界面在模板页、该模板的成员卡片与消息气泡里显示它；取不到文件字节时回落身份图案 | 不画上传图，按实体 id 画身份图案 |
+| `profile` | 顶层 | 用户资料块（可整块不写） | 用户头像按常量种子画身份图案 |
+| `avatar_path` | `profile` 下 | 用户头像（可选）：与模板头像同一套规则（附件目录内的绝对路径） | 没有用户头像 |
+| `user_id` | `profile` 下 | 用户标识，用作身份图案的哈希种子；同时决定 `config.get` 返回的实际生效种子 | `local-user`（产品内置常量，界面不会自动写回一个） |
 | `spill` | 顶层 | 工具输出的落盘与预览配置（整块都可以不写） | 用下表里的缺省值 |
 | `preview_chars` | `spill` 下（完整键名 `spill.preview_chars`） | 工具输出太长时，结果里**头尾各留多少字符**（其余写进 spill 文件、靠 `read_spill` 按字节读回）。判"要不要省略"的阈值是它的 2 倍：头 1000 + 尾 1000 = 2000，超过 2000 字符才省略。适用工具：`run_command` 的标准输出/标准错误、`web_fetch` 的正文、`load_skill` 的技能内容 | 1000 |
 | `tool` | 顶层 | 只读工具并行执行的配置（整块都可以不写） | 用下表里的缺省值 |
@@ -164,6 +173,15 @@ Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单�
 > 关于"把会话改到已有模板"：用当前会话工具栏（`对话视图` / `真实上下文` 同一行）右侧的模板下拉框，见 [Agent 模板](agent-templates.md)。切换会替换该会话运行中的 Agent 实例，并把数据库 `sessions.agent_type` 更新成新模板名；重启应用后仍按这个值重建实例。改 `agent_types` 里的模板定义本身不会改任何会话的引用。
 
 > 关于 `deepseek` 的一条安全规矩：**只有地址确实指向 DeepSeek（含 `api.deepseek.com`）时才会复用 `providers` 里那把密钥**；地址指向别处时这个后端直接不可用、一个请求都不发（那把密钥可能是别家的，不能发到别的地址上）。
+
+## 头像与用户资料（`avatar_path` / `profile`）
+
+- **模板头像**：写在 `agent_types.<模板名>.avatar_path`，值是附件目录（`~/.aliasagent/attachments/`）里一张图片的**绝对路径**。上传入口在 web 模板页（`模板` → 编辑 → 选择图片）与 Flutter 的 `Agents` 编辑器；上传走产品的附件接口，图片不复制、不建第二个目录。
+- **用户资料块**：顶层 `profile` 里有两个键 —— `avatar_path`（用户头像，规则同模板头像）与 `user_id`（用户标识，用作默认身份图案的哈希种子）。两个键都可选；块里一项都没有时整块不写回。
+- **不写会怎样**：没有头像就画**身份图案**（由实体 id 决定：成员用成员 id、单聊用会话 id、模板用模板名、用户用 `user_id`，缺省是产品常量 `local-user`）。同一 id 永远同一张图案，改名不改图案。头像文件被删 / 移走时同样回落身份图案，不弹错、不阻断消息渲染。
+- **写回时机**：在模板页保存模板、在侧栏点「换头像 / 恢复默认」时写回；两者都写整份配置（providers / agent_types / search / spill / tool 原样保留）。`config.get` 会多返回一个 `profile` 块（含**读取期派生**的实际生效种子，界面据此画图案；这个派生值不会写进文件）。
+- **手写规则**：路径里用**双反斜杠**（JSON 转义）或正斜杠；文件必须真实存在于附件目录内，且必须是文件而不是目录 —— 写错时保存会被拒绝并点名路径。`user_id` 写空串等同没写（读取侧把空串当"没有值"并留一行日志）。
+- **降级边界（重要）**：**旧版本不认识这两个键**（模板的 `avatar_path` 与顶层 `profile`），用旧版本保存一次模板或配置会把它们丢掉。要退回旧版本之前，先备份 `~/.aliasagent/config.json`。
 
 ## 出错时会看到什么
 

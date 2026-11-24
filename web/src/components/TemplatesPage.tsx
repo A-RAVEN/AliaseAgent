@@ -7,42 +7,38 @@
 // 生效时机（design D9 的两类）由核心 `effectiveNote` 原样显示 —— web 不复制文案。
 // 保存走 `template.save`（核心复用 AgentTemplateController.validate/save，未开放
 // 字段原样保留），失败原因直接显示核心给的那句（含字段名）。
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
+import { uploadAvatarFile } from '../avatars/upload';
 import { templateSavePayload, type TemplateFormState } from '../manage/logic';
-import type { CoreClient } from '../protocol';
-
-interface TemplateRow {
-  name: string;
-  provider?: string;
-  model?: string;
-  thinking_effort?: string | null;
-  system_prompt?: string;
-  tools?: string[];
-  max_context_tokens?: number | null;
-  input_modalities?: string[];
-  compaction_threshold_percent?: number;
-  compaction_wait_threshold_percent?: number;
-}
-
-interface CatalogEntry {
-  id?: string;
-  display_name?: string;
-  context_window?: number | null;
-  modalities?: { input?: string[] };
-}
+import { avatarSizes } from '../tokens';
+import type {
+  CatalogEntry,
+  ConfigGetResult,
+  CoreClient,
+  TemplateListResult,
+  TemplateSummary,
+} from '../protocol';
+import { Avatar } from './Avatar';
 
 export interface TemplatesPageProps {
   client: CoreClient;
   onClose: () => void;
   onChanged: () => void;
+  /**
+   * 头像路径 → data URL 的**共用缓存**（change `chat-bubbles-avatars` D2：四个调用点
+   * 共用 App 层那一份去重缓存，本组件不自己发 `attachment.read`）。
+   */
+  avatarDataUrls?: Record<string, string | null>;
+  /** 请求 App 层补取若干头像路径的字节（上传完后预览要用）。 */
+  onResolveAvatar?: (paths: string[]) => void;
 }
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function formFromTemplate(template: TemplateRow): TemplateFormState {
+function formFromTemplate(template: TemplateSummary): TemplateFormState {
   return {
     originalName: template.name,
     name: template.name,
@@ -83,8 +79,14 @@ const EMPTY_FORM: TemplateFormState = {
   compactionWaitThresholdPercent: '',
 };
 
-export function TemplatesPage({ client, onClose, onChanged }: TemplatesPageProps) {
-  const [templates, setTemplates] = useState<TemplateRow[]>([]);
+export function TemplatesPage({
+  client,
+  onClose,
+  onChanged,
+  avatarDataUrls,
+  onResolveAvatar,
+}: TemplatesPageProps) {
+  const [templates, setTemplates] = useState<TemplateSummary[]>([]);
   const [tools, setTools] = useState<string[]>([]);
   const [providers, setProviders] = useState<string[]>([]);
   const [defaultTools, setDefaultTools] = useState<string[]>([]);
@@ -96,21 +98,14 @@ export function TemplatesPage({ client, onClose, onChanged }: TemplatesPageProps
   const [error, setError] = useState<string | null>(null);
   const [deleteErrors, setDeleteErrors] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
+  // 头像三态草稿：undefined = 没碰（保存时不带该字段）、null = 清除、字符串 = 设为该路径。
+  const [avatarDraft, setAvatarDraft] = useState<string | null | undefined>(undefined);
+  const avatarFileRef = useRef<HTMLInputElement | null>(null);
 
   const load = useCallback(async () => {
     const [list, config] = await Promise.all([
-      client.request<{
-        templates: TemplateRow[];
-        tools: string[];
-        providers: string[];
-        defaultTools: string[];
-        thinkingEfforts: string[];
-        allowedModalities: string[];
-        effectiveNote: string;
-      }>('template.list'),
-      client.request<{
-        providers: Record<string, { models: CatalogEntry[] }>;
-      }>('config.get'),
+      client.request<TemplateListResult>('template.list'),
+      client.request<ConfigGetResult>('config.get'),
     ]);
     setTemplates(list.templates);
     setTools(list.tools);
@@ -131,6 +126,28 @@ export function TemplatesPage({ client, onClose, onChanged }: TemplatesPageProps
   useEffect(() => {
     load().catch((loadError: unknown) => setError(errorText(loadError)));
   }, [load]);
+
+  // 列表里各模板的头像字节交给 App 层共用缓存去取（组件不自己发 attachment.read）。
+  useEffect(() => {
+    const paths = templates
+      .map((template) => template.avatar_path)
+      .filter((path): path is string => typeof path === 'string' && path.length > 0);
+    if (paths.length > 0) onResolveAvatar?.(paths);
+  }, [templates, onResolveAvatar]);
+
+  /** 某模板已保存的头像路径（列表里的 `avatar_path`）。 */
+  const savedAvatarPath = (templateName: string | null | undefined): string | null => {
+    if (!templateName) return null;
+    const row = templates.find((template) => template.name === templateName);
+    return typeof row?.avatar_path === 'string' && row.avatar_path.length > 0
+      ? row.avatar_path
+      : null;
+  };
+
+  /** 预览用路径：草稿优先（undefined = 没碰，看已保存值）。 */
+  const previewPath =
+    avatarDraft === undefined ? savedAvatarPath(form?.originalName) : avatarDraft;
+  const previewDataUrl = previewPath !== null ? avatarDataUrls?.[previewPath] ?? null : null;
 
   /** 目录里的模型条目（当前 form 的 provider）。 */
   const catalog = form ? (catalogs[form.provider] ?? []) : [];
@@ -161,12 +178,31 @@ export function TemplatesPage({ client, onClose, onChanged }: TemplatesPageProps
     setBusy(true);
     try {
       const payload = templateSavePayload(form);
+      // 头像三态（design D3）：没碰 ⇒ 不带（= 不改）；清除 ⇒ 空串；设置 ⇒ 该路径。
+      if (avatarDraft !== undefined) payload.avatarPath = avatarDraft ?? '';
       await client.request('template.save', payload);
       setForm(null);
+      setAvatarDraft(undefined);
       await load();
       onChanged();
     } catch (saveError: unknown) {
       setError(errorText(saveError));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** 选图：读文件 → `attachment.upload`（核心做上限与魔数校验）→ 先存草稿，保存时才提交。 */
+  const onPickAvatar = async (file: File | undefined) => {
+    if (!file || !form) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const uploaded = await uploadAvatarFile(client, file);
+      setAvatarDraft(uploaded.path);
+      onResolveAvatar?.([uploaded.path]);
+    } catch (uploadError: unknown) {
+      setError(`头像上传失败：${errorText(uploadError)}`);
     } finally {
       setBusy(false);
     }
@@ -207,6 +243,7 @@ export function TemplatesPage({ client, onClose, onChanged }: TemplatesPageProps
             data-testid="template-add"
             onClick={() => {
               setError(null);
+              setAvatarDraft(undefined);
               setForm({
                 ...EMPTY_FORM,
                 provider: providers[0] ?? '',
@@ -343,6 +380,50 @@ export function TemplatesPage({ client, onClose, onChanged }: TemplatesPageProps
                 className="mt-1 w-full rounded-card border border-line bg-surface px-2 py-1 text-sm text-fg"
               />
             </label>
+            <div className="col-span-2 text-xs text-muted">
+              头像（上传图优先，否则按模板名生成身份图案）
+              <div className="mt-1 flex items-center gap-2">
+                <div data-testid="template-avatar-preview" className="shrink-0">
+                  <Avatar
+                    dataUrl={previewDataUrl}
+                    source={previewDataUrl !== null ? 'upload' : 'identicon'}
+                    seed={form.originalName ?? form.name}
+                    size={avatarSizes.member}
+                    label="模板头像"
+                  />
+                </div>
+                <button
+                  type="button"
+                  data-testid="template-avatar-pick"
+                  disabled={busy}
+                  onClick={() => avatarFileRef.current?.click()}
+                  className="min-h-6 rounded-card border border-line px-2 py-1 text-muted hover:text-fg disabled:opacity-40"
+                >
+                  选择图片
+                </button>
+                <button
+                  type="button"
+                  data-testid="template-avatar-clear"
+                  disabled={busy}
+                  onClick={() => setAvatarDraft(null)}
+                  className="min-h-6 rounded-card border border-line px-2 py-1 text-muted hover:text-fg disabled:opacity-40"
+                >
+                  清除头像
+                </button>
+                <input
+                  ref={avatarFileRef}
+                  type="file"
+                  accept="image/*"
+                  data-testid="template-avatar-upload"
+                  className="hidden"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    event.target.value = '';
+                    void onPickAvatar(file);
+                  }}
+                />
+              </div>
+            </div>
             <div className="text-xs text-muted">
               输入模态
               <div data-testid="template-form-modalities" className="mt-1 flex gap-3">
@@ -411,7 +492,10 @@ export function TemplatesPage({ client, onClose, onChanged }: TemplatesPageProps
             <button
               type="button"
               data-testid="template-form-cancel"
-              onClick={() => setForm(null)}
+              onClick={() => {
+                setForm(null);
+                setAvatarDraft(undefined);
+              }}
               className="rounded-card border border-line px-3 py-1 text-sm text-muted hover:text-fg"
             >
               取消
@@ -439,18 +523,36 @@ export function TemplatesPage({ client, onClose, onChanged }: TemplatesPageProps
               className="rounded-card border border-line bg-surface px-3 py-2"
             >
               <div className="flex items-center justify-between gap-2">
-                <div className="min-w-0">
-                  <p className="truncate text-sm font-semibold text-fg">
-                    {template.name}
-                    {template.name === 'general' && (
-                      <span className="ml-2 text-xs text-muted">（默认，不可删）</span>
-                    )}
-                  </p>
-                  <p className="truncate text-xs text-muted">
-                    {template.provider} · {template.model} · 推理{' '}
-                    {template.thinking_effort || '关闭'} · 模态{' '}
-                    {(template.input_modalities ?? ['text']).join('+')}
-                  </p>
+                <div className="flex min-w-0 items-center gap-2">
+                  <Avatar
+                    dataUrl={
+                      typeof template.avatar_path === 'string'
+                        ? avatarDataUrls?.[template.avatar_path] ?? null
+                        : null
+                    }
+                    source={
+                      typeof template.avatar_path === 'string' &&
+                      (avatarDataUrls?.[template.avatar_path] ?? null) !== null
+                        ? 'upload'
+                        : 'identicon'
+                    }
+                    seed={template.name}
+                    size={avatarSizes.bubble}
+                    label={`${template.name} 的头像`}
+                  />
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-semibold text-fg">
+                      {template.name}
+                      {template.name === 'general' && (
+                        <span className="ml-2 text-xs text-muted">（默认，不可删）</span>
+                      )}
+                    </p>
+                    <p className="truncate text-xs text-muted">
+                      {template.provider} · {template.model} · 推理{' '}
+                      {template.thinking_effort || '关闭'} · 模态{' '}
+                      {(template.input_modalities ?? ['text']).join('+')}
+                    </p>
+                  </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
                   <button
@@ -458,6 +560,7 @@ export function TemplatesPage({ client, onClose, onChanged }: TemplatesPageProps
                     data-testid="template-edit"
                     onClick={() => {
                       setError(null);
+                      setAvatarDraft(undefined);
                       setForm(formFromTemplate(template));
                     }}
                     className="rounded-card border border-line px-2 py-1 text-xs text-muted hover:text-fg"

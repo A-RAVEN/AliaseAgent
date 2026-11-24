@@ -12,10 +12,15 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 
 import type { ChatItem } from '../chat/render';
 import { attachmentRowModel } from '../chat/attachments';
-import { layoutConfig } from '../tokens';
+import { avatarSizes, layoutConfig } from '../tokens';
+import type { AvatarData } from './Avatar';
 import { Markdown } from './Markdown';
+import { MessageBubble } from './MessageBubble';
 import { ThinkingCard } from './ThinkingCard';
 import { ToolCard } from './ToolCard';
+
+/** 没传头像时的兜底：一律身份图案（decorative，不阻断渲染）。 */
+const FALLBACK_AVATAR: AvatarData = { dataUrl: null, source: 'identicon', seed: '' };
 
 export interface MessageListProps {
   items: ChatItem[];
@@ -26,6 +31,10 @@ export interface MessageListProps {
   attachments?: Record<string, string | null>;
   /** 当前模板是否声明了 image 输入模态（null = 未知，不提示）。 */
   imagesSupported?: boolean | null;
+  /** 用户头像（App 层按 `profile.avatar_path` + 字节缓存算出，design D2）。 */
+  userAvatar?: AvatarData;
+  /** 当前会话 agent 的头像（模板上传图优先，否则会话 id 身份图案）。 */
+  agentAvatar?: AvatarData;
 }
 
 /** 估算行高（真实高度由 measureElement 量出来；估算只影响未测量区域）。 */
@@ -50,10 +59,14 @@ function MessageItem({
   item,
   attachments,
   imagesSupported,
+  userAvatar,
+  agentAvatar,
 }: {
   item: ChatItem;
   attachments: Record<string, string | null>;
   imagesSupported: boolean | null;
+  userAvatar: AvatarData;
+  agentAvatar: AvatarData;
 }) {
   switch (item.kind) {
     case 'user': {
@@ -63,11 +76,12 @@ function MessageItem({
         imagesSupported,
       });
       return (
-        <article
-          data-testid="user-message"
-          className="ml-auto max-w-xl rounded-card border border-line bg-surface-2 px-3 py-2"
+        <MessageBubble
+          side="user"
+          avatar={userAvatar}
+          avatarSize={avatarSizes.bubble}
+          testId="user-message"
         >
-          <div className="mb-1 text-xs uppercase tracking-wide text-muted">You</div>
           <Markdown text={item.text ?? ''} />
           {rowModel.thumbnails.length > 0 && (
             <div className="mt-2 flex flex-wrap gap-2">
@@ -94,30 +108,30 @@ function MessageItem({
               {line}
             </p>
           ))}
-        </article>
+        </MessageBubble>
       );
     }
     case 'assistant':
       return (
-        <article
-          data-testid="assistant-message"
-          className="max-w-2xl rounded-card border border-line bg-surface px-3 py-2"
+        <MessageBubble
+          side="agent"
+          avatar={agentAvatar}
+          avatarSize={avatarSizes.bubble}
+          testId="assistant-message"
         >
-          <div className="mb-1 text-xs uppercase tracking-wide text-muted">Assistant</div>
           <Markdown text={item.text ?? ''} />
-        </article>
+        </MessageBubble>
       );
     case 'streaming':
       return (
-        <article
-          data-testid="streaming-message"
-          className="max-w-2xl rounded-card border border-accent/40 bg-surface px-3 py-2"
+        <MessageBubble
+          side="agent"
+          avatar={agentAvatar}
+          avatarSize={avatarSizes.bubble}
+          testId="streaming-message"
         >
-          <div className="mb-1 text-xs uppercase tracking-wide text-accent">
-            Assistant · 流式
-          </div>
           <Markdown text={item.text ?? ''} />
-        </article>
+        </MessageBubble>
       );
     case 'tool':
       return <ToolCard tool={item.tool!} />;
@@ -141,6 +155,8 @@ export function MessageList({
   onLoadEarlier,
   attachments = {},
   imagesSupported = null,
+  userAvatar = FALLBACK_AVATAR,
+  agentAvatar = FALLBACK_AVATAR,
 }: MessageListProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [atBottom, setAtBottom] = useState(true);
@@ -253,6 +269,8 @@ export function MessageList({
                       item={item}
                       attachments={attachments}
                       imagesSupported={imagesSupported}
+                      userAvatar={userAvatar}
+                      agentAvatar={agentAvatar}
                     />
                   </div>
                 </div>

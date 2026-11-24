@@ -25,6 +25,7 @@ import '../models/provider_config.dart';
 import '../models/group_member.dart';
 import '../models/instance_overrides.dart';
 import '../models/session.dart';
+import '../models/user_profile.dart';
 import '../services/agent.dart';
 import '../services/agent_config_resolver.dart';
 import '../services/agent_factory.dart';
@@ -82,6 +83,8 @@ const List<String> kCoreRpcMethodNames = <String>[
   'agent.cancel',
   'config.get',
   'config.save',
+  // 用户资料（change `chat-bubbles-avatars`）：只写 `profile` 块，不进模型请求。
+  'profile.save',
   'provider.probe',
   'provider.probeFetch',
   'template.list',
@@ -448,6 +451,7 @@ class HeadlessCore {
       'agent.cancel': _handleAgentCancel,
       'config.get': _handleConfigGet,
       'config.save': _handleConfigSave,
+      'profile.save': _handleProfileSave,
       'provider.probe': _handleProviderProbe,
       'provider.probeFetch': _handleProviderProbeFetch,
       'template.list': _handleTemplateList,
@@ -830,7 +834,39 @@ class HeadlessCore {
             entry.key: {...entry.value.toJson(), 'name': entry.key},
         },
         'tools': (ToolCatalog.instance.names.toList()..sort()),
+        // 用户资料（change `chat-bubbles-avatars` D2）：路径无密钥风险，原样回显；
+        // `identitySeed` 是读取期派生值（userId ?? kDefaultUserSeed），不写回配置。
+        'profile': _profilePayload(source.profile),
       };
+
+  /// `profile` 块的对外载荷（`config.get` / `profile.save` 共用同一形状）。
+  Map<String, dynamic> _profilePayload(UserProfile? profile) => {
+        'avatarPath': profile?.avatarPath,
+        'userId': profile?.userId,
+        'identitySeed': profile?.identitySeed ?? UserProfile.kDefaultUserSeed,
+      };
+
+  /// 头像路径校验（change `chat-bubbles-avatars` D3）：必须在注入的附件目录内、且
+  /// **确实是一个存在的文件**。判定复用 `_handleAttachmentRead` 的同一写法
+  /// （`p.normalize` + `p.isWithin`）；**禁字符串前缀比较**（`…\att` 会误容 `…\attacker`）。
+  String _requireAvatarPath(String rawPath) {
+    final dirAbs = p.normalize(p.absolute(attachmentsDir));
+    final fileAbs = p.normalize(p.absolute(rawPath));
+    if (fileAbs != dirAbs && !p.isWithin(dirAbs, fileAbs)) {
+      throw JsonRpcException(
+        JsonRpcErrorCode.invalidParams,
+        '头像路径必须位于附件目录（$dirAbs）内：拒绝 "$rawPath"',
+      );
+    }
+    // 「是文件而不是目录」的判定：`FileSystemEntity.isFileSync` 对目录返回 false。
+    if (!FileSystemEntity.isFileSync(fileAbs)) {
+      throw JsonRpcException(
+        JsonRpcErrorCode.invalidParams,
+        '头像路径不是一个存在的文件（$fileAbs）：拒绝 "$rawPath"',
+      );
+    }
+    return fileAbs;
+  }
 
   /// `config.get`：读盘 + 脱敏。文件不存在时 `missing: true`（web 端据此开首启向导）。
   Future<Map<String, dynamic>> _handleConfigGet(
@@ -999,6 +1035,46 @@ class HeadlessCore {
     return {'config': _redactedConfig(next)};
   }
 
+  /// `profile.save{avatarPath}`：写用户资料块（change `chat-bubbles-avatars` D3）。
+  ///
+  /// `avatarPath` **必填字符串**：`''` = 清除、非空 = 设为该路径；省略 / null / 其它
+  /// 类型 ⇒ `-32602`（它是一次写操作，不允许"什么都没写"却返回成功）。
+  ///
+  /// **先 `_readLatestConfig()` 再 `copyWith(profile: …)` 最后整份写回**：即使内存里
+  /// 有一份旧快照，也不能盖掉别人刚写进磁盘的 provider / 模板。它**不调** `applyConfig`
+  /// —— 用户资料不参与 resolver / 模板注册，运行中的核心不读它（不变量判据见
+  /// `test/integration/web_management_rpc_test.dart` 的「读盘不变量」）。
+  Future<Map<String, dynamic>> _handleProfileSave(
+      Map<String, dynamic> params) async {
+    if (!params.containsKey('avatarPath')) {
+      throw const JsonRpcException(
+        JsonRpcErrorCode.invalidParams,
+        'Invalid params: avatarPath 必填字符串（"" = 清除用户头像；省略/null 都不允许）',
+      );
+    }
+    final rawAvatar = params['avatarPath'];
+    if (rawAvatar is! String) {
+      throw const JsonRpcException(
+        JsonRpcErrorCode.invalidParams,
+        'Invalid params: avatarPath 必须是字符串（"" = 清除用户头像）',
+      );
+    }
+    final typed = rawAvatar.trim();
+    final avatarPath = typed.isEmpty ? null : _requireAvatarPath(typed);
+    final current = _readLatestConfig();
+    final nextProfile = UserProfile(
+      avatarPath: avatarPath,
+      userId: current.profile?.userId,
+    );
+    final next = current.copyWith(
+      profile: nextProfile,
+      // 两项都没有值时整块不写出（旧配置不因清除头像产生空块）。
+      clearProfile: nextProfile.isEmpty,
+    );
+    ConfigService.save(next, configPath: configPath);
+    return {'profile': _profilePayload(next.profile)};
+  }
+
   /// `provider.probe`：= `ModelDiscoveryService.discover`（要求 provider 已存在，
   /// 成功写回 catalog + discovered_at）。用**盘上最新配置**探测，避免内存旧快照
   /// 盖掉刚写的编辑（D1）。
@@ -1138,6 +1214,24 @@ class HeadlessCore {
       throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
           'Invalid params: compactionWaitThresholdPercent 必须是整数');
     }
+    // 头像三态（change `chat-bubbles-avatars` D3）：省略 / 显式 null ⇒ 不改；'' ⇒ 清除；
+    // 非空 ⇒ 设为该路径（必须在附件目录内且是存在的文件）；其它类型 ⇒ -32602。
+    // 注意它与「配置读取侧」口径不同：读取侧的空串是手误、读作"没有覆盖"，不是清除。
+    final rawAvatar = params['avatarPath'];
+    String? avatarPathDraft;
+    if (!params.containsKey('avatarPath') || rawAvatar == null) {
+      avatarPathDraft = null;
+    } else if (rawAvatar is! String) {
+      throw const JsonRpcException(
+        JsonRpcErrorCode.invalidParams,
+        'Invalid params: avatarPath 必须是字符串或省略/null'
+        '（省略/null = 不改，"" = 清除头像）',
+      );
+    } else {
+      final typedAvatar = rawAvatar.trim();
+      avatarPathDraft =
+          typedAvatar.isEmpty ? '' : _requireAvatarPath(typedAvatar);
+    }
 
     // 从盘上重读最新配置：不要拿内存旧快照盖掉用户刚写进去的 providers。
     templateController.replaceConfig(_readLatestConfig());
@@ -1153,6 +1247,7 @@ class HeadlessCore {
       inputModalities: modalities,
       compactionThresholdPercent: rawCompaction as int?,
       compactionWaitThresholdPercent: rawWait as int?,
+      avatarPath: avatarPathDraft,
     );
     try {
       final result = templateController.save(draft);

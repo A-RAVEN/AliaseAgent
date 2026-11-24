@@ -190,4 +190,37 @@ void main() {
         reason: '无头核心文档必须写明链失败时界面显示真因');
     // 工作区回落缺省只属 group-chat.md（本文件没有工作区段），不在这里加锚点。
   });
+
+  test('头像载荷按表行补齐（change `chat-bubbles-avatars` 7.3b）', () {
+    final text = doc.readAsStringSync();
+    final rows = tableRows(text);
+    final firstColumn = {
+      for (final row in rows)
+        if (row.isNotEmpty) row.first.replaceAll('`', ''),
+    };
+    _obs('RPC 表第一列', firstColumn);
+    expect(firstColumn, contains('profile.save'),
+        reason: '无头核心 RPC 表必须有 profile.save 的独立一行');
+    final configRows = rows
+        .where((row) => row.isNotEmpty && row.first.replaceAll('`', '') == 'config.get')
+        .toList();
+    _obs('config.get 表行', configRows);
+    expect(configRows, isNotEmpty);
+    expect(
+      configRows.any((row) =>
+          row.any((cell) => cell.contains('profile') || cell.contains('identitySeed'))),
+      isTrue,
+      reason: 'config.get 那一行必须带 profile / identitySeed 字样（整篇子串不算过）',
+    );
+    final templateRows = rows
+        .where((row) => row.isNotEmpty && row.first.replaceAll('`', '') == 'template.save')
+        .toList();
+    _obs('template.save 表行', templateRows);
+    expect(templateRows, isNotEmpty);
+    expect(
+      templateRows.any((row) => row.any((cell) => cell.contains('avatarPath'))),
+      isTrue,
+      reason: 'template.save 那一行必须带 avatarPath 字样（整篇子串不算过）',
+    );
+  });
 }

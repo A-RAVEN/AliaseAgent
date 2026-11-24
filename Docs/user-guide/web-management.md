@@ -38,6 +38,7 @@ web 端不再只能聊天：左侧会话栏能新建 / 改名 / 删除 / 切换�
 | 重命名 | 每行的「改名」→ 内联输入框 → Enter 确认 / Esc 取消 | 空标题被忽略（不会把标题改成空串）；会话不存在时顶部红条显示「不存在」；群聊改名会同步群主区标题 |
 | 删除 | 每行的「删除」→ 弹出确认浮层 → 再点「删除」 | 先确认再删；**群聊行**确认后走 `group.delete`（停链、销毁成员实例、成员 / 消息 / 摘要级联删除），**单聊行**走 `session.delete`。删除当前会话后主区按**下一条会话的类型**激活；删到最后一条时是**空聊天屏**。删除进行中切换模板会被拒绝并显示阶段（见下） |
 | 切换模板 | 侧栏底部的「模板」下拉 | 成功后该会话之后的对话用新模板；失败时下方红字显示**失败阶段 + 候选模板名**（例如「阶段：会话正在删除，候选 "alt"」），旧实例与数据库不变。**群聊打开时该下拉禁用**并显示「群聊模板由各成员决定」（每个成员的模板来自成员行） |
+| 换头像 / 恢复默认 | 侧栏最底部的**用户头像块**：点「换头像」选一张图，点「恢复默认」清掉 | 换头像先上传再保存到用户资料，成功后侧栏与所有用户消息气泡立刻换图（不需要刷新页面）；恢复默认把头像清空、回到身份图案。**头像资料读取失败**（打开页面时 `config.get` 出错）会在这里显示「头像资料读取失败：…」并提供「重试」，聊天屏照常加载，不会把失败当成"没有头像"静默吞掉 |
 
 ## 贴图片给模型看
 
@@ -81,11 +82,16 @@ web 端不再只能聊天：左侧会话栏能新建 / 改名 / 删除 / 切换�
 
 ## Agent 模板页（顶栏「模板」）
 
-- **列表**：每个模板显示 provider、模型、推理强度、输入模态；提供「编辑」「删除」。
+- **列表**：每个模板显示头像、provider、模型、推理强度、输入模态；提供「编辑」「删除」。
 - **可编辑字段**：provider、模型（可从 provider 目录选，也可手输）、推理强度（执行层
   合法档位 + 关闭）、系统提示词、工具勾选、上下文窗口覆盖（留空 = 用目录窗口）、
   `input_modalities` 模态勾选（勾 image 才能收图）、压缩阈值与等待阈值（1..100，留空 =
-  沿用既有值）。
+  沿用既有值）、**头像**（见下一条）。
+- **模板头像**：编辑器里有头像预览、「选择图片」与「清除头像」。选图先经核心的附件接口
+  上传、拿到路径；保存模板时把该路径作为头像提交，重新打开编辑器看到的就是这张图。点
+  「清除头像」并保存会把配置里的头像键去掉，预览回到身份图案。**没碰头像的保存不带这个
+  字段**（不会因为页面没带上而清空既有头像）；**新增模板不继承**任何既有模板（包括
+  `general`）的头像。上传失败会显示可归因错误（点名原因），既有头像不变。
 - **从目录选模型会回填**：模型下拉选目录条目后，上下文窗口与模态按目录值预填；之后你
   的修改为准（目录后续刷新不会改已保存的模板）。
 - **模板名创建后不可改**：编辑既有模板时名字输入框只读。
@@ -130,8 +136,9 @@ web 端不再只能聊天：左侧会话栏能新建 / 改名 / 删除 / 切换�
 | `message.query` | `{sessionId, pageSize, anchor?, cursor?, before?}` | 分页（详见 web-core-shim 文档） |
 | `agent.send` | `{sessionId, text, attachments?}` | `{sessionId, status, finalText, error, metering}`；`attachments` 是 `attachment.upload` 返回的路径数组 |
 | `agent.cancel` | `{sessionId, memberId?}` | `{sessionId, cancelled, reason?, memberId?, reactionChainStopped?}`；组会话按组路由（链运行中停整条链并回 `reactionChainStopped`，成员在链里排队时 `cancelled:false`） |
-| `config.get` | 无 | `{missing, configPath, providers, agentTypes, tools}`；**api_key 永不回显**（只给 hasApiKey） |
+| `config.get` | 无 | `{missing, configPath, providers, agentTypes, tools, profile}`；**api_key 永不回显**（只给 hasApiKey）；`profile` = `{avatarPath, userId, identitySeed}`（`identitySeed` 是读取期派生值，不写回配置） |
 | `config.save` | `{providers}` | `{config}`；providers 是**整份表**（没提交的现存 provider = 删除），值可带 `api_key`（留空 = 沿用）、`rename_from`（改名级联）、`models` + `discovered_at`（向导写目录） |
+| `profile.save` | `{avatarPath}` | `{profile}`；`avatarPath` **必填字符串**：`''` = 清除、非空 = 设成附件目录内一个真实存在的文件；省略 / null / 其它类型 ⇒ `-32602`。整份配置写回（providers / agent_types 原样保留），不参与运行中 Agent 的装配 |
 | `provider.probe` | `{providerName}` | 探测报告（新增/更新/移除/丢弃/`discovered_at`），成功写回目录 |
 | `provider.probeFetch` | `{providerName?, baseUrl, apiKey}` | 探测结果（**只探测不写盘**，向导用） |
 | `group.create` | `{title?, workspace?, reactionsEnabled?, maxRounds?}` | `{group}`；建组并建立组上下文（`reactionsEnabled` 省略 = 新建组开启自发反应；`maxRounds` 省略 / null = 默认 8，范围 1..50） |
@@ -145,7 +152,7 @@ web 端不再只能聊天：左侧会话栏能新建 / 改名 / 删除 / 切换�
 | `group.send` | `{groupId, speaker?, text?}` | `{groupId, sessionId, status, triggerSeq}`；**异步且永不 busy**：写完用户消息后立刻回 `started`（链在后台跑，进度查 `group.chain`）；链/执行器运行中再发也接受（入队/被吸收），不回 `busy`；`speaker` 可选（省略 = 纯触发反应链 / 关闭态按 `@mention` 定向） |
 | `group.view` | `{groupId, memberId}` | `{snapshot\|null}`；本次运行内最近一次真实发出的快照（反应轮也算） |
 | `template.list` | 无 | `{templates, tools, providers, defaultTools, thinkingEfforts, allowedModalities, effectiveNote}` |
-| `template.save` | `{originalName?, name, provider, model, thinkingEffort, systemPrompt, tools, maxContextTokens, inputModalities, compactionThresholdPercent?, compactionWaitThresholdPercent?}` | `{template, created}`；校验失败消息含字段名 |
+| `template.save` | `{originalName?, name, provider, model, thinkingEffort, systemPrompt, tools, maxContextTokens, inputModalities, compactionThresholdPercent?, compactionWaitThresholdPercent?, avatarPath?}` | `{template, created}`；校验失败消息含字段名；`avatarPath` 三态：省略 / null = 不改、`''` = 清除、非空 = 设成附件目录内的真实文件（类型错 / 越界 / 不存在 / 是目录 ⇒ `-32602`） |
 | `template.delete` | `{templateName}` | `{templateName, deleted:true}`；general 不可删、被会话引用拒删（名单在错误消息里） |
 | `attachment.upload` | `{filename, base64}` | `{path, bytes, format, mediaType, width, height}`；上限与类型校验见上 |
 | `attachment.read` | `{path}` | `{path, bytes, base64, mediaType}`；只允许读附件目录内文件；文件不存在 → 「图片已丢失」可归因错误 |

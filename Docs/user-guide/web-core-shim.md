@@ -85,6 +85,14 @@ AliasAgent 无头核心已启动
   多工具消息就是多张单行卡）。点卡片展开完整输入与结果（结果区域可滚），折叠不等于丢弃。
 - **空气泡已修**：工具轮里「正文为空、只有工具调用」的助手消息不再渲染成空气泡，
   它的每个工具调用各自占一张折叠卡；最终文字回复单独成气泡。
+- **单聊是聊天式左右气泡**：用户消息靠右（绿气泡，用户头像在这一行最右端）；助手消息
+  （含流式消息）靠左（助手头像在左、气泡在右）。气泡里不再有「You」「Assistant」这类大写
+  角色标签，也不在气泡上方画名字。「正在生成…」是状态指示、不配头像。头像优先用当前会话
+  模板上传的图（经核心附件接口换成 data URL 渲染，不暴露磁盘路径），否则用**会话 id** 生成
+  的身份图案（会话改名不换脸）；图片文件丢了就回落身份图案，不弹错、不阻断消息。
+  附件缩略图与「图片未发送 / 图片已丢失」提示行照旧。
+- **侧栏用户头像**：会话列表最底部是用户头像块（「换头像」「恢复默认」），见
+  [管理屏](web-management.md)；`config.get` 读取失败时在那里显示可重试的提示，不挡聊天屏。
 - **贴底跟随**：列表在底部时，新消息/流式增量/工具卡到达会自动滚到底；
   自己上翻阅读历史时不打扰（不会把你拽回底部）。
 - **跳底按钮**：非贴底时，输入框上方右侧出现圆形 `chevron-down` 按钮；点它滚到底并恢复
@@ -183,12 +191,13 @@ web 客户端本身是独立子项目，回退到最少形态就是恢复 `web/s
 | `message.query` | `{sessionId, pageSize, anchor?, cursor?, before?}` | `{sessionId,pageSize,messages,nextCursor,prevCursor}`。`pageSize` **请求方必填且为正整数**，缺参/非法返回 `-32602`；核心不提供默认页大小，也不发明上限。`anchor`：`tail`（缺省，取**最新一页**）或 `head`（从最旧开始）；`cursor` = 上一页的 `nextCursor`（前向，seq 升序）；`before` = 上一页的 `prevCursor`（反向，取更早一页）；`cursor` 与 `before` 不能同时出现。`prevCursor` 是本页首条 seq（没有更早页时为 null）。 |
 | `agent.send` | `{sessionId, text, attachments?}` | `{sessionId,status,finalText,error,metering}`；复用 `Agent.send` / `AgentFactory.ensure`。 |
 | `agent.cancel` | `{sessionId, memberId?}` | `{sessionId,cancelled,reason?,memberId?,groupId?,reactionChainStopped?}`。单会话按实例表；**组会话按组路由**：链运行中停整条反应链并回 `reactionChainStopped: true`（带当前成员）；带 `memberId` 且该成员**在链里排队未轮到** ⇒ 停链但 `cancelled:false`（不谎报）；带 `memberId` 且该成员既不在链里也没在运行 ⇒ 「当前没有在运行」，链继续；组内没有成员在运行时说明「该组当前没有成员在运行」（不是"查不到实例"）。 |
-| `config.get` | 无 | `{missing, configPath, providers, agentTypes, tools}`；**api_key 不回显**（只给 hasApiKey） |
+| `config.get` | 无 | `{missing, configPath, providers, agentTypes, tools, profile}`；**api_key 不回显**（只给 hasApiKey）；`profile` = `{avatarPath, userId, identitySeed}`（`identitySeed` 是读取期派生值，不写回配置） |
 | `config.save` | `{providers}` | `{config}`；整份 provider 表（没提交的现存 provider = 删除），支持 `rename_from` 改名级联与向导写目录 |
+| `profile.save` | `{avatarPath}` | `{profile}`；`avatarPath` **必填字符串**：`''` = 清除用户头像、非空 = 设为附件目录内真实存在的文件；省略 / null / 其它类型 ⇒ `-32602`；整份配置写回，不参与运行中 Agent 装配 |
 | `provider.probe` | `{providerName}` | 探测报告（新增/更新/移除/丢弃 + `discovered_at`），成功写回目录 |
 | `provider.probeFetch` | `{providerName?, baseUrl, apiKey}` | 探测结果，**只探测不写盘**（首启向导用） |
 | `template.list` | 无 | `{templates, tools, providers, defaultTools, thinkingEfforts, allowedModalities, effectiveNote}` |
-| `template.save` | `{originalName?, name, provider, model, thinkingEffort, systemPrompt, tools, maxContextTokens, inputModalities, compactionThresholdPercent?, compactionWaitThresholdPercent?}` | `{template, created}`；校验失败可归因（含字段名） |
+| `template.save` | `{originalName?, name, provider, model, thinkingEffort, systemPrompt, tools, maxContextTokens, inputModalities, compactionThresholdPercent?, compactionWaitThresholdPercent?, avatarPath?}` | `{template, created}`；校验失败可归因（含字段名）；`avatarPath` 三态：省略 / null = 不改、`''` = 清除、非空 = 附件目录内的真实文件（类型错 / 越界 / 不存在 / 目录 ⇒ `-32602`） |
 | `template.delete` | `{templateName}` | `{templateName, deleted}`；general 不可删、被会话引用拒删（名单在错误里） |
 | `attachment.upload` | `{filename, base64}` | `{path, bytes, format, mediaType, width, height}`；单张上限与文件头魔数校验见管理屏文档 |
 | `attachment.read` | `{path}` | `{path, bytes, base64, mediaType}`；只读附件目录内文件 |
@@ -275,6 +284,8 @@ flutter test --tags live --run-skipped test/live/web_core_shim_live_test.dart
 ## 已知限制
 
 - **未读标记首版不做**：跳底按钮不显示未读数（deliberate 简化，待拍板可加）。
+- **头像文件丢失不报错**：模板 / 用户的头像文件被删或移走时，气泡与侧栏直接回落身份图案
+  （装饰性资源）；身份图案只由实体 id 决定，会话改名不换脸。
 - **断线期间的事件没有重放缓冲**：重连只重拉当前页消息；断线瞬间正在流式的事件不补发
   （核心无事件重放/订阅游标）。已落库的消息会补上。
 - **本机回环、无鉴权**：只绑 `127.0.0.1`，本机信任边界内可接受；不要把它暴露到网络。

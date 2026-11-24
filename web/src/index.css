@@ -20,6 +20,12 @@
   --color-warn: #fbbf24;
   --color-danger: #f87171;
 
+  /* 身份图案三档填色（change `chat-bubbles-avatars` design D1）：第 0 档 = accent 本身，
+     另两档是它的色相 +90° / +180°（S/L 不变）。与 `tokens.ts` 的 avatarTints 逐项比对。 */
+  --color-avatar-tint-0: #38BDF8;
+  --color-avatar-tint-1: #D338F8;
+  --color-avatar-tint-2: #F87338;
+
   --text-xs: 12px;
   --text-xs--line-height: 16px;
   --text-sm: 14px;
@@ -121,4 +127,12 @@ body {
   line-height: var(--text-xl--line-height);
   font-weight: 600;
   margin: 12px 0 8px;
+}
+
+/* 状态点的脉冲动画（change `chat-bubbles-avatars` D5）：尊重系统的"减少动态效果"。
+   Tailwind 的 animate-pulse 在 utilities 层，未分层 CSS 优先，这里直接关掉动画。 */
+@media (prefers-reduced-motion: reduce) {
+  .status-dot-running {
+    animation: none;
+  }
 }

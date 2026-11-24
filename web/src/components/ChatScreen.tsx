@@ -13,6 +13,7 @@ import type { ChatView } from '../chat/model';
 import type { PendingImage } from '../chat/attachments';
 import { renderMessages } from '../chat/render';
 import type { ConnectionStatus, SnapshotEventData } from '../protocol';
+import type { AvatarData } from './Avatar';
 import { Composer } from './Composer';
 import { ConnectionBadge } from './ConnectionBadge';
 import { ContextRing } from './ContextRing';
@@ -42,6 +43,9 @@ export interface ChatScreenProps {
   /** 打开管理屏（change `web-management-ui` 3.3 / 3.4）；不传 = 不显示入口。 */
   onOpenProviders?: () => void;
   onOpenTemplates?: () => void;
+  /** 单聊用户 / agent 头像（change `chat-bubbles-avatars` 4.4；App 层算好，组件不持 client）。 */
+  userAvatar?: AvatarData;
+  agentAvatar?: AvatarData;
 }
 
 export function ChatScreen({
@@ -62,6 +66,8 @@ export function ChatScreen({
   imagesSupported = null,
   onOpenProviders,
   onOpenTemplates,
+  userAvatar,
+  agentAvatar,
 }: ChatScreenProps) {
   const items = useMemo(() => renderMessages(view), [view]);
   const [showRealContext, setShowRealContext] = useState(false);
@@ -156,6 +162,8 @@ export function ChatScreen({
           onLoadEarlier={onLoadEarlier}
           attachments={attachments}
           imagesSupported={imagesSupported}
+          userAvatar={userAvatar}
+          agentAvatar={agentAvatar}
         />
 
         {loadingEarlier && (

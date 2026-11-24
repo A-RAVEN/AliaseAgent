@@ -333,4 +333,35 @@ void main() {
       expect(markdown, contains(anchor), reason: '群聊文档缺少锚点「$anchor」');
     }
   });
+
+  test('⑩ web 气泡与成员卡片锚点（change `chat-bubbles-avatars`）', () {
+    final markdown = doc.readAsStringSync();
+    final viewSource = File('web/src/group/GroupView.tsx').readAsStringSync();
+    // 锚点写死为"期望存在"：组件还没长出这两处文案时就先红（不是拿既有旧文案当锚点，
+    // 那会恒绿）。它们分别标在齿轮面板的生效结果标题与成员卡片的 aria-label 上。
+    for (final anchor in const ['生效结果', '成员卡片']) {
+      _obs('组件锚点', anchor);
+      expect(viewSource, contains(anchor),
+          reason: 'GroupView.tsx 缺少新成员卡片/齿轮面板的锚点「$anchor」');
+    }
+    // 文档必须覆盖的七件事（与 7.2 写进群聊文档的文字逐字对应）。
+    for (final anchor in const [
+      '左右气泡',
+      '状态点',
+      '紧凑环',
+      'tokens 详情',
+      '生效结果',
+      '只读',
+      '靠名字',
+    ]) {
+      _obs('群聊文档锚点', anchor);
+      expect(markdown, contains(anchor),
+          reason: '群聊文档缺少气泡/成员卡片锚点「$anchor」');
+    }
+    // 头像来源两侧都要写清（用户 / 成员）。
+    for (final anchor in const ['用户头像', '成员头像']) {
+      _obs('头像来源锚点', anchor);
+      expect(markdown, contains(anchor), reason: '群聊文档缺少「$anchor」的说明');
+    }
+  });
 }

@@ -95,6 +95,37 @@ class AgentTypeConfig {
     _illegalModalitiesReported = false;
   }
 
+  /// 该模板的头像上传覆盖（配置键 `avatar_path`，change `chat-bubbles-avatars`）。
+  ///
+  /// 值是附件目录内一张图片的绝对路径；`null` = 没有覆盖（界面按实体 id 画身份图案）。
+  /// **读取侧口径**（design D3）：字段缺席静默读作"没有覆盖"（没有头像是正常状态）；
+  /// 字段存在但不是字符串、或去掉空白后为空串 ⇒ 读作"没有覆盖"并打一行日志。
+  /// 配置里的空串**不是**清除指令（写入侧的三态在 `template.save` 的参数里）。
+  ///
+  /// 它只决定界面画哪张头像，**不进模型请求**（不参与系统提示词 / 工具定义 / 消息内容）。
+  final String? avatarPath;
+
+  /// 只在第一次遇到非法 `avatar_path` 时打一行日志（免得每个模板各喊一次）。
+  static bool _illegalAvatarPathReported = false;
+
+  /// 仅测试用：清掉"已经报过一次非法头像值"的标记，让日志断言不受用例顺序影响。
+  @visibleForTesting
+  static void resetAvatarPathReportForTests() {
+    _illegalAvatarPathReported = false;
+  }
+
+  /// 解析 `avatar_path`：非空字符串才生效；其它（数字 / 对象 / 空串 / 纯空白）回落
+  /// `null` 并打一行日志点名原始值（手误不被静默吞掉）。
+  static String? _parseAvatarPath(Object? raw) {
+    if (raw is String && raw.trim().isNotEmpty) return raw.trim();
+    if (!_illegalAvatarPathReported) {
+      _illegalAvatarPathReported = true;
+      debugPrint('[AliasAgent] avatar_path=$raw is not a non-empty string — '
+          'treating it as "no avatar override"');
+    }
+    return null;
+  }
+
   /// 命令工具（change `add-command-tool`）的超时旋钮，随每次调用一起传到执行侧
   /// （执行侧不读配置文件）。缺省值必须与 `sidecar/src/command_tool.cpp` 里
   /// 那几个常量一致；非法值一律回落缺省。
@@ -186,6 +217,7 @@ class AgentTypeConfig {
     this.compactionWaitThresholdPercent = kDefaultCompactionWaitThresholdPercent,
     this.standingRequirements = const [],
     this.inputModalities = kDefaultInputModalities,
+    this.avatarPath,
     this.commandTimeoutMs = kDefaultCommandTimeoutMs,
     this.commandMaxTimeoutMs = kDefaultCommandMaxTimeoutMs,
   });
@@ -217,6 +249,10 @@ class AgentTypeConfig {
               .toList() ??
           [],
       inputModalities: _parseInputModalities(json['input_modalities']),
+      // 字段缺席静默（没有头像是正常状态）；存在但不是非空字符串才打一行日志。
+      avatarPath: json.containsKey('avatar_path')
+          ? _parseAvatarPath(json['avatar_path'])
+          : null,
       commandTimeoutMs: _parsePositiveInt(json['command_timeout_ms'],
           kDefaultCommandTimeoutMs, 'command_timeout_ms'),
       commandMaxTimeoutMs: _parsePositiveInt(json['command_max_timeout_ms'],
@@ -237,6 +273,8 @@ class AgentTypeConfig {
         'compaction_wait_threshold_percent': compactionWaitThresholdPercent,
         // 总是写回：这个旋钮没有界面，只能靠 config.json 改。
         'input_modalities': inputModalities,
+        // 头像只在有值时写回：没有头像的模板不许被补一个空键（design D3）。
+        if (avatarPath != null) 'avatar_path': avatarPath,
         // 命令工具的两项超时：一并写回，让它们在 ~/.aliasagent/config.json 里看得见。
         // **两个输出上限键不再写回** —— 它们已废弃，写回去等于告诉用户它们还有用。
         'command_timeout_ms': commandTimeoutMs,

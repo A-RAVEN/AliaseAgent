@@ -1,12 +1,21 @@
+import 'package:meta/meta.dart';
+
 import '../services/logging.dart';
 import 'agent_type_config.dart';
 import 'provider_config.dart';
+import 'user_profile.dart';
 
 class AppConfig {
   final int version;
   final Map<String, ProviderConfig> providers;
   final Map<String, AgentTypeConfig> agentTypes;
   final Map<String, dynamic>? search;
+
+  /// 本机用户资料块（change `chat-bubbles-avatars` D2）：头像路径 + 用户标识。
+  ///
+  /// `null` = 没有资料（界面按常量种子画身份图案）。整块缺席或不是对象时读作没有
+  /// 资料；块里两项都没有值也归成 `null`，好让 `toJson` 不写出空块。
+  final UserProfile? profile;
 
   /// `spill.preview_chars`：工具输出超长时，内联预览**头尾各留多少字符**。
   ///
@@ -30,6 +39,15 @@ class AppConfig {
   /// 只在第一次遇到非法的 `tool.parallel_max` 时打印一行，免得每次读配置都喊一次。
   static bool _illegalToolParallelMaxReported = false;
 
+  /// 只在第一次遇到"`profile` 不是对象"时打印一行。
+  static bool _illegalProfileBlockReported = false;
+
+  /// 仅测试用：清掉"已经报过一次 profile 块非法"的标记。
+  @visibleForTesting
+  static void resetProfileBlockReportForTests() {
+    _illegalProfileBlockReported = false;
+  }
+
   /// 解析 `tool.parallel_max`：只有"非负整数"才生效，其它值一律回落 0。
   static int _parseToolParallelMax(Object? raw) {
     if (raw is int && raw >= 0) return raw;
@@ -47,6 +65,7 @@ class AppConfig {
     this.providers = const {},
     this.agentTypes = const {},
     this.search,
+    this.profile,
     this.spillPreviewChars = kDefaultSpillPreviewChars,
     this.toolParallelMax = kDefaultToolParallelMax,
   });
@@ -84,11 +103,30 @@ class AppConfig {
     final toolParallelMax = _parseToolParallelMax(
         tool is Map<String, dynamic> ? tool['parallel_max'] : null);
 
+    // `profile` 是可选的顶层块（change `chat-bubbles-avatars` D2）：缺席静默；不是
+    // 对象 ⇒ 读作"没有资料"并打一行日志；块里两项都没有值 ⇒ 归成 null（不写空块）。
+    final rawProfile = json['profile'];
+    UserProfile? profile;
+    if (rawProfile == null) {
+      profile = null;
+    } else if (rawProfile is Map) {
+      final parsed = UserProfile.fromJson(Map<String, dynamic>.from(rawProfile));
+      profile = parsed.isEmpty ? null : parsed;
+    } else {
+      if (!_illegalProfileBlockReported) {
+        _illegalProfileBlockReported = true;
+        debugPrint('[AliasAgent] profile=$rawProfile is not an object — '
+            'treating it as "no user profile"');
+      }
+      profile = null;
+    }
+
     return AppConfig(
       version: json['version'] as int? ?? 1,
       providers: providers,
       agentTypes: agentTypes,
       search: json['search'] as Map<String, dynamic>?,
+      profile: profile,
       spillPreviewChars: previewChars,
       toolParallelMax: toolParallelMax,
     );
@@ -107,6 +145,10 @@ class AppConfig {
     if (search != null && search!.isNotEmpty) {
       m['search'] = search;
     }
+    // 用户资料块只在至少一项有值时写回（没有资料不写空块）。
+    if (profile != null && !profile!.isEmpty) {
+      m['profile'] = profile!.toJson();
+    }
     return m;
   }
 
@@ -119,6 +161,8 @@ class AppConfig {
     Map<String, ProviderConfig>? providers,
     Map<String, AgentTypeConfig>? agentTypes,
     Map<String, dynamic>? search,
+    UserProfile? profile,
+    bool clearProfile = false,
     int? spillPreviewChars,
     int? toolParallelMax,
   }) {
@@ -127,6 +171,9 @@ class AppConfig {
       providers: providers ?? this.providers,
       agentTypes: agentTypes ?? this.agentTypes,
       search: search ?? this.search,
+      // 照 `GroupMember.copyWith(clearOverrides: true)` 的先例：`null` 不能表达
+      // "清掉"，必须给一个显式的清除开关。
+      profile: clearProfile ? null : (profile ?? this.profile),
       spillPreviewChars: spillPreviewChars ?? this.spillPreviewChars,
       toolParallelMax: toolParallelMax ?? this.toolParallelMax,
     );

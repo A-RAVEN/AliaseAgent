@@ -9,20 +9,23 @@ import type { ReactNode } from 'react';
 export interface ChatShellProps {
   /** 左侧常驻会话列表（由应用入口渲染 `SessionList`，壳不复制它的状态）。 */
   sidebar: ReactNode;
+  /** 侧栏底部槽位（change `chat-bubbles-avatars` 6.3：用户头像块）；必须仍在 aside 内。 */
+  sidebarFooter?: ReactNode;
   /** 管理页覆盖层；只盖主区，左列仍可见可点。 */
   overlay?: ReactNode;
   /** 主区：群聊主区或单聊主区。 */
   children: ReactNode;
 }
 
-export function ChatShell({ sidebar, overlay = null, children }: ChatShellProps) {
+export function ChatShell({ sidebar, sidebarFooter = null, overlay = null, children }: ChatShellProps) {
   return (
     <div className="flex h-full min-h-0 bg-bg text-fg">
       <aside
         data-testid="session-sidebar"
         className="flex w-56 shrink-0 flex-col border-r border-line bg-surface"
       >
-        {sidebar}
+        <div className="flex min-h-0 flex-1 flex-col">{sidebar}</div>
+        {sidebarFooter}
       </aside>
       <main
         data-testid="main-area"

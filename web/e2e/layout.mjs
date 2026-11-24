@@ -1488,6 +1488,415 @@ await run('首启向导：探测失败可归因且不写盘', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// 4.1 单聊气泡与头像（change `chat-bubbles-avatars` / design D4）
+//
+// 度量落点钉死：`user-message` / `assistant-message` / `streaming-message` 是**整行容器**
+// （含头像），内层气泡 `data-testid="bubble"` + `data-bubble-side` 是**纯气泡**。
+// 只量内层气泡的左缘；不量右缘（头像 + 间距在它右边，永远贴不上容器边）、也不量
+// "宽度 < 容器一半"（短文本宽度与侧别无关）。
+// ---------------------------------------------------------------------------
+
+const AVATAR_IMAGE_PATH = 'C:/tmp/agent-avatar.png';
+
+function bubbleScenario(overrides = {}) {
+  return {
+    sessions: [
+      {
+        id: 's-bubble',
+        title: '气泡用例会话',
+        agentType: 'general',
+        parentSessionId: null,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ],
+    messages: [
+      {
+        id: 'u-bubble',
+        role: 'user',
+        content: '用户这一句不长',
+        attachments: ['/x/att.png'],
+      },
+      { id: 'a-bubble', role: 'assistant', content: '助手回复一句。' },
+    ],
+    // 让「图片未发送」提示行出现（既有内容不许因改气泡而消失）。
+    imagesSupported: false,
+    attachments: { '/x/att.png': PIXEL_DATA_URL },
+    profile: { avatarPath: null, userId: null, identitySeed: 'local-user' },
+    templateAvatars: { general: AVATAR_IMAGE_PATH },
+    avatarReads: { [AVATAR_IMAGE_PATH]: PIXEL_DATA_URL },
+    ...overrides,
+  };
+}
+
+async function readBubbleGeometry(page) {
+  return page.evaluate(() => {
+    const rect = (node) => {
+      const box = node.getBoundingClientRect();
+      return { left: box.left, right: box.right, width: box.width, height: box.height };
+    };
+    const area = document.querySelector('[data-testid="message-list"]');
+    const userRow = document.querySelector('[data-testid="user-message"]');
+    const assistantRow = document.querySelector('[data-testid="assistant-message"]');
+    const userBubble = userRow.querySelector('[data-testid="bubble"]');
+    const assistantBubble = assistantRow.querySelector('[data-testid="bubble"]');
+    const userColumn = userRow.querySelector('[data-testid="bubble-column"]');
+    const assistantColumn = assistantRow.querySelector('[data-testid="bubble-column"]');
+    const userAvatar = userRow.querySelector('[data-avatar-source]');
+    const assistantAvatar = assistantRow.querySelector('[data-avatar-source]');
+    return {
+      area: rect(area),
+      userRow: rect(userRow),
+      assistantRow: rect(assistantRow),
+      userSide: userBubble.dataset.bubbleSide,
+      userBubble: rect(userBubble),
+      userColumn: rect(userColumn),
+      userAvatar: rect(userAvatar),
+      assistantSide: assistantBubble.dataset.bubbleSide,
+      assistantBubble: rect(assistantBubble),
+      assistantColumn: rect(assistantColumn),
+      assistantAvatar: rect(assistantAvatar),
+      userAvatarSource: userAvatar.dataset.avatarSource,
+      userAvatarSeed: userAvatar.dataset.seed,
+      assistantAvatarSource: assistantAvatar.dataset.avatarSource,
+      assistantAvatarSeed: assistantAvatar.dataset.seed,
+      userText: userRow.innerText,
+      assistantText: assistantRow.innerText,
+    };
+  });
+}
+
+await run('单聊气泡与头像：用户靠右 / 助手靠左 / 头像在正确一侧 / 无角色标签', async () => {
+  const page = await openPage(bubbleScenario());
+  try {
+    await page.waitForSelector('[data-testid="bubble"]', { timeout: 8000 });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const geo = await readBubbleGeometry(page);
+    obs('单聊气泡几何', geo);
+
+    // ① 用户内层气泡的**左缘**在消息区右半区。
+    assert(geo.userSide === 'user', `用户内层气泡的 data-bubble-side 必须是 user，实测 ${geo.userSide}`);
+    assert(
+      geo.userBubble.left > geo.area.left + geo.area.width / 2,
+      `用户气泡左缘必须落在消息区右半区（气泡 left=${geo.userBubble.left}，` +
+        `中点=${geo.area.left + geo.area.width / 2}）`,
+    );
+    // ② 助手内层气泡贴着它自己那一列的左缘（≤1px），且整行靠左。
+    assert(
+      geo.assistantSide === 'agent',
+      `助手内层气泡的 data-bubble-side 必须是 agent，实测 ${geo.assistantSide}`,
+    );
+    assert(
+      Math.abs(geo.assistantBubble.left - geo.assistantColumn.left) <= 1,
+      `助手气泡左缘必须贴着自己的列左缘（≤1px）：气泡 ${geo.assistantBubble.left} / 列 ${geo.assistantColumn.left}`,
+    );
+    // 助手整行靠左：头像贴消息行左缘（气泡列紧跟在头像右侧，所以列为 头像+间距）。
+    assert(
+      geo.assistantAvatar.left - geo.assistantRow.left <= 1,
+      `助手头像必须贴消息行左缘（≤1px）：头像 ${geo.assistantAvatar.left} / 行 ${geo.assistantRow.left}`,
+    );
+
+    // ④ 头像位置：用户在行最右端、助手在行最左端（头像节点在气泡之外）。
+    assert(
+      geo.userAvatar.left >= geo.userBubble.right - 0.5,
+      `用户头像必须在气泡右侧（头像 left=${geo.userAvatar.left} / 气泡 right=${geo.userBubble.right}）`,
+    );
+    assert(
+      geo.userRow.right - geo.userAvatar.right <= 1,
+      `用户头像必须贴消息行右缘（≤1px）：行 right=${geo.userRow.right} / 头像 right=${geo.userAvatar.right}`,
+    );
+    assert(
+      geo.assistantAvatar.right <= geo.assistantBubble.left + 0.5,
+      `助手头像必须在气泡左侧（头像 right=${geo.assistantAvatar.right} / 气泡 left=${geo.assistantBubble.left}）`,
+    );
+
+    // ⑤ 去掉 You / Assistant 角色标签。
+    for (const [label, text] of [['用户', geo.userText], ['助手', geo.assistantText]]) {
+      assert(!text.includes('You'), `${label}消息里不得再有「You」标签，实测「${text}」`);
+      assert(
+        !text.includes('Assistant'),
+        `${label}消息里不得再有「Assistant」标签，实测「${text}」`,
+      );
+    }
+
+    // ⑦ 上传图真显示：data URL、可解码、尺寸等于头像令牌值 24。
+    assert(
+      geo.assistantAvatarSource === 'upload',
+      `模板有可读头像时助手头像来源必须是 upload，实测 ${geo.assistantAvatarSource}`,
+    );
+    const image = await page.$eval('[data-testid="assistant-message"] img[data-avatar-source]', (node) => ({
+      src: node.getAttribute('src') ?? '',
+      width: node.getBoundingClientRect().width,
+      naturalWidth: node.naturalWidth,
+      complete: node.complete,
+    }));
+    obs('上传头像的 img', image);
+    assert(image.src.startsWith('data:'), `头像 <img> 的 src 必须是 data URL，实测 ${image.src.slice(0, 24)}`);
+    assert(image.complete && image.naturalWidth > 0, '头像 <img> 必须真的解码出来（不是破图）');
+    assertNumber(image.width, 24, '气泡内头像尺寸', 0.5);
+
+    // ⑨ 既有附件缩略图与「图片未发送」提示行仍在。
+    const attachments = await page.evaluate(() => ({
+      thumbnails: document.querySelectorAll('[data-testid="attachment-thumbnail"]').length,
+      notSent: document.querySelector('[data-testid="attachment-not-sent"]')?.innerText ?? '',
+      missing: document.querySelector('[data-testid="attachment-missing"]') !== null,
+    }));
+    obs('附件渲染', attachments);
+    assert(attachments.thumbnails === 1, `用户消息的附件缩略图必须仍在，实测 ${attachments.thumbnails}`);
+    assert(
+      attachments.notSent.includes('图片未发送'),
+      `「图片未发送」提示行必须仍在且文案不变，实测「${attachments.notSent}」`,
+    );
+    assert(!attachments.missing, '不该出现「图片已丢失」提示（文件其实在）');
+
+    if (process.env.LAYOUT_SHOT) {
+      await page.screenshot({ path: process.env.LAYOUT_SHOT, fullPage: false });
+      console.log(`[SHOT] captured ${process.env.LAYOUT_SHOT}`);
+    }
+  } finally {
+    await page.close();
+  }
+});
+
+await run('单聊头像：身份图案种子 = 会话 id；上传图读不到时回落身份图案且不阻断', async () => {
+  // ⑥ 没有上传覆盖：助手身份图案的种子必须是会话 id。
+  const identiconPage = await openPage(bubbleScenario({ templateAvatars: {} }));
+  try {
+    await identiconPage.waitForSelector('[data-testid="assistant-message"] [data-avatar-source]', {
+      timeout: 8000,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const avatar = await identiconPage.$eval(
+      '[data-testid="assistant-message"] [data-avatar-source]',
+      (node) => ({ source: node.dataset.avatarSource, seed: node.dataset.seed }),
+    );
+    obs('身份图案头像', avatar);
+    assert(avatar.source === 'identicon', `无上传图时来源必须是 identicon，实测 ${avatar.source}`);
+    assert(avatar.seed === 's-bubble', `身份图案种子必须是会话 id（s-bubble），实测 ${avatar.seed}`);
+    const userAvatar = await identiconPage.$eval(
+      '[data-testid="user-message"] [data-avatar-source]',
+      (node) => ({ source: node.dataset.avatarSource, seed: node.dataset.seed }),
+    );
+    obs('用户身份图案头像', userAvatar);
+    assert(userAvatar.source === 'identicon', '用户没有头像时也画身份图案');
+    assert(userAvatar.seed === 'local-user', `用户身份图案种子必须是 identitySeed，实测 ${userAvatar.seed}`);
+  } finally {
+    await identiconPage.close();
+  }
+
+  // ⑧ 上传路径读不到（文件被删）：助手头像回落身份图案，正文与附件照常、无错误横幅。
+  const missingPage = await openPage(
+    bubbleScenario({ avatarReads: { [AVATAR_IMAGE_PATH]: null } }),
+  );
+  try {
+    await missingPage.waitForSelector('[data-testid="assistant-message"]', { timeout: 8000 });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const state = await missingPage.evaluate(() => ({
+      source: document.querySelector('[data-testid="assistant-message"] [data-avatar-source]')
+        ?.dataset.avatarSource,
+      assistantText:
+        document.querySelector('[data-testid="assistant-message"]')?.innerText ?? '',
+      userText: document.querySelector('[data-testid="user-message"]')?.innerText ?? '',
+      thumbnails: document.querySelectorAll('[data-testid="attachment-thumbnail"]').length,
+      errorBanner: document.querySelector('[data-testid="error-banner"]') !== null,
+    }));
+    obs('头像文件丢失后的单聊', state);
+    assert(state.source === 'identicon', `读不到头像字节时必须回落身份图案，实测 ${state.source}`);
+    assert(state.assistantText.includes('助手回复一句'), '助手正文必须照常渲染');
+    assert(state.userText.includes('用户这一句不长'), '用户正文必须照常渲染');
+    assert(state.thumbnails === 1, '附件缩略图必须照常渲染');
+    assert(!state.errorBanner, '头像读失败是装饰性资源，不得弹错误横幅');
+  } finally {
+    await missingPage.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 6.1 头像上传：模板页与侧栏用户头像（change `chat-bubbles-avatars` / design D3）
+// ---------------------------------------------------------------------------
+
+const AVATAR_PICK_FILENAME = 'pixel.png';
+/** 假核心的 attachment.upload 返回的确定性路径（见 web/test/harness/main.tsx）。 */
+const AVATAR_UPLOADED_PATH = `uploaded/${AVATAR_PICK_FILENAME}`;
+
+function callsOf(calls, prefix) {
+  return calls.filter((call) => call.startsWith(prefix));
+}
+
+function payloadOf(call) {
+  const at = call.indexOf(':');
+  return JSON.parse(call.slice(at + 1));
+}
+
+await run('模板页头像：选择→attachment.upload→template.save 带 avatarPath；清除提交空串；没碰不带字段', async () => {
+  const scenario = {
+    mode: 'templates',
+    fake: templatesScenario.fake,
+    avatarReads: {},
+  };
+  const page = await openPage(scenario);
+  try {
+    await page.waitForSelector('[data-testid="template-row"]', { timeout: 15000 });
+    await page.click('[data-testid="template-row"][data-name="general"] [data-testid="template-edit"]');
+    await page.waitForSelector('[data-testid="template-avatar-preview"]', { timeout: 8000 });
+    assert(
+      (await page.$('[data-testid="template-avatar-upload"]')) !== null,
+      '模板页必须有头像选择入口 template-avatar-upload',
+    );
+    assert(
+      (await page.$('[data-testid="template-avatar-clear"]')) !== null,
+      '模板页必须有头像清除入口 template-avatar-clear',
+    );
+
+    // ① 选图 → attachment.upload → 保存带 avatarPath（等于上传返回路径）。
+    await (await page.$('[data-testid="template-avatar-upload"]')).uploadFile(PIXEL_PNG);
+    await page.waitForFunction(
+      () => window.__harness.calls().some((call) => call.startsWith('attachment.upload:')),
+      { timeout: 8000 },
+    );
+    await page.click('[data-testid="template-form-save"]');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const afterUpload = await page.evaluate(() => window.__harness.calls());
+    const uploadCall = callsOf(afterUpload, 'attachment.upload:').at(-1);
+    const saveCall = callsOf(afterUpload, 'template.save:').at(-1);
+    obs('template.save payload（上传后）', saveCall);
+    assert(uploadCall !== undefined, '选图必须走 attachment.upload');
+    assert(saveCall !== undefined, '保存必须调用 template.save');
+    assert(
+      payloadOf(uploadCall).filename === AVATAR_PICK_FILENAME,
+      `attachment.upload 必须带上文件名，实测 ${uploadCall}`,
+    );
+    assert(
+      payloadOf(saveCall).avatarPath === AVATAR_UPLOADED_PATH,
+      `template.save 的 avatarPath 必须等于上传返回路径（${AVATAR_UPLOADED_PATH}），` +
+        `实测 ${JSON.stringify(payloadOf(saveCall))}`,
+    );
+
+    // ② 清除：提交空串。
+    await page.click('[data-testid="template-row"][data-name="general"] [data-testid="template-edit"]');
+    await page.waitForSelector('[data-testid="template-avatar-clear"]', { timeout: 8000 });
+    await page.click('[data-testid="template-avatar-clear"]');
+    await page.click('[data-testid="template-form-save"]');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const afterClear = await page.evaluate(() => window.__harness.calls());
+    const clearSave = callsOf(afterClear, 'template.save:').at(-1);
+    obs('template.save payload（清除后）', clearSave);
+    assert(
+      payloadOf(clearSave).avatarPath === '',
+      `清除头像必须提交空串 avatarPath，实测 ${JSON.stringify(payloadOf(clearSave))}`,
+    );
+
+    // ③ 没碰头像的保存不带该字段。
+    await page.click('[data-testid="template-row"][data-name="general"] [data-testid="template-edit"]');
+    await page.waitForSelector('[data-testid="template-form-model"]', { timeout: 8000 });
+    await page.click('[data-testid="template-form-model"]');
+    await page.keyboard.down('Control');
+    await page.keyboard.press('KeyA');
+    await page.keyboard.up('Control');
+    await page.type('[data-testid="template-form-model"]', 'm-touched');
+    await page.click('[data-testid="template-form-save"]');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const afterPlain = await page.evaluate(() => window.__harness.calls());
+    const plainSave = callsOf(afterPlain, 'template.save:').at(-1);
+    obs('template.save payload（没碰头像）', plainSave);
+    assert(
+      !Object.prototype.hasOwnProperty.call(payloadOf(plainSave), 'avatarPath'),
+      `没碰头像的保存不得带 avatarPath，实测 ${JSON.stringify(payloadOf(plainSave))}`,
+    );
+
+    if (process.env.LAYOUT_SHOT_TEMPLATES) {
+      await page.screenshot({ path: process.env.LAYOUT_SHOT_TEMPLATES, fullPage: false });
+      console.log(`[SHOT] captured ${process.env.LAYOUT_SHOT_TEMPLATES}`);
+    }
+  } finally {
+    await page.close();
+  }
+});
+
+await run('侧栏用户头像：换头像走 profile.save 带路径；恢复默认提交空串；config.get 失败可见并可重试', async () => {
+  const scenario = bubbleScenario({ templateAvatars: {} });
+  const page = await openPage(scenario);
+  try {
+    await page.waitForSelector('[data-testid="user-avatar-block"]', { timeout: 8000 });
+    assert((await page.$('[data-testid="user-avatar-change"]')) !== null, '侧栏必须有「换头像」入口');
+    assert((await page.$('[data-testid="user-avatar-reset"]')) !== null, '侧栏必须有「恢复默认」入口');
+
+    // ① 换头像：attachment.upload + profile.save（payload 带路径）。
+    await (await page.$('[data-testid="user-avatar-file"]')).uploadFile(PIXEL_PNG);
+    await page.waitForFunction(
+      () => window.__harness.calls().some((call) => call.startsWith('profile.save:')),
+      { timeout: 8000 },
+    );
+    const afterChange = await page.evaluate(() => window.__harness.calls());
+    const profileSave = callsOf(afterChange, 'profile.save:').at(-1);
+    obs('profile.save payload（换头像）', profileSave);
+    assert(
+      callsOf(afterChange, 'attachment.upload:').length >= 1,
+      '换头像必须先走 attachment.upload',
+    );
+    const savedPath = payloadOf(profileSave).avatarPath;
+    assert(savedPath && savedPath.length > 0, `profile.save 必须带上传路径，实测 ${profileSave}`);
+    await page.waitForFunction(
+      () =>
+        document.querySelector('[data-testid="user-avatar-block"] [data-avatar-source]')
+          ?.dataset.avatarSource === 'upload',
+      { timeout: 8000 },
+    );
+    const changed = await page.$eval(
+      '[data-testid="user-avatar-block"] [data-avatar-source]',
+      (node) => node.dataset.avatarSource,
+    );
+    obs('换头像后侧栏头像来源', changed);
+    assert(changed === 'upload', '换头像成功后侧栏头像必须立刻变成上传图（不刷新整页）');
+
+    // ② 恢复默认：profile.save 的 avatarPath 为空串。
+    await page.click('[data-testid="user-avatar-reset"]');
+    await page.waitForFunction(
+      () => {
+        const calls = window.__harness.calls().filter((call) => call.startsWith('profile.save:'));
+        return calls.length >= 2 && JSON.parse(calls.at(-1).slice('profile.save:'.length)).avatarPath === '';
+      },
+      { timeout: 8000 },
+    );
+    const afterReset = await page.evaluate(() =>
+      window.__harness.calls().filter((call) => call.startsWith('profile.save:')).at(-1),
+    );
+    obs('profile.save payload（恢复默认）', afterReset);
+    const resetSource = await page.$eval(
+      '[data-testid="user-avatar-block"] [data-avatar-source]',
+      (node) => node.dataset.avatarSource,
+    );
+    assert(resetSource === 'identicon', '恢复默认后回到身份图案');
+  } finally {
+    await page.close();
+  }
+
+  // ③ config.get 失败：头像块显示可归因提示 + 重试，聊天屏仍渲染。
+  const failedPage = await openPage(bubbleScenario({ profileFail: true }));
+  try {
+    await failedPage.waitForSelector('[data-testid="user-avatar-error"]', { timeout: 8000 });
+    await failedPage.waitForSelector('[data-testid="message-list"]', { timeout: 8000 });
+    const state = await failedPage.evaluate(() => ({
+      error: document.querySelector('[data-testid="user-avatar-error"]')?.innerText ?? '',
+      retry: document.querySelector('[data-testid="user-avatar-retry"]') !== null,
+      messageList: document.querySelector('[data-testid="message-list"]') !== null,
+      avatarSource: document.querySelector('[data-testid="user-avatar-block"] [data-avatar-source]')
+        ?.dataset.avatarSource,
+    }));
+    obs('config.get 失败时的头像块', state);
+    assert(
+      state.error.includes('头像资料读取失败'),
+      `必须显示可归因的读取失败提示，实测「${state.error}」`,
+    );
+    assert(state.retry, '读取失败提示必须带重试入口');
+    assert(state.messageList, 'config.get 失败不得挡住聊天屏');
+    assert(state.avatarSource === 'identicon', '读取失败时头像按身份图案渲染');
+  } finally {
+    await failedPage.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
 
 await browser.close();
 await staticServer.close();

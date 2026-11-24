@@ -49,6 +49,13 @@ class AgentTemplateDraft {
   /// 等待阈值百分比（同上）：1..100；null = 沿用既有值。
   final int? compactionWaitThresholdPercent;
 
+  /// 头像字段（change `chat-bubbles-avatars` D3）的**三态**：
+  /// `null` = 不改（既有模板沿用原值；**新增模板 = 没有头像**，不继承 general）、
+  /// `''` = 清除、非空字符串 = 设为该路径。
+  ///
+  /// 类型校验（数字 / 对象 ⇒ `-32602`）在 RPC 层做，草稿里只会是字符串或 null。
+  final String? avatarPath;
+
   const AgentTemplateDraft({
     this.originalName,
     required this.name,
@@ -61,6 +68,7 @@ class AgentTemplateDraft {
     this.inputModalities,
     this.compactionThresholdPercent,
     this.compactionWaitThresholdPercent,
+    this.avatarPath,
   });
 
   bool get isNew => originalName == null;
@@ -222,6 +230,18 @@ class AgentTemplateController {
           : unique;
     }
 
+    // 头像（change `chat-bubbles-avatars` D3）：三态语义与"新模板不继承头像"。
+    // 省略（null）= 不改：**新增模板**刻意不走"从 general 继承缺省字段"那条路 ——
+    // 头像属于"身份"而不是"缺省行为"，继承过来会让人以为新模板跟 general 同一个人。
+    final String? avatarPath;
+    if (draft.avatarPath == null) {
+      avatarPath = draft.isNew ? null : existing?.avatarPath;
+    } else if (draft.avatarPath!.trim().isEmpty) {
+      avatarPath = null;
+    } else {
+      avatarPath = draft.avatarPath!.trim();
+    }
+
     return AgentTypeConfig(
       name: name,
       provider: provider,
@@ -243,6 +263,7 @@ class AgentTemplateController {
         '等待阈值',
       ),
       inputModalities: List<String>.unmodifiable(modalities),
+      avatarPath: avatarPath,
       commandTimeoutMs:
           base?.commandTimeoutMs ?? AgentTypeConfig.kDefaultCommandTimeoutMs,
       commandMaxTimeoutMs: base?.commandMaxTimeoutMs ??

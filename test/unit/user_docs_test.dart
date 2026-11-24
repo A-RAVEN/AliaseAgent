@@ -27,8 +27,9 @@ const _indexHeading = '## 功能文档索引';
 
 /// 产品代码里"配置键的解析路径"，Dart 侧。文档中的配置键必须能在这些文件里找到。
 const _dartConfigSourcePaths = <String>[
-  'lib/models/app_config.dart', // version / providers / agent_types / search
-  'lib/models/agent_type_config.dart', // provider / model / system_prompt / tools / ...
+  'lib/models/app_config.dart', // version / providers / agent_types / search / profile
+  'lib/models/agent_type_config.dart', // provider / model / system_prompt / tools / avatar_path ...
+  'lib/models/user_profile.dart', // profile 块的 avatar_path / user_id（change chat-bubbles-avatars）
   'lib/models/provider_config.dart', // api_key / base_url
   // 第一次启动的对话框写出的那份配置：providers 里的键名 anthropic、
   // agent_types 里的键名 general 都在这里写出来。
@@ -390,6 +391,25 @@ void main() {
       expect(missing, isEmpty,
           reason: '这些标成界面文案的句子在 lib/ 下找不到（界面改了文案、文档没跟着改？）：'
               '$missing');
+    });
+
+    test('配置文档写出 profile 块与模板头像字段（change `chat-bubbles-avatars` 7.5）', () {
+      final configDoc = File('$_userGuideDir/configuration.md');
+      expect(configDoc.existsSync(), isTrue, reason: '缺少配置文档');
+      final configText = configDoc.readAsStringSync();
+      // 配置示例（json 代码块）里必须真的出现这些键：反向检查（代码解析了、文档没写）
+      // 在 `_configKeysFromCode` 那条用例里，这里补"示例块里看得见"这一层。
+      for (final key in const ['profile', 'user_id', 'avatar_path']) {
+        // ignore: avoid_print
+        print('[配置文档] json 示例含 "$key"=${configText.contains('"$key"')}');
+        expect(configText, contains('"$key"'),
+            reason: '配置文档的 json 示例缺少 "$key"（模型字段与用户资料块都要可见）');
+      }
+      // 回退边界：旧版本不认识这些键，保存会丢掉它们（design Risks）。
+      expect(configText, contains('旧版本'),
+          reason: '配置文档必须写明旧版本不认这两个键、保存会丢');
+      expect(configText, contains('备份'),
+          reason: '配置文档必须提示降级前备份配置');
     });
   });
 }

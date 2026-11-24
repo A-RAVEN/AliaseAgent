@@ -231,6 +231,25 @@ void main() {
     expect(agentText.contains('重新打开'), isFalse,
         reason: '模板文档不得再声称重新打开会话就会使用新配置');
   });
+
+  test('模板头像字段在模板文档与配置文档里有说明（change `chat-bubbles-avatars` 7.5）', () {
+    final agentText = docs.readAsStringSync();
+    final configText = configDoc.readAsStringSync();
+    // 配置键名取自产品解析路径（`agent_type_config.dart` 的 avatar_path）。
+    for (final anchor in const ['avatar_path', '头像']) {
+      // ignore: avoid_print
+      print('  [OBS] 模板文档含「$anchor」=${agentText.contains(anchor)} '
+          '配置文档含「$anchor」=${configText.contains(anchor)}');
+      expect(agentText, contains(anchor), reason: '模板文档没有说明头像字段「$anchor」');
+      expect(configText, contains(anchor), reason: '配置文档没有说明头像字段「$anchor」');
+    }
+    // 新模板不继承头像（design D3 的 P1 修订）必须写进模板文档。
+    expect(agentText, contains('新增模板不继承头像'),
+        reason: '模板文档必须写明新增模板不继承 general 的头像');
+    // 上传入口与回落口径（身份图案）。
+    expect(agentText, contains('身份图案'),
+        reason: '模板文档必须写明没有头像时按身份图案显示');
+  });
 }
 
 List<String> _allLibSources() {

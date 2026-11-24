@@ -23,6 +23,8 @@ import { emptyChatView, type ChatView } from './chat/render';
 import { ChatScreen } from './components/ChatScreen';
 import { ChatShell } from './components/ChatShell';
 import { SessionList } from './components/SessionList';
+import { UserAvatarBlock } from './components/UserAvatarBlock';
+import type { AvatarData } from './components/Avatar';
 import { GroupView } from './group/GroupView';
 import { loadingMemberSnapshot, splitGroupMessages, type MemberSnapshotState } from './group/model';
 import { workspaceMode } from './layout/model';
@@ -30,10 +32,13 @@ import { ProvidersPage } from './components/ProvidersPage';
 import { TemplatesPage } from './components/TemplatesPage';
 import { Wizard } from './components/Wizard';
 import { parseAgentSwitchError, type AgentSwitchFailure } from './manage/logic';
+import { resolveAvatar } from './avatars/resolve';
 import {
   RpcClient,
   type AgentEvent,
+  type ConfigGetResult,
   type ConnectionStatus,
+  type Profile,
   type Session,
   type GroupListResult,
   type GroupChainResult,
@@ -43,6 +48,8 @@ import {
   type SessionResult,
   type SessionSwitchResult,
   type SnapshotEventData,
+  type TemplateListResult,
+  type TemplateSummary,
 } from './protocol';
 import { layoutConfig } from './tokens';
 
@@ -102,6 +109,10 @@ export default function App() {
   const [switchFailure, setSwitchFailure] = useState<AgentSwitchFailure | null>(null);
   const [attachmentDataUrls, setAttachmentDataUrls] = useState<Record<string, string | null>>({});
   const [imagesSupported, setImagesSupported] = useState<boolean | null>(null);
+  // 用户资料与模板摘要（change `chat-bubbles-avatars`）：头像路径从这两处来。
+  const [profile, setProfile] = useState<Profile | null>(null);
+  const [profileError, setProfileError] = useState<string | null>(null);
+  const [templateSummaries, setTemplateSummaries] = useState<TemplateSummary[]>([]);
   const [panel, setPanel] = useState<'providers' | 'templates' | null>(null);
   const [configMissing, setConfigMissing] = useState(false);
   // 群视图状态（change `agent-group-chat`）：组成员、**原始消息列表**（分页的单一来源）、
@@ -135,7 +146,7 @@ export default function App() {
   /** 配置文件是否存在：不存在 ⇒ 打开首启向导（design D2 / D11）。 */
   const checkConfig = useCallback(async () => {
     try {
-      const result = await client.request<{ missing: boolean }>('config.get');
+      const result = await client.request<ConfigGetResult>('config.get');
       setConfigMissing(result.missing === true);
     } catch {
       setConfigMissing(false);
@@ -150,10 +161,11 @@ export default function App() {
         return;
       }
       try {
-        const result = await client.request<{
-          agentTypes: Record<string, { input_modalities?: string[] }>;
-        }>('config.get');
-        const modalities = result.agentTypes[agentType]?.input_modalities ?? [];
+        const result = await client.request<ConfigGetResult>('config.get');
+        const raw = result.agentTypes[agentType]?.input_modalities;
+        const modalities = Array.isArray(raw)
+          ? raw.filter((value): value is string => typeof value === 'string')
+          : [];
         setImagesSupported(modalities.includes('image'));
       } catch {
         setImagesSupported(null);
@@ -186,11 +198,31 @@ export default function App() {
   /** 模板名列表（会话侧栏的切换下拉用）；核心没提供 `template.list` 时明确提示。 */
   const loadTemplates = useCallback(async () => {
     try {
-      const result = await client.request<{ templates: { name: string }[] }>('template.list');
+      const result = await client.request<TemplateListResult>('template.list');
       setTemplates(result.templates.map((template) => template.name));
+      // 模板摘要留着建"模板 → 上传头像路径"映射（design D2：头像数据来源不改 RPC）。
+      setTemplateSummaries(result.templates);
     } catch (templateError: unknown) {
       setTemplates([]);
+      setTemplateSummaries([]);
       setNotice(`模板列表不可用：${errorText(templateError)}`);
+    }
+  }, [client]);
+
+  /**
+   * 用户资料（`config.get` 的 `profile`）。
+   *
+   * 失败**必须可见**（侧栏用户头像块显示「头像资料读取失败：…」并可重试，D8），
+   * 但不得挡住聊天屏 / 群视图 —— 这里只记错误文本，不抛给上层。
+   */
+  const loadProfile = useCallback(async () => {
+    try {
+      const result = await client.request<ConfigGetResult>('config.get');
+      setProfile(result.profile ?? null);
+      setProfileError(null);
+    } catch (profileLoadError: unknown) {
+      setProfile(null);
+      setProfileError(errorText(profileLoadError));
     }
   }, [client]);
 
@@ -632,8 +664,11 @@ export default function App() {
     client
       .connect(coreWsUrl)
       .then(async () => {
-        await loadSessions();
+        // 模板与用户资料先于会话加载：头像映射要在群/单聊首帧之前就绪，否则第一帧会
+        // 画身份图案再"闪"成上传图（change `chat-bubbles-avatars` D2）。
         await loadTemplates();
+        await loadProfile();
+        await loadSessions();
         await loadGroupOptions();
         await checkConfig();
       })
@@ -644,7 +679,7 @@ export default function App() {
       offReconnected();
       client.close();
     };
-  }, [client, loadSessions, loadTemplates, checkConfig, onEvent, refreshAfterReconnect]);
+  }, [client, loadSessions, loadTemplates, loadProfile, checkConfig, onEvent, refreshAfterReconnect]);
 
   const selectSession = async (sessionId: string) => {
     const selected = sessions.find((session) => session.id === sessionId) ?? null;
@@ -829,6 +864,63 @@ export default function App() {
     if (paths.length > 0) void resolveAttachments(paths);
   }, [view.messages, resolveAttachments]);
 
+  // ---------------------------------------------------------------------------
+  // 头像（change `chat-bubbles-avatars` design D2）
+  //
+  // 只读来源：模板头像 = `template.list` 的 `avatar_path`，用户头像 = `config.get` 的
+  // `profile.avatar_path`。字节统一走与聊天图片同一份**去重缓存**（`attachmentDataUrls`
+  // + `requestedAttachments`），组件层只收 dataUrl（MUST NOT 给 `<img>` 绝对路径）。
+  // ---------------------------------------------------------------------------
+
+  /** 模板名 → 上传头像路径。 */
+  const templateAvatarPaths = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const template of templateSummaries) {
+      if (typeof template.avatar_path === 'string' && template.avatar_path.length > 0) {
+        map[template.name] = template.avatar_path;
+      }
+    }
+    return map;
+  }, [templateSummaries]);
+
+  /** 当前需要字节的头像路径（用户 + 所有模板 + 群成员所属模板）；失败缓存 null。 */
+  const avatarPaths = useMemo(() => {
+    const paths = new Set<string>();
+    const add = (path: string | null | undefined) => {
+      if (typeof path === 'string' && path.length > 0) paths.add(path);
+    };
+    add(profile?.avatarPath);
+    for (const path of Object.values(templateAvatarPaths)) add(path);
+    for (const member of groupSummary?.members ?? []) add(templateAvatarPaths[member.template]);
+    return [...paths];
+  }, [profile, templateAvatarPaths, groupSummary]);
+
+  useEffect(() => {
+    if (avatarPaths.length > 0) void resolveAttachments(avatarPaths);
+  }, [avatarPaths, resolveAttachments]);
+
+  /** 一张头像的渲染数据：上传图取到字节才用，否则身份图案（种子原样）。 */
+  const avatarFor = useCallback(
+    (entityId: string, uploadedPath: string | null | undefined): AvatarData => {
+      const resolved = resolveAvatar({ entityId, uploadedPath });
+      const dataUrl =
+        resolved.uploadedPath !== null
+          ? attachmentDataUrls[resolved.uploadedPath] ?? null
+          : null;
+      if (resolved.source === 'upload' && dataUrl !== null) {
+        return { dataUrl, source: 'upload', seed: resolved.seed };
+      }
+      return { dataUrl: null, source: 'identicon', seed: resolved.seed };
+    },
+    [attachmentDataUrls],
+  );
+
+  const userAvatar = avatarFor(profile?.identitySeed ?? '', profile?.avatarPath);
+  const agentAvatar = avatarFor(
+    currentSessionId ?? '',
+    currentAgentType !== null ? templateAvatarPaths[currentAgentType] : null,
+  );
+
   if (configMissing) {
     return (
       <Wizard
@@ -862,6 +954,21 @@ export default function App() {
           disabled={status !== 'open'}
         />
       }
+      sidebarFooter={
+        <UserAvatarBlock
+          client={client}
+          profile={profile}
+          avatar={userAvatar}
+          error={profileError}
+          onUpdated={(next) => {
+            // 成功后就地更新（不整页刷新）；新路径的字节交给共用缓存去取。
+            setProfile(next);
+            setProfileError(null);
+            if (next.avatarPath !== null) void resolveAttachments([next.avatarPath]);
+          }}
+          onRetry={() => void loadProfile()}
+        />
+      }
       overlay={
         panel === 'providers' ? (
           <ProvidersPage
@@ -876,6 +983,8 @@ export default function App() {
           <TemplatesPage
             client={client}
             onClose={() => setPanel(null)}
+            avatarDataUrls={attachmentDataUrls}
+            onResolveAvatar={(paths) => void resolveAttachments(paths)}
             onChanged={() => {
               void loadTemplates();
               void loadImagesSupported(currentAgentType);
@@ -908,6 +1017,13 @@ export default function App() {
             onReload={() => loadGroup(groupSummary.id, { preserveLoadedContent: true })}
             onReloadMemberSnapshot={(memberId) => void reloadMemberSnapshot(memberId)}
             onError={(message) => setError(message)}
+            userAvatar={userAvatar}
+            memberAvatars={Object.fromEntries(
+              (groupSummary.members ?? []).map((member) => [
+                member.id,
+                avatarFor(member.id, templateAvatarPaths[member.template]),
+              ]),
+            )}
           />
         ) : (
           <GroupLoading error={error} />
@@ -929,6 +1045,8 @@ export default function App() {
           onSend={(text, images) => void send(text, images)}
           attachments={attachmentDataUrls}
           imagesSupported={imagesSupported}
+          userAvatar={userAvatar}
+          agentAvatar={agentAvatar}
           onOpenProviders={() => setPanel('providers')}
           onOpenTemplates={() => setPanel('templates')}
         />

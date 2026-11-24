@@ -24,6 +24,7 @@ import 'package:alias_agent/models/agent_type_config.dart';
 import 'package:alias_agent/models/app_config.dart';
 import 'package:alias_agent/models/model_catalog_entry.dart';
 import 'package:alias_agent/models/provider_config.dart';
+import 'package:alias_agent/models/user_profile.dart';
 import 'package:alias_agent/services/agent_config_resolver.dart';
 import 'package:alias_agent/services/agent_template_controller.dart';
 import 'package:alias_agent/services/config_service.dart';
@@ -1100,6 +1101,278 @@ void main() {
       _obs('删不存在模板的错误', missing['error']);
       expect((missing['error'] as Map)['code'], -32602);
       expect('${(missing['error'] as Map)['message']}', contains('不存在'));
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 3.3 头像字段经 RPC 落盘（change `chat-bubbles-avatars` 3.1 / design D2 / D3）
+  //
+  // 红靶：落盘才是判据 —— 每条既看返回值，也读 `config.json` 原文。只断言返回值的
+  // 实现（例如把 avatarPath 塞进内存配置却不写盘）在这里红。
+  // ---------------------------------------------------------------------------
+  group('3.3 头像字段经 RPC 落盘（chat-bubbles-avatars）', () {
+    late _Harness harness;
+    late String pngPath;
+
+    setUp(() async {
+      harness = await _Harness.start(config: _configForTemplateRpc);
+      Directory(harness.attachmentsDir).createSync(recursive: true);
+      final uploaded = await harness.ws.request('attachment.upload', {
+        'filename': 'face.png',
+        'base64': base64Encode(_tinyPng(width: 4, height: 4)),
+      });
+      pngPath = (uploaded['result'] as Map)['path'] as String;
+      _obs('测试头像已落盘', pngPath);
+    });
+
+    tearDown(() async {
+      await harness.stop();
+    });
+
+    AppConfig diskConfig() => ConfigService.load(configPath: harness.configPath).config!;
+
+    Map<String, dynamic> saveTemplate({
+      required String name,
+      String? originalName,
+      Object? avatarPath,
+      bool includeAvatar = true,
+    }) {
+      final params = <String, dynamic>{
+        'name': name,
+        'originalName': ?originalName,
+        'provider': 'p',
+        'model': name == 'general' ? 'm' : 'm-spare',
+        'thinkingEffort': 'high',
+        'systemPrompt': '',
+        'tools': ['read_file'],
+        'maxContextTokens': '',
+        if (includeAvatar) 'avatarPath': avatarPath,
+      };
+      return params;
+    }
+
+    test('template.save 头像三态：设置写回 / 空串清除 / 省略与 null 不改（读盘判据）', () async {
+      // ① 设置：先给 general 一个真头像。
+      final setResponse = await harness.ws.request('template.save', saveTemplate(
+        name: 'general',
+        originalName: 'general',
+        avatarPath: pngPath,
+      ));
+      _obs('设置头像的响应', setResponse['error']);
+      expect(setResponse['error'], isNull);
+      final afterSet = diskConfig().agentTypes['general']!;
+      _obs('设置后落盘 avatarPath', afterSet.avatarPath);
+      expect(afterSet.avatarPath, p.normalize(p.absolute(pngPath)));
+      expect(harness.core.config.agentTypes['general']!.avatarPath, isNotNull,
+          reason: '写盘后组合根也要同步（模板页/群聊立刻能读到）');
+
+      final listed = await harness.ws.request('template.list');
+      final generalRow = (listed['result'] as Map)['templates'] as List;
+      final general = generalRow
+          .cast<Map>()
+          .firstWhere((template) => template['name'] == 'general');
+      _obs('template.list 的 general.avatar_path', general['avatar_path']);
+      expect(general['avatar_path'], p.normalize(p.absolute(pngPath)),
+          reason: 'template.list 返回模板完整 JSON，头像键必须可读');
+
+      // ② 省略 = 不改。
+      final omitted = await harness.ws.request(
+          'template.save', saveTemplate(name: 'general', originalName: 'general', includeAvatar: false));
+      _obs('省略 avatarPath 的响应', omitted['error']);
+      expect(omitted['error'], isNull);
+      expect(diskConfig().agentTypes['general']!.avatarPath,
+          p.normalize(p.absolute(pngPath)),
+          reason: '省略 avatarPath = 不改（MUST NOT 清空既有头像）');
+
+      // ③ 显式 null = 不改。
+      final nulled = await harness.ws.request('template.save',
+          saveTemplate(name: 'general', originalName: 'general', avatarPath: null));
+      expect(nulled['error'], isNull);
+      expect(diskConfig().agentTypes['general']!.avatarPath,
+          p.normalize(p.absolute(pngPath)),
+          reason: '显式 null = 不改');
+
+      // ④ 空串 = 清除（写回里不再有该键）。
+      final cleared = await harness.ws.request('template.save',
+          saveTemplate(name: 'general', originalName: 'general', avatarPath: ''));
+      _obs('清空头像的响应', cleared['error']);
+      expect(cleared['error'], isNull);
+      expect(diskConfig().agentTypes['general']!.avatarPath, isNull);
+      final raw = jsonDecode(File(harness.configPath).readAsStringSync()) as Map<String, dynamic>;
+      final rawGeneral =
+          ((raw['agent_types'] as Map)['general'] as Map).cast<String, dynamic>();
+      _obs('清除后配置原文 has avatar_path', rawGeneral.containsKey('avatar_path'));
+      expect(rawGeneral.containsKey('avatar_path'), isFalse,
+          reason: '清除 = 写回里不再有该键（不是写空串 / null）');
+    });
+
+    test('template.save 头像类型错 ⇒ -32602 且配置不变', () async {
+      final before = File(harness.configPath).readAsStringSync();
+      for (final illegal in <Object>[123, <String, dynamic>{'x': 1}, <Object>[1, 2]]) {
+        final response = await harness.ws.request('template.save',
+            saveTemplate(name: 'general', originalName: 'general', avatarPath: illegal));
+        _obs('非法 avatarPath ${illegal.runtimeType} 的错误', response['error']);
+        final error = response['error'] as Map;
+        expect(error['code'], -32602);
+        expect('${error['message']}', contains('avatarPath'));
+        expect(File(harness.configPath).readAsStringSync(), before,
+            reason: '类型错不得写盘');
+      }
+    });
+
+    test('template.save 头像路径越界 / 不存在 / 是目录 ⇒ -32602 且既有头像不变', () async {
+      // 先给 general 一个合法头像（后续非法请求不许把它清掉）。
+      await harness.ws.request('template.save', saveTemplate(
+        name: 'general',
+        originalName: 'general',
+        avatarPath: pngPath,
+      ));
+      final before = File(harness.configPath).readAsStringSync();
+      final subdir = Directory(p.join(harness.attachmentsDir, 'subdir'))..createSync();
+      final cases = <String, String>{
+        '越界': p.join(harness.dir.path, 'outside.png'),
+        '不存在': p.join(harness.attachmentsDir, 'gone.png'),
+        '子目录': subdir.path,
+      };
+      for (final entry in cases.entries) {
+        final response = await harness.ws.request('template.save',
+            saveTemplate(name: 'general', originalName: 'general', avatarPath: entry.value));
+        _obs('${entry.key}头像路径的错误', response['error']);
+        final error = response['error'] as Map;
+        expect(error['code'], -32602, reason: '${entry.key}必须被拒');
+        expect('${error['message']}', contains('头像'), reason: '错误文本必须点名头像字段');
+        expect('${error['message']}', contains(entry.value),
+            reason: '错误文本必须点名出问题的路径');
+        expect(File(harness.configPath).readAsStringSync(), before,
+            reason: '${entry.key}被拒时不得改动配置（既有头像保持原值）');
+      }
+      // 目录边界用 isWithin 语义：`<dir>attacker` 这类前缀相同的兄弟目录不许误容。
+      final sibling = p.join(harness.dir.path, 'attachments-x');
+      final response = await harness.ws.request('template.save',
+          saveTemplate(name: 'general', originalName: 'general', avatarPath: sibling));
+      expect((response['error'] as Map)['code'], -32602,
+          reason: '字符串前缀相同不算在目录内（isWithin 语义）');
+    });
+
+    test('profile.save 写 profile.avatar_path，config.get 返回路径与 identitySeed；空串清除', () async {
+      final saved = await harness.ws.request('profile.save', {'avatarPath': pngPath});
+      _obs('profile.save 响应', saved['error'] ?? saved['result']);
+      expect(saved['error'], isNull);
+      final afterSave = diskConfig().profile;
+      _obs('落盘的 profile', afterSave?.toJson());
+      expect(afterSave, isNotNull);
+      expect(afterSave!.avatarPath, p.normalize(p.absolute(pngPath)));
+
+      final got = await harness.ws.request('config.get');
+      final profile = (got['result'] as Map)['profile'] as Map;
+      _obs('config.get 的 profile', profile);
+      expect(profile['avatarPath'], p.normalize(p.absolute(pngPath)));
+      expect(profile['userId'], isNull);
+      expect(profile['identitySeed'], 'local-user',
+          reason: '没有 user_id 时实际生效种子必须回落到常量缺省值');
+
+      // 用户显式写了 user_id 时 identitySeed 跟着变（系统不自动生成 userId）。
+      final direct = diskConfig().copyWith(
+        profile: UserProfile(avatarPath: afterSave.avatarPath, userId: 'alice'),
+      );
+      ConfigService.save(direct, configPath: harness.configPath);
+      final gotWithUser = await harness.ws.request('config.get');
+      final profileWithUser = (gotWithUser['result'] as Map)['profile'] as Map;
+      _obs('带 user_id 的 config.get profile', profileWithUser);
+      expect(profileWithUser['identitySeed'], 'alice');
+
+      // 空串清除：写回里不再有 profile.avatar_path（user_id 仍在）。
+      final cleared = await harness.ws.request('profile.save', {'avatarPath': ''});
+      _obs('清除用户头像的响应', cleared['error'] ?? cleared['result']);
+      expect(cleared['error'], isNull);
+      final afterClear = diskConfig().profile;
+      _obs('清除后的 profile', afterClear?.toJson());
+      expect(afterClear, isNotNull);
+      expect(afterClear!.avatarPath, isNull);
+      expect(afterClear.userId, 'alice', reason: '清除头像不许顺手清掉 user_id');
+      final raw = jsonDecode(File(harness.configPath).readAsStringSync()) as Map<String, dynamic>;
+      final rawProfile = (raw['profile'] as Map).cast<String, dynamic>();
+      expect(rawProfile.containsKey('avatar_path'), isFalse);
+    });
+
+    test('profile.save 的 avatarPath 必填：省略 / null / 数字 / 对象 ⇒ -32602', () async {
+      final before = File(harness.configPath).readAsStringSync();
+      final requests = <String, Future<Map<String, dynamic>>>{
+        '省略': harness.ws.request('profile.save'),
+        'null': harness.ws.request('profile.save', {'avatarPath': null}),
+        '数字': harness.ws.request('profile.save', {'avatarPath': 7}),
+        '对象': harness.ws.request('profile.save', {
+          'avatarPath': {'path': pngPath},
+        }),
+      };
+      for (final entry in requests.entries) {
+        final response = await entry.value;
+        _obs('${entry.key} avatarPath 的错误', response['error']);
+        final error = response['error'] as Map;
+        expect(error['code'], -32602, reason: '${entry.key}必须被拒（它是一次写操作）');
+        expect('${error['message']}', contains('avatarPath'));
+        expect(File(harness.configPath).readAsStringSync(), before,
+            reason: '${entry.key}被拒时不得写盘');
+      }
+    });
+
+    test('profile.save 路径校验：越界 / 不存在 / 是目录 ⇒ -32602', () async {
+      final subdir = Directory(p.join(harness.attachmentsDir, 'sub'))..createSync();
+      for (final path in [
+        p.join(harness.dir.path, 'nope.png'),
+        p.join(harness.attachmentsDir, 'missing.png'),
+        subdir.path,
+      ]) {
+        final response = await harness.ws.request('profile.save', {'avatarPath': path});
+        _obs('非法用户头像路径的错误', response['error']);
+        final error = response['error'] as Map;
+        expect(error['code'], -32602);
+        expect('${error['message']}', contains('头像'));
+        expect('${error['message']}', contains(path));
+      }
+    });
+
+    test('已有 profile 时只提交 providers 的 config.save 不抹用户头像', () async {
+      await harness.ws.request('profile.save', {'avatarPath': pngPath});
+      final saved = await harness.ws.request('config.save', {
+        'providers': {
+          'p': {'base_url': 'http://127.0.0.1:1'},
+          'q': {'base_url': 'http://127.0.0.1:2'},
+        },
+      });
+      _obs('config.save 的响应错误', saved['error']);
+      expect(saved['error'], isNull);
+      final profile = diskConfig().profile;
+      _obs('只提交 provider 后落盘的 profile', profile?.toJson());
+      expect(profile?.avatarPath, p.normalize(p.absolute(pngPath)),
+          reason: 'Profile 页保存只提交 providers，MUST NOT 抹掉 profile');
+    });
+
+    test('读盘不变量：先把 provider 直接写进磁盘，再 profile.save，写盘后该 provider 仍在', () async {
+      // 模拟"别人刚写进磁盘"的新 provider —— 核心内存里没有它。
+      final latest = diskConfig();
+      ConfigService.save(
+        latest.copyWith(providers: {
+          ...latest.providers,
+          'newly': const ProviderConfig(
+              apiKey: 'key-new', baseUrl: 'http://127.0.0.1:9'),
+        }),
+        configPath: harness.configPath,
+      );
+      final response = await harness.ws.request('profile.save', {'avatarPath': pngPath});
+      expect(response['error'], isNull);
+      final after = diskConfig();
+      _obs('profile.save 后盘上的 provider', after.providers.keys.toList());
+      expect(after.providers.containsKey('newly'), isTrue,
+          reason: 'profile.save 必须先读盘再 copyWith，不能拿内存旧快照整份覆盖');
+      expect(after.profile?.avatarPath, p.normalize(p.absolute(pngPath)));
+    });
+
+    test('profile.save 进 kCoreRpcMethodNames 且注册表与常量一致', () async {
+      _obs('kCoreRpcMethodNames 是否含 profile.save', kCoreRpcMethodNames.contains('profile.save'));
+      expect(kCoreRpcMethodNames, contains('profile.save'));
+      expect(harness.core.rpcMethods, kCoreRpcMethodNames,
+          reason: '注册表必须与常量完全一致（漏注册会在 start 抛 StateError）');
     });
   });
 }

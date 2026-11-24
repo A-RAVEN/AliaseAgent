@@ -63,6 +63,78 @@ export interface SessionResult {
   session: Session;
 }
 
+// ---------------------------------------------------------------------------
+// 配置 / 模板 / 头像（change `chat-bubbles-avatars` 任务 3.3 / design D2）
+// ---------------------------------------------------------------------------
+
+/**
+ * `config.get` 返回的用户资料块（顶层 `profile`）。
+ *
+ * `identitySeed` 是核心按 `userId ?? kDefaultUserSeed` 算出的**实际生效种子** ——
+ * web 端不必复制 `kDefaultUserSeed`，也不会两处漂移；它是读取期派生值，不写回配置。
+ */
+export interface Profile {
+  avatarPath: string | null;
+  userId: string | null;
+  identitySeed: string;
+}
+
+/** 模板目录里的一个模型条目（`provider.models`，只取界面用到的字段）。 */
+export interface CatalogEntry {
+  id?: string;
+  display_name?: string;
+  context_window?: number | null;
+  modalities?: { input?: string[] };
+}
+
+/** `config.get` 的返回形状（api_key 已脱敏，只给 hasApiKey）。 */
+export interface ConfigGetResult {
+  missing: boolean;
+  configPath?: string;
+  providers: Record<
+    string,
+    {
+      baseUrl?: string;
+      hasApiKey?: boolean;
+      models?: CatalogEntry[];
+      discoveredAt?: string | null;
+    }
+  >;
+  agentTypes: Record<string, Record<string, unknown>>;
+  tools: string[];
+  profile: Profile;
+}
+
+/**
+ * `template.list` 返回的模板摘要（= `AgentTypeConfig.toJson()` + name）。
+ *
+ * 头像键是配置键 `avatar_path`（snake）；`template.save` 的**参数**名是 `avatarPath`。
+ */
+export interface TemplateSummary {
+  name: string;
+  provider?: string;
+  model?: string;
+  thinking_effort?: string | null;
+  system_prompt?: string;
+  tools?: string[];
+  max_context_tokens?: number | null;
+  input_modalities?: string[];
+  compaction_threshold_percent?: number;
+  compaction_wait_threshold_percent?: number;
+  avatar_path?: string | null;
+}
+
+/** `template.list` 的返回形状（含编辑器下拉的选项来源与生效时机说明）。 */
+export interface TemplateListResult {
+  templates: TemplateSummary[];
+  tools: string[];
+  providers: string[];
+  defaultTools: string[];
+  thinkingEfforts: string[];
+  allowedModalities: string[];
+  effectiveNote: string;
+}
+
 /** `session.delete` 的结果形状。 */
 export interface SessionDeleteResult {
   sessionId: string;

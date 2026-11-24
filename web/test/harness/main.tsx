@@ -10,26 +10,31 @@
 //     可量 24px 单行高度、滚动真的会动）；
 //   - 注入 scenario：渲染真实 `ChatScreen`，并通过 `window.__harness` 暴露
 //     "推消息 / 推流式增量 / 上翻加载更早一页"这些驱动入口。
-import { StrictMode, useCallback, useMemo, useRef, useState } from 'react';
+import { StrictMode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 
 import '../../src/index.css';
+import { resolveAvatar } from '../../src/avatars/resolve';
 import { applyAgentEvent, type AgentEventLike } from '../../src/chat/events';
 import type { RawMessage } from '../../src/chat/model';
 import { emptyChatView, type ChatView } from '../../src/chat/render';
+import type { AvatarData } from '../../src/components/Avatar';
 import { ChatScreen } from '../../src/components/ChatScreen';
 import { ChatShell } from '../../src/components/ChatShell';
 import { SessionList } from '../../src/components/SessionList';
 import { ProvidersPage } from '../../src/components/ProvidersPage';
 import { TemplatesPage } from '../../src/components/TemplatesPage';
+import { UserAvatarBlock } from '../../src/components/UserAvatarBlock';
 import { Wizard } from '../../src/components/Wizard';
 import {
   parseAgentSwitchError,
   type AgentSwitchFailure,
 } from '../../src/manage/logic';
 import type {
+  ConfigGetResult,
   ConnectionStatus,
   CoreClient,
+  Profile,
   Session,
   SnapshotEventData,
 } from '../../src/protocol';
@@ -92,6 +97,15 @@ interface HarnessScenario {
   imagesSupported?: boolean | null;
   /** 附件路径 → data URL（null = 文件丢失）。 */
   attachments?: Record<string, string | null>;
+  // ---- change `chat-bubbles-avatars`：头像夹具（假核心） ----
+  /** 用户资料（`config.get` 的 `profile`）；缺省 = 常量种子的空资料。 */
+  profile?: Profile | null;
+  /** true ⇒ `config.get` 回错（造「头像资料读取失败」的可见出口）。 */
+  profileFail?: boolean;
+  /** 模板名 → 上传头像路径（`template.list` 的 `avatar_path`）。 */
+  templateAvatars?: Record<string, string>;
+  /** 头像路径 → 可读的 data URL；值为 null（或键缺失）= `attachment.read` 回错。 */
+  avatarReads?: Record<string, string | null>;
 }
 
 interface HarnessApi {
@@ -157,17 +171,60 @@ function makeSessions(count: number): Session[] {
   }));
 }
 
-/** 假核心：按方法名回放状态；每次请求都记进 `calls`（e2e 断言 payload）。 */
+/**
+ * 假核心：按方法名回放状态；每次请求都记进 `calls`（e2e 断言 payload）。
+ *
+ * change `chat-bubbles-avatars`：补 `attachment.upload` / `attachment.read` /
+ * `profile.save` 三个假分支（模板页与侧栏头像用；返回值只够驱动界面）。
+ */
 function makeFakeClient(
   state: FakeCoreState,
   calls: string[],
+  profileRef: { current: Profile },
+  uploaded: Record<string, string>,
 ): CoreClient {
   return {
     async request<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
       calls.push(`${method}:${JSON.stringify(params)}`);
       switch (method) {
         case 'config.get':
-          return state.config as unknown as T;
+          return { ...state.config, profile: profileRef.current } as unknown as T;
+        case 'attachment.upload': {
+          const filename = String(params.filename ?? 'avatar.png');
+          const path = `uploaded/${filename}`;
+          uploaded[path] = `data:image/png;base64,${String(params.base64 ?? '')}`;
+          return {
+            path,
+            bytes: 0,
+            format: 'png',
+            mediaType: 'image/png',
+            width: 1,
+            height: 1,
+          } as unknown as T;
+        }
+        case 'attachment.read': {
+          const path = String(params.path ?? '');
+          const dataUrl = uploaded[path];
+          if (!dataUrl) throw new Error(`图片已丢失（e2e 注入）：${path}`);
+          const comma = dataUrl.indexOf(',');
+          return {
+            path,
+            bytes: 0,
+            base64: comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl,
+            mediaType: 'image/png',
+          } as unknown as T;
+        }
+        case 'profile.save': {
+          const avatarPath = params.avatarPath;
+          if (typeof avatarPath !== 'string') {
+            throw new Error('profile.save 的 avatarPath 必须是字符串（"" = 清除）');
+          }
+          profileRef.current = {
+            ...profileRef.current,
+            avatarPath: avatarPath.length > 0 ? avatarPath : null,
+          };
+          return { profile: profileRef.current } as unknown as T;
+        }
         case 'config.save': {
           const table = (params.providers ?? {}) as Record<
             string,
@@ -235,11 +292,17 @@ function makeFakeClient(
           return state.templates as unknown as T;
         case 'template.save': {
           const name = String(params.name ?? '');
-          if (name === 'general' && state.templates.templates.some((t) => t.name === 'general')) {
-            // 允许修改 general；这里只记录（删除守卫由 template.delete 负责）。
-          }
           const existing = state.templates.templates.findIndex((t) => t.name === name);
-          const saved = { ...params, name };
+          const before = existing >= 0 ? state.templates.templates[existing] : null;
+          const saved: Record<string, unknown> = { ...params, name };
+          // 头像三态（design D3）：省略 = 沿用、'' = 清除、非空 = 设。
+          if (typeof params.avatarPath === 'string') {
+            if (params.avatarPath.length > 0) saved.avatar_path = params.avatarPath;
+            else delete saved.avatar_path;
+          } else if (before && before.avatar_path !== undefined) {
+            saved.avatar_path = before.avatar_path;
+          }
+          delete saved.avatarPath;
           if (existing >= 0) state.templates.templates[existing] = saved;
           else state.templates.templates.push(saved);
           return { template: saved, created: existing < 0 } as unknown as T;
@@ -253,6 +316,88 @@ function makeFakeClient(
             (template) => template.name !== name,
           );
           return { templateName: name, deleted: true } as unknown as T;
+        }
+        default:
+          throw new Error(`假核心未实现的方法：${method}`);
+      }
+    },
+  };
+}
+
+/** 聊天 harness 的假核心（change `chat-bubbles-avatars`）：只够驱动头像与 profile 流程。 */
+function makeChatFakeClient(options: {
+  scenario: HarnessScenario;
+  calls: string[];
+  uploaded: Record<string, string>;
+  profileRef: { current: Profile };
+}): CoreClient {
+  const { scenario, calls, uploaded, profileRef } = options;
+  return {
+    async request<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+      calls.push(`${method}:${JSON.stringify(params)}`);
+      switch (method) {
+        case 'config.get': {
+          if (scenario.profileFail) {
+            throw new Error('config.get 失败（e2e 注入）');
+          }
+          return {
+            missing: false,
+            configPath: 'C:/tmp/config.json',
+            providers: {},
+            agentTypes: { general: { input_modalities: ['text'] } },
+            tools: [],
+            profile: profileRef.current,
+          } as unknown as T;
+        }
+        case 'template.list': {
+          const templates = Object.entries(scenario.templateAvatars ?? {}).map(
+            ([name, avatarPath]) => ({ name, avatar_path: avatarPath }),
+          );
+          return {
+            templates,
+            tools: [],
+            providers: [],
+            defaultTools: [],
+            thinkingEfforts: [],
+            allowedModalities: ['text', 'image'],
+            effectiveNote: '',
+          } as unknown as T;
+        }
+        case 'attachment.upload': {
+          const filename = String(params.filename ?? 'avatar.png');
+          const path = `uploaded/${filename}`;
+          uploaded[path] = `data:image/png;base64,${String(params.base64 ?? '')}`;
+          return {
+            path,
+            bytes: 0,
+            format: 'png',
+            mediaType: 'image/png',
+            width: 1,
+            height: 1,
+          } as unknown as T;
+        }
+        case 'attachment.read': {
+          const path = String(params.path ?? '');
+          const dataUrl = uploaded[path] ?? scenario.avatarReads?.[path] ?? null;
+          if (dataUrl === null) throw new Error(`图片已丢失（e2e 注入）：${path}`);
+          const comma = dataUrl.indexOf(',');
+          return {
+            path,
+            bytes: 0,
+            base64: comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl,
+            mediaType: 'image/png',
+          } as unknown as T;
+        }
+        case 'profile.save': {
+          const avatarPath = params.avatarPath;
+          if (typeof avatarPath !== 'string') {
+            throw new Error('profile.save 的 avatarPath 必须是字符串（"" = 清除）');
+          }
+          profileRef.current = {
+            ...profileRef.current,
+            avatarPath: avatarPath.length > 0 ? avatarPath : null,
+          };
+          return { profile: profileRef.current } as unknown as T;
         }
         default:
           throw new Error(`假核心未实现的方法：${method}`);
@@ -286,7 +431,42 @@ function ManagementHarness({ scenario }: { scenario: HarnessScenario }) {
     probeResults: scenario.fake?.probeResults,
     probeFetchQueue: [...(scenario.fake?.probeFetchQueue ?? [])],
   });
-  const client = useMemo(() => makeFakeClient(stateRef.current, callsRef.current), []);
+  const profileRef = useRef<Profile>({
+    avatarPath: null,
+    userId: null,
+    identitySeed: 'local-user',
+  });
+  const uploadedRef = useRef<Record<string, string>>({});
+  const client = useMemo(
+    () => makeFakeClient(stateRef.current, callsRef.current, profileRef, uploadedRef.current),
+    [],
+  );
+  // 头字节节走与 App 同一模式：路径 → data URL 的共用去重缓存（design D2）。
+  const [avatarDataUrls, setAvatarDataUrls] = useState<Record<string, string | null>>({});
+  const requestedAvatarPaths = useRef<Set<string>>(new Set());
+  const resolveAvatarPaths = useCallback(
+    (paths: string[]) => {
+      for (const path of paths) {
+        if (!path || requestedAvatarPaths.current.has(path)) continue;
+        requestedAvatarPaths.current.add(path);
+        void (async () => {
+          try {
+            const result = await client.request<{ base64: string; mediaType: string }>(
+              'attachment.read',
+              { path },
+            );
+            setAvatarDataUrls((previous) => ({
+              ...previous,
+              [path]: `data:${result.mediaType};base64,${result.base64}`,
+            }));
+          } catch {
+            setAvatarDataUrls((previous) => ({ ...previous, [path]: null }));
+          }
+        })();
+      }
+    },
+    [client],
+  );
 
   useMemo(() => {
     window.__harness = {
@@ -308,6 +488,8 @@ function ManagementHarness({ scenario }: { scenario: HarnessScenario }) {
           client={client}
           onClose={() => callsRef.current.push('panel.close')}
           onChanged={() => callsRef.current.push('panel.changed')}
+          avatarDataUrls={avatarDataUrls}
+          onResolveAvatar={resolveAvatarPaths}
         />
       )}
       {scenario.mode === 'wizard' && (
@@ -332,6 +514,63 @@ function Harness({ scenario }: { scenario: HarnessScenario }) {
     () => scenario.attachments ?? {},
   );
   const callsRef = useRef<string[]>([]);
+  const uploadedRef = useRef<Record<string, string>>({});
+  const profileRef = useRef<Profile>(
+    scenario.profile ?? { avatarPath: null, userId: null, identitySeed: 'local-user' },
+  );
+  const client = useMemo(
+    () =>
+      makeChatFakeClient({
+        scenario,
+        calls: callsRef.current,
+        uploaded: uploadedRef.current,
+        profileRef,
+      }),
+    [scenario],
+  );
+  // 头像：config.get 读 profile、attachment.read 取字节（与 App 同一份去重缓存模式）。
+  const [profile, setProfile] = useState<Profile | null>(null);
+  const [profileError, setProfileError] = useState<string | null>(null);
+  const [avatarDataUrls, setAvatarDataUrls] = useState<Record<string, string | null>>({});
+  const requestedAvatarPaths = useRef<Set<string>>(new Set());
+  const templateAvatars = useMemo(() => scenario.templateAvatars ?? {}, [scenario]);
+
+  const loadProfile = useCallback(async () => {
+    try {
+      const result = await client.request<ConfigGetResult>('config.get');
+      setProfile(result.profile);
+      setProfileError(null);
+    } catch (profileFailure: unknown) {
+      setProfile(null);
+      setProfileError(
+        profileFailure instanceof Error ? profileFailure.message : String(profileFailure),
+      );
+    }
+  }, [client]);
+
+  const resolveAvatarPaths = useCallback(
+    (paths: string[]) => {
+      for (const path of paths) {
+        if (!path || requestedAvatarPaths.current.has(path)) continue;
+        requestedAvatarPaths.current.add(path);
+        void (async () => {
+          try {
+            const result = await client.request<{ base64: string; mediaType: string }>(
+              'attachment.read',
+              { path },
+            );
+            setAvatarDataUrls((previous) => ({
+              ...previous,
+              [path]: `data:${result.mediaType};base64,${result.base64}`,
+            }));
+          } catch {
+            setAvatarDataUrls((previous) => ({ ...previous, [path]: null }));
+          }
+        })();
+      }
+    },
+    [client],
+  );
   const createdCount = useRef(0);
   const [view, setView] = useState<ChatView>(() => ({
     ...emptyChatView,
@@ -344,6 +583,23 @@ function Harness({ scenario }: { scenario: HarnessScenario }) {
   const [error] = useState<string | null>(scenario.error ?? null);
   const [notice] = useState<string | null>(scenario.notice ?? null);
   const chunksRef = useRef<RawMessage[][]>(scenario.earlierChunks ?? []);
+
+  useEffect(() => {
+    void loadProfile();
+  }, [loadProfile]);
+
+  const avatarPaths = useMemo(() => {
+    const paths = new Set<string>();
+    if (profile?.avatarPath) paths.add(profile.avatarPath);
+    const agentType = sessions.find((session) => session.id === currentSessionId)?.agentType;
+    const templatePath = agentType ? templateAvatars[agentType] : undefined;
+    if (templatePath) paths.add(templatePath);
+    return [...paths];
+  }, [profile, sessions, currentSessionId, templateAvatars]);
+
+  useEffect(() => {
+    if (avatarPaths.length > 0) resolveAvatarPaths(avatarPaths);
+  }, [avatarPaths, resolveAvatarPaths]);
 
   const onCreate = useCallback(() => {
     callsRef.current.push('session.create');
@@ -445,8 +701,37 @@ function Harness({ scenario }: { scenario: HarnessScenario }) {
 
   const status: ConnectionStatus = 'open';
   const currentSession = sessions.find((session) => session.id === currentSessionId) ?? null;
+
+  const avatarFor = (entityId: string, uploadedPath: string | null | undefined): AvatarData => {
+    const resolved = resolveAvatar({ entityId, uploadedPath });
+    const dataUrl =
+      resolved.uploadedPath !== null ? avatarDataUrls[resolved.uploadedPath] ?? null : null;
+    if (resolved.source === 'upload' && dataUrl !== null) {
+      return { dataUrl, source: 'upload', seed: resolved.seed };
+    }
+    return { dataUrl: null, source: 'identicon', seed: resolved.seed };
+  };
+  const userAvatar = avatarFor(profile?.identitySeed ?? '', profile?.avatarPath ?? null);
+  const agentAvatar = avatarFor(
+    currentSessionId ?? '',
+    currentSession?.agentType ? templateAvatars[currentSession.agentType] ?? null : null,
+  );
   return (
     <ChatShell
+      sidebarFooter={
+        <UserAvatarBlock
+          client={client}
+          profile={profile}
+          avatar={userAvatar}
+          error={profileError}
+          onUpdated={(next) => {
+            setProfile(next);
+            setProfileError(null);
+            if (next.avatarPath !== null) resolveAvatarPaths([next.avatarPath]);
+          }}
+          onRetry={() => void loadProfile()}
+        />
+      }
       sidebar={
         <SessionList
           sessions={sessions}
@@ -477,6 +762,8 @@ function Harness({ scenario }: { scenario: HarnessScenario }) {
         metering={null}
         attachments={attachmentDataUrls}
         imagesSupported={scenario.imagesSupported ?? null}
+        userAvatar={userAvatar}
+        agentAvatar={agentAvatar}
         onSend={(text, images = []) => {
           callsRef.current.push(`agent.send:${text}:${images.length}`);
           const paths = images.map((image) => ({
