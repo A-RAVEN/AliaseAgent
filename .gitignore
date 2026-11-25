@@ -87,3 +87,9 @@ web/node_modules/
 web/dist/
 # 布局/滚动测试用的 harness 构建产物（puppeteer 真实渲染通道）
 web/dist-test/
+
+# Windows 桌面壳（change windows-desktop-shell）：自包含产物上百兆，绝不入库；
+# 中间目录同样不入库（写法与仓库既有 **/ 风格一致）。
+shell/dist/
+shell/**/bin/
+shell/**/obj/

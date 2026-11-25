@@ -125,6 +125,9 @@ Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单�
   "tool": {
     "parallel_max": 0
   },
+  "core": {
+    "port": 16705
+  },
   "profile": {
     "avatar_path": "C:\\Users\\你\\.aliasagent\\attachments\\me.png",
     "user_id": "alice"
@@ -161,12 +164,16 @@ Agent 类型（模板）现在有图形界面：会话侧栏的 `Agents` 菜单�
 | `preview_chars` | `spill` 下（完整键名 `spill.preview_chars`） | 工具输出太长时，结果里**头尾各留多少字符**（其余写进 spill 文件、靠 `read_spill` 按字节读回）。判"要不要省略"的阈值是它的 2 倍：头 1000 + 尾 1000 = 2000，超过 2000 字符才省略。适用工具：`run_command` 的标准输出/标准错误、`web_fetch` 的正文、`load_skill` 的技能内容 | 1000 |
 | `tool` | 顶层 | 只读工具并行执行的配置（整块都可以不写） | 用下表里的缺省值 |
 | `parallel_max` | `tool` 下（完整键名 `tool.parallel_max`） | 同一轮里**最多同时启动几个只读工具**：`0` = 不设上限（模型发几个就同时跑几个）；正整数 = 按这个数把一段只读调用分批，批与批之间按顺序执行，交付顺序不变。它在**启动时读一次**，改完要重启应用；正整数值会随配置保存写回 `tool` 块 | 0（不设上限） |
+| `core` | 顶层 | 无头核心的固定端口配置（整块都可以不写） | 用下表里的缺省值 |
+| `core.port` | `core` 下（完整键名 `core.port`） | 无头核心监听的**固定端口**：1–65535 的整数。Windows 桌面壳与手工启动的核心都按 `--port` > `core.port` > 默认 16705 决定；端口被占时显式失败并点名改法（不会静默换端口）。值非法（字符串 / 0 / 负数 / 大于 65535）⇒ **回落默认值并留一行日志**（回落可见、不拒绝启动）。低端口（小于 1024）**只是容易与系统服务相撞、不推荐**（Windows 没有 Unix 式特权端口，不需要提权）。改完要重启壳/核心才生效 | 16705 |
 | `search` | 顶层 | 搜索服务配置（整块都可以不写） | 不注册任何搜索服务，也就没有 `web_search` 工具 |
 | `zhipuai` / `kimi` / `searxng` | 每个搜索服务 | 三家搜索服务的名字，对应各自的键 | 该服务不启用 |
 | `deepseek` | `search` 下 | DeepSeek 自己的搜索：**不用另外买搜索 key**，复用你在 `providers` 里已经填的那把（前提是那个地址指向 `api.deepseek.com`） | 该服务不启用（写一个空的 `{}` 就算启用） |
 | `search_engine` | `zhipuai` | 用哪个搜索引擎档位 | 由服务端默认决定 |
 | `api_key` / `base_url` / `model` | `deepseek` 下 | 单独给搜索指定密钥、地址、模型（都可选） | 用 `providers` 里那把密钥与地址；模型用 `deepseek-v4-flash` |
 | `base_url`（`searxng` 下） | `searxng` | 自建搜索服务地址 | `http://localhost:8888` |
+
+> **`core` 块的降级边界**：旧版本不认识 `core` 块，用旧版本保存一次配置会**丢掉它**（退回默认 16705）——与 `profile` 块同一条降级边界。要回退版本前先备份 `%USERPROFILE%\.aliasagent\config.json`。
 
 > 关于搜索：**`web_search` 工具只有在至少配了一家搜索服务时才会出现**。目前这一版里 `searxng` 在启动时被直接标记为不可用，所以实际能生效的是 `deepseek`、`zhipuai` 和 `kimi` 三家（前一家不用另外买 key，后两家要付费 key）。详见 [联网工具](tools-web.md)。
 

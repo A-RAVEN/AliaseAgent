@@ -14,6 +14,7 @@
 | **Integration（headless）** | `test/integration/` + `helpers/` | `testWidgets()`（FakeSidecar 驱动）+ 真 DLL `test()` | 端到端消息流 / 工具调用 / 错误流 / 流式状态 / 会话持久化 | 否（真 DLL bridge 测试需 DLL，不联网） |
 | **Live（窗口真模型）** | `integration_test/` | `@Tags(['live'])` + `-d windows` | **真实模型**驱动真实 sidecar，在真实桌面窗口跑 | **是**（真 API） |
 | **C++ Sidecar 测试** | `sidecar/test/` | Catch2 v3 + CMake/CTest | 全部 C++ 层：SSE 解析 / HTTP / 工具执行 / 搜索 provider / 子进程 / FFI 追踪 | 实时路径可选（`[live]` 标签） |
+| **桌面壳纯逻辑（C#）** | `shell/test/AliasAgent.Desktop.Tests/` | xunit + `dotnet test` | 壳的纯逻辑：选项解析 / 端口解析 / 仓库根定位 / dart 解析 / 预检 / 命令与引号 / 就绪探测 / 单实例 / 关窗与菜单策略 / 状态机 / WebView2 失败映射。**能测纯逻辑，不能测窗口与托盘外观**（外观靠视觉验收） | 否（假 WebSocket 服务、临时目录、不联网） |
 | **冒烟 + 视觉回归** | `test/smoke/` + `integration_test/screenshot_test.dart` | bash 脚本 + Flutter | 构建 / analyze / checkpoint / 启动验证 / 视觉像素比对 | 本地 |
 
 **决策口诀**：能纯逻辑 → `test/unit/`;要渲染/交互 → `test/widget/`;要假 sidecar 端到端 → `test/integration/`;要真模型端到端 → `integration_test/`(+`--tags live`);要 C++ → `sidecar/test/`;要不要整套冒烟 → `test/smoke/run_all.sh`。
@@ -83,8 +84,22 @@
  ```
 - 视觉回归：`05_visual_regression.sh` 跑 `flutter test integration_test/screenshot_test.dart --reporter compact`;compare `test/smoke/output/<name>.png` vs `test/smoke/references/<name>.png`(1% 像素容差,首跑自动建 baseline)。
 - `03_checkpoints.sh` 跑 `dart run test/checkpoint_*_verify.dart`（`test/` 根，非 flutter test）。
-- **前置依赖**(`check_deps`)：需要 flutter / dart / sqlite3 / powershell,缺任一整套冒烟会直接退出。
+- **前置依赖**(`check_deps`)：需要 flutter / dart / sqlite3 / powershell,缺任一整套冒烟会直接退出。**`dotnet` 不在这个清单里**：它只被 06 步用到，检查放在 06 脚本内部（进 `check_deps` 会让没装 dotnet 的机器上既有 01–05 提前失败）。
 - **Windows 一键入口 `run.bat`**(仓库根,与 bash `run_all.sh` 并列)：`flutter build windows --debug` → 构建 Release sidecar 并拷 DLL → 跑**单元冒烟** `flutter test test\unit\sidecar_bridge_test.dart` → 启动 app。这是 Windows 上最省事的冒烟入口(不跑窗口 live/视觉,只跑 unit 冒烟)。
+
+### 2.7 桌面壳（C#，`shell/`）——新层
+
+- **测试层**：`shell/test/AliasAgent.Desktop.Tests/`（xunit）。跑法（**从仓库根**，这样读到仓库根的 `global.json` 钉住的 SDK）：
+  ```bash
+  dotnet test shell/AliasAgent.Desktop.sln
+  ```
+- **能测什么**：纯逻辑 —— 选项解析（含拒绝 `--port 0`）/ 端口解析（`core.port` 六个分支）/ 仓库根定位 / `dart` 解析（含 `.bat` 必须经 `cmd.exe /C`）/ 预检 / 命令行与引号 / 输出解码（UTF-8 与 GBK 兜底标注）/ 就绪探测（进程内假 WebSocket 服务）/ 单实例 / 关窗与托盘菜单策略 / 状态机 / WebView2 失败映射。
+- **不能测什么**：窗口与托盘**外观**、真实 WebView2 渲染、前台激活的视觉效果。这些只由视觉验收判定（需用户当场许可开窗）；**不许**用「策略类过了」推及「界面没问题」。
+- **接缝约定**：命令构造 / 环境变量 / 时钟与超时 / 日志落点 / WebSocket 服务端 / WebView2 环境工厂一律构造函数注入；失败时用 `ITestOutputHelper` 打印实际观察值（命令串、超时次数、菜单项集合）。
+- **链路（无窗口）**：`shell/dist/AliasAgent.Desktop.exe --selftest` 验「起核心 → `core.ping` → 静态页 → `core.shutdown` → 锁释放 → 再起一个再停」。它不开窗、不建托盘、不碰用户真实配置/数据。
+- **06 冒烟步骤**：`bash test/smoke/06_desktop_shell.sh`（dotnet test → 构建壳 → `--selftest`，**全程无窗口**）。
+  **它不在 `run_all.sh` 的聚合链里**：那条链的 04/05 会拉起应用窗口，受 CLAUDE.md 禁开窗规则管辖；06 单独跑，不是那五步的一部分。
+- **与 `CLAUDE.md` 五步枚举的漂移**：`CLAUDE.md` 的「整套冒烟」仍写 `run_all.sh` 的五个步骤，本 change **没有**擅自改规则文件；06 是**新增**的无窗口步骤，与 `run_all.sh` 的 04/05 不是同一件事。这条漂移等用户决定是否把 06 写进规则文件。
 
 ---
 

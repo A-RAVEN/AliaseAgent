@@ -61,7 +61,8 @@ const int kCoreProtocolVersion = 1;
 /// 只绑回环地址（本机信任边界，无鉴权；见用户文档的已知限制）。
 const String kCoreBindHost = '127.0.0.1';
 
-/// 启动回显的 URL 形状（`<port>` 是 OS 实际分配值的占位说明，文档守卫读它）。
+/// 启动回显的 URL 形状（`<port>` 是**实际监听端口**的占位；端口来自 `--port` >
+/// `core.port` > 具名默认，见 `lib/core/core_cli.dart`。文档守卫读它）。
 const String kCoreUrlTemplate = 'http://$kCoreBindHost:<port>';
 
 /// 启动命令（用户文档与 `--help` 同源，文档守卫读它）。
@@ -73,6 +74,8 @@ const String kCoreEntryCommand = 'dart run bin/alias_agent_core.dart';
 /// （清单与实现必须一致）；文档守卫要求每个名字都出现在用户文档的 RPC 表里。
 const List<String> kCoreRpcMethodNames = <String>[
   'core.ping',
+  // 优雅停机（change `windows-desktop-shell` 2.2）：先回 `{ok:true}` 刷出，再停机。
+  'core.shutdown',
   'session.list',
   'session.create',
   'session.delete',
@@ -108,6 +111,29 @@ const List<String> kCoreRpcMethodNames = <String>[
 
 /// WebSocket 路径（与 web 客户端一致）。
 const String kCoreWebSocketPath = '/ws';
+
+/// 停机期间出现告警时的进程退出码（change `windows-desktop-shell` 2.1 / design D3）。
+///
+/// 取「与既有 1（启动失败）、2（参数错误）不冲突的最小未用码」；有告警时**不许**
+/// 以 0 退出假装成功。
+const int kExitCodeShutdownWithWarnings = 3;
+
+/// 停机报告：停机期间发生的异常逐条收在这里（不再被吞成一句 debugPrint）。
+///
+/// 每条 warning 由 [HeadlessCore.stop] 写进核心日志；[exitCode] 是进程该用的退出码。
+class ShutdownReport {
+  const ShutdownReport({this.warnings = const <String>[]});
+
+  final List<String> warnings;
+
+  bool get hasWarnings => warnings.isNotEmpty;
+
+  /// 0 = 正常停机；[kExitCodeShutdownWithWarnings] = 停机有告警。
+  int get exitCode => hasWarnings ? kExitCodeShutdownWithWarnings : 0;
+
+  @override
+  String toString() => 'ShutdownReport(warnings=$warnings, exitCode=$exitCode)';
+}
 
 /// 启动失败：带可归因信息，入口直接打印并退出（不假装就绪）。
 class HeadlessCoreStartupException implements Exception {
@@ -210,6 +236,17 @@ class HeadlessCore {
   String? _webRoot;
   CoreInstanceLock? _lock;
   bool _stopped = false;
+  ShutdownReport? _lastShutdownReport;
+
+  /// 停机信号：`core.shutdown` 的**响应已刷出**、或收到 SIGINT 时完成。
+  ///
+  /// 「先回包、再停机」的时序落点在这里（design D3）：WS 侧先把响应写出并
+  /// `await socket.close()` 排空队列，然后才 complete 它；等待方
+  /// [serveUntilShutdown] 收到信号后才执行 [stop]。
+  final Completer<void> _shutdownSignal = Completer<void>();
+
+  /// 已受理、但响应还没刷出的 `core.shutdown` 请求（WS 侧在刷出后据此收尾）。
+  bool _shutdownResponsePending = false;
 
   /// 实际监听端口（未启动时抛 StateError）。
   int get port {
@@ -250,12 +287,27 @@ class HeadlessCore {
     templateController.replaceConfig(next);
   }
 
-  /// 绑定回环地址并开始服务。[port] 默认 0 = 由 OS 分配（D7）。
+  /// 绑定回环地址并开始服务。[port] 默认 0 = 由 OS 分配（测试形态）。
+  ///
+  /// 显式给定的端口绑不上（被占用 / 权限 / 地址不可用）时必须抛**可归因**的
+  /// [HeadlessCoreStartupException]（change `windows-desktop-shell` 任务 1.3）：
+  /// 消息点名端口号并给出改法（改 `core.port` 或用 `--port`），**不静默换端口** ——
+  /// 固定端口的全部价值就是地址稳定。裸 `SocketException` 会让壳只能显示一句
+  /// 「启动失败」，用户无从下手。
   Future<void> start({int port = 0, String? webRoot}) async {
     if (_server != null) throw StateError('无头核心已经启动');
     _webRoot = webRoot;
     _registerMethods();
-    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, port);
+    final HttpServer server;
+    try {
+      server = await HttpServer.bind(InternetAddress.loopbackIPv4, port);
+    } on SocketException catch (e) {
+      throw HeadlessCoreStartupException(
+        '无头核心无法绑定端口 $port：${e.message}\n'
+        '端口被占用或不可用。改 core.port（配置文件里的固定端口）或用 --port '
+        '指定另一个端口后重新启动；核心不会静默改用其它端口。',
+      );
+    }
     _server = server;
     server.listen((request) {
       unawaited(_handleHttpRequest(request));
@@ -264,10 +316,41 @@ class HeadlessCore {
     });
   }
 
-  /// 停止服务：先断开 WS 客户端，再关服务器，最后释放 Agent / DB / 单实例锁。
-  Future<void> stop() async {
-    if (_stopped) return;
+  /// 停机（可重入）。顺序是**产品语义**，不许调换（design D3 / spec `core.shutdown`）：
+  ///
+  /// ① 对所有运行中的 Agent 调 `cancel()`（同步：只置取消标志、不等待整轮结束）；
+  /// ② **`await` 每个实例的 `waitForRounds()`** —— 在途整轮收尾、事件仍可经 WS 发出，
+  ///    这是「收尾事件在通道关闭前到达」的实现前提（少了它只剩「置标志就关通道」）；
+  /// ③ 关 WS 客户端 → ④ 关服务器 → ⑤ `disposeAll()`（幂等）→ ⑥ 关数据库 →
+  /// ⑦ 释放单实例锁。
+  ///
+  /// ⑤ / ⑥ 的异常收进 [ShutdownReport.warnings] 并写日志，有告警时调用方用
+  /// [kExitCodeShutdownWithWarnings] 退出（不许静默当成功）。
+  Future<ShutdownReport> stop() async {
+    final previous = _lastShutdownReport;
+    if (_stopped) return previous ?? const ShutdownReport();
     _stopped = true;
+    final warnings = <String>[];
+
+    // ① 取消所有运行中的实例（快照：等待期间注册表可能还有动作）。
+    final running = List<Agent>.from(agents.instances);
+    for (final agent in running) {
+      try {
+        agent.cancel();
+      } catch (e) {
+        warnings.add('取消 Agent ${agent.handle} 失败：$e');
+      }
+    }
+    // ② 等在途整轮收尾（收尾事件还能经 WS 发出去）。
+    for (final agent in running) {
+      try {
+        await agent.waitForRounds();
+      } catch (e) {
+        warnings.add('等待 Agent ${agent.handle} 收尾失败：$e');
+      }
+    }
+
+    // ③ 断开 WS 客户端。
     for (final client in List<WebSocket>.from(_clients)) {
       try {
         await client.close(WebSocketStatus.goingAway, 'core stopping');
@@ -276,22 +359,69 @@ class HeadlessCore {
       }
     }
     _clients.clear();
+    // ④ 关服务器。
     final server = _server;
     _server = null;
-    await server?.close(force: true);
+    try {
+      await server?.close(force: true);
+    } catch (e) {
+      warnings.add('关闭 HTTP 服务器失败：$e');
+    }
+    // ⑤ 销毁 Agent（disposeAll 幂等：先 dispose 再清表）。
     try {
       await agents.disposeAll();
     } catch (e) {
-      debugPrint('[AliasAgent] 无头核心销毁 Agent 失败：$e');
+      warnings.add('销毁 Agent 失败：$e');
     }
+    // ⑥ 关数据库。
     try {
       await DatabaseService.close();
     } catch (e) {
-      debugPrint('[AliasAgent] 无头核心关闭数据库失败：$e');
+      warnings.add('关闭数据库失败：$e');
     }
+    // ⑦ 释放单实例锁。
     final lock = _lock;
     _lock = null;
-    await lock?.release();
+    try {
+      await lock?.release();
+    } catch (e) {
+      warnings.add('释放单实例锁失败：$e');
+    }
+
+    final report = ShutdownReport(warnings: warnings);
+    for (final warning in warnings) {
+      debugPrint('[AliasAgent] 停机告警：$warning');
+    }
+    debugPrint('[AliasAgent] 无头核心已停机'
+        '（warnings=${warnings.length}，exitCode=${report.exitCode}）');
+    _lastShutdownReport = report;
+    return report;
+  }
+
+  /// 停机信号已就绪（`core.shutdown` 的响应**已刷出**）。由 WS 层在刷出后调用。
+  void markShutdownResponseFlushed() {
+    if (!_shutdownSignal.isCompleted) _shutdownSignal.complete();
+  }
+
+  /// 入口与测试**共用**的停机等待点（design D3 / spec `core.shutdown`）。
+  ///
+  /// 等「`core.shutdown` 的响应已刷出」或 SIGINT，然后执行 [stop] 并返回停机报告。
+  /// 测试不许自己拼一套停机序列 —— 否则验的是测试自己。
+  Future<ShutdownReport> serveUntilShutdown() async {
+    StreamSubscription<ProcessSignal>? sigint;
+    try {
+      sigint = ProcessSignal.sigint.watch().listen((_) {
+        if (!_shutdownSignal.isCompleted) _shutdownSignal.complete();
+      });
+    } catch (_) {
+      // 某些平台不支持 signal watch：进程仍可由外部终止。
+    }
+    try {
+      await _shutdownSignal.future;
+    } finally {
+      await sigint?.cancel();
+    }
+    return stop();
   }
 
   // ---------------------------------------------------------------------------
@@ -338,8 +468,23 @@ class HeadlessCore {
           },
         });
       }
+      // `core.shutdown` 的收尾必须发生在**响应刷出之后**（design D3）：handler 只
+      // 登记请求，这里先把响应 `add` 进发送队列，再 `await socket.close()` ——
+      // Dart 的 `WebSocket.close()` 会先把排队消息发完，因此调用方一定先收到
+      // `{ok:true}`，之后才看到连接关闭。MUST NOT 反过来（先 stop 会把响应吞掉）。
+      final shutdownAfterWrite = _shutdownResponsePending;
       if (response != null && socket.readyState == WebSocket.open) {
         socket.add(response);
+      }
+      if (shutdownAfterWrite) {
+        try {
+          await socket.close(
+              WebSocketStatus.normalClosure, 'core shutting down');
+        } catch (_) {
+          // 已经断开：忽略。
+        }
+        _clients.remove(socket);
+        markShutdownResponseFlushed();
       }
     }, onDone: () {
       _clients.remove(socket);
@@ -441,6 +586,7 @@ class HeadlessCore {
   void _registerMethods() {
     final handlers = <String, JsonRpcMethod>{
       'core.ping': _handlePing,
+      'core.shutdown': _handleCoreShutdown,
       'session.list': _handleSessionList,
       'session.create': _handleSessionCreate,
       'session.delete': _handleSessionDelete,
@@ -485,6 +631,20 @@ class HeadlessCore {
         'protocolVersion': kCoreProtocolVersion,
         'pid': pid,
       };
+
+  /// `core.shutdown`：**只回包、不在这里停机**（change `windows-desktop-shell` 2.2）。
+  ///
+  /// 时序（design D3）：① handler 返回 `{ok: true}` 并登记「响应刷出后」要做的事；
+  /// ② WS 侧先把响应写进发送队列、`await socket.close()` 排空，然后 complete 停机
+  /// 信号；③ 等待方 [serveUntilShutdown] 收到信号后才调 [stop]。
+  ///
+  /// 反过来（handler 里先 stop）会把客户端以 going-away 关掉，而响应还在队列里 ——
+  /// 调用方看到的是「调了但没回」。所以这里 MUST NOT 调 stop。
+  Map<String, dynamic> _handleCoreShutdown(Map<String, dynamic> params) {
+    _shutdownResponsePending = true;
+    debugPrint('[AliasAgent] 收到 core.shutdown：先回包，响应刷出后停机');
+    return {'ok': true};
+  }
 
   Future<Map<String, dynamic>> _handleSessionList(
       Map<String, dynamic> params) async {

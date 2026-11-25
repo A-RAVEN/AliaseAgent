@@ -128,6 +128,7 @@ web 端不再只能聊天：左侧会话栏能新建 / 改名 / 删除 / 切换�
 | 方法 | 参数 | 返回 |
 |---|---|---|
 | `core.ping` | 无 | `{ok, service, protocolVersion, pid}` |
+| `core.shutdown` | 无 | `{ok: true}`；**先回包、再停机**（停 WS/服务器、销毁 Agent、关库、放锁）。任何本机进程都能调它关停核心——这是无鉴权回环服务的已知边界（见 web-core-shim 文档的已知限制）。本表**不是**逐行核对的对象：管理文档的守卫只查整篇子串 |
 | `session.list` | 无 | `{sessions: [...]}`（顶层会话，按最近更新倒序） |
 | `session.create` | `{title?, agentType?}` | `{session}`；`agentType` 必须是已存在的模板 |
 | `session.rename` | `{sessionId, title}` | `{session}`；会话不存在 → `-32602` 可归因错误（不静默 no-op） |

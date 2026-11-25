@@ -11,7 +11,9 @@
 - 同一个回环 HTTP 服务上：
   - `/`：serve `web/` 的构建产物（**完整聊天屏**）；
   - `/ws`：WebSocket + JSON-RPC 2.0 通道（发消息、流式事件、工具事件、会话/消息查询）；
-  - 监听端口由 OS 分配（port 0），启动时回显实际 URL，不写死端口。
+  - 监听端口是**固定且可配**的：优先级 `--port` > 配置 `core.port` > 默认值 `16705`；
+    `--port 0` 是**核心自己的**调试/测试形态（交回 OS 分配）。Windows 桌面壳会把这套值
+    显式传给核心，所以壳导航的地址与核心实际监听的端口必然一致。
 - 与 Flutter 应用**灰度共存**：同一份配置（`~/.aliasagent/config.json`）、同一个 SQLite
   数据库、同一个 sidecar。回退 = 不启动无头核心进程。
 
@@ -48,16 +50,29 @@ AliasAgent 无头核心已启动
   WebSocket: ws://127.0.0.1:<port>/ws
 ```
 
-其中 `http://127.0.0.1:<port>` 的 `<port>` 是 **OS 实际分配**给这次进程的端口，不是配置值。
+其中 `http://127.0.0.1:<port>` 的 `<port>` 是**这次实际监听的端口**：默认取配置
+`core.port`，没有就取默认值 `16705`；`--port <n>` 覆盖它们。端口被占用时核心**可归因失败**
+（点名端口 + 给出「改 `core.port` 或用 `--port`」的出路），**不会静默改用别的端口**。
+
+端口的三锚点（优先级从高到低）：
+
+1. `--port <n>` —— 显式参数（`--port 0` = 交回 OS 分配，仅调试/测试用）；
+2. `core.port` —— 配置文件里的固定端口（1–65535；缺席 / 非法 ⇒ 回落默认并留一行日志）；
+3. 默认值 `16705`（具名常量 `kDefaultCorePort`；Windows 桌面壳用自己的 `DefaultCorePort`，
+   两处同值且有守卫绑死）。
 
 可选参数：
 
 ```text
+--port <n>         监听端口（1–65535；0 = 交回 OS 分配，仅调试/测试用）
 --config <path>    指定配置文件（默认 ~/.aliasagent/config.json）
 --lock <path>      指定单实例锁文件（默认 ~/.aliasagent/core.lock）
 --web-root <path>  web 客户端构建产物目录（默认 <CWD>/web/dist）
 -h, --help         显示帮助
 ```
+
+> 低端口（小于 1024）**只是容易与系统服务相撞、不推荐**：Windows 没有 Unix 式特权端口，
+> 绑定低端口不需要提权（本机实测非提权绑定 80 / 1023 均成功）。
 
 ## 打开聊天屏
 
@@ -156,7 +171,10 @@ npm run build
 ## 回退
 
 不启动无头核心即可回到纯 Flutter：不用迁移数据、不用改配置、sidecar 与数据库都是同一份。
-浏览器页面只是核心进程的前端，关掉核心进程它就失效——没有任何后台常驻组件。
+浏览器页面只是核心进程的前端，关掉核心进程它就失效——**纯浏览器用法**下没有任何后台常驻
+组件；如果你用的是 Windows 桌面壳（`shell/dist/AliasAgent.Desktop.exe`），关窗口只是隐藏到
+托盘，壳与核心都还在后台运行，要真退必须用托盘菜单的「退出」（见
+[Windows 桌面壳](desktop-shell.md)）。
 web 客户端本身是独立子项目，回退到最少形态就是恢复 `web/src/App.tsx` 的上一版（git）。
 
 ## 开发期（Vite）与生产的关系
@@ -171,7 +189,7 @@ web 客户端本身是独立子项目，回退到最少形态就是恢复 `web/s
   ```
 
   Vite 把 `/ws` 代理到 `VITE_CORE_ORIGIN`；没有设置该环境变量时**不启用代理**，
-  也不使用任何默认端口（端口是 OS 分配的，写死默认值就是魔数）。
+  也就没有默认的开发期转发目标（生产形态是核心 serve `web/dist`、页面与 WS 同源）。
 
 ## RPC 方法
 
@@ -183,6 +201,7 @@ web 客户端本身是独立子项目，回退到最少形态就是恢复 `web/s
 | 方法 | 参数 | 返回 |
 |---|---|---|
 | `core.ping` | 无 | `{ok, service, protocolVersion, pid}` |
+| `core.shutdown` | 无 | `{ok: true}`。**先回包、再停机**：服务端先把这条响应刷出、关掉这条连接，然后断开客户端、关服务器、销毁 Agent、关数据库、释放单实例锁。任何本机进程（含本机网页）都能调用它关停核心——这是本机回环无鉴权服务的已知边界，见「已知限制」。停机期间若销毁 Agent / 关库出错，告警进停机报告并写日志，进程以非 0 码（3）退出 |
 | `session.list` | 无 | `{sessions: [{id,title,agentType,parentSessionId,createdAt,updatedAt,kind,overrides,reactionsEnabled}]}`（只含顶层会话，按最近更新倒序）；「kind」 为 「single」 / 「group」，客户端据此分流到聊天屏或组视图；`reactionsEnabled` 组与单会话都写（客户端只对组使用） |
 | `session.create` | `{title?, agentType?}` | `{session}`；`agentType` 必须是已存在的模板 |
 | `session.delete` | `{sessionId}` | `{sessionId, deleted}`；删除进行中的切换被拒（阶段 deleting） |
@@ -289,6 +308,11 @@ flutter test --tags live --run-skipped test/live/web_core_shim_live_test.dart
 - **断线期间的事件没有重放缓冲**：重连只重拉当前页消息；断线瞬间正在流式的事件不补发
   （核心无事件重放/订阅游标）。已落库的消息会补上。
 - **本机回环、无鉴权**：只绑 `127.0.0.1`，本机信任边界内可接受；不要把它暴露到网络。
+  **端口从随机变成已知之后，本机恶意网页更容易命中它；而且任何本机进程（包括本机网页）
+  都能调 `core.shutdown` 关掉核心。** 这是本版明确披露并接受的边界（要鉴权得另立 change）。
+- **固定端口的取舍**：默认端口 `16705` 被别的程序占用时，核心会**可归因失败**（不再
+  「总能起来」）；这时改 `core.port` 或用 `--port` 指定另一个端口，也可以用 `--port 0`
+  回到随机端口的老形态。
 - **配置文件不存在时是空配置启动**：首启向导完成前没有任何模板 / provider，此时发消息
   会失败（可归因）；完成向导后组合根立即同步，不用重启核心。
 - **发送路径仍全量载入历史**：`Agent.restore` 现有行为不变；分页只落在

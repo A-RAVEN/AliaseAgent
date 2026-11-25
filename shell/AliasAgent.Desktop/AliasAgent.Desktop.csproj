@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>AliasAgent.Desktop</AssemblyName>
+    <RootNamespace>AliasAgent.Desktop</RootNamespace>
+    <!-- 允许在非 Windows 主机上做 restore/编译检查（本仓库只支持 Windows 运行）。 -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <!-- 自包含发布由 scripts/build_desktop_shell.ps1 指定 RID 与自包含开关。 -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 版本必须写死：漏写版本 NuGet 会以 NU1015 直接拒绝还原（design D6）。 -->
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4370.26" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 测试接缝（design D8「C# 侧的接缝要求」）：xunit 工程要能验 ShellApplication 的
+         捕获点与 UiThreadMarshaller（任务 6.1a），不真起核心 / 不开窗。 -->
+    <InternalsVisibleTo Include="AliasAgent.Desktop.Tests" />
+  </ItemGroup>
+
+</Project>
