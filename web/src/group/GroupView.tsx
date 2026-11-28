@@ -39,9 +39,16 @@ import {
 import type { AvatarData } from '../components/Avatar';
 import { Avatar } from '../components/Avatar';
 import { ContextRing, MemberRing } from '../components/ContextRing';
+import { FolderPickerDialog } from '../components/FolderPickerDialog';
 import { MessageBubble } from '../components/MessageBubble';
 import { RealContextView } from '../components/RealContextView';
 import { avatarSizes } from '../tokens';
+import { workspaceLabel } from '../workspace/model';
+import {
+  pickerStartPath,
+  workspaceDirsParams,
+  type WorkspaceDirsResult,
+} from '../workspace/picker';
 
 /** 没传成员头像时的兜底：身份图案（种子 = 成员 id，不阻断渲染）。 */
 function fallbackAvatar(seed: string): AvatarData {
@@ -138,6 +145,11 @@ export function GroupView({
     group.maxRounds === null ? '' : String(group.maxRounds),
   );
   const [savingRoundCap, setSavingRoundCap] = useState(false);
+  // 群工作路径栏（change `custom-workspace` D9；返工 12.6 改成文件夹选择对话框）：
+  // 「切换」弹框点选目录，不再就地手输。未设置工作区时栏里显示「缺省（应用主目录）」
+  // —— 文案常量 `kDefaultWorkspaceLabel` 在 `web/src/workspace/model.ts`（与单聊
+  // 标题旁共用同一份，不在组件里另写一份）。
+  const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
   // R.8：一次性提示游标的**挂载基线**是挂载时的 tick，不是 0。否则换群重挂后
   // 旧的 `chainCompletedTick`（全局单调）会立刻越过 0，把上一次链的提示重放一遍。
   const lastCompletedTick = useRef(chainCompletedTick);
@@ -168,6 +180,35 @@ export function GroupView({
     sending,
   });
   const cancelEnabled = chainRunning;
+
+  // 群工作路径栏（change `custom-workspace` D9 / 返工 12.6）：点「切换」弹文件夹选择框
+  // （`workspace.listDirs` 列子目录，起点 = 组的设置值；未设置 ⇒ 省略 path，核心用主
+  // 目录）。确认走 `group.setWorkspace`，成功后重拉组数据；失败把可归因文本交回框内
+  // （框不关、已保存路径不变）。
+  const listWorkspaceDirs = async (path: string | null): Promise<WorkspaceDirsResult> =>
+    client.request<WorkspaceDirsResult>('workspace.listDirs', workspaceDirsParams(path));
+
+  const applyWorkspace = async (path: string): Promise<string | null> => {
+    try {
+      await client.request('group.setWorkspace', {
+        groupId: group.id,
+        workspace: path,
+      });
+    } catch (error) {
+      return `保存工作路径失败：${error instanceof Error ? error.message : String(error)}`;
+    }
+    // 写成功才重拉；重拉失败走组级错误横幅（不再把已成功的写说成失败）。
+    try {
+      await onReload();
+    } catch (reloadError) {
+      onError(
+        `工作路径已切换，但重拉组数据失败：${
+          reloadError instanceof Error ? reloadError.message : String(reloadError)
+        }`,
+      );
+    }
+    return null;
+  };
 
   // 上限值随重拉更新（`group.update` 成功后 App 会重拉 group.list）。
   useEffect(() => {
@@ -800,6 +841,38 @@ export function GroupView({
               : 'hidden w-72 shrink-0 flex-col overflow-y-auto border-l border-line bg-surface px-3 py-3 xl:static xl:flex'
           }
         >
+          <div
+            data-testid="group-workspace"
+            className="mb-2 rounded-card border border-line bg-bg/40 p-2"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-xs font-semibold uppercase tracking-wide text-muted">
+                群工作路径
+              </h2>
+              <button
+                type="button"
+                data-testid="group-workspace-edit"
+                disabled={chainRunning}
+                aria-disabled={chainRunning ? 'true' : undefined}
+                title={
+                  chainRunning
+                    ? '链运行中：不能切换工作路径（先取消，或等链结束）'
+                    : '打开文件夹选择框'
+                }
+                onClick={() => setWorkspacePickerOpen(true)}
+                className="min-h-6 shrink-0 rounded-card border border-line px-2 py-1 text-xs text-muted hover:text-fg disabled:opacity-40"
+              >
+                切换
+              </button>
+            </div>
+            <p
+              className="mt-1 truncate text-xs text-muted"
+              data-testid="group-workspace-path"
+              title={workspaceLabel(group.workspace)}
+            >
+              {workspaceLabel(group.workspace)}
+            </p>
+          </div>
           <div className="mb-2 flex items-center justify-between gap-2">
             <h2 className="text-xs font-semibold uppercase tracking-wide text-muted">成员</h2>
             <button
@@ -1181,6 +1254,18 @@ export function GroupView({
           </>
         )}
       </div>
+
+      {/* 文件夹选择对话框（返工 12.6）：模态、`z-50` 盖住本视图顶栏（z-30）与管理页
+          覆盖层（z-40）；确认走 `group.setWorkspace`（传播到所有在册成员）。 */}
+      {workspacePickerOpen && (
+        <FolderPickerDialog
+          title="选择群工作路径"
+          initialPath={pickerStartPath(group.workspace)}
+          listDirs={listWorkspaceDirs}
+          onConfirm={applyWorkspace}
+          onClose={() => setWorkspacePickerOpen(false)}
+        />
+      )}
     </div>
   );
 }

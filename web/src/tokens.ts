@@ -62,6 +62,19 @@ export const radii = {
 } as const;
 
 /**
+ * 文件夹选择框的固定高度（change `custom-workspace` 返工任务 12.10 / 12.12）。
+ *
+ * 12.10 先解决「界面把屏幕撑满」：用**视口占比**而不是固定像素（任何窗口高度下都只占约
+ * 七成，固定像素在小窗口上会重新接近满屏）。12.12 用户实测「每次进新窗口高度都会跳变」：
+ * 只给 max-height 时框高仍随子目录数量伸缩，导航时一跳一跳。所以这里是**固定高度**语义，
+ * 组件写 `h-folder-picker`（不是 `max-h-*`），子目录多少都同高，列表在框内滚动。
+ *
+ * CSS 侧 `index.css` 的 `--height-folder-picker` 必须同值（`tokens.test.ts` 逐项比对），
+ * 组件只写 token 生成的工具类，不写方括号任意值。
+ */
+export const folderPickerHeight = '70dvh';
+
+/**
  * 头像尺寸（change `chat-bubbles-avatars` design D7）：取自 `spacingScale`，不新写数字。
  *
  * - 气泡内头像 24 = 正文字阶 `base` 的行高，与单行文本等高；

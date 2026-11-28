@@ -51,7 +51,7 @@ class _RecordingSessionRepo implements SessionRepository {
   final List<Session> sessions;
 
   @override
-  Future<Session> create({String? title, String? agentType, String? parentSessionId, String kind = Session.kindSingle, String? overridesJson, bool reactionsEnabled = true, int? maxRounds}) async {
+  Future<Session> create({String? title, String? agentType, String? parentSessionId, String kind = Session.kindSingle, String? overridesJson, bool reactionsEnabled = true, int? maxRounds, String? workspace}) async {
     final s = Session(
       id: 'new-${sessions.length}',
       title: title ?? 'New Chat',
@@ -61,6 +61,7 @@ class _RecordingSessionRepo implements SessionRepository {
       updatedAt: DateTime.now().millisecondsSinceEpoch,
       reactionsEnabled: reactionsEnabled,
       maxRounds: maxRounds,
+      workspace: workspace,
     );
     sessions.insert(0, s);
     return s;
@@ -88,6 +89,19 @@ class _RecordingSessionRepo implements SessionRepository {
         ? sessions[i].copyWith(clearMaxRounds: true)
         : sessions[i].copyWith(maxRounds: maxRounds);
     ledger.record('session-update-max-rounds');
+  }
+
+  /// 工作路径（change `custom-workspace`）：按内存里的会话写回并返回受影响行数；
+  /// 台账记录一次，让"删除与写库的先后"仍然可核（本文件不驱动这条路径）。
+  @override
+  Future<int> updateWorkspace(String id, String? workspace) async {
+    final i = sessions.indexWhere((s) => s.id == id);
+    if (i < 0) return 0;
+    sessions[i] = workspace == null
+        ? sessions[i].copyWith(clearWorkspace: true)
+        : sessions[i].copyWith(workspace: workspace);
+    ledger.record('session-update-workspace');
+    return 1;
   }
 
   @override

@@ -6,17 +6,30 @@
 //
 // change `group-chat-layout` D1：会话列表的宿主上提到 `ChatShell`，本组件瘦身为
 // **纯主区**（header + 提示条 + 消息视图 + 快照 + 发送区）。它保留 error / notice /
-// skillFailures 三条横幅与 Provider / 模板入口；列表与选中状态不再由它持有。
+// skillFailures 三条横幅；列表与选中状态不再由它持有。
+//
+// change `global-settings-menu` D6：管理入口收归壳层左栏底部的全局设置菜单 ——
+// 本组件头部只承载身份与状态信息（标题 / token 计量 / 连接状态），不再有
+// Provider / 模板按钮，也不再收 `onOpenProviders` / `onOpenTemplates` 两个回调。
+//
+// change `custom-workspace` D8：标题旁显示**当前会话的工作路径**；返工任务 12.6 把
+// 「就地手输」换成「文件夹选择对话框」——用户明令不喜欢手输（会打错字），所以切换是
+// 点选目录：点「切换」→ `FolderPickerDialog` → 核心的 `workspace.listDirs` 列子目录 →
+// 「选择此目录」走 `onSetWorkspace`。组件仍是纯展示容器：路径与动作全由 App 注入，
+// 不传回调时不渲染该控件（既有注入式挂架与别的宿主不受影响）。
 import { useMemo, useState } from 'react';
 
 import type { ChatView } from '../chat/model';
 import type { PendingImage } from '../chat/attachments';
 import { renderMessages } from '../chat/render';
 import type { ConnectionStatus, SnapshotEventData } from '../protocol';
+import { pickerStartPath, type WorkspaceDirsResult } from '../workspace/picker';
+import { workspaceLabel } from '../workspace/model';
 import type { AvatarData } from './Avatar';
 import { Composer } from './Composer';
 import { ConnectionBadge } from './ConnectionBadge';
 import { ContextRing } from './ContextRing';
+import { FolderPickerDialog } from './FolderPickerDialog';
 import { MessageList } from './MessageList';
 import { RealContextView } from './RealContextView';
 
@@ -40,12 +53,24 @@ export interface ChatScreenProps {
   attachments?: Record<string, string | null>;
   /** 当前模板是否声明 image 模态（null = 未知 ⇒ 不提示「图片未发送」）。 */
   imagesSupported?: boolean | null;
-  /** 打开管理屏（change `web-management-ui` 3.3 / 3.4）；不传 = 不显示入口。 */
-  onOpenProviders?: () => void;
-  onOpenTemplates?: () => void;
   /** 单聊用户 / agent 头像（change `chat-bubbles-avatars` 4.4；App 层算好，组件不持 client）。 */
   userAvatar?: AvatarData;
   agentAvatar?: AvatarData;
+  /** 当前会话的工作路径设置值（null = 未设置、用缺省主目录）。 */
+  workspace?: string | null;
+  /**
+   * 保存工作路径（App 注入 RPC；返回 null = 成功，字符串 = 可显示的失败原因）。
+   *
+   * **不传就不渲染**该控件：既有注入式挂架与别的宿主不受影响（change
+   * `custom-workspace` design D8）。
+   */
+  onSetWorkspace?: (path: string) => Promise<string | null>;
+  /**
+   * 列举一层子目录（App 注入 `workspace.listDirs`；`null` = 省略 `path`，起点由核心给）。
+   *
+   * 与 [onSetWorkspace] 同时注入才渲染切换控件（返工任务 12.6：只看不选没有意义）。
+   */
+  onListWorkspaceDirs?: (path: string | null) => Promise<WorkspaceDirsResult>;
 }
 
 export function ChatScreen({
@@ -64,14 +89,27 @@ export function ChatScreen({
   onSend,
   attachments = {},
   imagesSupported = null,
-  onOpenProviders,
-  onOpenTemplates,
   userAvatar,
   agentAvatar,
+  workspace = null,
+  onSetWorkspace,
+  onListWorkspaceDirs,
 }: ChatScreenProps) {
   const items = useMemo(() => renderMessages(view), [view]);
   const [showRealContext, setShowRealContext] = useState(false);
   const currentTitle = sessionSelected ? (sessionTitle ?? '（未选择会话）') : '（未选择会话）';
+  // 文件夹选择对话框的开关（返工任务 12.6）：只属本组件，不上升。
+  const [pickerOpen, setPickerOpen] = useState(false);
+  // 空选中 / 未注入回调时不渲染该控件（群聊主区根本不渲染本组件）。
+  const showWorkspace =
+    onSetWorkspace !== undefined && onListWorkspaceDirs !== undefined && sessionSelected;
+
+  const saveWorkspace = async (path: string): Promise<string | null> => {
+    if (onSetWorkspace === undefined) {
+      return '没有注入保存回调：工作路径未改动';
+    }
+    return onSetWorkspace(path);
+  };
 
   return (
     <div
@@ -91,6 +129,28 @@ export function ChatScreen({
           >
             {currentTitle}
           </p>
+          {/* 工作路径（change `custom-workspace` D8 / 返工 12.6）：标题旁一行，单行截断
+              + title 全文；「切换」弹文件夹选择对话框（不手输）。 */}
+          {showWorkspace && (
+            <div className="mt-1 flex min-w-0 items-center gap-2 text-xs text-muted">
+              <span className="shrink-0">工作路径</span>
+              <span
+                className="min-w-0 max-w-sm truncate"
+                data-testid="workspace-path"
+                title={workspaceLabel(workspace)}
+              >
+                {workspaceLabel(workspace)}
+              </span>
+              <button
+                type="button"
+                data-testid="workspace-edit"
+                onClick={() => setPickerOpen(true)}
+                className="shrink-0 rounded-card border border-line px-2 py-1 text-xs text-muted hover:text-fg"
+              >
+                切换
+              </button>
+            </div>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-3 text-xs text-muted">
           {metering && (
@@ -98,26 +158,6 @@ export function ChatScreen({
               in {String(metering.input_tokens ?? 0)} / out{' '}
               {String(metering.output_tokens ?? 0)} tokens
             </span>
-          )}
-          {onOpenProviders && (
-            <button
-              type="button"
-              data-testid="open-providers"
-              onClick={onOpenProviders}
-              className="rounded-card border border-line px-2 py-1 text-xs text-muted hover:text-fg"
-            >
-              Providers
-            </button>
-          )}
-          {onOpenTemplates && (
-            <button
-              type="button"
-              data-testid="open-templates"
-              onClick={onOpenTemplates}
-              className="rounded-card border border-line px-2 py-1 text-xs text-muted hover:text-fg"
-            >
-              模板
-            </button>
           )}
           <ConnectionBadge status={status} />
         </div>
@@ -209,6 +249,18 @@ export function ChatScreen({
           onSend={onSend}
         />
       </section>
+
+      {/* 文件夹选择对话框（返工 12.6）：模态、盖住主区（z-50 > 群顶栏 z-30 /
+          管理页覆盖层 z-40）；确认后由 App 走 `session.setWorkspace`。 */}
+      {showWorkspace && pickerOpen && onListWorkspaceDirs !== undefined && (
+        <FolderPickerDialog
+          title="选择工作路径（单聊）"
+          initialPath={pickerStartPath(workspace)}
+          listDirs={onListWorkspaceDirs}
+          onConfirm={saveWorkspace}
+          onClose={() => setPickerOpen(false)}
+        />
+      )}
     </div>
   );
 }

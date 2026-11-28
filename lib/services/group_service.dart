@@ -12,6 +12,8 @@
 //   - `group.view` 只返回本次运行内最近一次**真实发出**的快照（重启后为空是既定语义）。
 import 'dart:async';
 
+import 'package:path/path.dart' as p;
+
 import 'context_snapshot.dart';
 import '../models/agent_type_config.dart';
 import '../models/group_member.dart';
@@ -26,11 +28,13 @@ import 'config_service.dart';
 import 'group_member_repository.dart';
 import 'group_reaction.dart';
 import 'group_view_loader.dart';
+import 'logging.dart';
 import 'message_repository.dart';
 import 'session_repository.dart';
 import 'sidecar_bridge.dart';
 import 'summary_node_repository.dart';
 import 'tool_catalog.dart';
+import 'workspace.dart';
 
 /// 可归因的组服务错误（RPC 层直接转成 JSON-RPC 错误）。
 class GroupException implements Exception {
@@ -373,6 +377,11 @@ class GroupService {
   /// 建组：会话行（`kind = group`）+ **组上下文**（工作区来自 RPC 可选参数，缺省
   /// 复用 `Agent.ensureContext` 的既有缺省 `ConfigService.homeDir`，不发明第二个缺省）。
   ///
+  /// change `custom-workspace` design D4 / D6：带 `workspace` 时**先校验再建行**
+  /// （绝对路径 / 存在 / 是目录），不合法抛 `GroupException('invalid_workspace', …)`
+  /// 且不创建任何会话行；合法则把**规范化后的设置值**落库（`sessions.workspace`）。
+  /// 只有空白字符 = 省略（写 NULL、用缺省）。
+  ///
   /// [reactionsEnabled]：组的自发反应开关（change `group-reactive-mode` D1 / D9）。
   /// 省略 = **新建组默认开启**（`SessionRepository.create` 的缺省）；显式 `false`
   /// 落 0（安静态）。行为用例在任务 3.1，这里只做签名与透传 —— 夹具（任务 0.3）
@@ -386,18 +395,25 @@ class GroupService {
     bool? reactionsEnabled,
     int? maxRounds,
   }) async {
+    // 先校验再建行：非法路径不许留下半个组（没有会话行、没有上下文）。
+    final setting = stripWorkspaceInput(workspace ?? '');
+    if (setting.isNotEmpty) {
+      final problem = workspaceProblem(setting);
+      if (problem != null) {
+        throw GroupException(
+            'invalid_workspace', '建组的工作路径被拒绝：$problem');
+      }
+    }
     final session = await sessionRepo.create(
       title: (title == null || title.trim().isEmpty) ? '新组' : title.trim(),
       kind: Session.kindGroup,
       reactionsEnabled: reactionsEnabled ?? true,
       maxRounds: maxRounds,
+      workspace: setting.isEmpty ? null : setting,
     );
-    final resolvedWorkspace =
-        (workspace == null || workspace.trim().isEmpty)
-            ? ConfigService.homeDir
-            : workspace.trim();
-    await ensureGroupContext(session.id, workspace: resolvedWorkspace);
-    return session;
+    await ensureGroupContext(session.id, workspace: setting);
+    final reread = await sessionRepo.get(session.id);
+    return reread ?? session;
   }
 
   /// 确保组上下文已注册（按需重注册）的**统一入口**（change `group-chat-layout`
@@ -411,15 +427,23 @@ class GroupService {
   /// 落定）；`false` = 上下文已存在（**不覆盖**已有工作区，同进程幂等）。
   ///
   /// [workspace] 省略 / 空串 = 产品既有缺省 `ConfigService.homeDir`（不发明第二个
-  /// 缺省）。`createGroup` 传自己的 resolvedWorkspace；`ensureMemberAgent` 用缺省 ——
-  /// 后者在 `created:false` 时不会吞掉自定义工作区。
+  /// 缺省）。change `custom-workspace` design D4：非空时**先校验**，不合法抛
+  /// `GroupException('workspace_unavailable', …)`（不建上下文、不静默用别的目录）。
   ///
   /// `sidecar.ensureContext` 的 `StateError` 在这里包成可归因 [GroupException]：
   /// 否则 member.add / send 的 `on GroupException` 接不住，会变成 -32603。
   Future<bool> ensureGroupContext(String groupId, {String? workspace}) async {
     final resolvedWorkspace = (workspace == null || workspace.trim().isEmpty)
         ? ConfigService.homeDir
-        : workspace.trim();
+        : stripWorkspaceInput(workspace);
+    final problem = workspaceProblem(resolvedWorkspace);
+    if (problem != null) {
+      throw GroupException(
+        'workspace_unavailable',
+        '组 "$groupId" 的工作路径「$resolvedWorkspace」不可用：$problem'
+            ' —— 不注册上下文、也不用别的目录顶替',
+      );
+    }
     try {
       return await sidecar.ensureContext(groupId,
           defaultWorkspace: resolvedWorkspace);
@@ -594,9 +618,10 @@ class GroupService {
     final group = await requireGroup(member.groupSessionId);
     // R.14：核心重启后 sidecar 内存上下文丢失，存量群必须先按需重注册，否则下面的
     // getWorkspace 会 unknown_context（成员轮在调模型前就失败、steps 一条都没有）。
-    // 统一入口传缺省工作区：上下文已存在（created:false）时不会覆盖 createGroup 设的
-    // 自定义工作区；重启后必然新建（created:true）⇒ 回落缺省（已知限制，见 design D13）。
-    await ensureGroupContext(group.id);
+    // change `custom-workspace` design D3：统一入口传**组行持久化的工作区** —— 上下文
+    // 已存在（created:false）时不会覆盖；重启后必然新建（created:true）⇒ 按持久化值
+    // 重建（旧组 workspace 为 NULL ⇒ 仍用缺省 homeDir）。
+    await ensureGroupContext(group.id, workspace: group.workspace);
     // 成员工作区 = 组上下文保存的工作区（只读读取，不给成员私有工作区）。
     final workspace = sidecar.getWorkspace(group.id);
     if (!workspace.ok) {
@@ -757,6 +782,90 @@ class GroupService {
   /// 只改反应轮数上限（整数 1..50 或显式 null = 恢复默认）。
   Future<Session> updateMaxRounds(String groupId, int? maxRounds) =>
       updateGroupSettings(groupId, maxRounds: maxRounds, setMaxRounds: true);
+
+  /// 切换组的**共享工作路径**（change `custom-workspace` design D6 / D7）。
+  ///
+  /// 顺序钉死：requireGroup → busy 拒绝（**不排队、不改值**）→ 规范化 + 校验（非法
+  /// 路径时任何状态都不改）→ `ensureGroupContext` + `sidecar.setWorkspace(groupId)`
+  /// （读回确认为非空）→ 落库（核对恰好一行）→ **传播到所有在册成员实例**的上下文 →
+  /// 返回重读的组会话。
+  ///
+  /// 传播失败不静默：此时组与库**已经**切到新目录，错误消息点名失败成员；每个成员轮
+  /// 开始还有一道对齐保险（[_alignMemberWorkspace]），下一轮会收敛。
+  Future<Session> setWorkspace(String groupId, String path) async {
+    final group = await requireGroup(groupId);
+    if (isGroupBusy(groupId)) {
+      throw GroupException(
+        'busy',
+        '组 "$groupId" 已有成员在运行（含反应链）：中途换根会让该轮的工具边界跳变，'
+            '本次没有排队、工作路径未改动',
+      );
+    }
+    final setting = stripWorkspaceInput(path);
+    final problem = workspaceProblem(setting);
+    if (problem != null) {
+      throw GroupException(
+          'invalid_workspace', '组 "$groupId" 的工作路径被拒绝：$problem');
+    }
+
+    // ① 让上下文先生效：ensure（校验过才建）+ 显式 set（已存在时 ensure 不覆盖）。
+    await ensureGroupContext(groupId, workspace: setting);
+    final error = sidecar.setWorkspace(groupId, setting);
+    if (error != null && error.isNotEmpty) {
+      throw GroupException(
+        'workspace_unavailable',
+        '组 "$groupId" 的上下文拒绝该工作路径（set_workspace）：$error',
+      );
+    }
+    final readBack = sidecar.getWorkspace(groupId);
+    final readPath = (readBack.workspace ?? '').trim();
+    if (!readBack.ok || readPath.isEmpty) {
+      throw GroupException(
+        'workspace_unavailable',
+        '组 "$groupId" 切换后读回的工作区${readBack.ok ? '为空串' : '失败（${readBack.code}）'}：'
+            '拒绝把未生效的值写进库',
+      );
+    }
+
+    // ② 落库（设置值 = 规范化后的用户输入），必须核对**恰好一行**。
+    final updated = await sessionRepo.updateWorkspace(groupId, setting);
+    if (updated != 1) {
+      throw GroupException(
+        'workspace_persist_failed',
+        '上下文已切换到「$setting」，但没有更新到唯一既有行（实际更新 $updated 行，期望 1 行）：'
+            '数据库里的工作路径未持久化（不假装成功）',
+      );
+    }
+
+    // ③ 传播到所有在册成员实例的上下文（成员没有私有工作区）。
+    final failures = <String>[];
+    for (final member in await memberRepo.listByGroup(groupId)) {
+      if (member.isRemoved) continue;
+      final agent = agents.lookup(member.handle);
+      if (agent == null) continue; // 还没建过实例：下一轮创建时直接用组值
+      try {
+        // 上下文丢失时直接建对；已存在时 ensure 不覆盖，随后 set 显式改。
+        await agent.ensureContext(defaultWorkspace: setting);
+        final memberError = sidecar.setWorkspace(member.handle, setting);
+        if (memberError != null && memberError.isNotEmpty) {
+          throw GroupException(
+              'workspace_unavailable', '成员上下文拒绝该路径（set_workspace）：$memberError');
+        }
+      } catch (e) {
+        failures.add('${member.name}（${member.id}）：$e');
+      }
+    }
+    if (failures.isNotEmpty) {
+      throw GroupException(
+        'workspace_propagation_failed',
+        '组 "$groupId" 与数据库已切到「$setting」，但以下成员实例即时更新失败：'
+            '${failures.join('；')} —— 它们会在下一轮开始前对齐到组工作区（不静默）',
+      );
+    }
+
+    final reread = await sessionRepo.get(groupId);
+    return reread ?? group.copyWith(workspace: setting);
+  }
 
   /// 当前 / 最近一条链的只读快照；本进程内还没有链时返回 `status = idle`。
   ///
@@ -1205,10 +1314,15 @@ class GroupService {
   }
 
   /// 后台异常兜底：链状态 `failed` + 可归因（不变成未处理异常）。
+  ///
+  /// change `custom-workspace`：`GroupException` 的可归因**错误码**要一起进链错误文本
+  /// （例如 `workspace_unavailable`），否则界面 / 测试只看到一句人话、拿不到码。
   void _failChainFromException(_GroupExecutorState chain, Object error) {
     chain.status = 'failed';
     chain.stopReason = 'failed';
-    chain.error = '$error';
+    chain.error = error is GroupException
+        ? '${error.code}: ${error.message}'
+        : '$error';
     final memberId = chain.runningMemberId ?? chain.lastMemberId;
     if (memberId != null &&
         !chain.steps.any((step) => step.memberId == memberId && step.isFailure)) {
@@ -1263,7 +1377,56 @@ class GroupService {
     }
   }
 
+  /// 成员轮开始前的**工作区对齐**（change `custom-workspace` design D7 第 2 条）。
+  ///
+  /// 先经统一入口按需重注册组上下文（重启后 created:true 用持久化值），再读组**当前**
+  /// 工作区；与成员上下文不一致就 `set_workspace` 到组值并留一行日志。读不到 / 为空
+  /// 一律按可归因 `workspace_unavailable` 拒绝 —— 不让成员在空工作区或别的目录里干活。
+  ///
+  /// 这是"成员继承组工作区"成为**每轮成立**的不变量，而不只依赖切换那一刻的传播。
+  Future<void> _alignMemberWorkspace({
+    required Session group,
+    required GroupMember member,
+    required Agent instance,
+  }) async {
+    await ensureGroupContext(group.id, workspace: group.workspace);
+    final groupWorkspace = sidecar.getWorkspace(group.id);
+    if (!groupWorkspace.ok) {
+      throw GroupException(
+        'workspace_unavailable',
+        '成员轮开始前读取组 "${group.id}" 的工作区失败'
+            '（${groupWorkspace.code}）：${groupWorkspace.error}',
+      );
+    }
+    final groupPath = (groupWorkspace.workspace ?? '').trim();
+    if (groupPath.isEmpty) {
+      throw GroupException(
+        'workspace_unavailable',
+        '组 "${group.id}" 的工作区为空（get_workspace 返回 ok 但为空串）：'
+            '拒绝让成员 "${member.name}" 在空工作区里发言（不能用别的目录顶替）',
+      );
+    }
+    final memberWorkspace = sidecar.getWorkspace(instance.handle);
+    final memberPath =
+        memberWorkspace.ok ? (memberWorkspace.workspace ?? '').trim() : '';
+    if (memberWorkspace.ok && p.equals(memberPath, groupPath)) return;
+    final error = sidecar.setWorkspace(instance.handle, groupPath);
+    if (error != null && error.isNotEmpty) {
+      throw GroupException(
+        'workspace_unavailable',
+        '成员 "${member.name}"（${member.id}）对齐组工作区「$groupPath」失败'
+            '（set_workspace）：$error',
+      );
+    }
+    debugPrint('[AliasAgent] 成员轮对齐工作区：${member.name}（${member.id}）'
+        '「${memberWorkspace.ok ? memberPath : '读取失败（${memberWorkspace.code}）'}」'
+        ' → 「$groupPath」');
+  }
+
   /// 跑一个成员的一轮（登记链的当前成员 + 更新"本次运行内最近一次真实发出"快照）。
+  ///
+  /// change `custom-workspace` design D7：装配前先**对齐工作区**（成员继承组当前工作
+  /// 区，成员轮开始再核对一次）；对齐失败按可归因 `workspace_unavailable` 拒绝。
   ///
   /// 注意：异步契约下用户的文本已由 `send` 在返回前写入库，这里一律
   /// `writeUserMessage: false`（成员视图装配会读到那条用户消息）。
@@ -1278,6 +1441,8 @@ class GroupService {
     Agent? agent,
   }) async {
     final instance = agent ?? await ensureMemberAgent(member);
+    // 双保险的第二道：即时传播失败 / 上下文被别处改过时，成员轮开始前回正。
+    await _alignMemberWorkspace(group: group, member: member, instance: instance);
     // 每轮开始前增量装配：后跑者能看到先跑者刚落库的公开回复（串行可见）。
     await instance.assembleMemberView();
     chain?.runningMemberId = member.id;

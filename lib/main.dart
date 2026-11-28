@@ -35,6 +35,7 @@ import 'services/summary_node_repository.dart';
 import 'services/tool_catalog.dart';
 import 'services/tool_bootstrap.dart';
 import 'services/tool_result_text.dart' as tool_text;
+import 'services/workspace.dart';
 import 'ui/agent_template_editor.dart';
 import 'ui/agent_template_menu.dart';
 import 'ui/chat_area.dart';
@@ -770,6 +771,11 @@ class ChatScreenState extends State<ChatScreen> {
     try {
       return await _agentFactory.ensure(session,
           callbacks: _callbacksFor(session.id));
+    } on WorkspaceUnavailableException catch (e) {
+      // change `custom-workspace`：持久化工作路径不可用（目录被删 / 不是目录）时
+      // 显示可归因错误——不崩、不静默回落到缺省目录开始干活。
+      _reportAgentError(e.toString());
+      return null;
     } on AgentConfigException catch (e) {
       _reportAgentError(e.toString());
       return null;

@@ -42,6 +42,17 @@
 
   --shadow-e1: 0 1px 2px rgb(0 0 0 / 0.35);
   --shadow-e2: 0 8px 24px rgb(0 0 0 / 0.45);
+
+  /* 文件夹选择框的固定高度（change `custom-workspace` 返工任务 12.10 / 12.12）：与
+     `tokens.ts` 的 folderPickerHeight 同值。70dvh = 视口七成；固定高度（不是 max-height）
+     保证换文件夹时框高不跳变，列表在框内滚动。 */
+  --height-folder-picker: 70dvh;
+}
+
+/* Tailwind 没有 height 的 theme 命名空间：用命名 token 生成工具类。组件写
+   `h-folder-picker`（固定高度），不写方括号任意值（tokens 守卫会拦任意值）。 */
+@utility h-folder-picker {
+  height: var(--height-folder-picker);
 }
 
 html,

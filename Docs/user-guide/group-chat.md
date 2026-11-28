@@ -115,11 +115,39 @@ tokens、二级摘要 / 一级摘要 / 原文三瓣的逐项数字，以及系�
 
 点会话列表顶部的「＋ 组」。新组会立刻出现在列表里并选中。
 
-组的共享工作区：`group.create` 建立组上下文时使用传入的 「workspace」；不传就用产品既有
-缺省工作区（应用主目录）。成员创建时**继承**组上下文已保存的工作区（不给成员单独目录）。
-**重启后工作区回落缺省**：`sessions` 表没有 workspace 列，自定义工作区只在本进程内有效；
-核心重启后组上下文按缺省主目录重新建立（已知限制，持久化另立）。回落之后成员轮仍能正常
-反应，不会报 `unknown_context`；web 界面不会发自定义 workspace，所以日常使用碰不到这条。
+组的共享工作区（也就是下面说的**群工作路径**）：`group.create` 可以带 `workspace` 指定一个
+已存在的目录，不设就用产品既有缺省工作区（应用主目录）。成员创建时**继承**组当前的工作路径
+（不给成员单独目录）。这个设置会**落库并持久化**（`sessions.workspace`）：**重启后工作区保留**
+—— 核心重启后组上下文按保存下来的目录重建，成员继承同一目录；升级前创建、没设过工作路径的
+旧组仍是缺省主目录，行为与以前一致。
+
+### 群工作路径
+
+位置：群聊标签**右侧栏的最上方**（成员名单之上；窄屏时在头部「成员」抽屉的顶部）。
+
+- 显示该组当前的工作路径；没设过时显示「缺省（应用主目录）」。
+- 长路径在栏里**单行截断**，鼠标悬停可以看全文（title 属性）。
+- 点「切换」弹**文件夹选择框**（应用内的浏览框，不是系统对话框）：框里是当前目录的子文件夹，
+  点文件夹进入下一层、点面包屑或「上级」回退，点「选择此目录」保存，点「取消」什么都不改。
+  没设过工作路径时，框从**应用主目录**开始。框顶的**路径地址栏**始终显示当前文件夹，浏览后
+  自动跟着变；也可以直接改路径后按 Enter 或点「跳转」（核心校验：合法就跳过去，输错在框内
+  报错、不跳、地址栏回到当前文件夹）。点选仍是主用法，地址栏是给已知路径用的快捷入口。
+  框高**固定**约视口七成（换文件夹不会跳高跳低），子文件夹很多时列表在框内滚动、框不会撑满屏幕。
+  面包屑顶层是「此电脑」（Windows）：
+  盘符根的「上级」回到「此电脑」，在那里可以换到其它盘（`C:` / `D:`…）；
+  停在「此电脑」时「选择此目录」禁用（它不是真实目录）。
+- 保存走核心的 `group.setWorkspace`：目录必须是**已存在的绝对目录**（框里点选或地址栏输入，
+  核心都会校验）。成功后栏里立刻显示新路径，并**传播到该组所有在册成员的实例上下文**，下一次
+  成员轮就在新目录里干活。
+- 核心拒绝这个目录（例如没有访问权限、目录刚被删）时，错误显示在**框里**（含路径与原因），
+  框保持打开，已保存路径的显示不变。
+- **链运行中不能切**：「切换」按钮禁用并给出可读原因（悬停看），点了也不会发写请求；先取消
+  反应链或等它结束。
+- 这一栏**只装工作路径**，不是群公告：没有公告正文、编辑历史或未读标记。
+- 没有「恢复缺省」按钮：把框导航到应用主目录再点「选择此目录」即可。
+- 浏览器拿不到本机绝对路径的**系统**文件夹对话框（安全限制），所以这里是**应用内**的文件夹
+  选择框，目录列表由核心的 `workspace.listDirs` 提供（只列子目录；Windows 的「此电脑」层
+  列盘符；地址栏跳转也用它校验，不合法路径返回可归因错误）。这是实现事实，不是暂时没做。
 
 ### 删除群
 
@@ -310,15 +338,20 @@ tokens、二级摘要 / 一级摘要 / 原文三瓣的逐项数字，以及系�
 - **组内没有成员在运行**时点「取消反应链」：返回「该组当前没有成员在运行」（真话）；带
   `memberId` 且该成员不在运行时会指名它。
 - **链运行中改组设置**：`group.update` 返回可归因 busy（不排队），设置值不变。
+- **群工作路径保存失败**：核心拒绝所选目录（没有访问权限 / 目录刚被删等）时，文件夹选择框里
+  就地显示错误（含路径与原因），框不关、已保存路径不变；链运行中「切换」按钮本身是禁用的。
+- **重启后组工作目录已被删**：核心会以可归因的 `workspace_unavailable` 拒绝建成员 / 跑成员轮
+  （消息里点名该路径），不会偷偷用主目录或空工作区顶替；把工作路径切到一个存在的目录即可恢复。
 
 ## RPC 一览（无头核心）
 
 | 方法 | 参数 | 说明 |
 | --- | --- | --- |
-| `group.create` | `title?` / `workspace?` / `reactionsEnabled?` / `maxRounds?` | 建组并建立组上下文（缺省工作区用产品既有口径）；`reactionsEnabled` 省略 = 新建组**开启**自发反应；`maxRounds` 省略 / 显式 null = 产品默认（8），范围 1..50，越界 `-32602` |
+| `group.create` | `title?` / `workspace?` / `reactionsEnabled?` / `maxRounds?` | 建组并建立组上下文；给了 `workspace` 时**先校验再落库**（重启后保留，见「群工作路径」），省略 / 只有空白 = 视为未设置（用缺省主目录）；`reactionsEnabled` 省略 = 新建组**开启**自发反应；`maxRounds` 省略 / 显式 null = 产品默认（8），范围 1..50，越界 `-32602` |
+| `group.setWorkspace` | `groupId` / `workspace` | 切换组的共享工作路径：校验（绝对 / 存在 / 是目录）→ 组上下文生效 → 落库（核对恰好一行）→ **传播到所有在册成员实例** → 返回 `{group}`（含 `workspace`）。非法路径 / 单聊 id ⇒ `-32602`；反应链或任一成员运行中 ⇒ 可归因 busy（不排队、不改值） |
 | `group.update` | `groupId` / `reactionsEnabled?` / `maxRounds?` | 改组的运行设置（至少给一个字段）；`maxRounds` 显式「null」 = 恢复默认（与**字段缺席**不同：缺席 = 不改）；缺字段 / 类型不对 / 越界 ⇒ `-32602`；链运行中 ⇒ 可归因 busy |
 | `group.chain` | `groupId` | 当前 / 最近一条链的只读状态：`groupId` / `sessionId` / `status` / `triggerSeq` / `rounds` / `stopReason` / `error` / `steps`。`status ∈ {idle, running, completed, cancelled, failed}`；`stopReason ∈ {all_passed, round_cap, cancelled, failed, no_members}`（运行中为 null）；`error` 为字符串或 null（`failed` 时非空且含可归因文本，`completed` / `cancelled` 为 null）；核心重启后为 `idle` |
-| `group.list` | — | 全部组 + 每组成员清单（id / 显示名 / 模板 / `removedAt` / 「overrides」 / 「effective」）；组项另带 `reactionsEnabled`、`maxRounds`、`busy`（布尔）与 `runningMemberId` |
+| `group.list` | — | 全部组 + 每组成员清单（id / 显示名 / 模板 / `removedAt` / 「overrides」 / 「effective」）；组项另带 `reactionsEnabled`、`maxRounds`、`busy`（布尔）、`runningMemberId` 与 `workspace`（组的工作路径设置值，字符串或 null） |
 | `group.delete` | `groupId` | 删组：成员 / 消息 / 摘要随外键级联删除（先停反应链、再取消并销毁成员实例） |
 | `group.member.add` | `groupId` / 「name」 / `templateName` / `overrides?` | 加成员（重名或空名可归因拒绝） |
 | `group.member.remove` | `groupId` / `memberId` | **软删**成员（行与历史保留，同名重建是新 id）；先停反应链 |
@@ -340,7 +373,7 @@ tokens、二级摘要 / 一级摘要 / 原文三瓣的逐项数字，以及系�
 
 | 方法 | 群聊上的行为 |
 | --- | --- |
-| `session.list` | 每项带 「kind」（「single」 / 「group」）、`reactionsEnabled`、`maxRounds`（整数或 null）与 「overrides」（会话级覆盖层，可空） |
+| `session.list` | 每项带 「kind」（「single」 / 「group」）、`reactionsEnabled`、`maxRounds`（整数或 null）、`workspace`（工作路径设置值，字符串或 null）与 「overrides」（会话级覆盖层，可空） |
 | `message.query` | 每条消息带 `author`（稳定成员 id，用户消息为 「null」）与 `visibility`（`public` / `private-to-author`）；分页语义不变 |
 | `agent.event` | 成员运行产生的组事件在 `sessionId` 之外带 `groupId` 与 `memberId`；**组服务自己写入的用户消息只带 `groupId`**（没有成员可归，不伪造 memberId）；链进入终态时发 `group.chain.completed`（本 change 唯一新增的事件类型）；`forced_pass` / `forced_empty` **不走** `turn.failed` |
 | `agent.cancel` | 组会话按组路由：链运行中停整条链并**清空排队**，回包带 `reactionChainStopped`；带 `memberId` 取消排队成员 ⇒ `cancelled: false` + `reactionChainStopped: true`（不谎报 cancelled）；没有链时「该组当前没有成员在运行」 |
@@ -407,3 +440,9 @@ tokens、二级摘要 / 一级摘要 / 原文三瓣的逐项数字，以及系�
 界面文案（web）：「已达轮数上限（反应已停止；可继续点名，或调大该组的反应轮数上限）」
 
 界面文案（web）：「反应轮数上限」
+
+界面文案（web）：「群工作路径」
+
+界面文案（web）：「切换」
+
+界面文案（web）：「缺省（应用主目录）」

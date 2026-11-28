@@ -24,6 +24,28 @@ class SessionAgentTypeUpdateException implements Exception {
   String toString() => message;
 }
 
+/// 把会话 / 组的工作路径写进 `sessions.workspace` 时，**没有更新到唯一既有行**。
+///
+/// 由**调用方**在核对 [SessionRepository.updateWorkspace] 的返回值后抛出（仓储只如实
+/// 返回行数，见 change `custom-workspace` design D2）：0 行 = 会话不存在 / 已被删除，
+/// 多行 = 主键重复。两种都必须显式失败，不得假报成功。
+class SessionWorkspaceUpdateException implements Exception {
+  final String sessionId;
+  final String? workspace;
+  final int updatedRows;
+  final String message;
+
+  const SessionWorkspaceUpdateException({
+    required this.sessionId,
+    required this.workspace,
+    required this.updatedRows,
+    required this.message,
+  });
+
+  @override
+  String toString() => message;
+}
+
 class SessionRepository {
   static const _uuid = Uuid();
 
@@ -41,6 +63,10 @@ class SessionRepository {
   /// [maxRounds]：组的**反应轮数上限**（change `group-reactive-mode` R.1 / D13）。
   /// 省略 / `null` = 用产品默认 [kDefaultMaxReactionRounds]（列写 NULL）。范围校验在
   /// `group.create` / `group.update` 的入口做（`-32602`），仓储只负责如实写入。
+  ///
+  /// [workspace]：会话 / 组的**工作路径设置值**（change `custom-workspace` design D2）。
+  /// 省略 = 未设置（写 NULL，用缺省 `ConfigService.homeDir`）。校验（绝对路径 / 存在 /
+  /// 是目录）在调用方入口做；仓储不猜、不改写用户输入（只原样落库）。
   Future<Session> create({
     String? title,
     String? agentType,
@@ -49,6 +75,7 @@ class SessionRepository {
     String? overridesJson,
     bool reactionsEnabled = true,
     int? maxRounds,
+    String? workspace,
   }) async {
     final db = await DatabaseService.database;
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -63,6 +90,7 @@ class SessionRepository {
       overridesJson: overridesJson,
       reactionsEnabled: reactionsEnabled,
       maxRounds: maxRounds,
+      workspace: workspace,
     );
     await db.insert('sessions', session.toRow());
     return session;
@@ -163,6 +191,20 @@ class SessionRepository {
   Future<void> updateMaxRounds(String id, int? maxRounds) async {
     final db = await DatabaseService.database;
     await db.update('sessions', {'max_reaction_rounds': maxRounds},
+        where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// 原地写工作路径设置值（`sessions.workspace`，change `custom-workspace` design D4）。
+  ///
+  /// 返回受影响行数：**调用方必须核对恰好一行**。0 行（会话不存在 / 已被删除）或多行
+  /// （主键重复）都由调用方显式失败（[SessionWorkspaceUpdateException]），仓储不静默
+  /// no-op、也不假报成功。[workspace] 为 `null` = 写 NULL（未设置；本 change 的 RPC
+  /// 不暴露清除语义，保留这一能力只是让仓储与列可空性一致）。
+  ///
+  /// 只写这一列：不碰标题、模板、覆盖层、组设置与 `updated_at`。
+  Future<int> updateWorkspace(String id, String? workspace) async {
+    final db = await DatabaseService.database;
+    return db.update('sessions', {'workspace': workspace},
         where: 'id = ?', whereArgs: [id]);
   }
 

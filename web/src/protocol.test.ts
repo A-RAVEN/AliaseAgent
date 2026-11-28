@@ -216,7 +216,7 @@ describe('断线期间的请求', () => {
 // ---------------------------------------------------------------------------
 
 describe('群聊协议形状', () => {
-  it('十个群聊方法名在客户端清单里齐备（与核心 kCoreRpcMethodNames 同步）', () => {
+  it('十一个群聊方法名在客户端清单里齐备（与核心 kCoreRpcMethodNames 同步）', () => {
     expect([...GROUP_RPC_METHODS]).toEqual([
       'group.create',
       'group.update',
@@ -228,6 +228,7 @@ describe('群聊协议形状', () => {
       'group.member.update',
       'group.send',
       'group.view',
+      'group.setWorkspace',
     ]);
   });
 
@@ -321,6 +322,8 @@ describe('群聊协议形状', () => {
       overrides: null,
       reactionsEnabled: true,
       maxRounds: null,
+      // change `custom-workspace`：工作路径是**必填**字段（null = 未设置、用缺省）。
+      workspace: null,
     };
     const summary: GroupSummary = {
       ...session,

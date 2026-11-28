@@ -16,6 +16,7 @@ import { describe, expect, it } from 'vitest';
 import {
   avatarTints,
   elevation,
+  folderPickerHeight,
   kDefaultBottomThresholdPx,
   kDefaultHeartbeatPeriodMs,
   kDefaultHeartbeatTimeoutMs,
@@ -120,6 +121,34 @@ describe('设计 tokens 与 CSS @theme 一致', () => {
     expect(themeValue('radius-panel')).toBe(`${radii.panel}px`);
     expect(themeValue('shadow-e1')).toBe(elevation.e1);
     expect(themeValue('shadow-e2')).toBe(elevation.e2);
+  });
+
+  // 返工 12.10 / 12.12：用户先实测「界面把屏幕撑满了」，又实测「每次进新文件夹高度都跳变」。
+  // 所以高度必须是**固定**的视口占比（`height` 不是 `max-height`），且与 CSS `@theme` 同值；
+  // 固定像素会在小窗口上重新接近满屏，max-height 会随子目录数量伸缩 —— 两种都钉死拒绝。
+  it('文件夹选择框固定高度 = 70dvh（两处同值、对话框用 h- 固定高度，不是 max-height / 固定像素）', () => {
+    obs('folderPickerHeight', folderPickerHeight);
+    expect(themeValue('height-folder-picker')).toBe(folderPickerHeight);
+    const match = /^(\d+)dvh$/.exec(folderPickerHeight);
+    expect(match, '高度必须写成 dvh 视口占比（固定像素在小窗口会重新接近满屏）').not.toBeNull();
+    const percent = Number(match?.[1]);
+    obs('固定高度（视口百分比）', percent);
+    expect(percent).toBeGreaterThanOrEqual(60);
+    expect(percent).toBeLessThanOrEqual(80);
+
+    // 固定高度的两个必要条件：CSS 生成 `h-folder-picker`（height），组件真的用它。
+    expect(INDEX_CSS, 'CSS 必须用 @utility h-folder-picker 生成 height 工具类').toMatch(
+      /@utility h-folder-picker\s*\{/,
+    );
+    expect(INDEX_CSS, '旧的 max-h-folder-picker 工具类必须撤除（max-height 会随内容伸缩）')
+      .not.toContain('max-h-folder-picker');
+    const dialog = fs.readFileSync(path.join(SRC_DIR, 'components', 'FolderPickerDialog.tsx'), 'utf8');
+    obs('对话框的高度类', {
+      fixed: /\sh-folder-picker\s/.test(dialog),
+      maxHeight: dialog.includes('max-h-folder-picker'),
+    });
+    expect(dialog, '对话框必须用 h-folder-picker（固定高度）').toMatch(/\sh-folder-picker\s/);
+    expect(dialog, '对话框不得再用 max-h-folder-picker').not.toContain('max-h-folder-picker');
   });
 
   it('只有五档字阶（没有第六档混进来）', () => {

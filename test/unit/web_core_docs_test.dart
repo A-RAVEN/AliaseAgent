@@ -140,14 +140,18 @@ void main() {
     }
   });
 
-  test('布局锚点：会话列表常驻 / 群聊只换主区 / 空聊天屏 / 管理入口在单聊（change `group-chat-layout`）', () {
+  test('布局锚点：会话列表常驻 / 群聊只换主区 / 空聊天屏 / 管理入口在左栏底部（change `group-chat-layout` / `global-settings-menu`）', () {
     final text = doc.readAsStringSync();
     for (final anchor in const [
       '会话列表常驻',
       '群聊',
       '主区',
       '空聊天屏',
-      '管理入口在单聊',
+      // change `global-settings-menu` 5.3：旧口径「管理入口在单聊（顶栏）」已不成立，
+      // 换成实际写进文档的新口径锚点；只换这一处，其余锚点与断言不动。
+      '左栏底部',
+      '设置',
+      '单聊与群聊都能打开',
     ]) {
       _obs('布局锚点', anchor);
       expect(text, contains(anchor), reason: '文档缺少布局锚点 "$anchor"');

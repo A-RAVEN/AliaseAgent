@@ -1,0 +1,32 @@
+## 1. 锚点核对（不改产品代码）
+
+- [x] 1.1 读并列出本 change 要保留 / 要改的锚点，贴进执行记录：`web/src/App.tsx` 的 `panel` 状态、`overlay` 渲染分支与 `sidebarFooter` 槽；`web/src/components/ChatShell.tsx` 的 `<aside>` / `<main>` / `panel-overlay`；`web/src/components/ChatScreen.tsx` 的 `open-providers` / `open-templates`；`web/src/components/UserAvatarBlock.tsx` 的 `user-avatar-block`；`ProvidersPage` 的 `providers-page` / `providers-close` 与 `TemplatesPage` 的 `templates-page` / `templates-close`；`web/src/tokens.ts` 的 `spacingScale` / `radii` / `elevation`；`web/e2e/group.mjs` 里 4 处 `open-providers` 点击与既有的 `panel-overlay` 用例；`test/unit/web_management_docs_test.dart` 与 `test/unit/web_core_docs_test.dart` 的布局锚点；`Docs/user-guide/web-management.md` 与 `Docs/user-guide/web-core-shim.md` 的入口说法。失败判据：漏掉 4 处 `open-providers` 中任何一处、漏掉两份文档守卫中的任一份、或把 `user-avatar-block` 当成可以挪走的锚点时，先补清单再开工。
+
+## 2. 先写会红的 web e2e（真实 App）
+
+- [x] 2.1 红：在 `web/e2e/group.mjs`（puppeteer，真实 `web/dist` + 假核心）新增「全局设置菜单」用例，放在文件末尾最后的「5.3 群聊气泡 / 成员卡片 / 紧凑环」用例之后、自带夹具并在 `finally` 用 `resetToBaseSingle` 清场。断言：①`global-settings-button` 在 `session-sidebar` 内、其 `getBoundingClientRect().top` 小于 `user-avatar-block` 的 `top`；②点开后 `global-settings-menu` 出现、按钮 `aria-expanded="true"`、`[role="menuitem"]` 恰好 2 项、文字逐字「Provider 配置」「模板配置」、每项含 `<svg>`；③菜单向上浮出（菜单 rect 的 `bottom <= 按钮 rect 的 top + 1`）且左右不超出左栏；④点 `global-settings-item-providers` → `providers-page` 出现、`global-settings-menu` 消失；点 `providers-close` 后回到聊天屏，`current-session-title` 与打开前相同、消息条数不变；⑤切到群视图（`clickSessionRow` + 等 `group-view`）后按钮仍可见，点 `global-settings-item-templates` → `templates-page` 出现（本 change 的核心修复），关闭后 `group-view` 仍在、时间线行数不变；⑥`Escape` 与点菜单外都能关菜单，`Escape` 后 `document.activeElement` 是设置按钮；连点两次按钮得到「开 → 关」；⑦页面上 `open-providers` / `open-templates` 节点数为 0，菜单里没有「关于 / 反馈 / 登录」文字；⑧`SETTINGS_SHOT` / `SETTINGS_SHOT_GROUP` 两个环境变量分别 `page.screenshot` 留「单聊菜单打开」「群聊菜单打开」两张图并打印 `[SHOT]`。同时把该文件里 4 处直接点 `open-providers` 的地方改成 helper `openProvidersPage(page)`（先点 `global-settings-button` 再点 `global-settings-item-providers`），断言强度不变。跑 `cd web && npm run build && node e2e/group.mjs` 见红（找不到 `global-settings-button`）。失败判据：新用例只断言按钮存在，不断言菜单项数量 / 向上几何 / 群视图可达 / 旧按钮为 0；或顺手削弱既有用例断言时不算数。
+
+## 3. 实现（绿）
+
+- [x] 3.1 新建 `web/src/components/GlobalSettingsMenu.tsx`：props `onOpenProviders` / `onOpenTemplates`；按钮 `data-testid="global-settings-button"`、文字「设置」+ `Settings` 图标（`size={16}`、`aria-hidden`）、`aria-haspopup="menu"` / `aria-expanded`，可点面积沿用 `UserAvatarBlock` 的 `min-h-6` + `px-2 py-1` 先例；菜单 `data-testid="global-settings-menu"`、`role="menu"` / `aria-label="全局设置"`，两项是 `data-testid="global-settings-item-providers"` / `global-settings-item-templates` 的 `role="menuitem"` 按钮（`Server` / `FileText` 图标 + 文字「Provider 配置」「模板配置」）；向上浮出用 `absolute bottom-full`；几何与颜色只取 `spacingScale` / `radii` / `elevation` 生成的类名；点项先关菜单再回调；`pointerdown` 菜单外与 `Escape` 关闭、`Escape` 把焦点还给按钮。跑 `cd web && npm run build` 通过。失败判据：组件里出现裸 hex / Tailwind 任意值（`npm test` 的 tokens 守卫会红），或菜单项多于 / 少于 2 个时先改回设计。
+- [x] 3.2 `web/src/App.tsx` 在 `sidebarFooter` 里把 `<GlobalSettingsMenu onOpenProviders={() => setPanel('providers')} onOpenTemplates={() => setPanel('templates')} />` 放在 `<UserAvatarBlock … />` 之上，并停止向 `ChatScreen` 传 `onOpenProviders` / `onOpenTemplates`；`web/src/components/ChatScreen.tsx` 删除这两个 props、头部两个按钮与注释里的入口说法。跑 `cd web && npm run build && node e2e/group.mjs` 全绿（含 2.1 新用例与 4 处改过的旧用例）。失败判据：群视图下按钮不可见 / 点不到、`open-providers` 仍在 DOM、或既有 e2e 有用例变红时不算完成。
+
+## 4. web 侧回归与守卫
+
+- [x] 4.1 跑 `cd web && npm test`（vitest；`src/tokens.test.ts` 自动扫到 `GlobalSettingsMenu.tsx` 的裸值与间距），贴通过数。失败判据：`spacingScale` 以外的间距、裸 hex、或任意 Tailwind 值出现在新组件里时不算完成。
+- [x] 4.2 跑 `cd web && npm run build:harness && node e2e/layout.mjs`（挂架不变；聊天屏布局 / 气泡 / 头像用例全绿），贴每条通过计数。失败判据：任一既有布局用例变红、或为了让新代码过而改了 `web/e2e/layout.mjs` 的断言时不算完成。
+
+## 5. 面向用户文档（与实现同 change）
+
+- [x] 5.1 改 `Docs/user-guide/web-management.md`：把「顶栏的 `Providers` 与「模板」按钮打开管理页」「顶栏 `Providers`：Provider 管理页」「顶栏「模板」：Agent 模板页」改成「左栏底部的「设置」→「Provider 配置 / 模板配置」」；把「管理入口在单聊顶栏：群聊打开时顶栏没有…要先点回一个单聊」改成「入口在左栏底部，单聊 / 群聊 / 空选中都能打开，管理页只覆盖主区」；并写明菜单**恰好两项**（Provider 配置、模板配置）；两个管理页小节标题同步改成新的入口路径。其余段落（密钥不回显、引用守卫、生效时机、RPC 表）不动。失败判据：`grep -n "顶栏" Docs/user-guide/web-management.md` 仍命中管理入口相关句子时不算完成。
+- [x] 5.2 改 `Docs/user-guide/web-core-shim.md` 的「打开聊天屏」清单：把以 `管理入口在单聊顶栏` 开头的那一条改成「管理入口在左栏底部（「设置」→「Provider 配置 / 模板配置」），单聊与群聊都能打开」；「侧栏用户头像」那条补一句「设置菜单在头像块上方」。失败判据：`grep -n "管理入口在单聊" Docs/user-guide` 仍命中时不算完成。
+- [x] 5.3 改两份文档守卫：`test/unit/web_management_docs_test.dart` 的布局锚点用例把 `'管理入口在单聊顶栏'` 换成新口径锚点（实际写进文档的字符串，至少含 `'左栏底部'`、`'Provider 配置'`、`'模板配置'`、`'恰好两项'`）；`test/unit/web_core_docs_test.dart` 的布局锚点用例把 `'管理入口在单聊'` 换成实际写进文档的字符串（如 `'左栏底部'`、`'设置'`、`'单聊与群聊都能打开'`）。只改这两个过时锚点，其它断言、其它用例一律不动。跑 `flutter test test/unit/web_management_docs_test.dart test/unit/web_core_docs_test.dart` 全绿。失败判据：删掉任一用例、把断言换成只查「设置」两字的弱断言、或改了别的断言时不算完成。
+- [x] 5.4 核对 `README.md` 不需要改，并把依据写进执行记录：它的「配置」段落 `首次启动应用会弹出一个两步向导` 讲的是 Flutter 桌面应用（会话侧栏 `Providers` 入口）；web 管理屏索引条目（指向 `Docs/user-guide/web-management.md` 的那行）没有写入口位置。失败判据：把 Flutter 段落的入口说法当成 web 入口改掉、或 README 里其实写了旧 web 入口位置却漏改时不算完成。
+
+## 6. 视觉验收与整体校验
+
+- [x] 6.1 截图验收（主循环 `read_image`）：`cd web && npm run build` 后带 `SETTINGS_SHOT` / `SETTINGS_SHOT_GROUP` 跑 `node e2e/group.mjs` 留两张图，核对：按钮在左栏底部、头像块上方；菜单在按钮上方浮出、圆角、两项各带图标与文字、没有第三项、没被裁切；打开的管理页只盖主区、左栏仍可见。失败判据：只跑测试不看图、图里菜单被裁切 / 向下弹 / 出现第三项时不算通过。
+- [x] 6.2 `design_audit` 审计包含全局设置菜单的页面：以 `GROUP_KEEP=1` 后台跑 `node e2e/group.mjs`，对回显的 `http://127.0.0.1:<port>/` 在 1280 宽跑 `design_audit`（菜单默认关闭，开放态由 6.1 截图核对），确认没有新增低对比 / 过小控件 / 横向溢出；报新违规就修到不新增，或按既有口径显式说明 deliberate 例外（如按钮高度沿用 `min-h-6` 先例）。失败判据：不跑审计却声称通过、或新增违规不修也不说明时不算完成。
+- [x] 6.3 全量 web 测试：`cd web && npm run test:all`（vitest + `build:harness` + `node e2e/layout.mjs` + `build` + `node e2e/group.mjs`），贴每条命令的通过 / 失败计数；再单独跑 `flutter test test/unit/web_management_docs_test.dart test/unit/web_core_docs_test.dart`。失败判据：只跑其中一段、任一用例红、或拿上一轮结果当本轮时不算完成。
+- [x] 6.4 静态检查与残留 grep：`flutter analyze`（改动文件不得新增问题）；grep 核对 `web/src` 不再有 `open-providers` / `open-templates`，`web/e2e` 不再有直接点这两个 testid 的语句（只剩新 helper），`Docs/user-guide` 不再有「管理入口在单聊」旧口径。失败判据：grep 仍命中旧入口，或 analyze 在改动文件上报新问题时不算完成。
+- [x] 6.5 分层覆盖自查（写进执行记录，不是跑命令）：web 渲染交互 → `web/e2e/group.mjs`（真实 App：菜单几何 / 恰好两项 / 群单聊可达 / 旧入口为 0）与 `web/e2e/layout.mjs`（回归）；web 样式守卫 → `web/src/tokens.test.ts`（扫到新组件）；Dart 文档守卫 → `test/unit/web_management_docs_test.dart` 与 `test/unit/web_core_docs_test.dart`；`test/widget` / `test/integration` / `sidecar/test` / `test/smoke` / `integration_test --tags live` 不适用（不改 Flutter 控件、不改 RPC、不改 C++、不改构建脚本、不改模型装配）。失败判据：声称某层通过而实际没跑、或改动其实碰到了某层却声称不适用时不算完成。

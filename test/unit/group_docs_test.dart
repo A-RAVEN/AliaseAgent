@@ -57,7 +57,7 @@ void main() {
         reason: 'README 的功能文档索引必须加入群聊文档');
   });
 
-  test('① 解析 RPC 表行：十个群聊方法逐个出现在第一列', () {
+  test('① 解析 RPC 表行：十一个群聊方法逐个出现在第一列', () {
     final markdown = doc.readAsStringSync();
     final rows = tableRows(markdown);
     // ignore: avoid_print
@@ -73,8 +73,8 @@ void main() {
     _obs('代码里的群聊方法', kCoreRpcMethodNames.where((m) => m.startsWith('group.')).toList());
     _obs('表格第一列', firstColumn);
     _obs('表里缺的方法', missing);
-    expect(kCoreRpcMethodNames.where((m) => m.startsWith('group.')).length, 10,
-        reason: 'group.chain 是第十个群聊方法（异步链状态查询）');
+    expect(kCoreRpcMethodNames.where((m) => m.startsWith('group.')).length, 11,
+        reason: 'group.setWorkspace 是第十一个群聊方法（切换共享工作路径）');
     expect(missing, isEmpty,
         reason: '群聊 RPC 表必须逐行列出这些方法（第一列），文档任意处出现不算过：$missing');
     expect(firstColumn, contains('group.update'),
@@ -310,7 +310,7 @@ void main() {
     }
   });
 
-  test('⑨ R.14/R.15 用户可见行为：group.chain 行含 error / 链失败显示真因 / 重启后工作区回落缺省（change `group-chat-layout` R.17）', () {
+  test('⑨ R.14/R.15 用户可见行为：group.chain 行含 error / 链失败显示真因 / 重启后工作区保留（change `group-chat-layout` R.17 / `custom-workspace`）', () {
     final markdown = doc.readAsStringSync();
     // **按表行**断言：整篇出现 `error` 早就成立（`steps` 段就写了），那种锚点修前也红不了。
     final rows = tableRows(markdown);
@@ -328,7 +328,9 @@ void main() {
     expect(hasErrorField, isTrue,
         reason: 'group.chain 表行必须写出 error 字段（失败真因；整篇子串 `error` 不算过）');
 
-    for (final anchor in <String>['链失败显示真因', '重启后工作区回落缺省']) {
+    // change `custom-workspace`：工作路径已持久化，旧锚点「重启后工作区回落缺省」不再成立；
+    // 换成文档里的新句（只换锚点，其它断言不动）。
+    for (final anchor in <String>['链失败显示真因', '重启后工作区保留']) {
       _obs('R.14/R.15 文档锚点', anchor);
       expect(markdown, contains(anchor), reason: '群聊文档缺少锚点「$anchor」');
     }

@@ -170,6 +170,10 @@ abstract class ISidecar {
   /// 幂等地保证 `sessionId` 对应的上下文存在。返回这次是否新建。
   /// 新建时（且给了 `defaultWorkspace`）由桥设置该上下文的工作区；已存在时
   /// 不覆盖已有工作区。空名字与保留名会抛错（C++ 侧拒绝，桥不静默吞掉）。
+  ///
+  /// change `custom-workspace` design D11：新建时设定工作区**失败**会先销毁刚建的
+  /// 上下文、再抛 `StateError('set_workspace failed: …')` —— 绝不留下空工作区上下文
+  /// （那会让文件工具对绝对路径不设界）。
   Future<bool> ensureContext(String sessionId, {String? defaultWorkspace});
 
   /// 销毁上下文：先拒绝新调用、等该上下文的排队请求与回调处理结束，再异步
@@ -413,7 +417,20 @@ class SidecarBridge implements ISidecar {
     }
     final created = parsed['created'] == true;
     if (created && defaultWorkspace != null && defaultWorkspace.isNotEmpty) {
-      setWorkspace(sessionId, defaultWorkspace);
+      // change `custom-workspace` design D11：设定工作区失败 MUST NOT 当无事发生。
+      // 留在**空工作区**的上下文一旦被后续 ensure 复用，文件工具对绝对路径就不再设界
+      // （静默 allow-all）。所以先清掉刚建的上下文，再把可归因错误抛出去。
+      final error = setWorkspace(sessionId, defaultWorkspace);
+      if (error != null && error.isNotEmpty) {
+        try {
+          await disposeContext(sessionId);
+        } catch (disposeError) {
+          // 清理失败不掩盖根因：把两件事都写进错误文本。
+          throw StateError(
+              'set_workspace failed: $error（清理新建上下文也失败：$disposeError）');
+        }
+        throw StateError('set_workspace failed: $error');
+      }
     }
     _closing.remove(sessionId);
     return created;

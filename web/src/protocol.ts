@@ -46,6 +46,14 @@ export interface Session {
    * （`kDefaultMaxReactionRounds`），界面以默认值占位显示。单会话也写该字段。
    */
   maxRounds: number | null;
+  /**
+   * 工作路径**设置值**（change `custom-workspace` D6 / D8）。
+   *
+   * `null` = 未设置 ⇒ 用缺省 `ConfigService.homeDir`，界面显示「缺省（应用主目录）」。
+   * **必填**（不是可选）：核心每次序列化都写该键，`null` 也是契约的一部分；
+   * 声明成可选会掩盖夹具遗漏。单聊与组共用该字段（组的就是组的共享工作区）。
+   */
+  workspace: string | null;
 }
 
 /**
@@ -638,4 +646,6 @@ export const GROUP_RPC_METHODS = [
   'group.member.update',
   'group.send',
   'group.view',
+  // change `custom-workspace`：切换组的共享工作路径（第十一个群聊方法）。
+  'group.setWorkspace',
 ] as const;

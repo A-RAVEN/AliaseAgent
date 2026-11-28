@@ -168,6 +168,8 @@ function makeSessions(count: number): Session[] {
     overrides: null,
     reactionsEnabled: true,
     maxRounds: null,
+    // 工作路径设置值（change `custom-workspace`）：null = 未设置、用缺省主目录。
+    workspace: null,
   }));
 }
 
@@ -615,6 +617,8 @@ function Harness({ scenario }: { scenario: HarnessScenario }) {
       overrides: null,
       reactionsEnabled: true,
       maxRounds: null,
+      // 新建会话不带工作路径：显示「缺省（应用主目录）」。
+      workspace: null,
     };
     setSessions((previous) => [created, ...previous]);
     setCurrentSessionId(created.id);

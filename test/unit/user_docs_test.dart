@@ -126,6 +126,16 @@ const _otherCodeNames = <String, String>{
   'rename_from': 'lib/core/headless_core.dart',
   // 会话表里的模板引用列名（模板删除守卫讲的"悬空引用"就是它）。
   'agent_type': 'lib/models/session.dart',
+  // 会话 / 组的工作路径设置值（change `custom-workspace`）：不是配置键，是
+  // `sessions.workspace` 列；文档讲「显示 / 切换 / 落库」时用反引号写它，到 Session
+  // 的读写字段里核对存在性。
+  'workspace': 'lib/models/session.dart',
+  // 文件夹选择框（`workspace.listDirs`）回包的字段名（change `custom-workspace` 返工
+  // 任务 12.7）：用户文档讲「列子目录 / 上级 / 存在性」时用反引号写出它们；不是配置
+  // 键也不是工具参数，到产生它们的 `WorkspaceDirListing` / `WorkspaceDirEntry` 里核对。
+  'parent': 'lib/services/workspace.dart',
+  'directories': 'lib/services/workspace.dart',
+  'exists': 'lib/services/workspace.dart',
   // 自发反应的开关与反应链词汇（change `group-reactive-mode`）：用户文档讲开关、哨兵、
   // 步骤状态与调度时用反引号写出这些名字。它们不是配置键（开关是 sessions 列）也不是
   // 工具参数，但确实是代码里的名字 —— 逐条指到它出现的文件。

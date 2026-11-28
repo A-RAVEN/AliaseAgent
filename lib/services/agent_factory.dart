@@ -277,7 +277,15 @@ class AgentFactory {
       callbacks: callbacks,
       subagentRunner: subagentRunner,
     );
-    await agent.ensureContext(defaultWorkspace: child?.workspace);
+    // change `custom-workspace` design D3：单聊恢复时把**持久化工作区**作为上下文缺省；
+    // 一次性子运行仍优先父上下文实际工作区（`child.workspace`）。`null` ⇒ 不传，由
+    // `Agent.ensureContext` 沿用 `ConfigService.homeDir`（缺省口径不变）。
+    // 子运行的值是**继承来的运行期值**（父上下文建立时已校验），不再按用户输入校验：
+    // 真实 sidecar 的 set_workspace 仍会拒绝失效路径（桥按 D11 处置），不会 allow-all。
+    await agent.ensureContext(
+      defaultWorkspace: child?.workspace ?? session.workspace,
+      validateWorkspace: child == null,
+    );
     await agent.restore();
     registry.register(agent);
     return agent;

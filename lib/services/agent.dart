@@ -36,6 +36,7 @@ import 'summary_node_repository.dart';
 import 'tool_catalog.dart';
 import 'tool_group_planner.dart';
 import 'tool_result_text.dart';
+import 'workspace.dart';
 
 /// 界面订阅 Agent 事件的通道。
 ///
@@ -444,13 +445,69 @@ class Agent {
   ///
   /// [defaultWorkspace] 缺省是应用主目录；一次性子运行创建时传入父上下文实际
   /// 保存的工作区，避免把"父子工作区相同"建立在主目录这个默认值上。
-  Future<bool> ensureContext({String? defaultWorkspace}) async {
+  ///
+  /// change `custom-workspace` D4 / design D11：带 [defaultWorkspace] 时**先校验**
+  /// （绝对路径 / 存在 / 是目录），不合法直接抛 [WorkspaceUnavailableException] ——
+  /// 校验发生在调 sidecar **之前**，所以失败不会留下空工作区上下文（allow-all）。
+  /// 桥层对「校验后目录被删」的竞态另有一道处置（`SidecarBridge.ensureContext`）。
+  ///
+  /// [validateWorkspace] = false 只用于**继承值**（一次性子运行继承父上下文实际保存的
+  /// 工作区）：那是 sidecar 里的运行期值、不是用户这次输入，父上下文建立时已校验过；
+  /// 真实 sidecar 的 `set_workspace` 仍会拒绝不存在 / 非目录路径（桥按 D11 处置），
+  /// 不因跳过这一道而变成 allow-all。
+  Future<bool> ensureContext(
+      {String? defaultWorkspace, bool validateWorkspace = true}) async {
     if (_disposed) throw AgentDisposedException(sessionId);
     if (_retiring) throw AgentRetiredException(sessionId, agentTypeName);
+    if (defaultWorkspace != null && validateWorkspace) {
+      final problem = workspaceProblem(defaultWorkspace);
+      if (problem != null) {
+        throw WorkspaceUnavailableException(
+          path: defaultWorkspace,
+          // 带会话与模板名：同一个失效路径可能出现在多个会话里，错误要能定位到对象。
+          reason: '$problem（会话 "$sessionId" / 模板 "$agentTypeName"）',
+          sessionId: sessionId,
+        );
+      }
+    }
     final created = await sidecar.ensureContext(handle,
         defaultWorkspace: defaultWorkspace ?? ConfigService.homeDir);
     if (created) _workspaceInitialized = true;
     return created;
+  }
+
+  /// 原地切换该实例上下文的工作路径（change `custom-workspace` design D6 / D7）。
+  ///
+  /// 拒绝三种状态：已销毁 / 退役中 / **正在生成**（`isStreaming`）—— 生成中换根会让
+  /// 同一轮里的工具边界跳变，调用方（RPC）也会先判 busy；这里再兜一层。
+  ///
+  /// 顺序钉死：**先校验，再让 sidecar 生效**。校验不合法或 sidecar 拒绝时抛
+  /// [WorkspaceUnavailableException]，**不改任何状态**（上下文工作区保持原值）。
+  /// 成功后才把 [_workspaceInitialized] 置真。
+  Future<void> setWorkspace(String path) async {
+    if (_disposed) throw AgentDisposedException(sessionId);
+    if (_retiring) throw AgentRetiredException(sessionId, agentTypeName);
+    if (_streaming) {
+      throw StateError(
+          'agent_busy: 会话 "$sessionId" 正在生成，不能切换工作路径（不排队、值未改动）');
+    }
+    final problem = workspaceProblem(path);
+    if (problem != null) {
+      throw WorkspaceUnavailableException(
+        path: path,
+        reason: problem,
+        sessionId: sessionId,
+      );
+    }
+    final error = sidecar.setWorkspace(handle, path);
+    if (error != null && error.isNotEmpty) {
+      throw WorkspaceUnavailableException(
+        path: path,
+        reason: 'sidecar 拒绝了该工作路径：$error',
+        sessionId: sessionId,
+      );
+    }
+    _workspaceInitialized = true;
   }
 
   /// 恢复/装配该实例的视图序列。
@@ -749,6 +806,35 @@ class Agent {
     return '本群成员：${names.join('、')}。你是「${self.displayName}」。';
   }
 
+  /// 本轮的工作区段（change `custom-workspace` design D5）。
+  ///
+  /// 每轮读**一次** `get_workspace`：`ok && 非空` ⇒ 正常段（含该轮实际路径）；
+  /// 读失败 / 空串 ⇒ 不可用段 + 一行日志（不省略整段、不伪造目录），该轮继续完成。
+  /// 组的分界：成员轮在装配前已由 `GroupService` 对齐到组工作区；组工作区读不到时
+  /// 由那一步以 `workspace_unavailable` 拒绝，不进入这里的不可用分支。
+  Future<String> _roundWorkspaceSection() async {
+    final WorkspaceQueryResult read;
+    try {
+      read = sidecar.getWorkspace(handle);
+    } catch (error) {
+      final reason = 'get_workspace 抛错：$error';
+      debugPrint('[AliasAgent] 工作区不可用（句柄 $handle）：$reason');
+      return workspaceUnavailablePromptSection(reason);
+    }
+    if (!read.ok) {
+      final reason = 'get_workspace 失败（${read.code}）：${read.error}';
+      debugPrint('[AliasAgent] 工作区不可用（句柄 $handle）：$reason');
+      return workspaceUnavailablePromptSection(reason);
+    }
+    final path = (read.workspace ?? '').trim();
+    if (path.isEmpty) {
+      const reason = 'get_workspace 返回 ok 但工作区为空串';
+      debugPrint('[AliasAgent] 工作区不可用（句柄 $handle）：$reason');
+      return workspaceUnavailablePromptSection(reason);
+    }
+    return workspacePromptSection(path);
+  }
+
   /// 反应轮的结构化收尾（R.10 / design D5）：读 `group_react` 的 `pass` / `message`，
   /// 决定是否写公开行。**绝不回退到 `[PASS]` 文本匹配**，也不为 `group_react` 写 tool 行。
   Future<AgentRunResult> _finishStructuredReaction({
@@ -910,6 +996,11 @@ class Agent {
     // 装配**（下一条消息）起生效。窗口/工具/模型/系统提示词仍读冻结的 [config]。
     final roundThinking = await _resolveRoundThinking();
 
+    // change `custom-workspace` design D5：**一轮开始时读一次**该实例上下文当前的工作区，
+    // 并把段文本冻在本轮局部变量里 —— 同一轮的所有模型请求（含工具轮）共用它，所以在途
+    // 轮不会中途换根；用户切换后**下一轮**装配才读到新值。
+    final workspaceSection = await _roundWorkspaceSection();
+
     // 实际发送的工具定义 = 本实例生效配置 ∩ 工具目录；未知名字在这里显式失败（
     // 创建路径已经校验过一次，这里保持同一判据，避免绕过目录）。
     //
@@ -1038,7 +1129,8 @@ class Agent {
 
       final thinkingMode = roundThinking.mode;
       final thinkingEffort = roundThinking.effort;
-      // 系统提示词：模板提示 + 每轮动态段（`guard.inject()`）+ 技能段 + 日期。
+      // 系统提示词：模板提示 + 每轮动态段（`guard.inject()`）+ 工作区段 + 技能段 + 日期
+      // （工作区段见 change `custom-workspace` D5：插在 guard 之后、技能段之前，只追加）。
       // 技能段紧随 `guard.inject()` 之后（change `add-skill-mechanism` design D4），
       // **不受模板工具清单影响**：每个模板都收到它。段内分两种形态（返工 5.1，
       // design D6）：有生效技能 = "Available skills" 标题 + 清单 + 创建简则；没有生效
@@ -1057,7 +1149,11 @@ class Agent {
       }
       systemPromptBuffer
         ..write('\n')
-        ..write(guard.inject());
+        ..write(guard.inject())
+        // change `custom-workspace` D5：工作区段插在 `guard.inject()` 之后、技能段之前。
+        // 只追加，不替换 `config.systemPrompt`（模板提示词 / 组角色说明 / 反应提示都在）。
+        ..write('\n')
+        ..write(workspaceSection);
       if (skillSection.isNotEmpty) {
         // 现在的 `promptSection` 恒非空（空集合也返回简则），这里保留判断是防御性写法：
         // 段真为空时仍不留空行。

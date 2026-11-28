@@ -392,6 +392,12 @@ class FakeSidecar implements ISidecar {
     }
   }
 
+  /// 已经弹到自己的闸门、正在等的 sendMessage 数量。
+  ///
+  /// 用例要"先确认这一轮真的被挂住、再断言 / 再放行"时用它 —— 只看到 `busy` 可能
+  /// 只是执行器刚启动（成员轮还没走到 `sendMessage`），此时 `releaseGate` 会落空。
+  int get awaitingGateCount => _awaitingGates.length;
+
   /// True when events remain queued (e.g. a tool-loop turn was aborted
   /// before consuming its events — 12.4).
   bool get hasQueuedEvents => _events.isNotEmpty;
@@ -482,6 +488,11 @@ class FakeSidecar implements ISidecar {
   String? setWorkspace(String handle, String path) {
     toolHandles.add(handle);
     setWorkspaceCalls.add((handle: handle, path: path));
+    // 真实 `set_workspace` 成功即改写该上下文保存的工作区，随后 `get_workspace`
+    // 读回的就是它。桩照做（否则组切换传播 / 成员轮对齐只能读调用记录、读不到
+    // "生效值"，与 PRODUCT 路径的断言口径不一致）。失败处置不在这里模拟 ——
+    // 那条路径由真实 DLL 的 `sidecar_bridge_test` 覆盖（design D11）。
+    workspaceByHandle[handle] = path;
     return null;
   }
 

@@ -67,6 +67,17 @@ class Session {
   /// （`-32602`），不静默截断。单会话行也带该列，但值不影响单 Agent 行为。
   final int? maxRounds;
 
+  /// 会话 / 组的**工作路径设置值**（`sessions.workspace`，可空；change
+  /// `custom-workspace` design D2 / D4）。
+  ///
+  /// `null` = **未设置**：恢复时沿用产品既有缺省 `ConfigService.homeDir`（本 change
+  /// 不改缺省口径），库里的 NULL 不会被回填成主目录。组会话的该列就是组的**共享**
+  /// 工作区（成员继承，没有私有工作区）。
+  ///
+  /// 存的是「设置值」（规范化后的用户输入，保留其分隔符风格）；上下文里的是 sidecar
+  /// 规范化后的「生效值」。两者指向同一目录，比较用 `p.equals`。
+  final String? workspace;
+
   const Session({
     required this.id,
     required this.title,
@@ -78,6 +89,7 @@ class Session {
     this.overridesJson,
     this.reactionsEnabled = true,
     this.maxRounds,
+    this.workspace,
   }) : assert(
           kind == kindSingle || kind == kindGroup,
           'kind 只能是 single 或 group：收到 "$kind"',
@@ -109,6 +121,8 @@ class Session {
       overridesJson: row['overrides_json'] as String?,
       reactionsEnabled: reactionsEnabled,
       maxRounds: maxRounds,
+      // 缺列（旧库 / 手工夹具）与显式 NULL 都读成 null：语义是「未设置、用缺省」。
+      workspace: row['workspace'] as String?,
     );
   }
 
@@ -123,6 +137,7 @@ class Session {
         'overrides_json': overridesJson,
         'reactions_enabled': reactionsEnabled ? 1 : 0,
         'max_reaction_rounds': maxRounds,
+        'workspace': workspace,
       };
 
   Session copyWith({
@@ -134,6 +149,8 @@ class Session {
     bool? reactionsEnabled,
     int? maxRounds,
     bool clearMaxRounds = false,
+    String? workspace,
+    bool clearWorkspace = false,
   }) {
     return Session(
       id: id,
@@ -149,6 +166,8 @@ class Session {
       // `maxRounds: null` 与「不传」在命名参数上不可区分（同 `clearOverrides`
       // 的先例）：要恢复默认显式传 `clearMaxRounds: true`。
       maxRounds: clearMaxRounds ? null : (maxRounds ?? this.maxRounds),
+      // workspace 同理：`null` 与「不传」不可区分，清空要显式传 `clearWorkspace: true`。
+      workspace: clearWorkspace ? null : (workspace ?? this.workspace),
     );
   }
 }

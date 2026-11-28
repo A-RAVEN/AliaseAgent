@@ -83,7 +83,7 @@ void main() {
     harness.sidecar.queueDone(inputTokens: 1, outputTokens: 1);
   }
 
-  test('R.3 十个群聊方法注册且与 kCoreRpcMethodNames 一致', () async {
+  test('R.3 十一个群聊方法注册且与 kCoreRpcMethodNames 一致', () async {
     const expected = [
       'group.create',
       'group.update',
@@ -95,16 +95,17 @@ void main() {
       'group.member.update',
       'group.send',
       'group.view',
+      'group.setWorkspace',
     ];
     // ignore: avoid_print
     print('[OBS] 核心注册的群聊方法='
         '${harness.core.rpcMethods.where((m) => m.startsWith('group.')).toList()}');
-    expect(expected.length, 10);
+    expect(expected.length, 11);
     for (final method in expected) {
       expect(kCoreRpcMethodNames, contains(method));
       expect(harness.core.rpcMethods, contains(method));
     }
-    expect(kCoreRpcMethodNames.where((m) => m.startsWith('group.')).length, 10);
+    expect(kCoreRpcMethodNames.where((m) => m.startsWith('group.')).length, 11);
   });
 
   test('R.3 group.create 带 reactionsEnabled / maxRounds 可回读；越界 -32602', () async {

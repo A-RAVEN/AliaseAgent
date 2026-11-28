@@ -112,6 +112,90 @@ const FAKE_AVATAR_PATH = 'uploaded/fake-agent-avatar.png';
 const FAKE_BROKEN_AVATAR_PATH = 'uploaded/fake-missing-avatar.png';
 const FAKE_AVATAR_DATA_URL =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/wD/2y6JAAAAAElFTkSuQmCC';
+
+// ---------------------------------------------------------------------------
+// 文件夹选择对话框的假目录树（change `custom-workspace` 返工任务 12.5）
+//
+// 页面只点选、不手输：目录列表由核心的 `workspace.listDirs` 给。假核心不做磁盘访问，
+// 这棵树就是固定夹具 —— 起点 = 会话 / 群的工作路径；省略 `path` ⇒ 假「应用主目录」。
+// 叶子目录里 `locked` 故意让 `setWorkspace` 拒绝（造「框内就地报错」）。
+// ---------------------------------------------------------------------------
+const PICKER_HOME = 'C:\\Users\\ws-tester';
+const LONG_SEGMENTS = [
+  '一个非常长的工作目录名-用于验证单行截断',
+  'src',
+  'deeply',
+  'nested',
+  'package',
+];
+const LONG_WORKSPACE = ['C:\\work', ...LONG_SEGMENTS].join('\\');
+/** 对话框里会点进去 / 选中的两个子目录（假目录树的叶子）。 */
+const WORKSPACE_NEW = `${LONG_WORKSPACE}\\alpha`;
+const WORKSPACE_GROUP_NEW = `${LONG_WORKSPACE}\\beta`;
+/** 假核心会拒绝保存的目录（「目录不可用」注入）。 */
+const WORKSPACE_LOCKED = `${LONG_WORKSPACE}\\locked`;
+const WORKSPACE_BAD = WORKSPACE_LOCKED;
+/** 40 个子目录的夹具（返工任务 12.10：长列表必须在框内滚动，不能把框撑满屏）。 */
+const PICKER_CROWDED = 'C:\\crowded';
+const PICKER_CROWDED_CHILDREN = Array.from(
+  { length: 40 },
+  (_, index) => `folder-${String(index + 1).padStart(2, '0')}`,
+);
+/** 「此电脑」虚拟根 sentinel（返工任务 12.11；核心 `workspace.listDirs` 同字符串）。 */
+const PICKER_DRIVES_ROOT = '@drives';
+/** 假核心列出的盘符（固定夹具：不依赖真机是否真有 D:）。 */
+const PICKER_DRIVES = ['C:\\', 'D:\\'];
+
+/** 路径 → 子目录名（只列子目录）。父目录必须也在树里，否则「上级」会列举失败。 */
+const PICKER_TREE = (() => {
+  const tree = new Map();
+  tree.set('C:\\work', [LONG_SEGMENTS[0]]);
+  let current = 'C:\\work';
+  for (let index = 0; index < LONG_SEGMENTS.length; index += 1) {
+    current = `${current}\\${LONG_SEGMENTS[index]}`;
+    tree.set(
+      current,
+      index + 1 < LONG_SEGMENTS.length
+        ? [LONG_SEGMENTS[index + 1]]
+        : ['alpha', 'beta', 'locked'],
+    );
+  }
+  for (const leaf of ['alpha', 'beta', 'locked']) {
+    tree.set(`${LONG_WORKSPACE}\\${leaf}`, []);
+  }
+  // 返工 12.10：40 个子目录，用来验「框有高度上限、列表内部滚动」。
+  tree.set(PICKER_CROWDED, PICKER_CROWDED_CHILDREN);
+  // 返工 12.12：每个子目录也是可进入的叶子 —— 用「多目录 ↔ 空叶子」前后对比框高是否恒定。
+  for (const name of PICKER_CROWDED_CHILDREN) tree.set(`${PICKER_CROWDED}\\${name}`, []);
+  // 返工 12.11：盘符根 + 第二个盘（D:）的固定夹具，「此电脑」不在树里（虚拟根单独回包）。
+  tree.set('C:\\', ['work', 'crowded']);
+  tree.set('D:\\', ['projects']);
+  tree.set('D:\\projects', []);
+  tree.set(PICKER_HOME, ['Documents', 'Projects']);
+  tree.set(`${PICKER_HOME}\\Documents`, []);
+  tree.set(`${PICKER_HOME}\\Projects`, []);
+  return tree;
+})();
+
+/**
+ * 假核心的「上级」计算（返工任务 12.11）：盘符根 → 「此电脑」虚拟根；普通目录 → 上一级。
+ * 取代原先 `lastIndexOf('\\') <= 2 ? null` 的写法（那会把 `C:\work` 也算成没有上级）。
+ */
+function pickerParentOf(dir) {
+  const normalized = dir.replace(/[\\/]+$/, '');
+  if (/^[A-Za-z]:$/.test(normalized)) return PICKER_DRIVES_ROOT;
+  const index = Math.max(normalized.lastIndexOf('\\'), normalized.lastIndexOf('/'));
+  if (index < 0) return null;
+  const parent = normalized.slice(0, index);
+  if (/^[A-Za-z]:$/.test(parent)) return `${parent}\\`;
+  return parent;
+}
+
+/** 拼假目录的子路径：盘符根已带尾分隔符时不要拼出双分隔符（`C:\\crowded`）。 */
+function pickerJoin(dir, name) {
+  return dir.endsWith('\\') || dir.endsWith('/') ? `${dir}${name}` : `${dir}\\${name}`;
+}
+
 let nextId = 1;
 const sessions = [
   {
@@ -146,7 +230,7 @@ function breakdown(windowTokens, raw, level1, level2) {
   };
 }
 
-function newGroup(title) {
+function newGroup(title, workspace = null) {
   const id = `g-${nextId++}`;
   const session = {
     id,
@@ -161,6 +245,8 @@ function newGroup(title) {
     reactionsEnabled: true,
     // 反应轮数上限（R.4 / D13）：null = 用产品默认；界面以默认值占位。
     maxRounds: null,
+    // 工作路径设置值（change `custom-workspace`）：null = 未设置（显示缺省文案）。
+    workspace: workspace ?? null,
   };
   sessions.push(session);
   groups.set(id, {
@@ -484,6 +570,8 @@ const groupLoadFlags = {
   configMissing: false,
   // R.4：没有真实链时也能造「链在跑」的只读状态（`group.list` 的 busy/runningMemberId）。
   busyFor: null,
+  // change `custom-workspace`：让 setWorkspace 对这个路径报「不存在」（造保存失败态）。
+  workspaceFailPath: null,
 };
 
 /** 链启动闸门（2.5：先切到成员视图再放行，制造「提示产生时不在群聊标签」）。 */
@@ -595,13 +683,103 @@ function handleRpc(socket, request) {
       kind: 'single',
       overrides: null,
       reactionsEnabled: true,
+      maxRounds: null,
+      // change `custom-workspace`：`session.create {workspace}` 原样返回（假核心不做目录校验）。
+      workspace: params.workspace ?? null,
     };
     sessions.unshift(session);
     return reply(socket, id, { session });
   }
   if (method === 'group.create') {
-    const group = newGroup(params.title ?? '新组');
+    const group = newGroup(params.title ?? '新组', params.workspace ?? null);
     return replyLogged(socket, id, method, { group });
+  }
+  // ---------------------------------------------------------------------------
+  // 文件夹选择对话框（change `custom-workspace` 返工任务 12.5）：只列子目录；省略
+  // path ⇒ 假「应用主目录」。非法 / 不存在的目录回可归因 `-32602`（不静默空列表）。
+  // ---------------------------------------------------------------------------
+  if (method === 'workspace.listDirs') {
+    const requested = params.path;
+    if (requested !== undefined && requested !== null && typeof requested !== 'string') {
+      return fail(socket, id, 'Invalid params: path 必须是字符串或省略');
+    }
+    const raw = typeof requested === 'string' ? requested.trim() : '';
+    const dir = raw.length === 0 ? PICKER_HOME : raw;
+    // 返工 12.11：「此电脑」虚拟根只列盘符；它不是真实目录（isDirectory=false），
+    // 界面据此禁用「选择此目录」。
+    if (dir === PICKER_DRIVES_ROOT) {
+      return reply(socket, id, {
+        path: PICKER_DRIVES_ROOT,
+        parent: null,
+        directories: PICKER_DRIVES.map((root) => ({
+          name: root.replace(/\\+$/, ''),
+          path: root,
+        })),
+        exists: true,
+        isDirectory: false,
+      });
+    }
+    const children = PICKER_TREE.get(dir);
+    if (children === undefined) {
+      return fail(socket, id, `工作路径「${dir}」不存在：请改成一个已存在的绝对目录`);
+    }
+    return reply(socket, id, {
+      path: dir,
+      parent: pickerParentOf(dir),
+      directories: [...children]
+        .sort((left, right) => left.localeCompare(right))
+        .map((name) => ({ name, path: pickerJoin(dir, name) })),
+      exists: true,
+      isDirectory: true,
+    });
+  }
+  // ---------------------------------------------------------------------------
+  // 工作路径切换（change `custom-workspace`）：payload 由 rpcLog 记录；失败用
+  // `groupLoadFlags.workspaceFailPath` 注入（演示"核心可归因错误"）。
+  // ---------------------------------------------------------------------------
+  if (method === 'session.setWorkspace') {
+    const session = sessions.find((entry) => entry.id === params.sessionId);
+    if (!session) return fail(socket, id, `会话 ${params.sessionId} 不存在`);
+    if (session.kind !== 'single') {
+      return fail(socket, id, `会话 ${params.sessionId} 是组会话：请用 group.setWorkspace`);
+    }
+    if (typeof params.workspace !== 'string' || params.workspace.trim().length === 0) {
+      return fail(socket, id, 'workspace 必填且必须是非空字符串');
+    }
+    if (
+      groupLoadFlags.workspaceFailPath !== null &&
+      params.workspace === groupLoadFlags.workspaceFailPath
+    ) {
+      return fail(socket, id, `工作路径「${params.workspace}」不可用：目录没有访问权限（e2e 注入）`);
+    }
+    session.workspace = params.workspace;
+    session.updatedAt = Date.now();
+    return replyLogged(socket, id, method, { session });
+  }
+  if (method === 'group.setWorkspace') {
+    const group = groups.get(params.groupId);
+    if (!group) {
+      const single = sessions.find((entry) => entry.id === params.groupId);
+      if (single) {
+        return fail(socket, id, `会话 ${params.groupId} 是单聊会话：请用 session.setWorkspace`);
+      }
+      return fail(socket, id, `组 ${params.groupId} 不存在`);
+    }
+    if (group.busy || groupLoadFlags.busyFor === params.groupId) {
+      return fail(socket, id, '组正在运行反应链：busy，工作路径未改动（不排队）');
+    }
+    if (typeof params.workspace !== 'string' || params.workspace.trim().length === 0) {
+      return fail(socket, id, 'workspace 必填且必须是非空字符串');
+    }
+    if (
+      groupLoadFlags.workspaceFailPath !== null &&
+      params.workspace === groupLoadFlags.workspaceFailPath
+    ) {
+      return fail(socket, id, `工作路径「${params.workspace}」不可用：目录没有访问权限（e2e 注入）`);
+    }
+    group.session.workspace = params.workspace;
+    group.session.updatedAt = Date.now();
+    return replyLogged(socket, id, method, { group: describeGroup(group) });
   }
   if (method === 'session.rename') {
     const session = sessions.find((entry) => entry.id === params.sessionId);
@@ -1032,6 +1210,7 @@ function startServer() {
         groupLoadFlags.groupUpdateDelayMs = 0;
         groupLoadFlags.configMissing = false;
         groupLoadFlags.busyFor = null;
+        groupLoadFlags.workspaceFailPath = null;
       }
       if (q.has('messageQueryFailFor')) {
         groupLoadFlags.messageQueryFailFor = q.get('messageQueryFailFor');
@@ -1079,11 +1258,15 @@ function startServer() {
       if (q.has('busyFor')) {
         groupLoadFlags.busyFor = q.get('busyFor');
       }
+      if (q.has('workspaceFailPath')) {
+        groupLoadFlags.workspaceFailPath = q.get('workspaceFailPath');
+      }
       response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       response.end(JSON.stringify(groupLoadFlags));
       return;
     }
     // 造一条单聊；`front=1` 时排到会话列表首位（夹具，不是产品接口）。
+    // change `custom-workspace`：`workspace=` 给该单聊设工作路径（用于显示 / 切换用例）。
     if (requestPath === '/__seed_single') {
       const q = new URL(request.url ?? '/', 'http://127.0.0.1').searchParams;
       const session = {
@@ -1097,11 +1280,42 @@ function startServer() {
         overrides: null,
         reactionsEnabled: true,
         maxRounds: null,
+        workspace: q.get('workspace') ?? null,
       };
       if (q.get('front') === '1') sessions.unshift(session);
       else sessions.push(session);
       response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       response.end(JSON.stringify({ id: session.id, title: session.title }));
+      return;
+    }
+    // 造一个带工作路径、两个成员的组（change `custom-workspace` 群栏用例的夹具）。
+    if (requestPath === '/__seed_workspace_group') {
+      const q = new URL(request.url ?? '/', 'http://127.0.0.1').searchParams;
+      const seeded = newGroup(q.get('title') ?? '工作区组', q.get('workspace') ?? null);
+      const group = groups.get(seeded.id);
+      for (const name of ['甲', '乙']) {
+        group.members.push({
+          id: `mem-ws-${seeded.id}-${name}`,
+          name,
+          template: 'general',
+          removedAt: null,
+          overrides: null,
+          window: windows[group.members.length % windows.length],
+        });
+      }
+      pushMessage(group, { role: 'user', content: '工作路径夹具：用户先说一句' });
+      pushMessage(group, {
+        role: 'assistant',
+        content: '甲的公开结论（工作路径夹具）',
+        author: group.members[0].id,
+      });
+      const index = sessions.findIndex((session) => session.id === seeded.id);
+      if (index >= 0) {
+        const [entry] = sessions.splice(index, 1);
+        sessions.unshift(entry);
+      }
+      response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      response.end(JSON.stringify({ id: seeded.id, title: seeded.title }));
       return;
     }
     // 把一个会话排到首位（控制删除后「下一条」的类型）。
@@ -1734,6 +1948,18 @@ async function clickByTestId(page, testId) {
   await page.click(selector);
 }
 
+/**
+ * 打开 Provider 管理页（change `global-settings-menu` 2.1）。
+ *
+ * 管理入口收归**左栏底部**的全局设置菜单：先点「设置」按钮，再点「Provider 配置」。
+ * 原先直接点单聊头部旧按钮的四个用例统一走这里 —— 旧按钮已随 D6 撤除，
+ * 断言强度不变（仍然是"打开管理页后做原来那套壳层/删除断言"）。
+ */
+async function openProvidersPage(page) {
+  await clickByTestId(page, 'global-settings-button');
+  await clickByTestId(page, 'global-settings-item-providers');
+}
+
 // ---------------------------------------------------------------------------
 // 用例
 // ---------------------------------------------------------------------------
@@ -2194,11 +2420,25 @@ async function setGroupFlags(query) {
 }
 
 /** 造一条单聊（夹具）。 */
-async function seedSingle(title, { front = false } = {}) {
+async function seedSingle(title, { front = false, workspace = null } = {}) {
+  const query = new URLSearchParams({ title });
+  if (front) query.set('front', '1');
+  if (workspace !== null) query.set('workspace', workspace);
   const seeded = await fetch(
-    `${staticServer.url}__seed_single?title=${encodeURIComponent(title)}${front ? '&front=1' : ''}`,
+    `${staticServer.url}__seed_single?${query.toString()}`,
   ).then((response) => response.json());
   obs(`单聊夹具 ${title}`, seeded);
+  return seeded;
+}
+
+/** 造一个带工作路径、两个成员的组（change `custom-workspace` 夹具）。 */
+async function seedWorkspaceGroup(title, workspace) {
+  const query = new URLSearchParams({ title });
+  if (workspace !== null && workspace !== undefined) query.set('workspace', workspace);
+  const seeded = await fetch(
+    `${staticServer.url}__seed_workspace_group?${query.toString()}`,
+  ).then((response) => response.json());
+  obs(`工作区组夹具 ${title}`, seeded);
   return seeded;
 }
 
@@ -2559,7 +2799,7 @@ await run('1.5 管理面板只盖主区：列表仍唯一可点、滚动位置�
     obs('打开面板前的列表 scrollTop', scrollBefore);
     assert(scrollBefore > 0, `列表必须真的可滚动（scrollTop=${scrollBefore}）`);
 
-    await page.click('[data-testid="open-providers"]');
+    await openProvidersPage(page);
     await page.waitForSelector('[data-testid="providers-page"]', { timeout: 15000 });
     const panelState = await page.evaluate(() => {
       const lists = [...document.querySelectorAll('[data-testid="session-list"]')];
@@ -2615,7 +2855,7 @@ await run('1.5 管理面板只盖主区：列表仍唯一可点、滚动位置�
       { timeout: 15000 },
     );
     // 再开一次，点一个会话 ⇒ 面板关闭、主区切到该会话。
-    await page.click('[data-testid="open-providers"]');
+    await openProvidersPage(page);
     await page.waitForSelector('[data-testid="providers-page"]', { timeout: 15000 });
     await clickSessionRow(page, '单会话');
     await page.waitForFunction(
@@ -5042,7 +5282,7 @@ await run('R.10 删除当前会话关管理面板（成功关 / 失败保留）'
       { timeout: 15000 },
     );
     // 管理页打开（只盖主区，侧栏仍可点）。
-    await clickByTestId(page, 'open-providers');
+    await openProvidersPage(page);
     await page.waitForSelector('[data-testid="panel-overlay"]', { timeout: 15000 });
 
     // 成功分支：从侧栏真实删除当前会话 ⇒ 面板必须关闭，主区按下一条加载。
@@ -5067,7 +5307,7 @@ await run('R.10 删除当前会话关管理面板（成功关 / 失败保留）'
     );
 
     // 失败分支：假核心删除报错 ⇒ 面板保留、错误可见（不被 setPanel(null) 掩盖）。
-    await clickByTestId(page, 'open-providers');
+    await openProvidersPage(page);
     await page.waitForSelector('[data-testid="panel-overlay"]', { timeout: 15000 });
     const currentId = await page.evaluate(() => {
       const row = document.querySelector('[data-testid="session-row"]');
@@ -5720,6 +5960,1499 @@ await run('5.3 群聊气泡 / 成员卡片 / 紧凑环（连跑两遍不串味�
   await bubbleCaseOnce(1);
   await bubbleCaseOnce(2);
 });
+
+// ---------------------------------------------------------------------------
+// 全局设置菜单（change `global-settings-menu` 2.1 / design D1~D9）
+//
+// 单聊与群聊共用**左栏底部**这一个管理入口：菜单向上浮出、恰好两项、旧头部入口为 0。
+// `SETTINGS_SHOT` / `SETTINGS_SHOT_GROUP` 分别留「单聊菜单打开」「群聊菜单打开」两张图。
+// ---------------------------------------------------------------------------
+await run('全局设置菜单：左栏底部唯一管理入口（恰好两项 / 向上浮出 / 群聊可达 / 旧入口为 0）', async () => {
+  await resetToBaseSingle('设置菜单基础单聊');
+  const group = await seedDistinctGroup('设置菜单群', '阿设', '设置菜单群消息');
+  const page = await openPage();
+  try {
+    await page.waitForSelector('[data-testid="session-list"]', { timeout: 15000 });
+    await page.waitForSelector('[data-testid="message-list"]', { timeout: 15000 });
+    // ① 全局设置按钮必须在（找不到即红：这就是本 change 的入口本体）。
+    await page.waitForSelector('[data-testid="global-settings-button"]', { timeout: 15000 });
+
+    const before = await page.evaluate(() => ({
+      title: document.querySelector('[data-testid="current-session-title"]')?.textContent ?? '',
+      messageRows: document.querySelectorAll('[data-testid="message-row"]').length,
+      legacyProviders: document.querySelectorAll('[data-testid="open-providers"]').length,
+      legacyTemplates: document.querySelectorAll('[data-testid="open-templates"]').length,
+    }));
+    obs('打开菜单前的单聊屏', before);
+    assert(
+      before.legacyProviders === 0,
+      `单聊头部不得再有旧 Provider 入口，实测 ${before.legacyProviders} 个`,
+    );
+    assert(
+      before.legacyTemplates === 0,
+      `单聊头部不得再有旧模板入口，实测 ${before.legacyTemplates} 个`,
+    );
+    assert(
+      before.title.includes('设置菜单基础单聊'),
+      `首屏必须落在基础单聊，实测「${before.title}」`,
+    );
+
+    // ① 按钮在左栏底部、用户头像块上方，且可访问性属性齐备。
+    const buttonBox = await page.evaluate(() => {
+      const box = (node) => {
+        const rect = node?.getBoundingClientRect();
+        return rect === undefined
+          ? null
+          : {
+              top: rect.top,
+              bottom: rect.bottom,
+              left: rect.left,
+              right: rect.right,
+              width: rect.width,
+              height: rect.height,
+            };
+      };
+      const button = document.querySelector('[data-testid="global-settings-button"]');
+      const sidebar = document.querySelector('[data-testid="session-sidebar"]');
+      const avatarBlock = document.querySelector('[data-testid="user-avatar-block"]');
+      return {
+        inSidebar: button !== null && sidebar !== null && sidebar.contains(button),
+        label: button?.textContent?.trim() ?? '',
+        iconCount: button?.querySelectorAll('svg').length ?? 0,
+        ariaHaspopup: button?.getAttribute('aria-haspopup') ?? null,
+        ariaExpanded: button?.getAttribute('aria-expanded') ?? null,
+        button: box(button),
+        avatarBlock: box(avatarBlock),
+      };
+    });
+    obs('设置按钮的几何与可访问性', buttonBox);
+    assert(buttonBox.inSidebar, '设置按钮必须在 session-sidebar 内');
+    assert(
+      buttonBox.label.includes('设置'),
+      `按钮必须有可见文字「设置」，实测「${buttonBox.label}」`,
+    );
+    assert(buttonBox.iconCount >= 1, '按钮必须带 Settings 图标（<svg>）');
+    assert(
+      buttonBox.ariaHaspopup === 'menu',
+      `按钮必须 aria-haspopup="menu"，实测 ${buttonBox.ariaHaspopup}`,
+    );
+    assert(
+      buttonBox.ariaExpanded === 'false',
+      `菜单初始必须 aria-expanded="false"，实测 ${buttonBox.ariaExpanded}`,
+    );
+    assert(
+      buttonBox.button !== null && buttonBox.avatarBlock !== null,
+      '设置按钮与用户头像块都必须存在',
+    );
+    assert(
+      buttonBox.button.top < buttonBox.avatarBlock.top,
+      `设置按钮必须在用户头像块之上（按钮 top=${buttonBox.button?.top} / 头像块 top=${buttonBox.avatarBlock?.top}）`,
+    );
+
+    // ② / ③ 点开菜单：恰好两项、标签逐字、各带图标、向上浮出且不超出左栏。
+    await clickByTestId(page, 'global-settings-button');
+    await page.waitForSelector('[data-testid="global-settings-menu"]', { timeout: 15000 });
+    const menuState = await page.evaluate(() => {
+      const box = (node) => {
+        const rect = node?.getBoundingClientRect();
+        return rect === undefined
+          ? null
+          : {
+              top: rect.top,
+              bottom: rect.bottom,
+              left: rect.left,
+              right: rect.right,
+              width: rect.width,
+              height: rect.height,
+            };
+      };
+      const menu = document.querySelector('[data-testid="global-settings-menu"]');
+      const items = [...(menu?.querySelectorAll('[role="menuitem"]') ?? [])];
+      return {
+        expanded:
+          document
+            .querySelector('[data-testid="global-settings-button"]')
+            ?.getAttribute('aria-expanded') ?? null,
+        role: menu?.getAttribute('role') ?? null,
+        ariaLabel: menu?.getAttribute('aria-label') ?? null,
+        itemCount: items.length,
+        labels: items.map((node) => node.textContent?.trim() ?? ''),
+        testIds: items.map((node) => node.getAttribute('data-testid') ?? ''),
+        withIcon: items.map((node) => node.querySelector('svg') !== null),
+        text: menu?.innerText ?? '',
+        menu: box(menu),
+        button: box(document.querySelector('[data-testid="global-settings-button"]')),
+        sidebar: box(document.querySelector('[data-testid="session-sidebar"]')),
+      };
+    });
+    obs('菜单实测（项数 / 标签 / 几何）', {
+      itemCount: menuState.itemCount,
+      labels: menuState.labels,
+      expanded: menuState.expanded,
+      menuRect: menuState.menu,
+      buttonRect: menuState.button,
+      sidebarRect: menuState.sidebar,
+    });
+    assert(
+      menuState.expanded === 'true',
+      `菜单打开后按钮必须 aria-expanded="true"，实测 ${menuState.expanded}`,
+    );
+    assert(menuState.role === 'menu', `菜单必须 role="menu"，实测 ${menuState.role}`);
+    assert(
+      menuState.ariaLabel === '全局设置',
+      `菜单 aria-label 必须是「全局设置」，实测 ${menuState.ariaLabel}`,
+    );
+    assert(
+      menuState.itemCount === 2,
+      `菜单项必须恰好 2 项，实测 ${menuState.itemCount} 项：${JSON.stringify(menuState.labels)}`,
+    );
+    assert(
+      JSON.stringify(menuState.labels) === JSON.stringify(['Provider 配置', '模板配置']),
+      `菜单项文字必须逐字为 Provider 配置 / 模板配置，实测 ${JSON.stringify(menuState.labels)}`,
+    );
+    assert(
+      JSON.stringify(menuState.testIds) ===
+        JSON.stringify(['global-settings-item-providers', 'global-settings-item-templates']),
+      `菜单项 testid 必须固定，实测 ${JSON.stringify(menuState.testIds)}`,
+    );
+    assert(
+      menuState.withIcon.every(Boolean),
+      `每个菜单项都必须带图标，实测 ${JSON.stringify(menuState.withIcon)}`,
+    );
+    for (const word of ['关于', '反馈', '登录', '用户资料']) {
+      assert(
+        !menuState.text.includes(word),
+        `菜单里不得出现「${word}」类入口，实测「${menuState.text}」`,
+      );
+    }
+    assert(menuState.menu !== null && menuState.button !== null, '菜单与按钮都必须可测几何');
+    assert(
+      menuState.menu.bottom <= menuState.button.top + 1,
+      `菜单必须向上浮出（菜单 bottom=${menuState.menu?.bottom} / 按钮 top=${menuState.button?.top}）`,
+    );
+    assert(
+      menuState.menu.left >= menuState.sidebar.left - 0.5 &&
+        menuState.menu.right <= menuState.sidebar.right + 0.5,
+      `菜单左右不得超出左栏（菜单 ${menuState.menu?.left}..${menuState.menu?.right} / 左栏 ${menuState.sidebar?.left}..${menuState.sidebar?.right}）`,
+    );
+
+    // ⑧ 单聊菜单打开：留图给主循环做视觉验收。
+    if (process.env.SETTINGS_SHOT) {
+      const target = process.env.SETTINGS_SHOT;
+      await page.screenshot({ path: target, fullPage: false });
+      console.log(`[SHOT] captured ${target}`);
+    }
+
+    // ④ 点「Provider 配置」⇒ 管理页打开、菜单关闭；关闭后回到原会话且标题 / 消息不变。
+    await page.click('[data-testid="global-settings-item-providers"]');
+    await page.waitForSelector('[data-testid="providers-page"]', { timeout: 15000 });
+    const providerOpen = await page.evaluate(() => {
+      const sidebar = document.querySelector('[data-testid="session-sidebar"]');
+      return {
+        menu: document.querySelector('[data-testid="global-settings-menu"]') !== null,
+        overlay: document.querySelector('[data-testid="panel-overlay"]') !== null,
+        sidebar: sidebar !== null,
+        sidebarWidth: sidebar?.getBoundingClientRect().width ?? null,
+        settingsButton: document.querySelector('[data-testid="global-settings-button"]') !== null,
+      };
+    });
+    obs('单聊打开 Provider 配置后', providerOpen);
+    assert(!providerOpen.menu, '点菜单项后菜单必须关闭');
+    assert(providerOpen.overlay, 'Provider 管理页必须挂在 panel-overlay 里（只盖主区）');
+    assert(
+      providerOpen.sidebar && providerOpen.sidebarWidth === 224,
+      `管理页打开时左栏必须仍可见且宽度 224，实测 ${providerOpen.sidebarWidth}`,
+    );
+    assert(providerOpen.settingsButton, '管理页打开时左栏底部的设置按钮仍必须在（左栏不被覆盖）');
+
+    await page.click('[data-testid="providers-close"]');
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="providers-page"]') === null,
+      { timeout: 15000 },
+    );
+    const providerClosed = await page.evaluate(() => ({
+      title: document.querySelector('[data-testid="current-session-title"]')?.textContent ?? '',
+      messageRows: document.querySelectorAll('[data-testid="message-row"]').length,
+      messageList: document.querySelector('[data-testid="message-list"]') !== null,
+    }));
+    obs('关闭 Provider 配置后', providerClosed);
+    assert(providerClosed.messageList, '关闭管理页后必须回到聊天屏');
+    assert(
+      providerClosed.title === before.title,
+      `关闭后标题必须不变（前「${before.title}」/ 后「${providerClosed.title}」）`,
+    );
+    assert(
+      providerClosed.messageRows === before.messageRows,
+      `关闭后消息条数必须不变（前 ${before.messageRows} / 后 ${providerClosed.messageRows}）`,
+    );
+
+    // ⑤ 群视图：入口仍在，点「模板配置」打开模板页（本 change 的核心修复）。
+    await clickSessionRow(page, '设置菜单群');
+    await page.waitForSelector('[data-testid="group-view"]', { timeout: 15000 });
+    await page.waitForSelector('[data-testid="timeline-item"]', { timeout: 15000 });
+    const groupBefore = await page.evaluate(() => ({
+      title: document.querySelector('[data-testid="group-view"] h1')?.textContent ?? '',
+      timelineItems: document.querySelectorAll('[data-testid="timeline-item"]').length,
+      settingsButton: document.querySelector('[data-testid="global-settings-button"]') !== null,
+      buttonTop:
+        document.querySelector('[data-testid="global-settings-button"]')?.getBoundingClientRect()
+          .top ?? null,
+      avatarTop:
+        document.querySelector('[data-testid="user-avatar-block"]')?.getBoundingClientRect().top ??
+        null,
+    }));
+    obs('群视图下的设置按钮', groupBefore);
+    assert(groupBefore.settingsButton, '群视图下左栏底部的设置按钮必须仍可见（修复群视图无入口）');
+    assert(
+      groupBefore.buttonTop < groupBefore.avatarTop,
+      `群视图下按钮仍必须在用户头像块上方（按钮 top=${groupBefore.buttonTop} / 头像块 top=${groupBefore.avatarTop}）`,
+    );
+    await clickByTestId(page, 'global-settings-button');
+    await page.waitForSelector('[data-testid="global-settings-menu"]', { timeout: 15000 });
+    // ⑧ 群聊菜单打开：留图。
+    if (process.env.SETTINGS_SHOT_GROUP) {
+      const target = process.env.SETTINGS_SHOT_GROUP;
+      await page.screenshot({ path: target, fullPage: false });
+      console.log(`[SHOT] captured ${target}`);
+    }
+    await page.click('[data-testid="global-settings-item-templates"]');
+    await page.waitForSelector('[data-testid="templates-page"]', { timeout: 15000 });
+    const templateOpen = await page.evaluate(() => ({
+      menu: document.querySelector('[data-testid="global-settings-menu"]') !== null,
+      overlay: document.querySelector('[data-testid="panel-overlay"]') !== null,
+      sidebar: document.querySelector('[data-testid="session-sidebar"]') !== null,
+    }));
+    obs('群视图打开模板配置后', templateOpen);
+    assert(!templateOpen.menu, '点「模板配置」后菜单必须关闭');
+    assert(templateOpen.overlay && templateOpen.sidebar, '模板页必须只盖主区，左栏仍可见');
+
+    await page.click('[data-testid="templates-close"]');
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="templates-page"]') === null,
+      { timeout: 15000 },
+    );
+    const groupAfter = await page.evaluate(() => ({
+      groupView: document.querySelector('[data-testid="group-view"]') !== null,
+      title: document.querySelector('[data-testid="group-view"] h1')?.textContent ?? '',
+      timelineItems: document.querySelectorAll('[data-testid="timeline-item"]').length,
+    }));
+    obs('关闭模板配置后的群视图', groupAfter);
+    assert(groupAfter.groupView, '关闭模板页后必须仍在群视图（群不因打开管理页卸载）');
+    assert(
+      groupAfter.title === groupBefore.title,
+      `群标题必须不变（前「${groupBefore.title}」/ 后「${groupAfter.title}」）`,
+    );
+    assert(
+      groupAfter.timelineItems === groupBefore.timelineItems,
+      `群时间线行数必须不变（前 ${groupBefore.timelineItems} / 后 ${groupAfter.timelineItems}）`,
+    );
+
+    // ⑥ 开合：Escape 关闭并把焦点还给按钮；点菜单外关闭；连点两次按钮是开 → 关。
+    await clickByTestId(page, 'global-settings-button');
+    await page.waitForSelector('[data-testid="global-settings-menu"]', { timeout: 15000 });
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="global-settings-menu"]') === null,
+      { timeout: 15000 },
+    );
+    const afterEscape = await page.evaluate(() => ({
+      menu: document.querySelector('[data-testid="global-settings-menu"]') !== null,
+      focused:
+        document.activeElement?.getAttribute('data-testid') ??
+        document.activeElement?.tagName ??
+        null,
+      expanded:
+        document
+          .querySelector('[data-testid="global-settings-button"]')
+          ?.getAttribute('aria-expanded') ?? null,
+    }));
+    obs('Escape 之后', afterEscape);
+    assert(!afterEscape.menu, 'Escape 必须关闭菜单');
+    assert(
+      afterEscape.focused === 'global-settings-button',
+      `Escape 后焦点必须回到设置按钮，实测 ${afterEscape.focused}`,
+    );
+    assert(
+      afterEscape.expanded === 'false',
+      `Escape 后 aria-expanded 必须是 false，实测 ${afterEscape.expanded}`,
+    );
+
+    // 点菜单外（主区中部空白处）⇒ 关闭。
+    await clickByTestId(page, 'global-settings-button');
+    await page.waitForSelector('[data-testid="global-settings-menu"]', { timeout: 15000 });
+    const mainBox = await page.evaluate(() => {
+      const rect = document.querySelector('[data-testid="main-area"]')?.getBoundingClientRect();
+      return rect === undefined
+        ? null
+        : { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+    });
+    assert(mainBox !== null, '必须能测到主区几何');
+    await page.mouse.click(mainBox.left + mainBox.width / 2, mainBox.top + mainBox.height / 2);
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="global-settings-menu"]') === null,
+      { timeout: 15000 },
+    );
+    const afterOutside = await page.evaluate(() => ({
+      menu: document.querySelector('[data-testid="global-settings-menu"]') !== null,
+      groupView: document.querySelector('[data-testid="group-view"]') !== null,
+    }));
+    obs('点菜单外之后', afterOutside);
+    assert(!afterOutside.menu, '点菜单外必须关闭菜单');
+    assert(afterOutside.groupView, '点菜单外不得切走群视图（点在主区中部是惰性的）');
+
+    // 连点两次：开 → 关。
+    await clickByTestId(page, 'global-settings-button');
+    await page.waitForSelector('[data-testid="global-settings-menu"]', { timeout: 15000 });
+    const firstClickOpened = await page.evaluate(
+      () => document.querySelector('[data-testid="global-settings-menu"]') !== null,
+    );
+    await clickByTestId(page, 'global-settings-button');
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="global-settings-menu"]') === null,
+      { timeout: 15000 },
+    );
+    const secondClickClosed = await page.evaluate(
+      () => document.querySelector('[data-testid="global-settings-menu"]') === null,
+    );
+    obs('连点两次按钮（第一次开 / 第二次关）', { firstClickOpened, secondClickClosed });
+    assert(firstClickOpened && secondClickClosed, '连点两次按钮必须是开 → 关');
+
+    // ⑦（复核）群视图下旧入口仍为 0。
+    const legacyAfter = await page.evaluate(() => ({
+      providers: document.querySelectorAll('[data-testid="open-providers"]').length,
+      templates: document.querySelectorAll('[data-testid="open-templates"]').length,
+    }));
+    obs('群视图下的旧入口节点数', legacyAfter);
+    assert(
+      legacyAfter.providers === 0 && legacyAfter.templates === 0,
+      `群视图下也不得出现旧入口（实测 ${JSON.stringify(legacyAfter)}）`,
+    );
+    assert(group.id, '夹具组必须存在');
+  } finally {
+    await page.close();
+    await resetToBaseSingle('设置菜单清场单聊');
+    // GROUP_DEFAULT 审计种子：与 1.4b 同一约定 —— 清场后重建一个组并排到首位，
+    // 保证 `GROUP_KEEP=1` 之后的 design_audit 仍直接落在群聊主区。
+    if (process.env.GROUP_DEFAULT === '1') {
+      const seeded = await seedReactionGroup('审计组');
+      auditGroupId = seeded.id;
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 工作路径（change `custom-workspace` 任务 8.3；返工任务 12.5 改成文件夹选择对话框）
+//
+// 判据以 **payload / 几何 / DOM 值**为准：假核心把每个 RPC 的 method+params 记进
+// `rpcLog`；路径显示读元素文本与 `title`；截断读 scrollWidth/clientWidth 与行高；
+// 目录列举读 `workspace.listDirs` 的请求形状；确认后的写 RPC payload 逐字断言。
+//
+// 用户明令「不喜欢手输路径」：交互是**点选** —— 点「切换」弹框 → 点目录进下一层 →
+// 「上级」回退 → 「选择此目录」确认。返工 12.13 用户又明确要「像 Windows 资源管理器的
+// 地址栏」：框内**有且仅有一个**可编辑路径输入框（`folder-picker-path`），它与当前显示的
+// 文件夹双向同步，回车 / 「跳转」会把输入路径交给 `workspace.listDirs` 校验后导航。
+// 所以这里断言的是「恰好一个地址栏 input」+ 同步 / 跳转行为，而不再是「框内没有任何输入」。
+// 假目录树的常量（`LONG_WORKSPACE` / `WORKSPACE_NEW` / `PICKER_HOME` 等）在假核心
+// 附近定义（`workspace.listDirs` 的 handler 与用例共用同一份夹具）。
+// ---------------------------------------------------------------------------
+
+/**
+ * 点「切换」打开文件夹选择框，并等目录列表就绪（返工任务 12.5）。
+ *
+ * 单聊入口 `workspace-edit`、群入口 `group-workspace-edit` 共用同一套框内 testid。
+ * 12.13 起当前路径是可编辑 input（读 `value`，不再是 `textContent`）。这里的 helper 保留
+ * 旧只读 span 的 `textContent` 兜底，只为红跑期能先量到框高（12.12 的缺陷与地址栏无关）；
+ * 框内形状由 WS.1 / WS.4 / WS.9 的「恰好一个可编辑 input」断言钉死，兜底不构成放松。
+ */
+async function openFolderPicker(page, editTestId) {
+  await clickByTestId(page, editTestId);
+  await page.waitForSelector('[data-testid="folder-picker"]', { timeout: 15000 });
+  await page.waitForFunction(
+    () => {
+      const node = document.querySelector('[data-testid="folder-picker-path"]');
+      const value = node instanceof HTMLInputElement ? node.value : (node?.textContent ?? '');
+      return value.length > 0;
+    },
+    { timeout: 15000 },
+  );
+}
+
+/** 读框内状态：当前路径（地址栏 value）/ 子目录按钮 / 输入框数量 / 上级按钮是否禁用。 */
+async function readFolderPicker(page) {
+  return page.evaluate(() => {
+    const dialog = document.querySelector('[data-testid="folder-picker-dialog"]');
+    const path = document.querySelector('[data-testid="folder-picker-path"]');
+    return {
+      role: dialog?.getAttribute('role') ?? null,
+      ariaModal: dialog?.getAttribute('aria-modal') ?? null,
+      path: path instanceof HTMLInputElement ? path.value : (path?.textContent ?? ''),
+      title: path?.getAttribute('title') ?? null,
+      pathTag: path?.tagName?.toLowerCase() ?? null,
+      pathEditable:
+        path instanceof HTMLInputElement && !path.readOnly && !path.disabled,
+      entries: [...document.querySelectorAll('[data-testid="folder-picker-entry"]')].map(
+        (button) => ({
+          // 按钮里还有一个装饰性的「›」，名字用 `data-name`（与显示文本同源）。
+          name: button.getAttribute('data-name') ?? (button.textContent ?? '').trim(),
+          path: button.getAttribute('data-path'),
+        }),
+      ),
+      inputs: dialog?.querySelectorAll('input, textarea').length ?? -1,
+      empty: document.querySelector('[data-testid="folder-picker-empty"]') !== null,
+      upDisabled: document.querySelector('[data-testid="folder-picker-up"]')?.disabled ?? null,
+      confirmDisabled:
+        document.querySelector('[data-testid="folder-picker-confirm"]')?.disabled ?? null,
+      drivesHint:
+        document.querySelector('[data-testid="folder-picker-drives-hint"]')?.textContent ?? null,
+      loadError:
+        document.querySelector('[data-testid="folder-picker-load-error"]')?.textContent ?? null,
+      crumbs: [...document.querySelectorAll('[data-testid="folder-picker-crumb"]')].map(
+        (button) => ({
+          label: (button.textContent ?? '').trim(),
+          path: button.getAttribute('data-path'),
+        }),
+      ),
+    };
+  });
+}
+
+/** 等框内地址栏显示成给定文本（盘符 / 「此电脑」/目录都走这一条）。 */
+async function waitFolderPath(page, expected) {
+  await page.waitForFunction(
+    (value) => {
+      const node = document.querySelector('[data-testid="folder-picker-path"]');
+      const current = node instanceof HTMLInputElement ? node.value : (node?.textContent ?? '');
+      return current === value;
+    },
+    { timeout: 15000 },
+    expected,
+  );
+}
+
+/** 点面包屑里 path 等于给定值的一段（返工任务 12.11：「此电脑」/盘符跳转）。 */
+async function clickFolderCrumb(page, crumbPath) {
+  const clicked = await page.evaluate((target) => {
+    const button = [...document.querySelectorAll('[data-testid="folder-picker-crumb"]')].find(
+      (entry) => entry.getAttribute('data-path') === target,
+    );
+    if (!button) return false;
+    button.click();
+    return true;
+  }, crumbPath);
+  assert(clicked, `面包屑里找不到「${crumbPath}」`);
+}
+
+/** 点框里的某个子目录（按名字）并等当前路径变成它的 `data-path`。 */
+async function enterFolder(page, name) {
+  const target = await page.evaluate((label) => {
+    const button = [...document.querySelectorAll('[data-testid="folder-picker-entry"]')].find(
+      (entry) => entry.getAttribute('data-name') === label,
+    );
+    if (!button) return null;
+    button.click();
+    return button.getAttribute('data-path');
+  }, name);
+  assert(target !== null, `文件夹选择框里找不到子目录「${name}」`);
+  await page.waitForFunction(
+    (expected) => {
+      const node = document.querySelector('[data-testid="folder-picker-path"]');
+      const current = node instanceof HTMLInputElement ? node.value : (node?.textContent ?? '');
+      return current === expected;
+    },
+    { timeout: 15000 },
+    target,
+  );
+  return target;
+}
+
+/** 把地址栏整体换成给定文本（聚焦 → Ctrl+A 全选 → 键入；受控 input 走键盘输入事件）。 */
+async function replaceAddress(page, value) {
+  await page.focus('[data-testid="folder-picker-path"]');
+  await page.keyboard.down('Control');
+  await page.keyboard.press('KeyA');
+  await page.keyboard.up('Control');
+  await page.keyboard.type(value);
+}
+
+await run('WS.1 单聊头部：路径逐字 + title 全文 + 单行截断 + 「切换」弹出文件夹选择框', async () => {
+  await resetToBaseSingle('WS1 基础单聊');
+  const withWorkspace = await seedSingle('WS1 长路径单聊', { workspace: LONG_WORKSPACE });
+  await seedSingle('WS1 无路径单聊');
+  await setGroupFlags('reset=1');
+  const page = await openPage();
+  try {
+    await page.waitForSelector('[data-testid="session-list"]', { timeout: 15000 });
+    await clickSessionRow(page, 'WS1 长路径单聊');
+    await page.waitForSelector('[data-testid="workspace-path"]', { timeout: 15000 });
+    const displayed = await page.evaluate(() => {
+      const element = document.querySelector('[data-testid="workspace-path"]');
+      const header = element?.closest('header');
+      const rect = element.getBoundingClientRect();
+      return {
+        text: element?.textContent ?? '',
+        title: element?.getAttribute('title'),
+        height: rect.height,
+        whiteSpace: getComputedStyle(element).whiteSpace,
+        scrollWidth: element?.scrollWidth ?? 0,
+        clientWidth: element?.clientWidth ?? 0,
+        headerOverflow: header ? header.scrollWidth - header.clientWidth : null,
+      };
+    });
+    obs('单聊工作路径显示', displayed);
+    assert(withWorkspace.id, '夹具必须返回会话 id');
+    assert(displayed.text === LONG_WORKSPACE, `路径必须逐字显示，实测「${displayed.text}」`);
+    assert(displayed.title === LONG_WORKSPACE, `title 必须是全文，实测「${displayed.title}」`);
+    assert(
+      displayed.whiteSpace === 'nowrap',
+      `路径必须单行（nowrap），实测 ${displayed.whiteSpace}`,
+    );
+    assert(displayed.height <= 24, `路径必须单行不换行，实测高度 ${displayed.height}`);
+    assert(
+      displayed.scrollWidth > displayed.clientWidth,
+      `长路径必须真的被截断（scrollWidth ${displayed.scrollWidth} / clientWidth ${displayed.clientWidth}）`,
+    );
+    assert(
+      displayed.headerOverflow !== null && displayed.headerOverflow <= 1,
+      `头部不得横向溢出，实测 ${displayed.headerOverflow}`,
+    );
+
+    // 「切换」= 弹文件夹选择框（起点 = 该会话的工作路径），不是展开输入框。
+    const start = rpcLog.length;
+    await openFolderPicker(page, 'workspace-edit');
+    const picker = await readFolderPicker(page);
+    const listCall = rpcLog.slice(start).find((entry) => entry.method === 'workspace.listDirs');
+    obs('文件夹选择框', picker);
+    obs('workspace.listDirs 请求', listCall?.params);
+    assert(
+      picker.role === 'dialog' && picker.ariaModal === 'true',
+      `必须是模态对话框（role=dialog / aria-modal=true），实测 ${picker.role}/${picker.ariaModal}`,
+    );
+    assert(
+      picker.path === LONG_WORKSPACE,
+      `框内当前路径必须是会话的工作路径，实测「${picker.path}」`,
+    );
+    assert(picker.title === LONG_WORKSPACE, '框内当前路径的 title 必须是全文');
+    // 返工 12.13（用户要求可编辑地址栏）：框内有且仅有一个 input，就是地址栏且可编辑。
+    assert(picker.inputs === 1, `框内必须恰好一个输入框（地址栏），实测 ${picker.inputs}`);
+    assert(
+      picker.pathTag === 'input' && picker.pathEditable,
+      `框内当前路径必须是可编辑 input，实测 ${picker.pathTag}/${picker.pathEditable}`,
+    );
+    assert(
+      JSON.stringify(picker.entries.map((entry) => entry.name)) ===
+        JSON.stringify(['alpha', 'beta', 'locked']),
+      `框内必须列出子目录（按名字排序），实测 ${JSON.stringify(picker.entries.map((entry) => entry.name))}`,
+    );
+    assert(
+      listCall?.params?.path === LONG_WORKSPACE,
+      `列举请求必须带该会话的工作路径，实测 ${JSON.stringify(listCall?.params)}`,
+    );
+
+    // 「取消」关框，且不发任何写请求。
+    const writesBefore = rpcLog.length;
+    await clickByTestId(page, 'folder-picker-cancel');
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="folder-picker"]') === null,
+      { timeout: 15000 },
+    );
+    const writes = rpcLog.slice(writesBefore).map((entry) => entry.method);
+    obs('取消后的请求', writes);
+    assert(!writes.some((method) => method.endsWith('setWorkspace')), '取消不得发写请求');
+  } finally {
+    await page.close();
+  }
+});
+
+await run('WS.2 单聊切换：浏览 → 上级 → 选择此目录 → session.setWorkspace payload；失败在框内可归因', async () => {
+  await resetToBaseSingle('WS2 基础单聊');
+  const withWorkspace = await seedSingle('WS2 长路径单聊', { workspace: LONG_WORKSPACE });
+  await seedSingle('WS2 无路径单聊');
+  await setGroupFlags('reset=1');
+  const page = await openPage();
+  try {
+    await page.waitForSelector('[data-testid="session-list"]', { timeout: 15000 });
+    await clickSessionRow(page, 'WS2 长路径单聊');
+    await page.waitForSelector('[data-testid="workspace-path"]', { timeout: 15000 });
+    const before = await page.evaluate((sessionId) => ({
+      title: document.querySelector('[data-testid="current-session-title"]')?.textContent ?? '',
+      selected:
+        document
+          .querySelector(`[data-session-id="${sessionId}"]`)
+          ?.getAttribute('aria-current') ?? null,
+      messages: document.querySelectorAll('[data-testid="message-row"]').length,
+    }), withWorkspace.id);
+
+    // 点选：进入子目录（叶子显示空态）→「上级」回到起点。
+    await openFolderPicker(page, 'workspace-edit');
+    const entered = await enterFolder(page, 'beta');
+    obs('进入子目录后的当前路径', entered);
+    assert(
+      entered === `${LONG_WORKSPACE}\\beta`,
+      `进入子目录后的路径必须逐字，实测「${entered}」`,
+    );
+    const insideLeaf = await readFolderPicker(page);
+    obs('叶子目录的框内状态', insideLeaf);
+    assert(insideLeaf.empty, '叶子目录必须显示「没有子文件夹」的空态');
+    assert(insideLeaf.entries.length === 0, '叶子目录的子目录列表必须为空');
+    await clickByTestId(page, 'folder-picker-up');
+    await waitFolderPath(page, LONG_WORKSPACE);
+    const afterUp = await readFolderPicker(page);
+    obs('上级回退后', afterUp);
+    assert(afterUp.path === LONG_WORKSPACE, '「上级」必须回到上一级目录');
+    assert(
+      afterUp.entries.length === 3,
+      `上级回退后必须重新列出子目录，实测 ${afterUp.entries.length}`,
+    );
+
+    // 选中 alpha 并确认：payload 逐字、界面更新、选中/消息不变、框关闭。
+    await enterFolder(page, 'alpha');
+    const start = rpcLog.length;
+    await clickByTestId(page, 'folder-picker-confirm');
+    await waitFor(
+      () => rpcLog.slice(start).some((entry) => entry.method === 'session.setWorkspace'),
+      '发出 session.setWorkspace',
+    );
+    const call = rpcLog.slice(start).find((entry) => entry.method === 'session.setWorkspace');
+    obs('session.setWorkspace payload', call.params);
+    assert(
+      call.params.sessionId === withWorkspace.id,
+      `payload.sessionId 必须是当前会话，实测 ${call.params.sessionId}`,
+    );
+    assert(
+      call.params.workspace === WORKSPACE_NEW,
+      `payload.workspace 必须逐字，实测 ${call.params.workspace}`,
+    );
+    await page.waitForFunction(
+      (expected) =>
+        document.querySelector('[data-testid="workspace-path"]')?.textContent === expected,
+      { timeout: 15000 },
+      WORKSPACE_NEW,
+    );
+    const pickerClosed = (await page.$('[data-testid="folder-picker"]')) === null;
+    const after = await page.evaluate((sessionId) => ({
+      title: document.querySelector('[data-testid="current-session-title"]')?.textContent ?? '',
+      selected:
+        document
+          .querySelector(`[data-session-id="${sessionId}"]`)
+          ?.getAttribute('aria-current') ?? null,
+      messages: document.querySelectorAll('[data-testid="message-row"]').length,
+    }), withWorkspace.id);
+    obs('切换成功后', { before, after, pickerClosed });
+    assert(pickerClosed, '确认成功后对话框必须关闭');
+    assert(after.title === before.title, '切换不得改变当前选中会话 / 标题');
+    assert(after.selected === 'true', '切换不得丢选中态');
+    assert(after.messages === before.messages, '切换不得改变消息列表');
+
+    // 核心拒绝（目录不可用）：框内就地错误、框不关、已保存路径不变。
+    // 当前工作路径已是 alpha（叶子），先「上级」回到含 locked 的那一层再点进去。
+    await setGroupFlags(`workspaceFailPath=${encodeURIComponent(WORKSPACE_BAD)}`);
+    await openFolderPicker(page, 'workspace-edit');
+    await clickByTestId(page, 'folder-picker-up');
+    await waitFolderPath(page, LONG_WORKSPACE);
+    await enterFolder(page, 'locked');
+    await clickByTestId(page, 'folder-picker-confirm');
+    await page.waitForSelector('[data-testid="folder-picker-error"]', { timeout: 15000 });
+    const failure = await page.evaluate(() => ({
+      error: document.querySelector('[data-testid="folder-picker-error"]')?.textContent ?? '',
+      path: document.querySelector('[data-testid="folder-picker-path"]')?.value ?? '',
+      open: document.querySelector('[data-testid="folder-picker"]') !== null,
+      saved: document.querySelector('[data-testid="workspace-path"]')?.textContent ?? '',
+    }));
+    obs('保存失败后', failure);
+    assert(failure.error.includes(WORKSPACE_BAD), `错误必须含路径，实测「${failure.error}」`);
+    assert(failure.error.includes('不可用'), `错误必须含原因，实测「${failure.error}」`);
+    assert(failure.open, '保存失败时对话框必须保持打开');
+    assert(failure.saved === WORKSPACE_NEW, '保存失败时已保存路径的显示必须不变');
+    assert(failure.path === WORKSPACE_BAD, '失败时框内仍停在选中的目录（不偷偷改写）');
+    await clickByTestId(page, 'folder-picker-cancel');
+
+    // 切到另一个未设置工作区的会话：显示缺省文案；框的起点是核心的主目录。
+    await clickSessionRow(page, 'WS2 无路径单聊');
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="workspace-path"]')?.textContent === '缺省（应用主目录）',
+      { timeout: 15000 },
+    );
+    const defaultLabel = await page.$eval(
+      '[data-testid="workspace-path"]',
+      (element) => element.textContent,
+    );
+    obs('未设置会话的缺省文案', defaultLabel);
+    assert(defaultLabel === '缺省（应用主目录）', '未设置工作区必须显示缺省文案');
+
+    const homeStart = rpcLog.length;
+    await openFolderPicker(page, 'workspace-edit');
+    const homePicker = await readFolderPicker(page);
+    const homeCall = rpcLog.slice(homeStart).find((entry) => entry.method === 'workspace.listDirs');
+    obs('未设置会话的框起点', { path: homePicker.path, params: homeCall?.params });
+    assert(
+      homePicker.path === PICKER_HOME,
+      `未设置工作区时框的起点必须是核心主目录，实测「${homePicker.path}」`,
+    );
+    assert(
+      homeCall?.params?.path === undefined,
+      `未设置时列举请求必须省略 path（起点由核心给），实测 ${JSON.stringify(homeCall?.params)}`,
+    );
+    assert(
+      JSON.stringify(homePicker.entries.map((entry) => entry.name)) ===
+        JSON.stringify(['Documents', 'Projects']),
+      `主目录的子目录必须列出来，实测 ${JSON.stringify(homePicker.entries.map((entry) => entry.name))}`,
+    );
+    await clickByTestId(page, 'folder-picker-cancel');
+  } finally {
+    await page.close();
+    await setGroupFlags('reset=1');
+  }
+});
+
+await run('WS.3 空选中：单聊工作路径控件不渲染（节点数 0）', async () => {
+  await resetToBaseSingle('WS3 唯一单聊');
+  await setGroupFlags('reset=1');
+  const page = await openPage();
+  try {
+    await page.waitForSelector('[data-testid="session-list"]', { timeout: 15000 });
+    await deleteFirstSessionRow(page);
+    await page.waitForFunction(
+      () =>
+        document
+          .querySelector('[data-testid="current-session-title"]')
+          ?.textContent?.includes('（未选择会话）') === true,
+      { timeout: 15000 },
+    );
+    const counts = await page.evaluate(() => ({
+      path: document.querySelectorAll('[data-testid="workspace-path"]').length,
+      edit: document.querySelectorAll('[data-testid="workspace-edit"]').length,
+      picker: document.querySelectorAll('[data-testid="folder-picker"]').length,
+      legacyInput: document.querySelectorAll('[data-testid="workspace-input"]').length,
+    }));
+    obs('空选中的单聊工作路径控件', counts);
+    assert(counts.path === 0, '空选中不得渲染 workspace-path');
+    assert(counts.edit === 0, '空选中不得渲染切换按钮');
+    assert(counts.picker === 0, '空选中不得渲染文件夹选择框');
+    assert(counts.legacyInput === 0, '手输路径的旧编辑器必须已撤除');
+  } finally {
+    await page.close();
+  }
+});
+
+await run('WS.4 群右栏「群工作路径」：在成员名单之上 + 切换 payload + 刷新不丢 + 只装工作路径', async () => {
+  await resetToBaseSingle('WS4 基础单聊');
+  const seeded = await seedWorkspaceGroup('WS4 工作区组', LONG_WORKSPACE);
+  await setGroupFlags('reset=1');
+  const page = await openPage();
+  try {
+    await page.waitForSelector('[data-testid="session-list"]', { timeout: 15000 });
+    await clickSessionRow(page, 'WS4 工作区组');
+    await page.waitForSelector('[data-testid="group-view"]', { timeout: 15000 });
+    await page.waitForSelector('[data-testid="group-workspace"]', { timeout: 15000 });
+    const layout = await page.evaluate(() => {
+      const card = document.querySelector('[data-testid="group-workspace"]');
+      const list = document.querySelector('[data-testid="group-members-list"]');
+      const aside = document.querySelector('#group-members');
+      const path = document.querySelector('[data-testid="group-workspace-path"]');
+      return {
+        cardTop: card.getBoundingClientRect().top,
+        listTop: list.getBoundingClientRect().top,
+        insideAside: aside?.contains(card) ?? false,
+        path: path?.textContent ?? '',
+        title: path?.getAttribute('title'),
+      };
+    });
+    obs('群工作路径栏几何与显示', layout);
+    assert(layout.path === LONG_WORKSPACE, `群路径必须逐字显示，实测「${layout.path}」`);
+    assert(layout.title === LONG_WORKSPACE, `群路径 title 必须是全文，实测「${layout.title}」`);
+    assert(layout.cardTop < layout.listTop, '「群工作路径」栏必须在成员名单之上');
+    assert(layout.insideAside, '该栏必须在 id=group-members 的右栏内');
+
+    // 这一栏只装工作路径：没有多行输入 / 可编辑块 / 公告类按钮。
+    const shape = await page.evaluate(() => {
+      const card = document.querySelector('[data-testid="group-workspace"]');
+      return {
+        textareas: card.querySelectorAll('textarea').length,
+        editables: card.querySelectorAll('[contenteditable]').length,
+        buttons: [...card.querySelectorAll('button')].map((button) => button.textContent?.trim() ?? ''),
+      };
+    });
+    obs('群工作路径栏的元素形状', shape);
+    assert(shape.textareas === 0, '该栏不得有 textarea（不是公告正文）');
+    assert(shape.editables === 0, '该栏不得有 contenteditable 元素');
+    assert(
+      JSON.stringify(shape.buttons) === JSON.stringify(['切换']),
+      `这一栏的按钮只允许「切换」（浏览在对话框里），实测 ${JSON.stringify(shape.buttons)}`,
+    );
+
+    const before = await page.evaluate(() => ({
+      members: document.querySelectorAll('[data-testid^="member-name-"]').length,
+      timeline: document.querySelectorAll('[data-testid="timeline-item"]').length,
+    }));
+    const listStart = rpcLog.length;
+    await openFolderPicker(page, 'group-workspace-edit');
+    const listCall = rpcLog.slice(listStart).find((entry) => entry.method === 'workspace.listDirs');
+    const picker = await readFolderPicker(page);
+    obs('群工作路径的文件夹选择框', picker);
+    obs('群的 workspace.listDirs 请求', listCall?.params);
+    assert(
+      picker.path === LONG_WORKSPACE,
+      `群选择框的起点必须是组的工作路径，实测「${picker.path}」`,
+    );
+    assert(picker.inputs === 1, `框内必须恰好一个输入框（地址栏），实测 ${picker.inputs}`);
+    assert(
+      listCall?.params?.path === LONG_WORKSPACE,
+      `群的列举请求必须带组的工作路径，实测 ${JSON.stringify(listCall?.params)}`,
+    );
+
+    // 模态层级：必须盖住群视图顶栏（`relative z-30`），否则顶栏会画在框上面。
+    const covered = await page.evaluate(() => {
+      const header = document.querySelector('[data-testid="group-view"] header');
+      const dialog = document.querySelector('[data-testid="folder-picker"]');
+      if (!header || !dialog) return { hitInsideDialog: false, headerZ: null, dialogZ: null };
+      const rect = header.getBoundingClientRect();
+      const hit = document.elementFromPoint(
+        rect.left + rect.width / 2,
+        rect.top + rect.height / 2,
+      );
+      return {
+        hitInsideDialog: dialog.contains(hit),
+        headerZ: getComputedStyle(header).zIndex,
+        dialogZ: getComputedStyle(dialog).zIndex,
+      };
+    });
+    obs('选择框与群顶栏的层级', covered);
+    assert(
+      covered.hitInsideDialog,
+      '文件夹选择框必须盖住群视图顶栏（顶栏中心的命中元素必须在框内）',
+    );
+    assert(
+      Number(covered.dialogZ) > Number(covered.headerZ),
+      `选择框 z-index 必须高于群顶栏，实测 ${covered.dialogZ} / ${covered.headerZ}`,
+    );
+
+    const start = rpcLog.length;
+    await enterFolder(page, 'beta');
+    await clickByTestId(page, 'folder-picker-confirm');
+    await waitFor(
+      () => rpcLog.slice(start).some((entry) => entry.method === 'group.setWorkspace'),
+      '发出 group.setWorkspace',
+    );
+    const call = rpcLog.slice(start).find((entry) => entry.method === 'group.setWorkspace');
+    obs('group.setWorkspace payload', call.params);
+    assert(call.params.groupId === seeded.id, `payload.groupId 必须是该组，实测 ${call.params.groupId}`);
+    assert(
+      call.params.workspace === WORKSPACE_GROUP_NEW,
+      `payload.workspace 必须逐字，实测 ${call.params.workspace}`,
+    );
+    await page.waitForFunction(
+      (expected) =>
+        document.querySelector('[data-testid="group-workspace-path"]')?.textContent === expected,
+      { timeout: 15000 },
+      WORKSPACE_GROUP_NEW,
+    );
+    const after = await page.evaluate(() => ({
+      members: document.querySelectorAll('[data-testid^="member-name-"]').length,
+      timeline: document.querySelectorAll('[data-testid="timeline-item"]').length,
+    }));
+    obs('切换成功后成员/时间线', { before, after });
+    const pickerClosed = (await page.$('[data-testid="folder-picker"]')) === null;
+    assert(pickerClosed, '群确认成功后对话框必须关闭');
+    assert(after.members === before.members, '切换工作路径不得丢成员名单');
+    assert(after.timeline === before.timeline, '切换工作路径不得丢时间线');
+
+    const methods = rpcLog.slice(listStart).map((entry) => entry.method);
+    assert(!methods.includes('session.setWorkspace'), '群切换不得发出 session.setWorkspace');
+    assert(
+      !methods.some((method) => method.includes('announce')),
+      `群切换不得发公告类 RPC，实测 ${JSON.stringify(methods)}`,
+    );
+    const singleControlCount = (await page.$$('[data-testid="workspace-path"]')).length;
+    assert(singleControlCount === 0, '群聊主区不得渲染单聊的工作路径控件');
+  } finally {
+    await page.close();
+    await setGroupFlags('reset=1');
+  }
+});
+
+await run('WS.5 群工作路径：选择框内失败可归因；链运行中「切换」禁用且不发写请求', async () => {
+  await resetToBaseSingle('WS5 基础单聊');
+  const seeded = await seedWorkspaceGroup('WS5 工作区组', LONG_WORKSPACE);
+  await setGroupFlags('reset=1');
+  const page = await openPage();
+  try {
+    await page.waitForSelector('[data-testid="session-list"]', { timeout: 15000 });
+    await clickSessionRow(page, 'WS5 工作区组');
+    await page.waitForSelector('[data-testid="group-workspace-path"]', { timeout: 15000 });
+
+    // 失败态：框内就地错误、框保持打开、已保存路径不变。
+    await setGroupFlags(`workspaceFailPath=${encodeURIComponent(WORKSPACE_BAD)}`);
+    await openFolderPicker(page, 'group-workspace-edit');
+    await enterFolder(page, 'locked');
+    await clickByTestId(page, 'folder-picker-confirm');
+    await page.waitForSelector('[data-testid="folder-picker-error"]', { timeout: 15000 });
+    const failure = await page.evaluate(() => ({
+      error: document.querySelector('[data-testid="folder-picker-error"]')?.textContent ?? '',
+      path: document.querySelector('[data-testid="group-workspace-path"]')?.textContent ?? '',
+      open: document.querySelector('[data-testid="folder-picker"]') !== null,
+    }));
+    obs('群保存失败后', failure);
+    assert(failure.error.includes(WORKSPACE_BAD), '群错误必须含路径');
+    assert(failure.error.includes('不可用'), '群错误必须含原因');
+    assert(failure.open, '群保存失败时对话框必须保持打开');
+    assert(failure.path === LONG_WORKSPACE, '群保存失败时已保存路径不变');
+    await clickByTestId(page, 'folder-picker-cancel');
+
+    // 链运行中：切换按钮禁用且有可读原因；点击不发写请求。
+    await setGroupFlags(`busyFor=${encodeURIComponent(seeded.id)}`);
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForSelector('[data-testid="session-list"]', { timeout: 15000 });
+    await clickSessionRow(page, 'WS5 工作区组');
+    await page.waitForSelector('[data-testid="group-workspace"]', { timeout: 15000 });
+    const disabled = await page.$eval('[data-testid="group-workspace-edit"]', (element) => ({
+      disabled: element.disabled === true,
+      ariaDisabled: element.getAttribute('aria-disabled'),
+      title: element.getAttribute('title'),
+    }));
+    obs('链运行中的切换按钮', disabled);
+    assert(disabled.disabled, '链运行中「切换」必须禁用');
+    assert(disabled.title !== null && disabled.title.length > 0, '禁用必须给出可读原因（title）');
+    const start = rpcLog.length;
+    await page.click('[data-testid="group-workspace-edit"]');
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const writes = rpcLog.slice(start).filter((entry) => entry.method === 'group.setWorkspace');
+    obs('链运行中点击后的写请求', writes);
+    assert(writes.length === 0, '链运行中点击不得发出 group.setWorkspace');
+  } finally {
+    await page.close();
+    await setGroupFlags('reset=1');
+  }
+});
+
+await run('WS.6 窄屏 720px：群工作路径栏随成员抽屉可见、页面无横向溢出', async () => {
+  await resetToBaseSingle('WS6 基础单聊');
+  await seedWorkspaceGroup('WS6 工作区组', LONG_WORKSPACE);
+  await setGroupFlags('reset=1');
+  const page = await openPage(720, 900);
+  try {
+    await page.waitForSelector('[data-testid="session-list"]', { timeout: 15000 });
+    await clickSessionRow(page, 'WS6 工作区组');
+    await page.waitForSelector('[data-testid="group-view"]', { timeout: 15000 });
+    const hiddenBefore = await page.evaluate(() => {
+      const card = document.querySelector('[data-testid="group-workspace"]');
+      const aside = document.querySelector('#group-members');
+      return {
+        cardVisible: card !== null && card.getBoundingClientRect().width > 0,
+        asideDisplay: aside ? getComputedStyle(aside).display : null,
+      };
+    });
+    obs('窄屏抽屉打开前', hiddenBefore);
+    await clickByTestId(page, 'group-members-toggle');
+    await page.waitForFunction(
+      () => {
+        const card = document.querySelector('[data-testid="group-workspace"]');
+        const aside = document.querySelector('#group-members');
+        return (
+          card !== null &&
+          card.getBoundingClientRect().width > 0 &&
+          aside !== null &&
+          getComputedStyle(aside).display !== 'none'
+        );
+      },
+      { timeout: 15000 },
+    );
+    const drawer = await page.evaluate(() => {
+      const card = document.querySelector('[data-testid="group-workspace"]');
+      const aside = document.querySelector('#group-members');
+      const overview = document.querySelector('[data-testid="session-list"]');
+      const rect = card.getBoundingClientRect();
+      return {
+        insideAside: aside?.contains(card) ?? false,
+        width: rect.width,
+        docScrollWidth: document.documentElement.scrollWidth,
+        innerWidth: window.innerWidth,
+        listVisible: overview !== null && overview.getBoundingClientRect().width > 0,
+      };
+    });
+    obs('窄屏抽屉里的工作路径栏', drawer);
+    assert(drawer.insideAside, '窄屏时栏必须在成员抽屉（#group-members）里');
+    assert(drawer.width > 0, '窄屏抽屉里的栏必须可见（有宽度）');
+    assert(
+      drawer.docScrollWidth <= drawer.innerWidth + 1,
+      `页面不得横向溢出（${drawer.docScrollWidth} > ${drawer.innerWidth}）`,
+    );
+    assert(drawer.listVisible, '打开成员抽屉不得覆盖 / 隐藏会话列表');
+  } finally {
+    await page.close();
+    await setGroupFlags('reset=1');
+  }
+});
+
+await run('WS.7 文件夹很多时：选择框高度受视口限制（不撑满）+ 列表框内滚动', async () => {
+  await resetToBaseSingle('WS7 基础单聊');
+  await seedSingle('WS7 多子目录单聊', { workspace: PICKER_CROWDED });
+  await setGroupFlags('reset=1');
+  const page = await openPage();
+  try {
+    await page.waitForSelector('[data-testid="session-list"]', { timeout: 15000 });
+    await clickSessionRow(page, 'WS7 多子目录单聊');
+    await page.waitForSelector('[data-testid="workspace-path"]', { timeout: 15000 });
+    await openFolderPicker(page, 'workspace-edit');
+    const geometry = await page.evaluate(() => {
+      const dialog = document.querySelector('[data-testid="folder-picker-dialog"]');
+      const list = document.querySelector('[data-testid="folder-picker-list"]');
+      const rect = dialog.getBoundingClientRect();
+      const listRect = list.getBoundingClientRect();
+      return {
+        dialogHeight: rect.height,
+        dialogWidth: rect.width,
+        dialogTop: rect.top,
+        dialogBottom: rect.bottom,
+        dialogCenter: rect.top + rect.height / 2,
+        viewportHeight: window.innerHeight,
+        viewportWidth: window.innerWidth,
+        viewportCenter: window.innerHeight / 2,
+        listHeight: listRect.height,
+        listClientHeight: list.clientHeight,
+        listScrollHeight: list.scrollHeight,
+        entries: document.querySelectorAll('[data-testid="folder-picker-entry"]').length,
+      };
+    });
+    obs('多目录选择框几何（框高 / 视口高 / 列表滚动量）', geometry);
+    assert(
+      geometry.entries === PICKER_CROWDED_CHILDREN.length,
+      `夹具必须渲染 ${PICKER_CROWDED_CHILDREN.length} 个子目录，实测 ${geometry.entries}`,
+    );
+    assert(
+      geometry.dialogHeight <= geometry.viewportHeight * 0.8,
+      `选择框高度必须明显小于视口（≤0.8×${geometry.viewportHeight}px），实测 ${geometry.dialogHeight}px`,
+    );
+    assert(
+      geometry.dialogBottom <= geometry.viewportHeight,
+      `选择框底边不得超出视口，实测底边 ${geometry.dialogBottom} / 视口 ${geometry.viewportHeight}`,
+    );
+    assert(
+      Math.abs(geometry.dialogCenter - geometry.viewportCenter) <= 1,
+      `选择框必须垂直居中（中心 ${geometry.dialogCenter} / 视口中心 ${geometry.viewportCenter}）`,
+    );
+    assert(
+      geometry.listScrollHeight > geometry.listClientHeight + 1,
+      `子目录多时列表必须在框内滚动（scrollHeight ${geometry.listScrollHeight} / clientHeight ${geometry.listClientHeight}）`,
+    );
+    assert(
+      geometry.listHeight > 0 && geometry.listHeight <= geometry.dialogHeight,
+      `列表必须真实占据框内高度，实测列表 ${geometry.listHeight} / 框 ${geometry.dialogHeight}`,
+    );
+    assert(
+      geometry.dialogWidth < geometry.viewportWidth * 0.8,
+      `选择框宽度必须紧凑（≤0.8×${geometry.viewportWidth}px），实测 ${geometry.dialogWidth}px`,
+    );
+
+    // 返工 12.12：框高必须**固定**，不能随子目录数量伸缩（max-height 会随内容跳变）。
+    // 40 个子目录 → 点进一个空叶子 → 再「上级」回来，三次框高必须一致。
+    const crowdedHeight = geometry.dialogHeight;
+    await enterFolder(page, PICKER_CROWDED_CHILDREN[0]);
+    const leaf = await page.evaluate(() => {
+      const dialog = document.querySelector('[data-testid="folder-picker-dialog"]');
+      const list = document.querySelector('[data-testid="folder-picker-list"]');
+      return {
+        dialogHeight: dialog.getBoundingClientRect().height,
+        entries: document.querySelectorAll('[data-testid="folder-picker-entry"]').length,
+        listScrollHeight: list.scrollHeight,
+        listClientHeight: list.clientHeight,
+      };
+    });
+    obs('空叶子目录的框高（12.12 固定高度）', {
+      dialogHeight: leaf.dialogHeight,
+      crowdedHeight,
+      viewportHeight: geometry.viewportHeight,
+      entries: leaf.entries,
+      listScrollHeight: leaf.listScrollHeight,
+      listClientHeight: leaf.listClientHeight,
+    });
+    assert(leaf.entries === 0, `叶子目录必须没有子目录，实测 ${leaf.entries}`);
+    assert(
+      Math.abs(leaf.dialogHeight - crowdedHeight) <= 1,
+      `导航到子目录少的文件夹后框高必须不变（多目录 ${crowdedHeight}px / 空叶子 ${leaf.dialogHeight}px）`,
+    );
+    assert(
+      leaf.listScrollHeight <= leaf.listClientHeight + 1,
+      `空叶子目录列表不该有滚动量（${leaf.listScrollHeight}/${leaf.listClientHeight}）`,
+    );
+    await clickByTestId(page, 'folder-picker-up');
+    await waitFolderPath(page, PICKER_CROWDED);
+    const backHeight = await page.evaluate(
+      () =>
+        document.querySelector('[data-testid="folder-picker-dialog"]').getBoundingClientRect()
+          .height,
+    );
+    obs('「上级」返回多目录后的框高（12.12 固定高度）', {
+      backHeight,
+      crowdedHeight,
+      viewportHeight: geometry.viewportHeight,
+    });
+    assert(
+      Math.abs(backHeight - crowdedHeight) <= 1,
+      `「上级」返回多目录后框高必须仍不变（首次 ${crowdedHeight}px / 返回 ${backHeight}px）`,
+    );
+
+    if (process.env.WORKSPACE_SHOT_CROWDED) {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const target = process.env.WORKSPACE_SHOT_CROWDED;
+      await page.screenshot({ path: target, fullPage: false });
+      console.log(`[SHOT] captured ${target}`);
+    }
+  } finally {
+    await page.close();
+    await setGroupFlags('reset=1');
+  }
+});
+
+await run('WS.8 Windows 多盘：盘符根 →「此电脑」→ 盘符列表 → 点盘进入；drives 根不可选', async () => {
+  await resetToBaseSingle('WS8 基础单聊');
+  await seedSingle('WS8 浅路径单聊', { workspace: 'C:\\work' });
+  await setGroupFlags('reset=1');
+  const page = await openPage();
+  try {
+    await page.waitForSelector('[data-testid="session-list"]', { timeout: 15000 });
+    await clickSessionRow(page, 'WS8 浅路径单聊');
+    await page.waitForSelector('[data-testid="workspace-path"]', { timeout: 15000 });
+    await openFolderPicker(page, 'workspace-edit');
+    const atWork = await readFolderPicker(page);
+    obs('C:\\work 的框内状态', atWork);
+    assert(atWork.path === 'C:\\work', `起点必须是 C:\\work，实测「${atWork.path}」`);
+    assert(
+      atWork.entries.some((entry) => entry.name === LONG_SEGMENTS[0]),
+      'C:\\work 必须列出它的子目录',
+    );
+
+    // ① 盘符根：上级从 C:\work 回到 C:\（盘符根，不再是「到顶」）。
+    await clickByTestId(page, 'folder-picker-up');
+    await waitFolderPath(page, 'C:\\');
+    const atDriveRoot = await readFolderPicker(page);
+    obs('C:\\（盘符根）的框内状态', atDriveRoot);
+    assert(atDriveRoot.upDisabled === false, '盘符根必须还能「上级」到「此电脑」');
+    assert(
+      JSON.stringify(atDriveRoot.entries.map((entry) => entry.name)) ===
+        JSON.stringify(['crowded', 'work']),
+      `C:\\ 必须列出盘符根子目录，实测 ${JSON.stringify(atDriveRoot.entries.map((entry) => entry.name))}`,
+    );
+
+    // ② 再上级 → 「此电脑」：列出 C:/D:，drives 根不可被选成工作路径。
+    const upStart = rpcLog.length;
+    await clickByTestId(page, 'folder-picker-up');
+    await waitFolderPath(page, '此电脑');
+    const drives = await readFolderPicker(page);
+    const drivesCall = rpcLog.slice(upStart).find((entry) => entry.method === 'workspace.listDirs');
+    obs('「此电脑」的框内状态与请求', { drives, params: drivesCall?.params });
+    assert(
+      JSON.stringify(drives.entries.map((entry) => entry.name)) ===
+        JSON.stringify(['C:', 'D:']),
+      `「此电脑」必须列出各盘，实测 ${JSON.stringify(drives.entries.map((entry) => entry.name))}`,
+    );
+    assert(
+      drivesCall?.params?.path === PICKER_DRIVES_ROOT,
+      `「此电脑」的列举请求必须带 sentinel，实测 ${JSON.stringify(drivesCall?.params)}`,
+    );
+    assert(drives.upDisabled === true, '「此电脑」再往上没有层：上级必须禁用');
+    assert(
+      JSON.stringify(drives.crumbs) ===
+        JSON.stringify([{ label: '此电脑', path: PICKER_DRIVES_ROOT }]),
+      `「此电脑」的面包屑必须是单段，实测 ${JSON.stringify(drives.crumbs)}`,
+    );
+    assert(drives.confirmDisabled === true, '「此电脑」不是目录：确认按钮必须禁用');
+    assert(
+      (drives.drivesHint ?? '').includes('不是目录'),
+      `「此电脑」必须给出不可选的原因提示，实测「${drives.drivesHint}」`,
+    );
+    const writesBefore = rpcLog.length;
+    await page.evaluate(() => {
+      document.querySelector('[data-testid="folder-picker-confirm"]')?.click();
+    });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const blockedWrites = rpcLog
+      .slice(writesBefore)
+      .filter((entry) => entry.method.endsWith('setWorkspace'));
+    obs('drives 根点确认后的写请求', blockedWrites);
+    assert(blockedWrites.length === 0, '「此电脑」不得被选成工作路径（不发写请求）');
+
+    // ③ 点 D: 进入；面包屑回到「此电脑」；再从 C: 回来，验证多盘可达。
+    await enterFolder(page, 'D:');
+    const atD = await readFolderPicker(page);
+    obs('D:\\ 的框内状态', atD);
+    assert(atD.path === 'D:\\', `点盘符必须进入 D:\\，实测「${atD.path}」`);
+    assert(
+      JSON.stringify(atD.entries.map((entry) => entry.name)) === JSON.stringify(['projects']),
+      `D:\\ 必须列出它的子目录，实测 ${JSON.stringify(atD.entries.map((entry) => entry.name))}`,
+    );
+    assert(
+      JSON.stringify(atD.crumbs) ===
+        JSON.stringify([
+          { label: '此电脑', path: PICKER_DRIVES_ROOT },
+          { label: 'D:', path: 'D:\\' },
+        ]),
+      `D:\\ 的面包屑必须是「此电脑 → D:」，实测 ${JSON.stringify(atD.crumbs)}`,
+    );
+
+    await clickFolderCrumb(page, PICKER_DRIVES_ROOT);
+    await waitFolderPath(page, '此电脑');
+    const backAtDrives = await readFolderPicker(page);
+    assert(
+      backAtDrives.entries.length === 2,
+      `点面包屑「此电脑」必须回到盘符列表，实测 ${backAtDrives.entries.length} 项`,
+    );
+
+    // ④ 跨盘切换真的写进工作路径：D:\projects → session.setWorkspace payload。
+    await enterFolder(page, 'D:');
+    await enterFolder(page, 'projects');
+    const start = rpcLog.length;
+    await clickByTestId(page, 'folder-picker-confirm');
+    await waitFor(
+      () => rpcLog.slice(start).some((entry) => entry.method === 'session.setWorkspace'),
+      '发出跨盘 session.setWorkspace',
+    );
+    const call = rpcLog.slice(start).find((entry) => entry.method === 'session.setWorkspace');
+    obs('跨盘 session.setWorkspace payload', call.params);
+    assert(
+      call.params.workspace === 'D:\\projects',
+      `跨盘选择必须逐字提交 D:\\projects，实测 ${call.params.workspace}`,
+    );
+    await page.waitForFunction(
+      (expected) =>
+        document.querySelector('[data-testid="workspace-path"]')?.textContent === expected,
+      { timeout: 15000 },
+      'D:\\projects',
+    );
+    assert(
+      (await page.$('[data-testid="folder-picker"]')) === null,
+      '跨盘确认成功后对话框必须关闭',
+    );
+  } finally {
+    await page.close();
+    await setGroupFlags('reset=1');
+  }
+});
+
+// 返工 12.13（2026-11-28 用户原话「你仍然需要给我一个路径输入框，和一个真正的 windows
+// 文件浏览器一样，路径输入和显示的文件夹对应」）：地址栏 input 与当前文件夹双向同步；
+// 合法路径回车 / 「跳转」导航，非法路径就地报错、不跳、地址栏回到当前文件夹。
+await run('WS.9 可编辑地址栏：值与当前文件夹同步；合法路径跳转；非法路径报错不跳（12.13）', async () => {
+  await resetToBaseSingle('WS9 基础单聊');
+  await seedSingle('WS9 地址栏单聊', { workspace: LONG_WORKSPACE });
+  await setGroupFlags('reset=1');
+  const page = await openPage();
+  try {
+    await page.waitForSelector('[data-testid="session-list"]', { timeout: 15000 });
+    await clickSessionRow(page, 'WS9 地址栏单聊');
+    await page.waitForSelector('[data-testid="workspace-path"]', { timeout: 15000 });
+    await openFolderPicker(page, 'workspace-edit');
+
+    const opened = await readFolderPicker(page);
+    obs('打开时的地址栏', {
+      value: opened.path,
+      tag: opened.pathTag,
+      editable: opened.pathEditable,
+      inputs: opened.inputs,
+      title: opened.title,
+    });
+    assert(opened.inputs === 1, `框内必须恰好一个输入框（地址栏），实测 ${opened.inputs}`);
+    assert(
+      opened.pathTag === 'input' && opened.pathEditable,
+      `地址栏必须是可编辑 input，实测 ${opened.pathTag}/${opened.pathEditable}`,
+    );
+    assert(
+      opened.path === LONG_WORKSPACE,
+      `地址栏初值必须是当前文件夹路径，实测「${opened.path}」`,
+    );
+    assert(opened.title === LONG_WORKSPACE, `地址栏 title 必须是全文，实测「${opened.title}」`);
+
+    // ① 点文件夹：地址栏跟着变（浏览 → 地址栏自动同步）。
+    const entered = await enterFolder(page, 'beta');
+    const afterEnter = await readFolderPicker(page);
+    obs('点 beta 后的地址栏', {
+      value: afterEnter.path,
+      expected: entered,
+      crumbs: afterEnter.crumbs,
+    });
+    assert(
+      afterEnter.path === entered,
+      `点文件夹后地址栏必须同步，实测「${afterEnter.path}」/ 期望「${entered}」`,
+    );
+
+    // ② 合法路径 + Enter：导航（列表 / 面包屑 / 请求参数一起变），不发写请求。
+    const legal = `${PICKER_CROWDED}\\${PICKER_CROWDED_CHILDREN[1]}`;
+    await replaceAddress(page, legal);
+    const typedLegal = await page.$eval(
+      '[data-testid="folder-picker-path"]',
+      (element) => element.value,
+    );
+    obs('键入后的地址栏', { value: typedLegal, expected: legal });
+    assert(typedLegal === legal, `地址栏必须接受键入并整体替换，实测「${typedLegal}」`);
+    const jumpStart = rpcLog.length;
+    await page.keyboard.press('Enter');
+    await waitFor(
+      () => rpcLog.slice(jumpStart).some((entry) => entry.method === 'workspace.listDirs'),
+      '回车后发出 workspace.listDirs（地址栏跳转）',
+    );
+    await waitFolderPath(page, legal);
+    // 地址栏的值在键入时就等于目标路径，光等它会被"输入中"骗过：必须等列举完成
+    // （面包屑出现该目录）才能断言列表 / 面包屑真的跟着跳了。错误也放行，交给下面的断言归因。
+    await page.waitForFunction(
+      (expected) => {
+        const crumb = [...document.querySelectorAll('[data-testid="folder-picker-crumb"]')].some(
+          (button) => button.getAttribute('data-path') === expected,
+        );
+        return crumb || document.querySelector('[data-testid="folder-picker-load-error"]') !== null;
+      },
+      { timeout: 15000 },
+      legal,
+    );
+    const jumped = await readFolderPicker(page);
+    const jumpCall = rpcLog.slice(jumpStart).find((entry) => entry.method === 'workspace.listDirs');
+    obs('地址栏跳转后', {
+      value: jumped.path,
+      entries: jumped.entries.map((entry) => entry.name),
+      request: jumpCall?.params,
+      crumbs: jumped.crumbs,
+      loadError: jumped.loadError,
+    });
+    assert(
+      jumped.loadError === null,
+      `合法路径跳转不得报错，实测「${jumped.loadError}」`,
+    );
+    assert(
+      jumped.path === legal,
+      `合法路径回车后地址栏必须显示该路径，实测「${jumped.path}」`,
+    );
+    assert(
+      jumpCall?.params?.path === legal,
+      `跳转必须用地址栏路径列举，实测 ${JSON.stringify(jumpCall?.params)}`,
+    );
+    assert(
+      jumped.crumbs.some((crumb) => crumb.path === legal),
+      `跳转后面包屑必须包含新目录，实测 ${JSON.stringify(jumped.crumbs)}`,
+    );
+    assert(
+      jumped.crumbs.some((crumb) => crumb.path === PICKER_CROWDED),
+      `跳转后面包屑必须跟着变（含 ${PICKER_CROWDED}），实测 ${JSON.stringify(jumped.crumbs)}`,
+    );
+    assert(
+      jumped.entries.length === 0,
+      `跳转后必须显示该目录内容（夹具叶子应为空），实测 ${jumped.entries.length}`,
+    );
+    const writesAfterJump = rpcLog
+      .slice(jumpStart)
+      .filter((entry) => entry.method.endsWith('setWorkspace'));
+    obs('地址栏跳转的写请求', writesAfterJump);
+    assert(
+      writesAfterJump.length === 0,
+      `地址栏跳转不得发写请求，实测 ${JSON.stringify(writesAfterJump)}`,
+    );
+
+    // ③「跳转」按钮与回车等价：跳回 40 个子目录的文件夹。
+    await replaceAddress(page, PICKER_CROWDED);
+    await clickByTestId(page, 'folder-picker-go');
+    await waitFolderPath(page, PICKER_CROWDED);
+    // 地址栏的值在键入时就等于目标路径，必须等列举结果真的渲染出来（40 项）再断言。
+    await page.waitForFunction(
+      (count) =>
+        document.querySelectorAll('[data-testid="folder-picker-entry"]').length === count,
+      { timeout: 15000 },
+      PICKER_CROWDED_CHILDREN.length,
+    );
+    const viaButton = await readFolderPicker(page);
+    obs('「跳转」按钮跳转后', {
+      value: viaButton.path,
+      entries: viaButton.entries.length,
+    });
+    assert(viaButton.path === PICKER_CROWDED, '「跳转」按钮必须与回车等价');
+    assert(
+      viaButton.entries.length === PICKER_CROWDED_CHILDREN.length,
+      `按钮跳转后必须列出 ${PICKER_CROWDED_CHILDREN.length} 个子目录，实测 ${viaButton.entries.length}`,
+    );
+
+    // ④ 非法路径 + Enter：框内错误含路径 / 原因、不跳、地址栏回到当前文件夹。
+    const bad = 'C:\\work\\nope';
+    await replaceAddress(page, bad);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="folder-picker-load-error"]') !== null,
+      { timeout: 15000 },
+    );
+    // 错误与「地址栏恢复成当前文件夹」可能不在同一帧：给一个短稳定窗口，超时也继续，
+    // 让下面的显式断言带着实测值失败（而不是只抛一个笼统的等待超时）。
+    await page
+      .waitForFunction(
+        (expected) =>
+          document.querySelector('[data-testid="folder-picker-path"]')?.value === expected,
+        { timeout: 2000 },
+        PICKER_CROWDED,
+      )
+      .catch(() => {});
+    const failed = await page.evaluate(() => {
+      const input = document.querySelector('[data-testid="folder-picker-path"]');
+      return {
+        value: input?.value ?? '',
+        error: document.querySelector('[data-testid="folder-picker-load-error"]')?.textContent ?? '',
+        entries: document.querySelectorAll('[data-testid="folder-picker-entry"]').length,
+        open: document.querySelector('[data-testid="folder-picker"]') !== null,
+      };
+    });
+    obs('非法路径回车后', { ...failed, attempted: bad });
+    assert(failed.error.includes(bad), `错误必须含输入的路径，实测「${failed.error}」`);
+    assert(failed.error.includes('不存在'), `错误必须含原因，实测「${failed.error}」`);
+    assert(
+      failed.value === PICKER_CROWDED,
+      `非法路径不得跳转：地址栏必须回到当前文件夹，实测「${failed.value}」/ 期望「${PICKER_CROWDED}」`,
+    );
+    assert(
+      failed.entries === PICKER_CROWDED_CHILDREN.length,
+      `非法路径不得改变列表（仍应显示 ${PICKER_CROWDED_CHILDREN.length} 项），实测 ${failed.entries}`,
+    );
+    assert(failed.open, '非法路径不得关闭对话框');
+    const writesAfterFail = rpcLog
+      .slice(jumpStart)
+      .filter((entry) => entry.method.endsWith('setWorkspace'));
+    assert(writesAfterFail.length === 0, '非法路径跳转不得发写请求');
+  } finally {
+    await page.close();
+    await setGroupFlags('reset=1');
+  }
+});
+
+// WORKSPACE_SHOT_SINGLE / WORKSPACE_SHOT_GROUP：各留一张视觉验收截图（change
+// `custom-workspace` 任务 8.3 ④；返工任务 12.5 改成截**打开状态的文件夹选择框**；
+// 图由主循环 read_image 判读：框内路径 / 子目录 / 两个按钮可读、层级盖住主区）。
+if (process.env.WORKSPACE_SHOT_SINGLE) {
+  await resetToBaseSingle('WS 截图基础单聊');
+  await seedSingle('WS 截图单聊', { workspace: LONG_WORKSPACE });
+  const page = await openPage();
+  try {
+    await page.waitForSelector('[data-testid="session-list"]', { timeout: 15000 });
+    await clickSessionRow(page, 'WS 截图单聊');
+    await page.waitForSelector('[data-testid="workspace-path"]', { timeout: 15000 });
+    await openFolderPicker(page, 'workspace-edit');
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    const target = process.env.WORKSPACE_SHOT_SINGLE;
+    await page.screenshot({ path: target, fullPage: false });
+    console.log(`[SHOT] captured ${target}`);
+  } finally {
+    await page.close();
+  }
+}
+
+if (process.env.WORKSPACE_SHOT_GROUP) {
+  await resetToBaseSingle('WS 截图基础单聊');
+  await seedWorkspaceGroup('WS 截图工作区组', LONG_WORKSPACE);
+  const page = await openPage();
+  try {
+    await page.waitForSelector('[data-testid="session-list"]', { timeout: 15000 });
+    await clickSessionRow(page, 'WS 截图工作区组');
+    await page.waitForSelector('[data-testid="group-workspace"]', { timeout: 15000 });
+    await openFolderPicker(page, 'group-workspace-edit');
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    const target = process.env.WORKSPACE_SHOT_GROUP;
+    await page.screenshot({ path: target, fullPage: false });
+    console.log(`[SHOT] captured ${target}`);
+  } finally {
+    await page.close();
+  }
+}
 
 console.log('\n[群视图 e2e] 摘要：' + JSON.stringify({ total: results.length, failures: failureCount }));
 await browser.close();

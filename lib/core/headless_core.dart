@@ -51,6 +51,7 @@ import '../services/subagent_runner.dart';
 import '../services/summary_node_repository.dart';
 import '../services/tool_bootstrap.dart';
 import '../services/tool_catalog.dart';
+import '../services/workspace.dart';
 import 'core_lock.dart';
 import 'event_serialization.dart';
 import 'json_rpc.dart';
@@ -81,6 +82,11 @@ const List<String> kCoreRpcMethodNames = <String>[
   'session.delete',
   'session.rename',
   'session.switchTemplate',
+  // 工作路径（change `custom-workspace`）：单聊原地切换（组用 `group.setWorkspace`）。
+  'session.setWorkspace',
+  // 文件夹选择对话框的列目录（change `custom-workspace` 返工任务 12.2）：只列子目录，
+  // 省略 `path` 时起点是应用主目录。单聊 / 群共用同一份浏览数据源。
+  'workspace.listDirs',
   'message.query',
   'agent.send',
   'agent.cancel',
@@ -96,7 +102,8 @@ const List<String> kCoreRpcMethodNames = <String>[
   'attachment.upload',
   'attachment.read',
   // 群聊（change `agent-group-chat` §7；change `group-reactive-mode` 加 `group.update`
-  // 与 `group.chain`）：十个方法，实现与清单必须一致。
+  // 与 `group.chain`；change `custom-workspace` 加 `group.setWorkspace`）：
+  // 十一个方法，实现与清单必须一致。
   'group.create',
   'group.update',
   'group.chain',
@@ -107,6 +114,7 @@ const List<String> kCoreRpcMethodNames = <String>[
   'group.member.update',
   'group.send',
   'group.view',
+  'group.setWorkspace',
 ];
 
 /// WebSocket 路径（与 web 客户端一致）。
@@ -178,9 +186,13 @@ class HeadlessCore {
     required this.groups,
     required this.configPath,
     required this.attachmentsDir,
+    // 文件夹选择对话框省略 `path` 时的起点（返工任务 12.2）。缺省 = 产品主目录；
+    // 测试注入临时目录，避免列举用户真实主目录。
+    String? homeDir,
     required this.probe,
     required Future<void> ready,
-  }) : _ready = ready;
+  })  : _ready = ready,
+        homeDir = homeDir ?? ConfigService.homeDir;
 
   /// 当前配置（可变：配置写盘后由 [applyConfig] 进程内同步）。
   AppConfig config;
@@ -210,6 +222,12 @@ class HeadlessCore {
 
   /// 附件落盘目录（design D12 / D14 注入点）。生产 = `ConfigService.attachmentsDir`。
   final String attachmentsDir;
+
+  /// 文件夹选择对话框的缺省起点（返工任务 12.2）。
+  ///
+  /// 生产 = `ConfigService.homeDir`（与缺省工作区同一口径，不发明第二个「主目录」）；
+  /// 测试注入临时目录 —— 用例**不得**去列举用户真实主目录。
+  final String homeDir;
 
   /// 模型目录探测入口（design D7 / D14 注入点）。生产 = 真 HTTP 探测；
   /// 测试注入假 probe（**绝不联网**）。
@@ -592,6 +610,8 @@ class HeadlessCore {
       'session.delete': _handleSessionDelete,
       'session.rename': _handleSessionRename,
       'session.switchTemplate': _handleSessionSwitchTemplate,
+      'session.setWorkspace': _handleSessionSetWorkspace,
+      'workspace.listDirs': _handleWorkspaceListDirs,
       'message.query': _handleMessageQuery,
       'agent.send': _handleAgentSend,
       'agent.cancel': _handleAgentCancel,
@@ -615,6 +635,7 @@ class HeadlessCore {
       'group.member.update': _handleGroupMemberUpdate,
       'group.send': _handleGroupSend,
       'group.view': _handleGroupView,
+      'group.setWorkspace': _handleGroupSetWorkspace,
     };
     for (final name in kCoreRpcMethodNames) {
       final handler = handlers[name];
@@ -681,9 +702,27 @@ class HeadlessCore {
       }
       agentType = rawAgentType;
     }
+    // 工作路径（change `custom-workspace` D4 / D6）：有值先校验再插行；非法 ⇒ -32602
+    // 且**不创建会话行**。只有空白字符 = 省略（写 NULL、用缺省）。
+    final rawWorkspace = params['workspace'];
+    if (rawWorkspace != null && rawWorkspace is! String) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: workspace 必须是字符串或省略');
+    }
+    final workspaceSetting =
+        stripWorkspaceInput((rawWorkspace as String?) ?? '');
+    if (workspaceSetting.isNotEmpty) {
+      final problem = workspaceProblem(workspaceSetting);
+      if (problem != null) {
+        throw JsonRpcException(
+            JsonRpcErrorCode.invalidParams,
+            '工作路径被拒绝：$problem（收到 "$workspaceSetting"）');
+      }
+    }
     final session = await sessionRepo.create(
       title: (title == null || title.isEmpty) ? null : title,
       agentType: agentType,
+      workspace: workspaceSetting.isEmpty ? null : workspaceSetting,
     );
     return {'session': serializeSession(session)};
   }
@@ -787,11 +826,115 @@ class HeadlessCore {
         '模板切换失败（阶段：${e.stage.name} / ${e.stage.label}，'
         '候选 "${e.candidateName}"）：${e.message}',
       );
+    } on WorkspaceUnavailableException catch (e) {
+      // 兜底：切换创建实例时工作路径不可用（正常路径会被包成 AgentSwitchException，
+      // 它的 message 已含路径与出路）。仍然映射为 -32602，不变成内部错误。
+      throw JsonRpcException(
+          JsonRpcErrorCode.invalidParams, '模板切换失败：$e');
     } on JsonRpcException {
       rethrow;
     } catch (e) {
       throw JsonRpcException(
           JsonRpcErrorCode.internalError, '模板切换失败（候选 "$templateName"）：$e');
+    }
+  }
+
+  /// `session.setWorkspace`：单聊原地切换工作路径（change `custom-workspace` D6）。
+  ///
+  /// 顺序钉死：kind 守卫 → 校验路径（非法 ⇒ -32602，**不改任何东西**）→ busy
+  /// （实例流式 / 模板切换中 / 删除中，不排队、不改值）→ 有在册实例则 `Agent.setWorkspace`
+  /// → 落库（核对**恰好一行**）→ 重读返回 `{session}`。
+  Future<Map<String, dynamic>> _handleSessionSetWorkspace(
+      Map<String, dynamic> params) async {
+    final sessionId = _requireString(params, 'sessionId');
+    final rawWorkspace = params['workspace'];
+    if (rawWorkspace is! String) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: workspace 必填且必须是字符串（要回主目录请显式传主目录路径）');
+    }
+    final session = await sessionRepo.get(sessionId);
+    if (session == null) {
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+          '会话 "$sessionId" 不存在：切换工作路径被拒绝（不静默 no-op）');
+    }
+    if (session.isGroup) {
+      throw JsonRpcException(
+        JsonRpcErrorCode.invalidParams,
+        '会话 "$sessionId" 是组会话（kind=group）：组的工作路径请用 group.setWorkspace'
+            '（它会把新路径传播到所有在册成员实例）',
+      );
+    }
+    final setting = stripWorkspaceInput(rawWorkspace);
+    final problem = workspaceProblem(setting);
+    if (problem != null) {
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+          '工作路径被拒绝：$problem（收到 "$setting"）');
+    }
+    if (sessionController.isSwitching(sessionId)) {
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+          '会话 "$sessionId" 正在切换模板：busy，工作路径未改动（不排队）');
+    }
+    if (sessionController.isDeleting(sessionId)) {
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+          '会话 "$sessionId" 正在删除：busy，工作路径未改动（不排队）');
+    }
+    final agent = agents.lookup(sessionId);
+    if (agent != null) {
+      if (agent.isStreaming) {
+        throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+            '会话 "$sessionId" 正在生成：busy，工作路径未改动（不排队、不中途换根）');
+      }
+      try {
+        await agent.setWorkspace(setting);
+      } on WorkspaceUnavailableException catch (e) {
+        throw JsonRpcException(JsonRpcErrorCode.invalidParams, '$e');
+      } on StateError catch (e) {
+        // Agent.setWorkspace 的并发兜底（例如竞态下刚开始生成）。
+        throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+            '会话 "$sessionId" 切换工作路径失败：$e');
+      }
+    }
+    final updated = await sessionRepo.updateWorkspace(sessionId, setting);
+    if (updated != 1) {
+      throw JsonRpcException(
+        JsonRpcErrorCode.invalidParams,
+        '上下文已切换到「$setting」，但没有更新到唯一既有行'
+            '（实际更新 $updated 行，期望 1 行）：数据库里的工作路径未持久化（不假装成功）',
+      );
+    }
+    final reread = await sessionRepo.get(sessionId);
+    if (reread == null) {
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams,
+          '会话 "$sessionId" 在切换工作路径过程中被删除：未能确认落库');
+    }
+    return {'session': serializeSession(reread)};
+  }
+
+  /// `workspace.listDirs`：文件夹选择对话框的一层子目录（返工任务 12.2 / 12.11）。
+  ///
+  /// 入参 `path` 可选：省略 / 只有空白 ⇒ 起点是 [homeDir]（生产 = 应用主目录）；
+  /// `path == kWorkspaceDrivesRoot`（`@drives`）⇒ 「此电脑」虚拟根，列本机逻辑盘
+  /// （仅 Windows；`isDirectory=false`，不能被选成工作路径）。
+  /// 只列**子目录**（用户选的是工作目录，不是文件），回包
+  /// `{path, parent, directories:[{name, path}], exists, isDirectory}`。
+  ///
+  /// 路径不存在 / 不是目录 / 读不到 ⇒ `-32602`（消息含路径与原因），
+  /// **不静默返回空列表** —— 界面要能说明为什么打不开这个目录。
+  Future<Map<String, dynamic>> _handleWorkspaceListDirs(
+      Map<String, dynamic> params) async {
+    final rawPath = params['path'];
+    if (rawPath != null && rawPath is! String) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: path 必须是字符串或省略（省略 = 从应用主目录开始）');
+    }
+    try {
+      final listing = listWorkspaceDirectories(
+        rawPath as String?,
+        defaultDir: homeDir,
+      );
+      return listing.toJson();
+    } on WorkspaceUnavailableException catch (e) {
+      throw JsonRpcException(JsonRpcErrorCode.invalidParams, '无法列举目录：$e');
     }
   }
 
@@ -895,8 +1038,15 @@ class HeadlessCore {
     }
 
     final callbacks = callbacksFor(sessionId);
-    final Agent agent =
-        await factory.ensure(session, callbacks: callbacks);
+    final Agent agent;
+    try {
+      agent = await factory.ensure(session, callbacks: callbacks);
+    } on WorkspaceUnavailableException catch (e) {
+      // change `custom-workspace` D6：持久化工作路径不可用（重启后目录被删 / 不是目录）
+      // ⇒ 可归因 -32602（含路径与出路）；不静默回落缺省目录、不在空工作区里发请求。
+      throw JsonRpcException(
+          JsonRpcErrorCode.invalidParams, 'agent.send 无法开始：$e');
+    }
     // T5：ensure 复用已存在实例时不会重赋 callbacks —— 这里必须把回调指向当前
     // WS 订阅者（广播到所有当前连接），否则重连后事件发往旧回调。
     agent.callbacks = callbacks;
@@ -1839,6 +1989,35 @@ class HeadlessCore {
     }
   }
 
+  /// `group.setWorkspace`：切换组的共享工作路径（change `custom-workspace` D6 / D7）。
+  ///
+  /// 走组服务的唯一实现（校验 → 组上下文生效 → 落库 → 传播到成员 → 重读）；可归因
+  /// `GroupException`（含 busy / invalid_workspace / workspace_propagation_failed）统一经
+  /// [_groupError] 变成 `-32602`。kind 不符在这里显式指向 `session.setWorkspace`。
+  Future<Map<String, dynamic>> _handleGroupSetWorkspace(
+      Map<String, dynamic> params) async {
+    final groupId = _requireString(params, 'groupId');
+    final rawWorkspace = params['workspace'];
+    if (rawWorkspace is! String) {
+      throw const JsonRpcException(JsonRpcErrorCode.invalidParams,
+          'Invalid params: workspace 必填且必须是字符串（要回主目录请显式传主目录路径）');
+    }
+    final existing = await sessionRepo.get(groupId);
+    if (existing != null && !existing.isGroup) {
+      throw JsonRpcException(
+        JsonRpcErrorCode.invalidParams,
+        '会话 "$groupId" 是单聊会话（kind=${existing.kind}）：'
+            '单聊的工作路径请用 session.setWorkspace（组才会传播到成员）',
+      );
+    }
+    try {
+      final session = await groups.setWorkspace(groupId, rawWorkspace);
+      return {'group': serializeSession(session)};
+    } on GroupException catch (e) {
+      throw _groupError(e);
+    }
+  }
+
   Future<Map<String, dynamic>> _handleGroupView(
       Map<String, dynamic> params) async {
     final groupId = _requireString(params, 'groupId');
@@ -1993,6 +2172,9 @@ Map<String, dynamic> serializeSession(Session session) => {
       'maxRounds': session.maxRounds,
       // 会话级覆盖层：可空字段如实写出（没有覆盖时是 null，不是 {}）。
       'overrides': session.overrides?.toJson(),
+      // 工作路径设置值（change `custom-workspace` D6）：null = 未设置（用缺省主目录）。
+      // 每次序列化都写该键，客户端据此显示「缺省（应用主目录）」或实际路径。
+      'workspace': session.workspace,
     };
 
 // -----------------------------------------------------------------------------
@@ -2017,6 +2199,8 @@ Future<HeadlessCore> buildHeadlessCore({
   bool backgroundFoldEnabled = true,
   String? configPath,
   String? attachmentsDir,
+  // 文件夹选择对话框的缺省起点（返工任务 12.2）：省略 = `ConfigService.homeDir`。
+  String? homeDir,
   ModelCatalogProbe? probe,
 }) async {
   if (openDatabase != null) await openDatabase();
@@ -2155,6 +2339,7 @@ Future<HeadlessCore> buildHeadlessCore({
     groups: groups,
     configPath: configPath ?? ConfigService.configPath,
     attachmentsDir: attachmentsDir ?? ConfigService.attachmentsDir,
+    homeDir: homeDir,
     probe: probe ?? HttpModelCatalogProbe(),
     ready: toolsReady.future,
   );

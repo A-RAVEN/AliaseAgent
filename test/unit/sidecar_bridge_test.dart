@@ -1,8 +1,11 @@
 import 'dart:convert';
 import 'dart:ffi';
+import 'dart:io';
+
 import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as p;
 import 'package:alias_agent/services/sidecar_bridge.dart';
 
 /// Smoke tests using the REAL sidecar DLL.  Catches:
@@ -309,6 +312,71 @@ void main() {
       final ok = parseWorkspaceResponse('{"ok":true,"workspace":""}');
       expect(ok.ok, isTrue);
       expect(ok.workspace, '');
+    });
+  });
+
+  // =========================================================================
+  // 2.6 ensureContext 设置工作区失败不再静默（change `custom-workspace` design D11）
+  //
+  // 红靶：修复前 `ensureContext` 忽略 `set_workspace` 的返回值 —— 路径不存在时上下文
+  // 留在**空工作区**（文件工具对绝对路径不再设界 = 静默 allow-all）。修复后必须：
+  // 清掉刚建的空工作区上下文再抛错。断言读真实 `get_workspace`（不读内部变量）。
+  // =========================================================================
+  group('ensureContext 的工作区失败处置（真实 DLL）', () {
+    test('不存在的 defaultWorkspace ⇒ 抛 set_workspace failed 且不留空工作区上下文', () async {
+      final bridge = SidecarBridge.instance;
+      const id = 'bridge-ws-missing-dir';
+      await bridge.disposeContext(id); // 幂等：从空状态开始
+      final missing = p.join(Directory.systemTemp.path, 'definitely-missing-9f1c');
+      if (Directory(missing).existsSync()) {
+        Directory(missing).deleteSync(recursive: true);
+      }
+      expect(Directory(missing).existsSync(), isFalse,
+          reason: '前置：这个目录必须真的不存在');
+
+      Object? thrown;
+      try {
+        await bridge.ensureContext(id, defaultWorkspace: missing);
+      } catch (error) {
+        thrown = error;
+      }
+      debugPrint('[OBS] ensureContext(不存在目录) 抛出=$thrown');
+      expect(thrown, isA<StateError>());
+      expect('$thrown', contains('set_workspace failed'),
+          reason: '设定工作区失败必须变成可归因错误，不是静默成功');
+
+      final after = bridge.getWorkspace(id);
+      debugPrint('[OBS] 失败后 get_workspace: ok=${after.ok} code=${after.code} '
+          'workspace=${after.workspace}');
+      expect(after.ok, isFalse,
+          reason: '刚建的空工作区上下文必须被清掉（否则后续复用 = allow-all）');
+      expect(after.code, 'unknown_context');
+      expect(after.workspace, isNull, reason: '失败后不得伪造工作区');
+    });
+
+    test('合法目录 ⇒ created:true 且 getWorkspace 读回同一目录（p.equals）', () async {
+      final bridge = SidecarBridge.instance;
+      const id = 'bridge-ws-valid-dir';
+      await bridge.disposeContext(id);
+      final dir = Directory.systemTemp.createTempSync('bridge_ws_valid_');
+      try {
+        final created =
+            await bridge.ensureContext(id, defaultWorkspace: dir.path);
+        final read = bridge.getWorkspace(id);
+        debugPrint('[OBS] created=$created 设定=${dir.path} '
+            '读回=${read.ok}/${read.workspace}');
+        expect(created, isTrue);
+        expect(read.ok, isTrue);
+        expect(p.equals(read.workspace!, dir.path), isTrue,
+            reason: '读回的是 sidecar 规范化（正斜杠）形式，比较用 p.equals');
+      } finally {
+        await bridge.disposeContext(id);
+        if (dir.existsSync()) {
+          try {
+            dir.deleteSync(recursive: true);
+          } catch (_) {}
+        }
+      }
     });
   });
 }

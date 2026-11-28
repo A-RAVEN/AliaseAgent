@@ -165,8 +165,9 @@ void main() {
             reason: 'CREATE TABLE 里也要带 attachments（v7 全新建库）');
         // 当前建库版本已随 group-reactive-mode 升到 11（v9 是 agent-group-chat，
         // v10 加 sessions.reactions_enabled、v11 补 sessions.max_reaction_rounds）；
+        // change `custom-workspace` 再升到 12（v12 加 sessions.workspace）。
         // 这里验的是「全新建库也带 attachments」，版本号取当前 schema 版本。
-        expect(await freshDb.getVersion(), 11);
+        expect(await freshDb.getVersion(), 12);
       } finally {
         await DatabaseService.close();
         if (freshDir.existsSync()) {
@@ -265,8 +266,9 @@ void main() {
           '${sessionCols.map((c) => c['name']).join(',')}');
       expect(sessionCols.any((c) => c['name'] == 'parent_session_id'), isTrue,
           reason: 'v7→v8 必须给 sessions 加上 parent_session_id');
-      // v10/v11（group-reactive-mode）再往上加两版：本用例只验 v8 的列在升级产物里。
-      expect(await db.getVersion(), 11);
+      // v10/v11/v12（group-reactive-mode + custom-workspace）再往上加三版：
+      // 本用例只验 v8 的列在升级产物里。
+      expect(await db.getVersion(), 12);
 
       final sessions = await db.query('sessions');
       // ignore: avoid_print
@@ -314,8 +316,9 @@ void main() {
         final cols = await db.rawQuery('PRAGMA table_info(sessions)');
         expect(cols.any((c) => c['name'] == 'parent_session_id'), isTrue,
             reason: 'CREATE TABLE 里也要带 parent_session_id（v8 全新建库）');
-        // 当前 schema 版本（v11 = group-reactive-mode 的 sessions.max_reaction_rounds）。
-        expect(await db.getVersion(), 11);
+        // 当前 schema 版本（v12 = custom-workspace 的 sessions.workspace；
+        // v11 = group-reactive-mode 的 sessions.max_reaction_rounds）。
+        expect(await db.getVersion(), 12);
 
         final repo = SessionRepository();
         final parent = await repo.create(title: '父会话');
@@ -385,6 +388,7 @@ void main() {
 
   _v9MigrationTests();
   _v10MigrationTests();
+  _v11MigrationTests();
 }
 
 // -----------------------------------------------------------------------------
@@ -607,7 +611,7 @@ Future<void> _createV10Database(Directory dir) async {
 }
 
 void _v10MigrationTests() {
-  group('Database schema migration v9 -> v11 / v10 -> v11', () {
+  group('Database schema migration v9 -> v12 / v10 -> v12', () {
     late Directory tempDir;
 
     setUp(() {
@@ -628,7 +632,7 @@ void _v10MigrationTests() {
     // 把 max_reaction_rounds 塞进 oldV <= 9 ⇒ 真实库永远补不上列）。修复：版本升到
     // 11，`oldV <= 10` 单独补列。
     // -------------------------------------------------------------------------
-    test('v10 库（同步实现升上来的真实库）升级到 v11：补 max_reaction_rounds、旧组开关保留、行数不变',
+    test('v10 库（同步实现升上来的真实库）升级到 v12：补 max_reaction_rounds 与 workspace、旧组开关保留、行数不变',
         () async {
       await _createV10Database(tempDir);
       // 前置事实：这个库真的**缺** max_reaction_rounds（否则本用例在测别的东西）。
@@ -668,8 +672,8 @@ void _v10MigrationTests() {
       expect(added['notnull'], 0, reason: '可空：NULL = 用产品默认');
       expect(added['dflt_value'], isNull);
 
-      // ② 版本号必须到 11。
-      expect(version, 11, reason: 'schema 版本必须是 11（v10→v11 补列）');
+      // ② 版本号必须到 12（v10→v11 补上限列，v12 补 workspace 列）。
+      expect(version, 12, reason: 'schema 版本必须是 12（v10→v11 补列 + v12 补 workspace）');
 
       // ③ 迁移不删行、不改既有值：旧组仍是安静态（同步实现的回填结果保留）。
       expect(sessions.length, 2, reason: '迁移不删行');
@@ -735,7 +739,8 @@ void _v10MigrationTests() {
       print('  [OBS] v10 messages => '
           '${messages.map((r) => '${r['id']}: ${r['content']}').join(' | ')}');
 
-      expect(version, 11, reason: 'schema 版本必须是 11（v9→v10 两列 + v10→v11 补上限列）');
+      expect(version, 12,
+          reason: 'schema 版本必须是 12（v9→v10 两列 + v10→v11 补上限列 + v12 补 workspace）');
       expect(sessions.length, 2, reason: '迁移不删行');
       expect(messages.length, 2, reason: '迁移不删行');
       expect(summaries.length, 1, reason: '迁移不删行');
@@ -808,7 +813,7 @@ void _v10MigrationTests() {
       }
     });
 
-    test('新建 v11 库直接含两个组设置列且新组读出 true / null', () async {
+    test('新建 v12 库直接含两个组设置列且新组读出 true / null', () async {
       final freshDir = Directory.systemTemp.createTempSync('mig_v10_new_');
       try {
         await DatabaseService.openAt(freshDir.path);
@@ -1009,9 +1014,10 @@ void _v9MigrationTests() {
       // ignore: avoid_print
       print('  [OBS] 旧摘要 => member_id=${summaries.first['member_id']}');
 
-      // v10/v11（group-reactive-mode）：v9 库再往上升，终点是 11；本用例验的是
-      // v9 的列（kind / overrides_json / author / visibility / member_id）都还在。
-      expect(version, 11);
+      // v10/v11/v12（group-reactive-mode + custom-workspace）：v9 库再往上升，
+      // 终点是 12；本用例验的是 v9 的列（kind / overrides_json / author / visibility /
+      // member_id）都还在。
+      expect(version, 12);
       expect(sessions.length, 1, reason: '迁移不删行');
       expect(messages.length, 1, reason: '迁移不删行');
       expect(summaries.length, 1, reason: '迁移不删行');
@@ -1081,6 +1087,280 @@ void _v9MigrationTests() {
         for (final table in upgraded.keys) {
           expect(upgraded[table], equals(fresh[table]),
               reason: '表 $table 的列/索引在「升级产物」与「全新建库」之间不一致');
+        }
+      } finally {
+        await DatabaseService.close();
+        if (freshDir.existsSync()) {
+          try {
+            freshDir.deleteSync(recursive: true);
+          } catch (_) {}
+        }
+      }
+    });
+  });
+}
+
+// -----------------------------------------------------------------------------
+// v11 → v12（change `custom-workspace` 任务 3.1 / design D2、D12）
+// -----------------------------------------------------------------------------
+
+/// 按 **v11** 的建表语句造一个旧库：一条组 + 一条单聊、两条消息（其中一条带附件）、
+/// 一条成员作用域摘要、两条成员（一条已移除），索引与生产 v11 逐项对齐。
+///
+/// 这是本 change 的升级靶：修复前 `sessions` 没有 `workspace` 列，升级后仍停在 v11。
+Future<void> _createV11Database(Directory dir) async {
+  final dbPath = p.join(dir.path, 'aliasagent.db');
+  final db11 = await openDatabase(dbPath, version: 11, onCreate: (db, v) async {
+    await db.execute('''CREATE TABLE sessions (
+      id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT 'New Chat',
+      agent_type TEXT NOT NULL DEFAULT 'general',
+      parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      tree_version INTEGER NOT NULL DEFAULT 0,
+      dirty_since_seq INTEGER NOT NULL DEFAULT 0,
+      kind TEXT NOT NULL DEFAULT 'single',
+      overrides_json TEXT,
+      reactions_enabled INTEGER NOT NULL DEFAULT 1,
+      max_reaction_rounds INTEGER)''');
+    await db.execute('''CREATE TABLE messages (
+      id TEXT PRIMARY KEY, seq INTEGER,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+      content TEXT NOT NULL, tool_calls TEXT, thinking_json TEXT,
+      token_count INTEGER, output_token_count INTEGER,
+      attachments TEXT, created_at INTEGER NOT NULL,
+      author TEXT, visibility TEXT NOT NULL DEFAULT 'public')''');
+    await db.execute('CREATE INDEX idx_messages_session ON messages(session_id)');
+    await db.execute('CREATE INDEX idx_messages_seq ON messages(session_id, seq)');
+    await db.execute(
+        'CREATE INDEX idx_sessions_updated ON sessions(updated_at DESC)');
+    await db.execute('''CREATE TABLE summary_nodes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      member_id TEXT,
+      level INTEGER NOT NULL, start_seq INTEGER NOT NULL, end_seq INTEGER NOT NULL,
+      node_type TEXT NOT NULL, parent_id INTEGER, summary_json TEXT,
+      token_cost INTEGER, summary_prompt_version INTEGER, model TEXT,
+      covered_min_seq INTEGER NOT NULL, covered_max_seq INTEGER NOT NULL)''');
+    await db.execute(
+        'CREATE INDEX idx_summary_nodes_session ON summary_nodes(session_id)');
+    await db.execute(
+        'CREATE INDEX idx_summary_nodes_span ON summary_nodes(session_id, member_id, level, start_seq, end_seq)');
+    await db.execute(
+        'CREATE INDEX idx_summary_nodes_leaf_owner ON summary_nodes(session_id, member_id, covered_min_seq, covered_max_seq)');
+    await db.execute('''CREATE TABLE group_members (
+      id TEXT PRIMARY KEY,
+      group_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      name TEXT NOT NULL, template_name TEXT NOT NULL, overrides_json TEXT,
+      removed_at INTEGER, created_at INTEGER NOT NULL)''');
+    await db.execute(
+        'CREATE INDEX idx_group_members_group ON group_members(group_session_id)');
+    await db.execute(
+        'CREATE UNIQUE INDEX idx_group_members_active_name '
+        'ON group_members(group_session_id, name) WHERE removed_at IS NULL');
+  });
+  // 一条组（历史上开过反应、设过上限）与一条单聊。
+  await db11.insert('sessions', {
+    'id': 'v11-group',
+    'title': '升级前的组',
+    'agent_type': 'reviewer',
+    'created_at': 11,
+    'updated_at': 22,
+    'tree_version': 3,
+    'dirty_since_seq': 5,
+    'kind': 'group',
+    'overrides_json': null,
+    'reactions_enabled': 1,
+    'max_reaction_rounds': 6,
+  });
+  await db11.insert('sessions', {
+    'id': 'v11-single',
+    'title': '升级前的单聊',
+    'agent_type': 'general',
+    'created_at': 33,
+    'updated_at': 44,
+    'tree_version': 1,
+    'dirty_since_seq': 0,
+    'kind': 'single',
+    'overrides_json': '{"toolsSubset":["read_file"]}',
+    'reactions_enabled': 1,
+    'max_reaction_rounds': null,
+  });
+  await db11.insert('messages', {
+    'id': 'v11-single-msg',
+    'seq': 1,
+    'session_id': 'v11-single',
+    'role': 'user',
+    'content': '升级前的单聊消息（带附件）',
+    'attachments': '[{"path":"old.png"}]',
+    'token_count': 7,
+    'output_token_count': 3,
+    'created_at': 11,
+    'author': null,
+    'visibility': 'public',
+  });
+  await db11.insert('messages', {
+    'id': 'v11-group-msg',
+    'seq': 2,
+    'session_id': 'v11-group',
+    'role': 'assistant',
+    'content': '升级前组里的公开回复',
+    'created_at': 33,
+    'author': 'v11-member-1',
+    'visibility': 'public',
+  });
+  await db11.insert('summary_nodes', {
+    'session_id': 'v11-group',
+    'member_id': 'v11-member-1',
+    'level': 1,
+    'start_seq': 2,
+    'end_seq': 2,
+    'node_type': 'leaf',
+    'summary_json': '{"summary":"升级前的摘要"}',
+    'token_cost': 9,
+    'covered_min_seq': 2,
+    'covered_max_seq': 2,
+  });
+  await db11.insert('group_members', {
+    'id': 'v11-member-1',
+    'group_session_id': 'v11-group',
+    'name': '甲',
+    'template_name': 'general',
+    'created_at': 11,
+  });
+  await db11.insert('group_members', {
+    'id': 'v11-member-2',
+    'group_session_id': 'v11-group',
+    'name': '乙（已移除）',
+    'template_name': 'general',
+    'removed_at': 44,
+    'created_at': 12,
+  });
+  await db11.close();
+}
+
+/// 读一张表的真实行数（升级前后各读一次，判据是数字不是"SQL 跑过了"）。
+Future<int> _rowCount(Database db, String table) async {
+  final rows = await db.rawQuery('SELECT COUNT(*) AS c FROM $table');
+  return rows.first['c'] as int;
+}
+
+void _v11MigrationTests() {
+  group('Database schema migration v11 -> v12 (custom-workspace)', () {
+    late Directory tempDir;
+
+    setUp(() {
+      tempDir = Directory.systemTemp.createTempSync('mig_v12_test_');
+    });
+
+    tearDown(() async {
+      await DatabaseService.close();
+      if (tempDir.existsSync()) {
+        try {
+          tempDir.deleteSync(recursive: true);
+        } catch (_) {}
+      }
+    });
+
+    test('v11 库无损升级：workspace 列就位、行数不变、旧行 NULL、结构指纹与全新建库一致',
+        () async {
+      await _createV11Database(tempDir);
+
+      // 前置事实：夹具必须是真实 v11 形状（没有 workspace 列），否则本用例测的是别的东西。
+      final probe = await openDatabase(p.join(tempDir.path, 'aliasagent.db'));
+      final beforeCols = await probe.rawQuery('PRAGMA table_info(sessions)');
+      final beforeNames = [for (final row in beforeCols) row['name']];
+      final beforeCounts = <String, int>{
+        for (final table in [
+          'sessions',
+          'messages',
+          'summary_nodes',
+          'group_members',
+        ])
+          table: await _rowCount(probe, table),
+      };
+      final beforeVersion = await probe.getVersion();
+      await probe.close();
+      // ignore: avoid_print
+      print('  [OBS] v11 升级前 version=$beforeVersion 列=$beforeNames 行数=$beforeCounts');
+      expect(beforeVersion, 11);
+      expect(beforeNames, isNot(contains('workspace')),
+          reason: '夹具必须是真实 v11 形状：sessions 没有 workspace 列');
+
+      await DatabaseService.openAt(tempDir.path);
+      final db = await DatabaseService.database;
+      final version = await db.getVersion();
+      final cols = await db.rawQuery('PRAGMA table_info(sessions)');
+      final names = [for (final row in cols) row['name']];
+      final sessions = await db.query('sessions', orderBy: 'id');
+      final afterCounts = <String, int>{
+        for (final table in [
+          'sessions',
+          'messages',
+          'summary_nodes',
+          'group_members',
+        ])
+          table: await _rowCount(db, table),
+      };
+      // ignore: avoid_print
+      print('  [OBS] v11 -> v12 version=$version 列=$names 行数=$afterCounts');
+      // ignore: avoid_print
+      print('  [OBS] v11 -> v12 sessions => '
+          '${sessions.map((r) => '${r['id']}: kind=${r['kind']} '
+              'workspace=${r['workspace']} reactions=${r['reactions_enabled']} '
+              'max_rounds=${r['max_reaction_rounds']}').join(' | ')}');
+
+      // ① workspace 列存在：TEXT、可空、无默认值（NULL = 未设置 = 用缺省）。
+      final workspaceCol = cols.firstWhere((row) => row['name'] == 'workspace');
+      expect(workspaceCol['type'], 'TEXT');
+      expect(workspaceCol['notnull'], 0, reason: '可空：NULL = 未设置（用缺省）');
+      expect(workspaceCol['dflt_value'], isNull,
+          reason: '不许把缺省主目录写成列默认值（不把缺省冻成用户没选过的路径）');
+
+      // ② 行数一张表都不许少（sessions / messages / summary_nodes / group_members）。
+      expect(afterCounts, equals(beforeCounts),
+          reason: 'v11→v12 只加列，不删行：$afterCounts vs $beforeCounts');
+
+      // ③ 所有旧会话的 workspace 为 NULL（不回填）。
+      for (final row in sessions) {
+        expect(row['workspace'], isNull,
+            reason: '旧行 ${row['id']} 的 workspace 必须保持 NULL（不回填）');
+      }
+      // 既有列的值原样保留（升级不改既有数据）。
+      final groupRow = sessions.firstWhere((r) => r['id'] == 'v11-group');
+      final singleRow = sessions.firstWhere((r) => r['id'] == 'v11-single');
+      expect(groupRow['reactions_enabled'], 1);
+      expect(groupRow['max_reaction_rounds'], 6);
+      expect(singleRow['overrides_json'], '{"toolsSubset":["read_file"]}');
+
+      // ④ 升级产物与全新建库（openAt 空目录）的 sessions 结构逐项一致。
+      final upgraded = await _structureFingerprint(db);
+      await DatabaseService.close();
+      final freshDir = Directory.systemTemp.createTempSync('mig_v12_fresh_');
+      try {
+        await DatabaseService.openAt(freshDir.path);
+        final freshDb = await DatabaseService.database;
+        final fresh = await _structureFingerprint(freshDb);
+        final freshCols = await freshDb.rawQuery('PRAGMA table_info(sessions)');
+        final upgradedColumns = (upgraded['sessions'] as Map)['columns'] as Map;
+        final freshColumns = (fresh['sessions'] as Map)['columns'] as Map;
+        // ignore: avoid_print
+        print('  [OBS] 升级产物 sessions 列序=$names');
+        // ignore: avoid_print
+        print('  [OBS] 全新建库 sessions 列序='
+            '${[for (final row in freshCols) row['name']]}');
+        // 列序不可避免不同（ALTER ADD COLUMN 追加到表尾），按列名逐项比较类型 / 非空 /
+        // 默认值 / 主键（与既有结构指纹同一口径）。
+        expect(upgradedColumns.keys.toSet(), equals(freshColumns.keys.toSet()),
+            reason: '升级产物与全新建库的 sessions 列名集合必须一致');
+        for (final column in freshColumns.keys) {
+          expect(upgradedColumns[column], equals(freshColumns[column]),
+              reason: 'sessions.$column 在升级产物与全新建库之间不一致');
+        }
+        // 其它三表在 v11→v12 完全不动：整表指纹也必须一致。
+        for (final table in ['messages', 'summary_nodes', 'group_members']) {
+          expect(upgraded[table], equals(fresh[table]),
+              reason: '表 $table 在 v11→v12 不该有结构变化');
         }
       } finally {
         await DatabaseService.close();

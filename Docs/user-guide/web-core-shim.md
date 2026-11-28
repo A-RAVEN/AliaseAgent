@@ -89,8 +89,9 @@ AliasAgent 无头核心已启动
    切换模板，见 [web 管理屏](web-management.md)）。数据库里没有任何会话时页面会提示新建一个。
 5. **空选中是空聊天屏**：没有任何会话（例如删除了最后一条）时，主区标题是
    「（未选择会话）」、输入禁用、消息为空，不残留上一条会话的快照 / 计量 / 提示条。
-6. **管理入口在单聊顶栏**（`Providers` 与「模板」）：群聊打开时没有这两个按钮，要先点回
-   一个单聊再打开管理页。管理页只覆盖主区，左侧会话列表仍可见、可点。
+6. **管理入口在左栏底部**（「设置」→「Provider 配置 / 模板配置」）：菜单在用户头像块上方，
+   单聊与群聊都能打开（空选中会话也可以），不再依赖主区类型。管理页只覆盖主区，左侧会话
+   列表仍可见、可点。菜单里恰好两项，没有用户资料 / 关于 / 反馈 / 登录等其它入口。
 
 ## 完整聊天屏怎么用
 
@@ -106,7 +107,8 @@ AliasAgent 无头核心已启动
   模板上传的图（经核心附件接口换成 data URL 渲染，不暴露磁盘路径），否则用**会话 id** 生成
   的身份图案（会话改名不换脸）；图片文件丢了就回落身份图案，不弹错、不阻断消息。
   附件缩略图与「图片未发送 / 图片已丢失」提示行照旧。
-- **侧栏用户头像**：会话列表最底部是用户头像块（「换头像」「恢复默认」），见
+- **侧栏用户头像**：会话列表最底部是用户头像块（「换头像」「恢复默认」），设置菜单在
+  头像块上方（「设置」→「Provider 配置 / 模板配置」），见
   [管理屏](web-management.md)；`config.get` 读取失败时在那里显示可重试的提示，不挡聊天屏。
 - **贴底跟随**：列表在底部时，新消息/流式增量/工具卡到达会自动滚到底；
   自己上翻阅读历史时不打扰（不会把你拽回底部）。
@@ -129,6 +131,42 @@ AliasAgent 无头核心已启动
 - **链失败显示真因**：群聊反应链进入 `failed` 时，主区顶部显示独立的「反应链失败：<真因>」
   （`group-chain-error`，不复用加载 / 视图错误横幅）；真因来自 `group.chain` 的 `error`。
   它是一过性提示，下一次发送即清除，`completed` / `cancelled` 不显示旧错。
+
+## 工作路径（单聊 / 群）
+
+工作路径（工作区）是**相对路径的解析根 + 文件工具的边界**：模型用相对路径时以它为根，
+文件工具越出该目录会被拒绝。缺省是**应用主目录**；单聊与群都可以改成别的已存在目录。
+它是「默认根 + 软围栏」，**不是沙箱**（见「已知限制」）。
+
+- **单聊**：在聊天屏头部**当前会话标题旁**显示「工作路径」+ 路径 +「切换」按钮
+  （`data-testid="workspace-path"` / `workspace-edit`）。点「切换」弹出**文件夹选择框**：
+  框里是当前目录的子文件夹列表，点文件夹进入下一层、点面包屑 / 「上级」回退，
+  点「选择此目录」把当前目录保存为工作路径（走核心的 `session.setWorkspace`），
+  「取消」不发任何写请求。长路径在头部单行截断，鼠标悬停看全文。
+  框顶还有一条**路径地址栏**（和 Windows 资源管理器一样）：它始终显示当前文件夹，
+  点文件夹 / 「上级」/ 面包屑后会跟着变；也可以直接改，按 Enter 或点「跳转」把路径交给
+  核心校验 —— 合法就跳过去，输错（不存在 / 不是目录 / 相对路径）会在框内报错、不跳，
+  地址栏回到当前文件夹。**点选仍是主用法**，地址栏只是给「已经知道路径」时用的快捷入口。
+  框高**固定**约视口七成、始终居中（不随子文件夹数量变化，换文件夹不会跳高跳低）；
+  子文件夹很多时列表在**框内滚动**，不会撑满屏幕。
+  面包屑顶层是「此电脑」（Windows）：盘符根（如 `C:\`）的「上级」回到「此电脑」，
+  那里列出本机各盘（`C:` / `D:`…），点盘进入；停在「此电脑」时「选择此目录」禁用
+  （它不是真实目录），先进入一个磁盘再选。
+- **群**：在群视图**右侧栏最上方**（成员名单之上；窄屏在「成员」抽屉顶部）显示「群工作路径」，
+  点「切换」弹同一个文件夹选择框，保存走 `group.setWorkspace`（会把新路径传播到所有在册
+  成员）。详见 [群聊](group-chat.md) 的「群工作路径」。
+- **没设过**时显示「缺省（应用主目录）」，文件夹选择框**从应用主目录开始**（请求里省略
+  `path`，起点由核心给）。设置会落库（`sessions.workspace`），**重启后仍生效**；
+  旧会话 / 旧组的该列为空，行为与以前一致（用缺省）。
+- **失败会看到什么**：在框里选中一个核心打不开 / 拒绝的目录时，错误**就地**显示在框内
+  （含路径与原因），框保持打开、已保存路径的显示不变；`-32602` 带可归因文本。
+  单聊实例正在生成、替换模板或删除中，或群的反应链 / 成员在运行时，切换返回可归因 busy
+  （**不排队、不改值**）；群视图的「切换」按钮在链运行时直接禁用。
+- **为什么是「应用内」的文件夹选择框，不是系统对话框**：浏览器拿不到本机绝对路径
+  （`<input type=file webkitdirectory>` 只给相对文件名，`showDirectoryPicker()` 只给目录
+  句柄），所以目录列表由核心的 `workspace.listDirs` 提供、页面负责浏览与地址栏。框里显示的是
+  核心回的绝对路径；地址栏输入的文本也原样交给核心校验（前端不猜路径），所以打错字只会得到
+  框内可归因的错误，不会静默跳到别处。
 
 ## 完整聊天屏参数
 
@@ -202,8 +240,10 @@ web 客户端本身是独立子项目，回退到最少形态就是恢复 `web/s
 |---|---|---|
 | `core.ping` | 无 | `{ok, service, protocolVersion, pid}` |
 | `core.shutdown` | 无 | `{ok: true}`。**先回包、再停机**：服务端先把这条响应刷出、关掉这条连接，然后断开客户端、关服务器、销毁 Agent、关数据库、释放单实例锁。任何本机进程（含本机网页）都能调用它关停核心——这是本机回环无鉴权服务的已知边界，见「已知限制」。停机期间若销毁 Agent / 关库出错，告警进停机报告并写日志，进程以非 0 码（3）退出 |
-| `session.list` | 无 | `{sessions: [{id,title,agentType,parentSessionId,createdAt,updatedAt,kind,overrides,reactionsEnabled}]}`（只含顶层会话，按最近更新倒序）；「kind」 为 「single」 / 「group」，客户端据此分流到聊天屏或组视图；`reactionsEnabled` 组与单会话都写（客户端只对组使用） |
-| `session.create` | `{title?, agentType?}` | `{session}`；`agentType` 必须是已存在的模板 |
+| `session.list` | 无 | `{sessions: [{id,title,agentType,parentSessionId,createdAt,updatedAt,kind,overrides,reactionsEnabled,maxRounds,workspace}]}`（只含顶层会话，按最近更新倒序）；「kind」 为 「single」 / 「group」，客户端据此分流到聊天屏或组视图；`reactionsEnabled` 组与单会话都写（客户端只对组使用）；`workspace` 是该会话的工作路径设置值（字符串或 null，null = 未设置、用缺省主目录） |
+| `session.create` | `{title?, agentType?, workspace?}` | `{session}`；`agentType` 必须是已存在的模板；`workspace` 可选：给了就**先校验再落库**（绝对路径 / 存在 / 是目录），非法 ⇒ `-32602` 且**不建会话行**；只有空白 = 省略（写 NULL、用缺省） |
+| `session.setWorkspace` | `{sessionId, workspace}` | `{session}`；单聊专用。校验 → 有在册实例则同步切该实例上下文 → 落库（核对恰好一行）→ 重读返回。非法路径 / 组会话（指明改用 `group.setWorkspace`）/ 会话不存在 ⇒ `-32602`；实例流式中 / 替换模板中 / 删除中 ⇒ 可归因 busy（不排队、不改值）。失败时数据库与运行上下文都不变 |
+| `workspace.listDirs` | `{path?}` | `{path, parent, directories:[{name,path}], exists, isDirectory}`；**文件夹选择框的数据源**。`path` 省略 / 只有空白 ⇒ 起点是**应用主目录**；只列**子目录**（不含文件），按名字排序；`parent` 是上级绝对路径（POSIX 根 / UNC 共享根时为空，界面据此禁用「上级」）；`path` 为 `"@drives"` ⇒ Windows「此电脑」虚拟根：`directories` 是本机盘符（`name` 如 `C:`、`path` 如 `C:\`），`parent` 为 null、`isDirectory` 为 false（不是真实目录、不可被选成工作路径）；Windows 盘符根（`C:\`）的 `parent` 是 `"@drives"`（「上级」可回「此电脑」切换其它盘），POSIX 调 `"@drives"` ⇒ 可归因 `-32602`；不合法路径（不存在 / 是文件 / 相对路径 / 类型不对）⇒ `-32602`（消息含该路径与原因），**不静默返回空列表**；文件夹选择框的地址栏跳转也走它校验（合法才导航） |
 | `session.delete` | `{sessionId}` | `{sessionId, deleted}`；删除进行中的切换被拒（阶段 deleting） |
 | `session.rename` | `{sessionId, title}` | `{session}`；不存在的会话 → 可归因 `-32602` |
 | `session.switchTemplate` | `{sessionId, templateName}` | `{sessionId, agentType, templateName}`；失败消息含阶段与候选名 |
@@ -220,10 +260,11 @@ web 客户端本身是独立子项目，回退到最少形态就是恢复 `web/s
 | `template.delete` | `{templateName}` | `{templateName, deleted}`；general 不可删、被会话引用拒删（名单在错误里） |
 | `attachment.upload` | `{filename, base64}` | `{path, bytes, format, mediaType, width, height}`；单张上限与文件头魔数校验见管理屏文档 |
 | `attachment.read` | `{path}` | `{path, bytes, base64, mediaType}`；只读附件目录内文件 |
-| `group.create` | `{title?, workspace?, reactionsEnabled?, maxRounds?}` | `{group}`；建组并建立组上下文（「workspace」 缺省 = 产品既有缺省工作区）；`reactionsEnabled` 省略 = 新建组**开启**自发反应（取布尔 true），显式 false 落 0；`maxRounds` 省略 / 显式 null = 产品默认 8，范围 1..50，越界 / 非整数 ⇒ `-32602` |
+| `group.create` | `{title?, workspace?, reactionsEnabled?, maxRounds?}` | `{group}`；建组并建立组上下文（「workspace」 缺省 = 产品既有缺省工作区）；给了 `workspace` 时**先校验再落库**（重启后保留），只有空白 = 省略；`reactionsEnabled` 省略 = 新建组**开启**自发反应（取布尔 true），显式 false 落 0；`maxRounds` 省略 / 显式 null = 产品默认 8，范围 1..50，越界 / 非整数 ⇒ `-32602` |
+| `group.setWorkspace` | `{groupId, workspace}` | `{group}`；切换组的共享工作路径：校验（绝对 / 存在 / 是目录）→ 组上下文生效 → 落库（核对恰好一行）→ **传播到所有在册成员实例** → 重读返回。非法路径 / 单聊 id（指明改用 `session.setWorkspace`）/ 组不存在 ⇒ `-32602`；反应链或任一成员运行中 ⇒ 可归因 busy（不排队、不改值）；成员实例即时更新失败 ⇒ 可归因错误并点名成员（组与库已切换，成员轮开始会对齐） |
 | `group.update` | `{groupId, reactionsEnabled?, maxRounds?}` | `{group}`；改组的运行设置（**至少给一个字段**）。`reactionsEnabled` 必须布尔；`maxRounds` 必须是 1..50 的整数或**显式 null**（恢复默认；字段缺席 = 不改）。缺字段 / 类型不对 / 越界 ⇒ `-32602`（指明字段）；组不存在 ⇒ 带 `groupId` 的可归因错误；反应链运行中 ⇒ 可归因 busy（不排队、值不变） |
 | `group.chain` | `{groupId}` | `{groupId, sessionId, status, triggerSeq, rounds, stopReason, error, steps}`；当前 / 最近一条链的只读状态。`status ∈ {idle, running, completed, cancelled, failed}`（`idle` = 本进程内还没有链，核心重启后回到它）；`stopReason ∈ {all_passed, round_cap, cancelled, failed, no_members}`（运行中为 null）；`error` 为失败真因：`failed` 时非空且含可归因文本，`completed` / `cancelled` / 运行中为 null；`rounds` 只计反应轮；`steps` 是 0..N 条观察数据（**不是第二份消息存储**） |
-| `group.list` | 无 | `{groups:[{...session, reactionsEnabled, maxRounds, busy, runningMemberId, members:[{id,name,template,removedAt,overrides,effective}]}]}`；含已移除成员；`maxRounds` 是整数或 null；`busy` 是布尔、`runningMemberId` 是当前运行成员或 null（成员间隙为 null），供断线重连后恢复「链在跑」 |
+| `group.list` | 无 | `{groups:[{...session, reactionsEnabled, maxRounds, workspace, busy, runningMemberId, members:[{id,name,template,removedAt,overrides,effective}]}]}`；含已移除成员；`maxRounds` 是整数或 null；`workspace` 是组的工作路径设置值（字符串或 null）；`busy` 是布尔、`runningMemberId` 是当前运行成员或 null（成员间隙为 null），供断线重连后恢复「链在跑」 |
 | `group.delete` | `{groupId}` | `{groupId, deleted:true}`；先停反应链、再取消并销毁成员实例，成员/消息/摘要随外键级联删除 |
 | `group.member.add` | `{groupId, name, templateName, overrides?}` | `{groupId, member}`；重名/空名/未知模板/非法覆盖层都可归因拒绝 |
 | `group.member.remove` | `{groupId, memberId}` | `{groupId, memberId, removed:true}`；先停反应链，再软删（行与历史保留，同名重建是新 id） |
@@ -289,6 +330,16 @@ npm run test:all
 
 # 真实模型 + 无头 Edge 的端到端（无窗口；截图在 test/live_visual/web_core_shim_live.png）
 flutter test --tags live --run-skipped test/live/web_core_shim_live_test.dart
+
+# 工作路径（change `custom-workspace`）：纯逻辑 / 上下文注入 / 持久化 / RPC / 组切换
+flutter test test/unit/workspace_paths_test.dart
+flutter test test/integration/workspace_prompt_test.dart
+flutter test test/integration/workspace_persistence_test.dart
+flutter test test/integration/group_workspace_test.dart
+flutter test test/integration/web_core_rpc_test.dart
+
+# 文件夹选择框（返工任务）：列目录纯逻辑 + 浏览 / 上级 / 多盘「此电脑」/ 选择 / 失败态 / 层级 / 固定高度不跳变 / 可编辑地址栏同步与跳转（假核心 + 无头浏览器）
+cd web && npm test && node e2e/group.mjs
 ```
 
 `integration_test/web_core_shim_live_test.dart` 是规范的 live 入口；但 `flutter test` 会把
@@ -324,4 +375,9 @@ flutter test --tags live --run-skipped test/live/web_core_shim_live_test.dart
   替换真实条数、L2 容量丢弃无日志；已确认缺陷见 `Docs/known-bugs.md`。本入口至少不更盲：
   技能失败明细随快照逐条推送，整轮 failed 会推 `turn.failed`。
 - **sidecar 依赖 CWD**：裸名字加载，必须在仓库根启动（或把 DLL 放到加载路径）。
+- **工作路径是「默认根 + 软围栏」，不是沙箱**：文件工具按它判越界（越界会被拒绝），但
+  `run_command` 仍以**你自己的权限**执行，可以访问该目录之外的位置，运行后**不可撤销**、
+  没有沙箱。工作区只决定相对路径的根与命令的缺省工作目录，不构成权限边界。
+  路径指向的目录在**重启后**被删时，核心以可归因错误拒绝该会话 / 成员轮（不静默回落主目录）；
+  同进程运行中目录被删则按工具自身的「文件不存在 / 工作目录不存在」如实报错。
 - **Flutter 侧未取同一把锁**：双开由「只启动一个核心」的约定约束，见上文。

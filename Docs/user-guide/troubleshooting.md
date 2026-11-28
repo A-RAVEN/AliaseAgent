@@ -25,7 +25,9 @@ Windows 上就是 `C:\Users\你的名字\.aliasagent\logs\sidecar.log`。应用�
 | 对话里一条以 `Error: ` 开头的回复 | 这一轮请求失败，冒号后面是原因 | 按原因处理：key 无效、欠费、服务地址写错、网络不通。具体 HTTP 状态在日志里 |
 | 回复里是 `Provider "xxx" not found.` | agent 里写的 `provider` 在 `providers` 里找不到同名的项 | 两边名字改成一致。详见 [配置](configuration.md) |
 | 回复里是 `No agent type configured.` | 配置里没有名字叫 `general` 的 agent | 加上 `general` |
-| 工具卡片状态 `Error`，结果是 `Access denied: path outside workspace` / `path traversal not allowed (..)` / `absolute path not allowed` | 模型想碰你主目录以外的文件，被拒了 | 这是**故意拦的**；把你的要求改成主目录里的路径。详见 [文件工具](tools-file.md) |
+| 工具卡片状态 `Error`，结果是 `Access denied: path outside workspace` / `path traversal not allowed (..)` / `absolute path not allowed` | 模型想碰当前工作区以外的文件，被拒了 | 这是**故意拦的**；把你的要求改成当前工作路径下的相对路径。工作区**缺省**是用户主目录，单聊 / 群可以改到别的目录（见 [文件工具](tools-file.md)） |
+| 在文件夹选择框里点「选择此目录」后框内提示「不存在」/「不可用」 | 该目录不可用（被删了、没有访问权限，或不是目录） | 在框里换一个目录再确认（框不会自动关，已保存的路径也没变）；路径是默认根 + 软围栏，不是沙箱，`run_command` 仍以你的权限执行、不可撤销，详见 [web 核心](web-core-shim.md) |
+| 在文件夹选择框的地址栏输入路径后回车，框内提示「读取目录失败：…不存在 / 不是目录 / 绝对路径」 | 地址栏输入的路径不可用（打错、相对路径、指向文件）。核心拒绝后**不会跳转** | 改对再回车，或直接点选目录；框内列表与地址栏仍停在原文件夹，已保存的工作路径不受影响 |
 | 工具卡片结果里有 `File too large for edit_file (>1MB)` / `Cannot edit binary or non-text file` | 这个文件超出 `edit_file` 的处理范围 | 让它整份重写（`write_file`），或者你自己改 |
 | 工具卡片结果是 `No search providers configured` | 一家搜索服务都没配，模型却在搜 | 在配置里加 `zhipuai` 或 `kimi` 的 `api_key`。详见 [联网工具](tools-web.md) |
 | 工具卡片结果是 `Fetch failed: internal address not allowed` | 想抓本机或内网地址，被拒了 | 这是**故意拦的**；换成公网地址 |

@@ -22,6 +22,7 @@ import {
 import { emptyChatView, type ChatView } from './chat/render';
 import { ChatScreen } from './components/ChatScreen';
 import { ChatShell } from './components/ChatShell';
+import { GlobalSettingsMenu } from './components/GlobalSettingsMenu';
 import { SessionList } from './components/SessionList';
 import { UserAvatarBlock } from './components/UserAvatarBlock';
 import type { AvatarData } from './components/Avatar';
@@ -52,6 +53,7 @@ import {
   type TemplateSummary,
 } from './protocol';
 import { layoutConfig } from './tokens';
+import { workspaceDirsParams, type WorkspaceDirsResult } from './workspace/picker';
 
 // 聊天屏一次向核心要多少条历史：**调用方的显示选择**（pageSize 由请求方必填，
 // 核心不提供默认值），不是核心的隐藏默认页大小。
@@ -790,6 +792,38 @@ export default function App() {
     }
   };
 
+  /**
+   * 保存单聊工作路径（change `custom-workspace` design D8）。
+   *
+   * 成功：用返回的 `{session}` 替换列表里那一行（**不动**选中态、消息、滚动与快照），
+   * 返回 null；失败：把可归因错误文本交回组件就地显示（不整页报错、不关编辑器）。
+   */
+  const setSessionWorkspace = async (path: string): Promise<string | null> => {
+    const sessionId = currentSessionIdRef.current;
+    if (sessionId === null) return '没有选中会话：无法保存工作路径';
+    try {
+      const result = await client.request<SessionResult>('session.setWorkspace', {
+        sessionId,
+        workspace: path,
+      });
+      setSessions((previous) =>
+        previous.map((session) => (session.id === sessionId ? result.session : session)),
+      );
+      return null;
+    } catch (workspaceError: unknown) {
+      return `保存工作路径失败：${errorText(workspaceError)}`;
+    }
+  };
+
+  /**
+   * 文件夹选择对话框的数据源（change `custom-workspace` 返工任务 12.6）。
+   *
+   * 浏览器拿不到本机绝对路径，目录列表由核心的 `workspace.listDirs` 给：`null`（会话
+   * 未设置工作区）⇒ 请求省略 `path`，起点是应用主目录 —— 前端不发明第二个缺省。
+   */
+  const listWorkspaceDirs = async (path: string | null): Promise<WorkspaceDirsResult> =>
+    client.request<WorkspaceDirsResult>('workspace.listDirs', workspaceDirsParams(path));
+
   /** 删除会话：群行走 `group.delete`，单聊行走 `session.delete`（D2 / D8）。 */
   const deleteSession = async (session: Session) => {
     setError(null);
@@ -955,19 +989,27 @@ export default function App() {
         />
       }
       sidebarFooter={
-        <UserAvatarBlock
-          client={client}
-          profile={profile}
-          avatar={userAvatar}
-          error={profileError}
-          onUpdated={(next) => {
-            // 成功后就地更新（不整页刷新）；新路径的字节交给共用缓存去取。
-            setProfile(next);
-            setProfileError(null);
-            if (next.avatarPath !== null) void resolveAttachments([next.avatarPath]);
-          }}
-          onRetry={() => void loadProfile()}
-        />
+        <>
+          {/* 管理入口收归左栏底部（change `global-settings-menu` D1/D5）：菜单在用户头像块
+              之上，<aside> 常驻 ⇒ 单聊 / 群聊 / 空选中都能开管理页。 */}
+          <GlobalSettingsMenu
+            onOpenProviders={() => setPanel('providers')}
+            onOpenTemplates={() => setPanel('templates')}
+          />
+          <UserAvatarBlock
+            client={client}
+            profile={profile}
+            avatar={userAvatar}
+            error={profileError}
+            onUpdated={(next) => {
+              // 成功后就地更新（不整页刷新）；新路径的字节交给共用缓存去取。
+              setProfile(next);
+              setProfileError(null);
+              if (next.avatarPath !== null) void resolveAttachments([next.avatarPath]);
+            }}
+            onRetry={() => void loadProfile()}
+          />
+        </>
       }
       overlay={
         panel === 'providers' ? (
@@ -1047,8 +1089,11 @@ export default function App() {
           imagesSupported={imagesSupported}
           userAvatar={userAvatar}
           agentAvatar={agentAvatar}
-          onOpenProviders={() => setPanel('providers')}
-          onOpenTemplates={() => setPanel('templates')}
+          // 工作路径（change `custom-workspace` D8）：路径来自 session.list 的
+          // `workspace`（null = 用缺省）；保存走 session.setWorkspace。
+          workspace={currentSession?.workspace ?? null}
+          onSetWorkspace={setSessionWorkspace}
+          onListWorkspaceDirs={listWorkspaceDirs}
         />
       )}
     </ChatShell>

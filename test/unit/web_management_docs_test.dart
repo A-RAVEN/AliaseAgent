@@ -110,13 +110,18 @@ void main() {
     }
   });
 
-  test('布局锚点：列表常驻 / 只覆盖主区 / 点会话关闭 / 管理入口在单聊顶栏（change `group-chat-layout`）', () {
+  test('布局锚点：列表常驻 / 只覆盖主区 / 点会话关闭 / 管理入口在左栏底部（change `group-chat-layout` / `global-settings-menu`）', () {
     final text = doc.readAsStringSync();
     for (final anchor in const [
       '会话列表',
       '只覆盖主区',
       '点会话',
-      '管理入口在单聊顶栏',
+      // change `global-settings-menu` 5.3：管理入口从「单聊顶栏」搬到「左栏底部」，
+      // 只换这一处过时锚点（换成实际写进文档的新口径），其余锚点与断言不动。
+      '左栏底部',
+      'Provider 配置',
+      '模板配置',
+      '恰好两项',
       '群聊模板由各成员决定',
     ]) {
       _obs('布局锚点', anchor);

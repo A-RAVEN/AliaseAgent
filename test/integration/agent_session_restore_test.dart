@@ -284,7 +284,7 @@ void main() {
 /// 只用于验证 `SessionRepository.create` 的缺省 agentType（与生产实现同义）。
 class _FakeCreateSessionRepository implements SessionRepository {
   @override
-  Future<Session> create({String? title, String? agentType, String? parentSessionId, String kind = Session.kindSingle, String? overridesJson, bool reactionsEnabled = true, int? maxRounds}) async =>
+  Future<Session> create({String? title, String? agentType, String? parentSessionId, String kind = Session.kindSingle, String? overridesJson, bool reactionsEnabled = true, int? maxRounds, String? workspace}) async =>
       Session(
         id: 'new-default',
         title: title ?? 'New Chat',
@@ -294,6 +294,7 @@ class _FakeCreateSessionRepository implements SessionRepository {
         updatedAt: 1,
         reactionsEnabled: reactionsEnabled,
         maxRounds: maxRounds,
+        workspace: workspace,
       );
 
   @override
@@ -307,6 +308,11 @@ class _FakeCreateSessionRepository implements SessionRepository {
   /// 反应轮数上限（change `group-reactive-mode` R.1）：同上，no-op。
   @override
   Future<void> updateMaxRounds(String id, int? maxRounds) async {}
+
+  /// 工作路径（change `custom-workspace`）：这个假仓库不保存任何行，所以返回 0
+  /// （= 没有更新到唯一既有行）；该用例只验 `create` 的缺省 agentType。
+  @override
+  Future<int> updateWorkspace(String id, String? workspace) async => 0;
 
   @override
   Future<Session?> get(String id) async => null;

@@ -33,7 +33,12 @@ export function ChatShell({ sidebar, sidebarFooter = null, overlay = null, child
       >
         {children}
         {overlay ? (
-          <div data-testid="panel-overlay" className="absolute inset-0 z-20 bg-bg">
+          // `z-40`：管理页必须真的盖住主区（change `global-settings-menu` 发现的既有层级漏洞）——
+          // `GroupView` 的 header 是 `relative z-30`，旧值 `z-20` 会让群视图的顶栏画在管理页
+          // **上面**（顶部 101px 被盖住，`templates-close` 的命中结果是 `group-kind`）。
+          // 旧入口只长在单聊头部（无 z-index），所以这个冲突在本 change 把入口搬到左栏
+          // 底部、群视图首次能开管理页之后才暴露出来。
+          <div data-testid="panel-overlay" className="absolute inset-0 z-40 bg-bg">
             {overlay}
           </div>
         ) : null}

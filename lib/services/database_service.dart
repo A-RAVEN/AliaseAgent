@@ -9,7 +9,8 @@ import 'package:path/path.dart' as p;
 import 'config_service.dart';
 
 class DatabaseService {
-  static const _schemaVersion = 11;
+  /// change `custom-workspace`：v11 → v12 只加 `sessions.workspace`（可空 TEXT）。
+  static const _schemaVersion = 12;
   static Database? _db;
 
   /// Whether a database is currently open. Compaction-tree persistence
@@ -70,7 +71,8 @@ class DatabaseService {
         kind TEXT NOT NULL DEFAULT 'single',
         overrides_json TEXT,
         reactions_enabled INTEGER NOT NULL DEFAULT 1,
-        max_reaction_rounds INTEGER
+        max_reaction_rounds INTEGER,
+        workspace TEXT
       )
     ''');
     await db.execute('''
@@ -267,6 +269,13 @@ class DatabaseService {
       // 只加可空列，既有行保持 NULL（= 用产品默认 8），不回填。
       await db.execute(
           'ALTER TABLE sessions ADD COLUMN max_reaction_rounds INTEGER');
+    }
+    if (oldV <= 11) {
+      // v11 → v12：会话 / 组的工作路径（change `custom-workspace` design D2）。
+      //
+      // 只加**可空**列，既有行保持 NULL（= 未设置，沿用既有缺省 `ConfigService.homeDir`）；
+      // **不回填**缺省主目录 —— 那会把「缺省」冻成用户没选过的路径。不删行、不改既有列。
+      await db.execute('ALTER TABLE sessions ADD COLUMN workspace TEXT');
     }
     if (oldV < 1 || oldV > _schemaVersion) {
       await db.execute('DROP TABLE IF EXISTS messages');

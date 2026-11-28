@@ -20,6 +20,7 @@ import 'package:alias_agent/services/database_service.dart';
 import 'package:alias_agent/services/message_repository.dart';
 import 'package:alias_agent/services/skills/skill_catalog_service.dart';
 import 'package:alias_agent/services/tool_catalog.dart';
+import 'package:alias_agent/services/workspace.dart';
 
 import 'helpers/fake_sidecar.dart';
 
@@ -169,6 +170,9 @@ class _Harness {
     FakeSidecar? sidecar,
     MessageRepository? messageRepo,
     String? webRoot,
+    // 返工 12.1：`workspace.listDirs` 省略 path 时的起点 —— 注入临时目录，
+    // **绝不**让用例去列举用户真实主目录。
+    String? homeDir,
   }) async {
     final dbDir = Directory.systemTemp.createTempSync('web_core_rpc_db_');
     sqfliteFfiInit();
@@ -179,6 +183,10 @@ class _Harness {
       sidecar: fake,
       openDatabase: () => DatabaseService.openAt(dbDir.path),
       messageRepository: messageRepo,
+      // 配置 / 附件也搬进临时目录：本文件绝不落到用户真实 ~/.aliasagent 的 config。
+      configPath: p.join(dbDir.path, 'config.json'),
+      attachmentsDir: p.join(dbDir.path, 'attachments'),
+      homeDir: homeDir,
     );
     await core.start(webRoot: webRoot);
     final ws = await _WsClient.connect(core.websocketUrl);
@@ -989,6 +997,440 @@ void main() {
       } finally {
         await harness.stop();
       }
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // change `custom-workspace` 任务 7.1：工作路径 RPC 面
+  //   session.create{workspace} / session.setWorkspace / session.list / group.list
+  //   的 workspace 序列化、-32602 语义、busy 不排队不改值、方法清单。
+  // ---------------------------------------------------------------------------
+  group('工作路径 RPC（change `custom-workspace`）', () {
+    late _Harness harness;
+    late Directory base;
+    late Directory workspaceA;
+    late Directory workspaceB;
+
+    setUp(() async {
+      harness = await _Harness.start();
+      base = Directory.systemTemp.createTempSync('workspace_rpc_');
+      workspaceA = Directory(p.join(base.path, 'ws-a'))..createSync(recursive: true);
+      workspaceB = Directory(p.join(base.path, 'ws-b'))..createSync(recursive: true);
+    });
+
+    tearDown(() async {
+      await harness.stop();
+      if (base.existsSync()) {
+        try {
+          base.deleteSync(recursive: true);
+        } catch (_) {}
+      }
+    });
+
+    Future<int> sessionCount() async =>
+        (await harness.core.sessionRepo.list()).length;
+
+    test('session.create{workspace} 落库并读回；非法路径 -32602 且不建行；空白 = 省略', () async {
+      final created = await harness.ws.request('session.create', {
+        'title': '带工作区',
+        'workspace': workspaceA.path,
+      });
+      _obs('session.create 回包', created);
+      expect(created['error'], isNull);
+      final session = (created['result'] as Map)['session'] as Map;
+      final sessionId = session['id'] as String;
+      expect(session['workspace'], workspaceA.path);
+
+      final list = await harness.ws.request('session.list');
+      final listed = (list['result'] as Map)['sessions'] as List;
+      final row = listed.singleWhere((item) => (item as Map)['id'] == sessionId);
+      expect((row as Map)['workspace'], workspaceA.path,
+          reason: 'session.list 必须序列化 workspace');
+
+      final before = await sessionCount();
+      final badCases = <String, String>{
+        '不存在': p.join(base.path, 'nope-9f1'),
+        '相对': p.join('relative', 'dir'),
+        '指向文件': (File(p.join(base.path, 'a-file.txt'))..writeAsStringSync('x'))
+            .path,
+      };
+      for (final entry in badCases.entries) {
+        final response = await harness.ws.request('session.create', {
+          'title': '坏工作区-${entry.key}',
+          'workspace': entry.value,
+        });
+        _obs('非法 workspace（${entry.key}）', response);
+        expect((response['error'] as Map)['code'], -32602,
+            reason: '${entry.key} 必须被拒绝');
+        expect('${(response['error'] as Map)['message']}',
+            contains(entry.value));
+      }
+      // 类型不对（不是字符串）同样是 -32602（消息不 Echo 值，只点名字段）。
+      final wrongType = await harness.ws.request('session.create', {
+        'title': '类型不对',
+        'workspace': 42,
+      });
+      _obs('非字符串 workspace', wrongType);
+      expect((wrongType['error'] as Map)['code'], -32602);
+      expect('${(wrongType['error'] as Map)['message']}',
+          contains('workspace'));
+      expect(await sessionCount(), before, reason: '非法路径不得创建会话行');
+
+      final blank = await harness.ws.request('session.create', {
+        'title': '空白工作区',
+        'workspace': '   ',
+      });
+      _obs('空白 workspace 的回包', blank);
+      expect(blank['error'], isNull);
+      final blankSession = (blank['result'] as Map)['session'] as Map;
+      expect(blankSession['workspace'], isNull, reason: '只有空白 = 省略（NULL）');
+      final reread = await harness.core.sessionRepo
+          .get(blankSession['id'] as String);
+      expect(reread!.workspace, isNull);
+    });
+
+    test('session.setWorkspace：成功改库 + 实例上下文；非法 / 组 / 不存在 / 流式中各自可归因', () async {
+      final created = await harness.ws.request('session.create', {
+        'title': '切换单聊',
+        'workspace': workspaceA.path,
+      });
+      final sessionId =
+          ((created['result'] as Map)['session'] as Map)['id'] as String;
+
+      // 先发一轮让实例存在（上下文已按 A 建立）。
+      harness.sidecar.queueChunk('第一轮');
+      harness.sidecar.queueDone(inputTokens: 1, outputTokens: 1);
+      await harness.ws.request('agent.send', {'sessionId': sessionId, 'text': 'hi'});
+      expect(harness.sidecar.getWorkspace(sessionId).workspace, workspaceA.path);
+
+      final ok = await harness.ws.request('session.setWorkspace', {
+        'sessionId': sessionId,
+        'workspace': workspaceB.path,
+      });
+      _obs('session.setWorkspace 成功回包', ok);
+      expect(ok['error'], isNull);
+      final updated = (ok['result'] as Map)['session'] as Map;
+      expect(updated['workspace'], workspaceB.path);
+      expect((await harness.core.sessionRepo.get(sessionId))!.workspace,
+          workspaceB.path, reason: '库里的 workspace 必须已改');
+      final contextRead = harness.sidecar.getWorkspace(sessionId);
+      _obs('切换后实例上下文', contextRead);
+      expect(contextRead.ok, isTrue);
+      expect(p.equals(contextRead.workspace!, workspaceB.path), isTrue,
+          reason: '有在册实例时上下文必须同步切到新目录');
+
+      // 非法路径：-32602 且库 / 上下文都不变。
+      final file = File(p.join(base.path, 'not-dir.txt'))..writeAsStringSync('x');
+      for (final bad in <Object>[
+        p.join(base.path, 'still-missing-9f1'),
+        'relative/path',
+        file.path,
+        '',
+        42,
+      ]) {
+        final response = await harness.ws.request('session.setWorkspace', {
+          'sessionId': sessionId,
+          'workspace': bad,
+        });
+        _obs('非法 setWorkspace（$bad）', response);
+        expect((response['error'] as Map)['code'], -32602);
+      }
+      expect((await harness.core.sessionRepo.get(sessionId))!.workspace,
+          workspaceB.path, reason: '失败不得改库');
+      expect(p.equals(harness.sidecar.getWorkspace(sessionId).workspace!,
+          workspaceB.path), isTrue, reason: '失败不得改运行中上下文');
+
+      // 不存在的会话。
+      final missing = await harness.ws.request('session.setWorkspace', {
+        'sessionId': 'no-such-session',
+        'workspace': workspaceA.path,
+      });
+      _obs('不存在会话的 setWorkspace', missing);
+      expect((missing['error'] as Map)['code'], -32602);
+
+      // 组会话用错方法：指明改用 group.setWorkspace。
+      final group = await harness.ws.request('group.create', {'title': '一个组'});
+      final groupId = ((group['result'] as Map)['group'] as Map)['id'] as String;
+      final wrongKind = await harness.ws.request('session.setWorkspace', {
+        'sessionId': groupId,
+        'workspace': workspaceA.path,
+      });
+      _obs('组会话的 session.setWorkspace', wrongKind);
+      expect((wrongKind['error'] as Map)['code'], -32602);
+      expect('${(wrongKind['error'] as Map)['message']}',
+          contains('group.setWorkspace'));
+      expect((await harness.core.sessionRepo.get(groupId))!.workspace, isNull,
+          reason: 'kind 不符不得改库');
+
+      // 流式中：可归因 busy，且不排队 / 不改值。
+      harness.sidecar.gateNextSend();
+      harness.sidecar.queueChunk('流式中');
+      harness.sidecar.queueDone(inputTokens: 1, outputTokens: 1);
+      final pending = harness.ws.request('agent.send', {
+        'sessionId': sessionId,
+        'text': '占住实例',
+      });
+      await _waitUntil(
+          () => harness.sidecar.awaitingGateCount == 1, '实例进入流式并挂住');
+      final busy = await harness.ws.request('session.setWorkspace', {
+        'sessionId': sessionId,
+        'workspace': workspaceA.path,
+      });
+      _obs('流式中的 session.setWorkspace', busy);
+      expect((busy['error'] as Map)['code'], -32602);
+      expect('${(busy['error'] as Map)['message']}', contains('busy'));
+      expect((await harness.core.sessionRepo.get(sessionId))!.workspace,
+          workspaceB.path, reason: 'busy 不改值');
+      harness.sidecar.releaseGate();
+      await pending;
+    });
+
+    test('无实例时 session.setWorkspace 只落库；首次发送的上下文用该值', () async {
+      final created = await harness.ws.request('session.create', {
+        'title': '还没有实例',
+        'workspace': workspaceA.path,
+      });
+      final sessionId =
+          ((created['result'] as Map)['session'] as Map)['id'] as String;
+      // 没有实例：不碰 sidecar，直接落库。
+      final ok = await harness.ws.request('session.setWorkspace', {
+        'sessionId': sessionId,
+        'workspace': workspaceB.path,
+      });
+      _obs('无实例时的 setWorkspace', ok);
+      expect(ok['error'], isNull);
+      expect(harness.sidecar.ensureContextCalls, isNot(contains(sessionId)),
+          reason: '没有实例就不该建上下文');
+
+      harness.sidecar.queueChunk('首次发送');
+      harness.sidecar.queueDone(inputTokens: 1, outputTokens: 1);
+      await harness.ws.request('agent.send', {'sessionId': sessionId, 'text': 'hi'});
+      final read = harness.sidecar.getWorkspace(sessionId);
+      _obs('首次发送后的上下文工作区', read);
+      expect(read.ok, isTrue);
+      expect(p.equals(read.workspace!, workspaceB.path), isTrue,
+          reason: '首次发送创建的上下文必须用持久化值');
+    });
+
+    test('session.list 与 group.list 每项都有 workspace 键（null 与字符串都在）', () async {
+      final withWorkspace = await harness.core.sessionRepo
+          .create(title: '有工作区', workspace: workspaceA.path);
+      final withoutWorkspace =
+          await harness.core.sessionRepo.create(title: '无工作区');
+      final group = await harness.ws.request('group.create', {
+        'title': '带工作区组',
+        'workspace': workspaceB.path,
+      });
+      expect(group['error'], isNull);
+      final groupId = ((group['result'] as Map)['group'] as Map)['id'] as String;
+
+      final sessions = ((await harness.ws.request('session.list'))['result']
+          as Map)['sessions'] as List;
+      for (final row in sessions.cast<Map>()) {
+        expect(row.containsKey('workspace'), isTrue,
+            reason: 'session.list 的每一项都必须带 workspace 键（null 也要在）');
+      }
+      final byId = {
+        for (final row in sessions.cast<Map>()) row['id']: row['workspace'],
+      };
+      _obs('session.list 的 workspace 映射', byId);
+      expect(byId[withWorkspace.id], workspaceA.path);
+      expect(byId[withoutWorkspace.id], isNull);
+      expect(byId[groupId], workspaceB.path);
+
+      final groups = ((await harness.ws.request('group.list'))['result']
+          as Map)['groups'] as List;
+      for (final row in groups.cast<Map>()) {
+        expect(row.containsKey('workspace'), isTrue,
+            reason: 'group.list 的每一项都必须带 workspace 键');
+      }
+      final groupRow =
+          groups.cast<Map>().singleWhere((row) => row['id'] == groupId);
+      _obs('group.list 的组 workspace', groupRow['workspace']);
+      expect(groupRow['workspace'], workspaceB.path);
+    });
+
+    test('方法清单：两个新方法在常量里且已注册（_registerMethods 不抛 StateError）', () async {
+      _obs('常量里的方法数', kCoreRpcMethodNames.length);
+      expect(kCoreRpcMethodNames, containsAll(<String>[
+        'session.setWorkspace',
+        'group.setWorkspace',
+      ]));
+      final registered = harness.core.rpcMethods;
+      _obs('核心已注册方法（工作路径相关）',
+          registered.where((m) => m.contains('etWorkspace')).toList());
+      expect(registered, containsAll(<String>[
+        'session.setWorkspace',
+        'group.setWorkspace',
+      ]));
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 返工 12.1：文件夹选择对话框的列目录 RPC（`workspace.listDirs`）
+  //
+  // 判据：**只列子目录**（文件不得混进来）、省略 `path` 用注入的主目录、
+  // `parent` 是上级绝对路径（根为 null）、非法路径 `-32602` 且消息可归因。
+  // 夹具全在临时目录里（`homeDir` 注入），不列举用户真实主目录。
+  // ---------------------------------------------------------------------------
+  group('workspace.listDirs（文件夹选择）', () {
+    late _Harness harness;
+    late Directory base;
+    late Directory home;
+    late Directory target;
+    late List<File> files;
+
+    setUp(() async {
+      base = Directory.systemTemp.createTempSync('workspace_dirs_');
+      home = Directory(p.join(base.path, 'home'))..createSync(recursive: true);
+      target = Directory(p.join(base.path, 'target'))..createSync(recursive: true);
+      Directory(p.join(target.path, 'alpha')).createSync(recursive: true);
+      Directory(p.join(target.path, 'beta')).createSync(recursive: true);
+      Directory(p.join(target.path, 'zed-empty')).createSync(recursive: true);
+      files = [
+        for (final name in ['a-file.txt', 'b-file.txt'])
+          File(p.join(target.path, name))..writeAsStringSync('x'),
+      ];
+      harness = await _Harness.start(homeDir: home.path);
+    });
+
+    tearDown(() async {
+      await harness.stop();
+      if (base.existsSync()) {
+        try {
+          base.deleteSync(recursive: true);
+        } catch (_) {}
+      }
+    });
+
+    test('省略 path（与只有空白）⇒ 起点是注入的主目录；回包 exists / isDirectory 为真', () async {
+      final omitted = await harness.ws.request('workspace.listDirs');
+      _obs('省略 path 的回包', omitted);
+      expect(omitted['error'], isNull);
+      final result = omitted['result'] as Map;
+      expect(p.equals(result['path'] as String, home.path), isTrue,
+          reason: '省略 path 必须用注入的主目录当起点，实测 ${result['path']}');
+      expect(result['exists'], isTrue);
+      expect(result['isDirectory'], isTrue);
+      expect(result['directories'], isEmpty);
+      expect(result['parent'], isNotNull,
+          reason: '临时主目录的上级（临时根）必须给出来，不是 null');
+
+      final blank = await harness.ws.request('workspace.listDirs', {'path': '   '});
+      _obs('只有空白的 path 的回包', blank);
+      expect(blank['error'], isNull);
+      expect(p.equals((blank['result'] as Map)['path'] as String, home.path), isTrue,
+          reason: '只有空白 = 省略（起点仍是主目录）');
+    });
+
+    test('只列子目录（不含文件）、按名字排序、每项 path 是绝对路径、parent 是上级', () async {
+      final response = await harness.ws.request('workspace.listDirs', {
+        'path': target.path,
+      });
+      _obs('列举夹具目录的回包', response);
+      expect(response['error'], isNull);
+      final result = response['result'] as Map;
+      final directories = (result['directories'] as List).cast<Map>();
+      _obs('子目录（名字）', [for (final entry in directories) entry['name']]);
+      expect(
+        [for (final entry in directories) entry['name']],
+        ['alpha', 'beta', 'zed-empty'],
+        reason: '只列子目录且按名字排序：两个文件不得混进来',
+      );
+      for (final entry in directories) {
+        final path = entry['path'] as String;
+        expect(p.isAbsolute(path), isTrue, reason: '子目录 path 必须是绝对路径：$path');
+        expect(p.equals(path, p.join(target.path, entry['name'] as String)), isTrue,
+            reason: '子目录 path 必须是父目录 + 名字：$path');
+        expect(p.isWithin(target.path, path), isTrue);
+      }
+      expect(result['exists'], isTrue);
+      expect(result['isDirectory'], isTrue);
+      expect(p.equals(result['parent'] as String, base.path), isTrue,
+          reason: 'parent 必须是上级绝对路径，实测 ${result['parent']}');
+    });
+
+    test('文件系统根：Windows 盘符根 parent 是「此电脑」；POSIX 根仍为 null', () async {
+      final root = p.rootPrefix(target.path);
+      final response = await harness.ws.request('workspace.listDirs', {'path': root});
+      final result = response['result'] as Map;
+      _obs('列举根目录 $root 的 parent（只读目录项，不写入）', result['parent']);
+      expect(response['error'], isNull,
+          reason: '根目录必须可列举（不是"不存在"）：${response['error']}');
+      if (Platform.isWindows) {
+        expect(result['parent'], kWorkspaceDrivesRoot,
+            reason: '盘符根的上一级必须是「此电脑」虚拟根，否则其它盘不可达');
+      } else {
+        expect(result['parent'], isNull);
+      }
+      expect(result['isDirectory'], isTrue);
+    });
+
+    test('「此电脑」drives 根：Windows 列出本机盘且含当前盘；POSIX 可归因拒绝', () async {
+      final response = await harness.ws.request('workspace.listDirs', {
+        'path': kWorkspaceDrivesRoot,
+      });
+      _obs('drives 根回包', response);
+      if (Platform.isWindows) {
+        expect(response['error'], isNull,
+            reason: 'Windows 必须支持「此电脑」：${response['error']}');
+        final result = response['result'] as Map;
+        final directories = (result['directories'] as List).cast<Map>();
+        _obs('本机盘符', [for (final entry in directories) entry['name']]);
+        expect(result['path'], kWorkspaceDrivesRoot);
+        expect(result['parent'], isNull);
+        expect(result['isDirectory'], isFalse,
+            reason: '「此电脑」不是目录：界面据此禁用确认，不能被选成工作路径');
+        expect(directories, isNotEmpty, reason: '至少应枚举到当前盘');
+        final paths = [for (final entry in directories) entry['path'] as String];
+        final currentRoot = p.rootPrefix(Directory.current.path);
+        expect(paths.any((path) => p.equals(path, currentRoot)), isTrue,
+            reason: '盘符列表必须含当前盘 $currentRoot，实测 $paths');
+        for (final entry in directories) {
+          final path = entry['path'] as String;
+          expect(p.isAbsolute(path), isTrue, reason: '盘符 path 必须绝对：$path');
+          expect(RegExp(r'^[A-Za-z]:\\$').hasMatch(path), isTrue,
+              reason: '盘符 path 必须是 `X:\\`：$path');
+          expect(entry['name'], path.substring(0, 2));
+        }
+      } else {
+        expect((response['error'] as Map)['code'], -32602,
+            reason: 'POSIX 没有盘符层，drives 根必须可归因拒绝');
+        expect('${(response['error'] as Map)['message']}', contains('此电脑'));
+      }
+    });
+
+    test('不存在 / 指向文件 / 相对路径 / 类型不对 ⇒ -32602，消息含路径与原因', () async {
+      final cases = <String, ({String path, String reason})>{
+        '不存在': (path: p.join(base.path, 'no-such-dir-9f1'), reason: '不存在'),
+        '指向文件': (path: files.first.path, reason: '不是目录'),
+        '相对': (path: p.join('relative', 'dir'), reason: '绝对路径'),
+      };
+      for (final entry in cases.entries) {
+        final response = await harness.ws.request('workspace.listDirs', {
+          'path': entry.value.path,
+        });
+        _obs('非法 path（${entry.key}）', response);
+        expect((response['error'] as Map)['code'], -32602,
+            reason: '${entry.key} 必须被拒绝');
+        final message = '${(response['error'] as Map)['message']}';
+        expect(message, contains(entry.value.path), reason: '错误消息必须点名该路径');
+        expect(message, contains(entry.value.reason), reason: '错误消息必须含原因');
+      }
+
+      final wrongType = await harness.ws.request('workspace.listDirs', {'path': 42});
+      _obs('非字符串 path', wrongType);
+      expect((wrongType['error'] as Map)['code'], -32602);
+      expect('${(wrongType['error'] as Map)['message']}', contains('path'));
+    });
+
+    test('方法清单含 workspace.listDirs 且已注册（_registerMethods 不抛 StateError）', () async {
+      _obs('方法清单长度', kCoreRpcMethodNames.length);
+      expect(kCoreRpcMethodNames, contains('workspace.listDirs'));
+      final registered = harness.core.rpcMethods;
+      _obs('已注册的 workspace.* 方法',
+          registered.where((name) => name.startsWith('workspace.')).toList());
+      expect(registered, contains('workspace.listDirs'));
     });
   });
 }

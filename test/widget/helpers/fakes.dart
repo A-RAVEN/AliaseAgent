@@ -8,7 +8,7 @@ class FakeSessionRepository implements SessionRepository {
   FakeSessionRepository(this.sessions);
 
   @override
-  Future<Session> create({String? title, String? agentType, String? parentSessionId, String kind = Session.kindSingle, String? overridesJson, bool reactionsEnabled = true, int? maxRounds}) async {
+  Future<Session> create({String? title, String? agentType, String? parentSessionId, String kind = Session.kindSingle, String? overridesJson, bool reactionsEnabled = true, int? maxRounds, String? workspace}) async {
     final s = Session(
       id: 'new-${sessions.length}',
       title: title ?? 'New Chat',
@@ -20,6 +20,7 @@ class FakeSessionRepository implements SessionRepository {
       overridesJson: overridesJson,
       reactionsEnabled: reactionsEnabled,
       maxRounds: maxRounds,
+      workspace: workspace,
     );
     sessions.insert(0, s);
     return s;
@@ -50,6 +51,8 @@ class FakeSessionRepository implements SessionRepository {
       overridesJson: json,
       reactionsEnabled: old.reactionsEnabled,
       maxRounds: old.maxRounds,
+      // 覆盖层写入只换这一列：工作路径原样保留（不同列互不覆盖）。
+      workspace: old.workspace,
     );
   }
 
@@ -100,6 +103,18 @@ class FakeSessionRepository implements SessionRepository {
     sessions[i] = maxRounds == null
         ? sessions[i].copyWith(clearMaxRounds: true)
         : sessions[i].copyWith(maxRounds: maxRounds);
+  }
+
+  /// 原地写工作路径（change `custom-workspace`）：按内存里的会话写回并**返回受影响
+  /// 行数**（与真仓库同口径：调用方核对恰好一行，0 = 不存在）。
+  @override
+  Future<int> updateWorkspace(String id, String? workspace) async {
+    final i = sessions.indexWhere((s) => s.id == id);
+    if (i < 0) return 0;
+    sessions[i] = workspace == null
+        ? sessions[i].copyWith(clearWorkspace: true)
+        : sessions[i].copyWith(workspace: workspace);
+    return 1;
   }
 
   @override
